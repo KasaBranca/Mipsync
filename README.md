@@ -6,6 +6,7 @@
 
 <p align="center">
   A Windows-first game editor and runtime for the original PlayStation.<br>
+  <a href="https://mipsyncweb.pages.dev/">Official Website</a> ·
   <a href="LICENSE">MIT License</a>
 </p>
 
