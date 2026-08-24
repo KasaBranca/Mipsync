@@ -1,4 +1,13 @@
-# Mipsync
+<p align="center">
+  <img src="resources/icons/app_icon.png" alt="Mipsync Engine logo" width="128">
+</p>
+
+<h1 align="center">Mipsync</h1>
+
+<p align="center">
+  A Windows-first game editor and runtime for the original PlayStation.<br>
+  <a href="LICENSE">MIT License</a>
+</p>
 
 Mipsync is a Windows-first game editor and runtime for authoring projects that target the original PlayStation. It combines a visual editor, scene and asset pipelines, Mips# gameplay scripting, animation, UI, audio, physics, native Windows player builds, a PS1 export path, and the Mipsync Hub project launcher.
 
@@ -97,7 +106,15 @@ No emulator, BIOS, Sony SDK material, or PSn00bSDK source/binary is stored in th
 
 Bundled, configure-time, npm, and Cargo dependencies were audited for this source publication. Versions, license families, and notice locations are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Full license texts for configure-time engine dependencies are under `third_party/licenses/`; bundled single-file libraries retain their notices in the source files, and Inter retains its SIL OFL license under `resources/fonts/`. Hub dependency resolution is fixed by `package-lock.json` and `Cargo.lock`.
 
-No project-wide license has been selected for the original Mipsync source in this repository. Third-party components remain governed by their respective licenses.
+## Contributing
+
+Contributions are welcome, including code created with assistance from AI tools. Disclosure of AI assistance is not required, but contributors must understand, review, and thoroughly test every submitted change. Please verify correctness, maintainability, security, and license compatibility before opening a pull request.
+
+Do not submit generated or copied code unless you have confirmed that it can legally be distributed under this repository's license.
+
+## License
+
+Original Mipsync source code is available under the [MIT License](LICENSE). Third-party components remain governed by their respective licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.
 
 ## Current status
 
