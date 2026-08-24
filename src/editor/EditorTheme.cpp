@@ -1,0 +1,502 @@
+#include "EditorTheme.h"
+#include "../core/RuntimePaths.h"
+#include <filesystem>
+#include <vector>
+#include <cmath>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
+namespace MipsyncEngine {
+
+ImVec4 EditorTheme::BtnFace = UiTokens::BgTertiary;
+ImVec4 EditorTheme::BtnFaceLight = UiTokens::BgHover;
+ImVec4 EditorTheme::BtnShadow = UiTokens::Border;
+ImVec4 EditorTheme::BtnDarkShadow = UiTokens::Bg;
+ImVec4 EditorTheme::BtnHighlight = UiTokens::BorderHighlight;
+ImVec4 EditorTheme::PanelFace = UiTokens::BgSecondary;
+ImVec4 EditorTheme::PanelAlt = UiTokens::Bg;
+ImVec4 EditorTheme::WorkArea = UiTokens::Bg;
+ImVec4 EditorTheme::Desktop = UiTokens::Bg;
+ImVec4 EditorTheme::InputBg = UiTokens::Bg;
+ImVec4 EditorTheme::TitleBarTop = UiTokens::Bg;
+ImVec4 EditorTheme::TitleBarBottom = UiTokens::Bg;
+ImVec4 EditorTheme::TitleBarText = UiTokens::Text;
+ImVec4 EditorTheme::Selection = UiTokens::Brand;
+ImVec4 EditorTheme::SelectionText = UiTokens::TextOnBrand;
+ImVec4 EditorTheme::PsAccent = UiTokens::Brand;
+ImVec4 EditorTheme::LinkCyan = UiTokens::TextBrand;
+ImVec4 EditorTheme::TextBrand = UiTokens::TextBrand;
+ImVec4 EditorTheme::TextPrimary = UiTokens::Text;
+ImVec4 EditorTheme::TextSecondary = UiTokens::TextSecondary;
+ImVec4 EditorTheme::TextMuted = UiTokens::TextTertiary;
+ImVec4 EditorTheme::TextDisabled = UiTokens::TextDisabled;
+ImVec4 EditorTheme::Error = UiTokens::Danger;
+ImVec4 EditorTheme::ErrorBg = UiTokens::DangerBg;
+ImVec4 EditorTheme::SuccessLabel = UiTokens::Success;
+ImVec4 EditorTheme::DangerFace = UiTokens::Danger;
+ImVec4 EditorTheme::DangerText = UiTokens::TextOnBrand;
+ImVec4 EditorTheme::Warning = UiTokens::Warning;
+ImVec4 EditorTheme::BorderLight = UiTokens::Border;
+ImVec4 EditorTheme::BorderDark = UiTokens::Bg;
+ImVec4 EditorTheme::Background = UiTokens::Bg;
+ImVec4 EditorTheme::Accent = UiTokens::Brand;
+ImVec4 EditorTheme::AccentHover = UiTokens::BrandHover;
+ImVec4 EditorTheme::AccentActive = UiTokens::BrandPressed;
+ImVec4 EditorTheme::AccentMuted = UiTokens::WithAlpha(UiTokens::Brand, 0.35f);
+ImVec4 EditorTheme::Primary = UiTokens::Brand;
+ImVec4 EditorTheme::OnPrimary = UiTokens::TextOnBrand;
+ImVec4 EditorTheme::SurfaceContainer = UiTokens::BgSecondary;
+ImVec4 EditorTheme::SurfaceContainerHigh = UiTokens::BgTertiary;
+ImVec4 EditorTheme::SurfaceRaised = UiTokens::BgTertiary;
+ImVec4 EditorTheme::SurfaceHover = UiTokens::BgHover;
+ImVec4 EditorTheme::OnSurface = UiTokens::Text;
+ImVec4 EditorTheme::OnSurfaceVariant = UiTokens::TextSecondary;
+ImVec4 EditorTheme::Outline = UiTokens::Border;
+ImVec4 EditorTheme::OutlineVariant = UiTokens::Border;
+ImVec4 EditorTheme::PanelBackground = UiTokens::BgSecondary;
+ImVec4 EditorTheme::GlassPanel = UiTokens::BgSecondary;
+ImVec4 EditorTheme::Border = UiTokens::Border;
+ImVec4 EditorTheme::BorderStrong = UiTokens::BorderStrong;
+ImVec4 EditorTheme::Success = UiTokens::Success;
+ImVec4 EditorTheme::SuccessHover = UiTokens::SuccessHover;
+ImVec4 EditorTheme::Danger = UiTokens::Danger;
+ImVec4 EditorTheme::DangerHover = UiTokens::DangerHover;
+
+namespace {
+
+bool gDarkMode = true;
+
+ImU32 U32(const ImVec4& c) {
+    return ImGui::ColorConvertFloat4ToU32(c);
+}
+
+using namespace UiTokens;
+
+std::filesystem::path ResolveBundledFont(const char* filename) {
+    const std::filesystem::path candidate =
+        GetBundledResourcesDirectory() / "fonts" / filename;
+    if (std::filesystem::exists(candidate))
+        return candidate;
+    return {};
+}
+
+} // namespace
+
+bool EditorTheme::IsDarkMode() {
+    return gDarkMode;
+}
+
+void EditorTheme::SetDarkMode(bool dark) {
+    gDarkMode = dark;
+
+    const ImVec4 bg = dark ? UiTokens::Hex(0x1E1E1E) : UiTokens::Hex(0xECECEC);
+    const ImVec4 panel = dark ? UiTokens::Hex(0x2C2C2C) : UiTokens::Hex(0xFAFAFA);
+    const ImVec4 panelAlt = dark ? UiTokens::Hex(0x1E1E1E) : UiTokens::Hex(0xF4F4F4);
+    const ImVec4 control = dark ? UiTokens::Hex(0x383838) : UiTokens::Hex(0xF0F0F0);
+    const ImVec4 hover = dark ? UiTokens::Hex(0x444444) : UiTokens::Hex(0xE2E2E2);
+    const ImVec4 pressed = dark ? UiTokens::Hex(0x242424) : UiTokens::Hex(0xD8D8D8);
+    const ImVec4 text = dark ? UiTokens::Hex(0xFFFFFF) : UiTokens::Hex(0x242424);
+    const ImVec4 textSecondary = dark ? UiTokens::Hex(0xB3B3B3) : UiTokens::Hex(0x5F6368);
+    const ImVec4 textMuted = dark ? UiTokens::Hex(0x8C8C8C) : UiTokens::Hex(0x858585);
+    const ImVec4 textDisabled = dark ? UiTokens::Hex(0x666666) : UiTokens::Hex(0xADADAD);
+    const ImVec4 border = dark ? UiTokens::Hex(0x444444) : UiTokens::Hex(0xD2D2D2);
+    const ImVec4 borderStrong = dark ? UiTokens::Hex(0x707070) : UiTokens::Hex(0xA9A9A9);
+
+    BtnFace = control;
+    BtnFaceLight = hover;
+    BtnShadow = border;
+    BtnDarkShadow = pressed;
+    BtnHighlight = borderStrong;
+    PanelFace = panel;
+    PanelAlt = panelAlt;
+    WorkArea = bg;
+    Desktop = bg;
+    InputBg = dark ? UiTokens::Hex(0x1E1E1E) : UiTokens::Hex(0xF3F3F3);
+    TitleBarTop = panel;
+    TitleBarBottom = panel;
+    TitleBarText = text;
+    Selection = UiTokens::Brand;
+    SelectionText = UiTokens::TextOnBrand;
+    PsAccent = UiTokens::Brand;
+    LinkCyan = UiTokens::TextBrand;
+    TextBrand = UiTokens::TextBrand;
+    TextPrimary = text;
+    TextSecondary = textSecondary;
+    TextMuted = textMuted;
+    TextDisabled = textDisabled;
+    Error = UiTokens::Danger;
+    ErrorBg = dark ? UiTokens::DangerBg : UiTokens::Hex(0xFCE8E3);
+    SuccessLabel = dark ? UiTokens::Success : UiTokens::Hex(0x07883F);
+    DangerFace = UiTokens::Danger;
+    DangerText = UiTokens::TextOnBrand;
+    Warning = dark ? UiTokens::Warning : UiTokens::Hex(0x9A6700);
+    BorderLight = border;
+    BorderDark = pressed;
+
+    Background = WorkArea;
+    Accent = Selection;
+    AccentHover = UiTokens::BrandHover;
+    AccentActive = UiTokens::BrandPressed;
+    AccentMuted = UiTokens::WithAlpha(UiTokens::Brand, dark ? 0.35f : 0.22f);
+    Primary = Selection;
+    OnPrimary = SelectionText;
+    SurfaceContainer = PanelFace;
+    SurfaceContainerHigh = control;
+    SurfaceRaised = control;
+    SurfaceHover = hover;
+    OnSurface = TextPrimary;
+    OnSurfaceVariant = TextSecondary;
+    Outline = BorderLight;
+    OutlineVariant = BorderLight;
+    PanelBackground = PanelFace;
+    GlassPanel = PanelFace;
+    Border = BorderLight;
+    BorderStrong = borderStrong;
+    Success = SuccessLabel;
+    SuccessHover = UiTokens::SuccessHover;
+    Danger = DangerFace;
+    DangerHover = UiTokens::DangerHover;
+}
+
+void EditorTheme::DrawButtonBevel(ImDrawList* drawList, ImVec2 min, ImVec2 max, bool pressed) {
+    // UI3 communicates affordance with a clean one-pixel outline and fill state,
+    // not a bevel, gloss, or drop shadow.
+    drawList->AddRect({min.x + 0.5f, min.y + 0.5f},
+                      {max.x - 0.5f, max.y - 0.5f},
+                      U32(pressed ? BorderStrong : BorderLight),
+                      ShapeCornerSmall, 0, 1.0f);
+}
+
+void EditorTheme::DrawTitleBar(ImDrawList* drawList, ImVec2 min, ImVec2 max, const char* title) {
+    const float h = 32.0f;
+    const ImVec2 barMax(max.x, min.y + h);
+    drawList->AddRectFilled(min, barMax, U32(PanelFace));
+    drawList->AddLine(ImVec2(min.x, barMax.y), ImVec2(max.x, barMax.y), U32(BorderLight));
+
+    if (title && title[0]) {
+        const ImVec2 textPos(min.x + 12.0f, min.y + 8.0f);
+        drawList->AddText(textPos, U32(EditorTheme::TextSecondary), title);
+    }
+}
+
+void EditorTheme::DrawCanvasBackground(ImDrawList* drawList, ImVec2 min, ImVec2 max) {
+    drawList->AddRectFilled(min, max, U32(WorkArea));
+}
+
+ImVec4 EditorTheme::GetClearColor() {
+    return Desktop;
+}
+
+bool EditorTheme::StyledButton(const char* label, const ImVec2& size, AeroButtonKind kind) {
+    const float h = size.y > 0.0f ? size.y : ButtonHeight;
+
+    ImVec4 face = BtnFace;
+    ImVec4 hover = BtnFaceLight;
+    ImVec4 active = BtnDarkShadow;
+    ImVec4 text = TextPrimary;
+    ImVec4 border = BorderLight;
+    float borderSize = 1.0f;
+    float rounding = ShapeCornerSmall;
+
+    switch (kind) {
+    case AeroButtonKind::Danger:
+        face = Danger;
+        hover = DangerHover;
+        active = DangerHover;
+        text = SelectionText;
+        border = Danger;
+        borderSize = 0.0f;
+        break;
+    case AeroButtonKind::Success:
+        face = Success;
+        hover = SuccessHover;
+        active = SuccessHover;
+        text = SelectionText;
+        border = Success;
+        borderSize = 0.0f;
+        break;
+    case AeroButtonKind::Primary:
+        face = Brand;
+        hover = BrandHover;
+        active = BrandPressed;
+        text = SelectionText;
+        border = Brand;
+        borderSize = 0.0f;
+        break;
+    case AeroButtonKind::Secondary:
+    default:
+        break;
+    }
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, rounding);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12.0f, 5.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, std::max(1.0f, borderSize));
+    ImGui::PushStyleColor(ImGuiCol_Border, border);
+    ImGui::PushStyleColor(ImGuiCol_Button, face);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hover);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, active);
+    ImGui::PushStyleColor(ImGuiCol_Text, text);
+
+    const bool pressed = ImGui::Button(label, ImVec2(size.x, h));
+    DrawButtonBevel(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(),
+                    ImGui::GetItemRectMax(), ImGui::IsItemActive());
+
+    ImGui::PopStyleColor(5);
+    ImGui::PopStyleVar(3);
+    return pressed;
+}
+
+bool EditorTheme::Checkbox(const char* label, bool* value) {
+    if (!label || !value)
+        return false;
+
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float size = ImGui::GetFrameHeight();
+    const ImVec2 labelSize = ImGui::CalcTextSize(label, nullptr, true);
+    const float labelGap = labelSize.x > 0.0f ? style.ItemInnerSpacing.x : 0.0f;
+    const ImVec2 min = ImGui::GetCursorScreenPos();
+    const ImVec2 max(min.x + size, min.y + size);
+    const ImVec2 itemSize(size + labelGap + labelSize.x,
+                          std::max(size, labelSize.y));
+
+    const bool pressed = ImGui::InvisibleButton(label, itemSize);
+    if (pressed)
+        *value = !*value;
+
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+    ImVec4 fill = *value ? Selection : InputBg;
+    if (held)
+        fill = *value ? AccentActive : BtnDarkShadow;
+    else if (hovered)
+        fill = *value ? AccentHover : BtnFaceLight;
+
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(min, max, ImGui::GetColorU32(fill), ShapeCornerSmall);
+    drawList->AddRect(min, max,
+                      ImGui::GetColorU32(*value ? Selection : BorderLight),
+                      ShapeCornerSmall, 0, 1.0f);
+
+    if (*value) {
+        const float scale = size / 18.0f;
+        const ImVec2 checkA(min.x + 4.5f * scale, min.y + 9.2f * scale);
+        const ImVec2 checkB(min.x + 7.4f * scale, min.y + 12.0f * scale);
+        const ImVec2 checkC(min.x + 13.5f * scale, min.y + 5.7f * scale);
+        const ImU32 checkColor = ImGui::GetColorU32(SelectionText);
+        const float thickness = std::max(1.5f, 1.7f * scale);
+        drawList->AddLine(checkA, checkB, checkColor, thickness);
+        drawList->AddLine(checkB, checkC, checkColor, thickness);
+    }
+
+    if (labelSize.x > 0.0f) {
+        const char* renderedEnd = label;
+        while (*renderedEnd && !(renderedEnd[0] == '#' && renderedEnd[1] == '#'))
+            ++renderedEnd;
+        const ImVec2 textPos(max.x + labelGap,
+                             min.y + (size - labelSize.y) * 0.5f);
+        drawList->AddText(textPos, ImGui::GetColorU32(ImGuiCol_Text),
+                          label, renderedEnd);
+    }
+
+    return pressed;
+}
+
+void EditorTheme::Apply() {
+    ImGuiStyle& s = ImGui::GetStyle();
+    ImVec4* c = s.Colors;
+
+    const float rSm = ShapeCornerSmall;
+
+    s.WindowRounding = 0.0f;
+    s.ChildRounding = 0.0f;
+    s.FrameRounding = rSm;
+    s.PopupRounding = ShapeCornerMedium;
+    s.ScrollbarRounding = ShapeCornerSmall;
+    s.GrabRounding = ShapeCornerSmall;
+    s.TabRounding = ShapeCornerSmall;
+
+    s.WindowPadding = ImVec2(6.0f, 6.0f);
+    s.FramePadding = ImVec2(6.0f, 3.0f);
+    s.ItemSpacing = ImVec2(6.0f, 4.0f);
+    s.ItemInnerSpacing = ImVec2(5.0f, 3.0f);
+    s.CellPadding = ImVec2(6.0f, 3.0f);
+    s.ScrollbarSize = 13.0f;
+    s.GrabMinSize = 8.0f;
+    s.IndentSpacing = 15.0f;
+
+    s.WindowBorderSize = 1.0f;
+    s.ChildBorderSize = 1.0f;
+    s.PopupBorderSize = 1.0f;
+    s.FrameBorderSize = 1.0f;
+    s.TabBorderSize = 1.0f;
+    s.TabBarBorderSize = 1.0f;
+    // Keep the selected state in the tab fill only. ImGui's selected-tab
+    // overline creates a detached accent stroke above docked window tabs.
+    s.TabBarOverlineSize = 0.0f;
+
+    c[ImGuiCol_Text] = TextPrimary;
+    c[ImGuiCol_TextDisabled] = TextDisabled;
+    c[ImGuiCol_WindowBg] = PanelFace;
+    c[ImGuiCol_ChildBg] = PanelFace;
+    c[ImGuiCol_PopupBg] = PanelFace;
+    c[ImGuiCol_Border] = BorderLight;
+    c[ImGuiCol_BorderShadow] = BtnHighlight;
+
+    c[ImGuiCol_FrameBg] = SurfaceContainerHigh;
+    c[ImGuiCol_FrameBgHovered] = SurfaceHover;
+    c[ImGuiCol_FrameBgActive] = SurfaceContainerHigh;
+
+    c[ImGuiCol_TitleBg] = PanelAlt;
+    c[ImGuiCol_TitleBgActive] = PanelFace;
+    c[ImGuiCol_TitleBgCollapsed] = WorkArea;
+
+    c[ImGuiCol_MenuBarBg] = PanelFace;
+
+    c[ImGuiCol_ScrollbarBg] = PanelAlt;
+    c[ImGuiCol_ScrollbarGrab] = BorderStrong;
+    c[ImGuiCol_ScrollbarGrabHovered] = SurfaceHover;
+    c[ImGuiCol_ScrollbarGrabActive] = Accent;
+
+    c[ImGuiCol_CheckMark] = TextPrimary;
+    c[ImGuiCol_SliderGrab] = Accent;
+    c[ImGuiCol_SliderGrabActive] = AccentActive;
+
+    c[ImGuiCol_Button] = BtnFace;
+    c[ImGuiCol_ButtonHovered] = BtnFaceLight;
+    c[ImGuiCol_ButtonActive] = BtnDarkShadow;
+
+    c[ImGuiCol_Header] = Selection;
+    c[ImGuiCol_HeaderHovered] = SurfaceHover;
+    c[ImGuiCol_HeaderActive] = AccentActive;
+
+    c[ImGuiCol_Separator] = BorderLight;
+    c[ImGuiCol_SeparatorHovered] = Accent;
+    c[ImGuiCol_SeparatorActive] = AccentHover;
+
+    c[ImGuiCol_ResizeGrip] = SurfaceContainerHigh;
+    c[ImGuiCol_ResizeGripHovered] = Accent;
+    c[ImGuiCol_ResizeGripActive] = AccentHover;
+
+    c[ImGuiCol_Tab] = PanelFace;
+    c[ImGuiCol_TabHovered] = SurfaceHover;
+    c[ImGuiCol_TabSelected] = SurfaceContainerHigh;
+    c[ImGuiCol_TabSelectedOverline] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_TabDimmed] = PanelAlt;
+    c[ImGuiCol_TabDimmedSelected] = SurfaceContainerHigh;
+    c[ImGuiCol_TabDimmedSelectedOverline] = ImVec4(0, 0, 0, 0);
+
+    c[ImGuiCol_TabActive] = SurfaceContainerHigh;
+    c[ImGuiCol_TabUnfocused] = PanelAlt;
+    c[ImGuiCol_TabUnfocusedActive] = SurfaceContainerHigh;
+
+    c[ImGuiCol_DockingPreview] = UiTokens::WithAlpha(Accent, 0.35f);
+    c[ImGuiCol_DockingEmptyBg] = WorkArea;
+
+    c[ImGuiCol_TableHeaderBg] = SurfaceContainerHigh;
+    c[ImGuiCol_TableBorderStrong] = BorderStrong;
+    c[ImGuiCol_TableBorderLight] = BorderLight;
+    c[ImGuiCol_TableRowBg] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_TableRowBgAlt] = UiTokens::WithAlpha(Accent, 0.04f);
+
+    c[ImGuiCol_PlotLines] = Accent;
+    c[ImGuiCol_PlotHistogram] = UiTokens::Component;
+    c[ImGuiCol_NavHighlight] = Accent;
+
+    c[ImGuiCol_DragDropTarget] = UiTokens::WithAlpha(Accent, 0.45f);
+    c[ImGuiCol_TextSelectedBg] = UiTokens::WithAlpha(Accent, 0.35f);
+}
+
+float EditorTheme::GetDefaultFontSizeForDisplay() {
+#ifdef _WIN32
+    // Query DPI of the primary monitor.
+    HDC hdc = GetDC(nullptr);
+    if (hdc) {
+        const int dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
+        ReleaseDC(nullptr, hdc);
+        // 96 DPI = 100% = 12px baseline
+        // Scale proportionally: size = 12 * (dpi / 96)
+        const float scale = static_cast<float>(dpiX) / 96.0f;
+        // Also factor in vertical resolution for very high-res displays.
+        const int screenH = GetSystemMetrics(SM_CYSCREEN);
+        float sizeFromRes = 12.0f;
+        if (screenH >= 2160)      sizeFromRes = 16.0f; // 4K
+        else if (screenH >= 1440) sizeFromRes = 14.0f; // 1440p
+        else                      sizeFromRes = 12.0f; // 1080p and below
+        // Take the larger of DPI-scaled and resolution-based values.
+        return std::max(sizeFromRes, std::round(12.0f * scale));
+    }
+#endif
+    return 12.0f;
+}
+
+static void LoadFontsInternal(float fontSize) {
+    ImGuiIO& io = ImGui::GetIO();
+
+    ImFontConfig cfg;
+    cfg.OversampleH = 2;
+    cfg.OversampleV = 2;
+    cfg.PixelSnapH = true;
+
+    const std::filesystem::path regular = ResolveBundledFont("Inter-Regular.ttf");
+
+    ImFont* font = nullptr;
+    if (!regular.empty())
+        font = io.Fonts->AddFontFromFileTTF(regular.string().c_str(), fontSize, &cfg);
+
+    if (!font) {
+        const char* fallbacks[] = {
+            "C:\\Windows\\Fonts\\SegUIVar.ttf",
+            "C:\\Windows\\Fonts\\segoeui.ttf",
+        };
+        for (const char* path : fallbacks) {
+            if (std::filesystem::exists(path)) {
+                font = io.Fonts->AddFontFromFileTTF(path, fontSize, &cfg);
+                break;
+            }
+        }
+    }
+
+    if (!font)
+        io.Fonts->AddFontDefault(&cfg);
+
+    const char* cjkPaths[] = {
+        "C:\\Windows\\Fonts\\meiryo.ttc",
+        "C:\\Windows\\Fonts\\YuGothM.ttc",
+        "C:\\Windows\\Fonts\\YuGothR.ttc",
+    };
+    ImFontConfig cjkCfg;
+    cjkCfg.MergeMode = true;
+    cjkCfg.OversampleH = 2;
+    cjkCfg.OversampleV = 2;
+    for (const char* path : cjkPaths) {
+        if (std::filesystem::exists(path)) {
+            io.Fonts->AddFontFromFileTTF(path, fontSize, &cjkCfg,
+                                         io.Fonts->GetGlyphRangesJapanese());
+            break;
+        }
+    }
+
+    io.FontGlobalScale = 1.0f;
+}
+
+void EditorTheme::LoadFonts(float fontSize) {
+    if (fontSize <= 0.0f)
+        fontSize = GetDefaultFontSizeForDisplay();
+    LoadFontsInternal(fontSize);
+}
+
+void EditorTheme::RebuildFonts(float fontSize) {
+    if (fontSize <= 0.0f)
+        fontSize = GetDefaultFontSizeForDisplay();
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->Clear();
+    LoadFontsInternal(fontSize);
+    io.Fonts->Build();
+}
+
+} // namespace MipsyncEngine

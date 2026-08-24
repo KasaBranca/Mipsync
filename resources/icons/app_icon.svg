@@ -1,0 +1,12 @@
+<svg width="700" height="700" viewBox="0 0 700 700" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect width="700" height="700" fill="#1E1E1E"/>
+<g clip-path="url(#paint0_angular_0_1_clip_path)" data-figma-skip-parse="true"><g transform="matrix(0 0.35 -0.35 0 350 350)"><foreignObject x="-1002.86" y="-1002.86" width="2005.71" height="2005.71"><div xmlns="http://www.w3.org/1999/xhtml" style="background:conic-gradient(from 90deg,rgba(17, 10, 40, 1) 0deg,rgba(65, 134, 169, 1) 360deg);height:100%;width:100%;opacity:1"></div></foreignObject></g></g><circle cx="350" cy="350" r="350" data-figma-gradient-fill="{&#34;type&#34;:&#34;GRADIENT_ANGULAR&#34;,&#34;stops&#34;:[{&#34;color&#34;:{&#34;r&#34;:0.070555195212364197,&#34;g&#34;:0.041188977658748627,&#34;b&#34;:0.15865384042263031,&#34;a&#34;:1.0},&#34;position&#34;:0.0},{&#34;color&#34;:{&#34;r&#34;:0.25517752766609192,&#34;g&#34;:0.52736687660217285,&#34;b&#34;:0.66346156597137451,&#34;a&#34;:1.0},&#34;position&#34;:1.0}],&#34;stopsVar&#34;:[{&#34;color&#34;:{&#34;r&#34;:0.070555195212364197,&#34;g&#34;:0.041188977658748627,&#34;b&#34;:0.15865384042263031,&#34;a&#34;:1.0},&#34;position&#34;:0.0},{&#34;color&#34;:{&#34;r&#34;:0.25517752766609192,&#34;g&#34;:0.52736687660217285,&#34;b&#34;:0.66346156597137451,&#34;a&#34;:1.0},&#34;position&#34;:1.0}],&#34;transform&#34;:{&#34;m00&#34;:4.2862638622871013e-14,&#34;m01&#34;:-700.0,&#34;m02&#34;:700.0,&#34;m10&#34;:700.0,&#34;m11&#34;:4.2862638622871013e-14,&#34;m12&#34;:-4.2862638622871013e-14},&#34;opacity&#34;:1.0,&#34;blendMode&#34;:&#34;NORMAL&#34;,&#34;visible&#34;:true}"/>
+<mask id="mask0_0_1" style="mask-type:luminance" maskUnits="userSpaceOnUse" x="0" y="0" width="700" height="700">
+<circle cx="350" cy="350" r="350" fill="white"/>
+</mask>
+<g mask="url(#mask0_0_1)">
+<path d="M-4.3457 74.1895H122.578L350 302.412L577.422 74.1895H704.346V700H577.422V249.961L350 468.975L122.578 249.961V700H-4.3457V74.1895Z" fill="#F2FAFF"/>
+</g>
+<defs>
+<clipPath id="paint0_angular_0_1_clip_path"><circle cx="350" cy="350" r="350"/></clipPath></defs>
+</svg>
