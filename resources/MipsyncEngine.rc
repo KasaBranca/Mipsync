@@ -1,0 +1,26 @@
+// Main application icon (resource ID 1 — used by Explorer and Win32 WM_SETICON)
+1 ICON "icons/app_icon.ico"
+
+1 VERSIONINFO
+FILEVERSION     0,1,0,2
+PRODUCTVERSION  0,1,0,2
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName",      "Mipsync"
+      VALUE "FileDescription",  "Mipsync Engine"
+      VALUE "FileVersion",      "0.1.0.2"
+      VALUE "InternalName",     "MipsyncEngine"
+      VALUE "LegalCopyright",   ""
+      VALUE "OriginalFilename", "MipsyncEngine.exe"
+      VALUE "ProductName",      "Mipsync Engine"
+      VALUE "ProductVersion",   "0.1.0.2"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

@@ -1,0 +1,37 @@
+# Build output and fetched dependencies
+build/
+build-debug/
+out/
+cmake-build-*/
+_deps/
+hub-tauri/node_modules/
+hub-tauri/dist/
+hub-tauri/src-tauri/target/
+hub-tauri/src-tauri/gen/
+*.tsbuildinfo
+
+# IDE files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln
+*.vcxproj*
+
+# Local editor state
+imgui.ini
+editor_layout.ini
+.mipsync/
+
+# Generated binaries and logs
+*.exe
+*.dll
+*.pdb
+*.zip
+*.log
+*.log.err
+
+# OS files
+Thumbs.db
+.DS_Store

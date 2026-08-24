@@ -1,0 +1,26 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 21,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name":          "default",
+            "displayName":   "Mipsync PS1 starter",
+            "description":   "Builds the Mipsync PS1 starter through PSn00bSDK.",
+            "generator":     "Ninja",
+            "toolchainFile": "$env{PSN00BSDK_LIBS}/cmake/sdk.cmake",
+            "binaryDir":     "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "PSN00BSDK_TC":     "",
+                "PSN00BSDK_TARGET": "mipsel-none-elf"
+            },
+            "warnings": {
+                "dev": false
+            }
+        }
+    ]
+}
