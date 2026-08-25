@@ -14,12 +14,32 @@ Mipsync is a Windows-first game editor and runtime for authoring projects that t
 
 This repository contains the engine/editor and Hub source. Release-production infrastructure and generated distribution artifacts are intentionally kept outside this source tree.
 
+## Command Platform and CLI
+
+Mipsync includes a live, agent-friendly command platform. Start the editor normally, then use the `mipsync` CLI from a terminal—or from an AI coding agent—while the project remains open and visible. Commands are executed by the running editor on its main thread, so scene changes appear immediately in the Scene View, Hierarchy, and Inspector.
+
+```powershell
+mipsync help
+mipsync search "create and place an object"
+mipsync describe entity.create
+mipsync entity create Crate --primitive cube --x 2 --y 1 --z -3
+mipsync entity transform Crate --ry 45
+mipsync material create assets/materials/Red.nmat 0.8 0.1 0.1
+mipsync material apply Crate assets/materials/Red.nmat
+mipsync runtime play
+```
+
+The Editor Console and external CLI share the same typed Command Registry, validation, and result model. `help`, `search`, and `describe` make the engine discoverable without prior training data; `--json` provides structured output for tools and agents. Live commands are routed over local IPC to the correct editor/project instance, mutations integrate with Editor Undo, and destructive operations require explicit confirmation.
+
+The CLI can inspect and edit scenes, create/select/duplicate/transform/reparent/delete entities, manage components and materials, open scripts in an IDE, save scenes, and control Play Mode. When the terminal is inside a Mipsync project, project selection is automatic; use `mipsync instances`, `--project`, or `--instance` when more than one editor is open.
+
 ## Repository scope
 
 Included:
 
 - The C++20 engine and editor under `src/`
 - The Mips# compiler, bytecode VM, and runtime
+- The shared Command Platform, Editor Console, and `mipsync` CLI
 - Scene, animation, UI, audio, renderer, physics, and asset systems
 - Native Windows player and PS1 export code
 - The React + Tauri Mipsync Hub under `hub-tauri/`
