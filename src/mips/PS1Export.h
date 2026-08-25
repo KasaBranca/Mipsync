@@ -63,6 +63,12 @@ std::vector<uint8_t> EncodeMbc(const CompiledModule& module);
 bool WriteMbcFile(const CompiledModule& module, const std::string& path,
                   std::string& outError);
 
+/// Reject bytecode that the current PS1 mini-VM cannot execute with desktop
+/// semantics, and data that exceeds its fixed runtime capacities.
+bool ValidatePs1Target(const std::vector<CompiledModule>& modules,
+                       uint32_t bindingCount,
+                       std::string& outError);
+
 /// Result of generating the engine-side data table that gets compiled into
 /// the PS1 starter (templates/ps1/starter/generated/scripts_data.c).
 struct ScriptsDataEmit {

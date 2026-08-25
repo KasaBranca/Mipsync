@@ -1,0 +1,7 @@
+class InvalidSyntax : MipsBehaviour
+{
+    void Update()
+    {
+        var value = ;
+    }
+}

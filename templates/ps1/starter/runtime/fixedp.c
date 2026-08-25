@@ -82,6 +82,18 @@ fix16_t fix16_cos(fix16_t turns) {
     return sin_internal((fix16_t)(turns + 0x4000));
 }
 
+/* round(2 * pi * 65536). Kept as an integer constant so no floating-point
+ * support is pulled into the PS1 runtime. */
+#define FIX16_TWO_PI ((fix16_t)411775)
+
+fix16_t fix16_sin_radians(fix16_t radians) {
+    return fix16_sin(fix16_div(radians, FIX16_TWO_PI));
+}
+
+fix16_t fix16_cos_radians(fix16_t radians) {
+    return fix16_cos(fix16_div(radians, FIX16_TWO_PI));
+}
+
 fix16_t fix16_sqrt(fix16_t a) {
     if (a <= 0) return 0;
     /* Newton-Raphson, 6 iters is enough for Q16.16 precision. Start guess
@@ -99,6 +111,12 @@ fix16_t fix16_clamp(fix16_t v, fix16_t lo, fix16_t hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
+}
+
+fix16_t fix16_round(fix16_t v) {
+    const int64_t magnitude = v < 0 ? -(int64_t)v : (int64_t)v;
+    const int64_t rounded = (magnitude + FIX16_ONE / 2) & ~0xFFFFLL;
+    return (fix16_t)(v < 0 ? -rounded : rounded);
 }
 
 static int fmt_uint(uint32_t v, char* out, int cap) {

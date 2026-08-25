@@ -1,67 +1,15 @@
 #include "MipsRuntime.h"
-#include "Compiler.h"
-#include "Lexer.h"
-#include "Parser.h"
+#include "MipsScriptLoader.h"
 #include "../core/Log.h"
 #include "../assets/AssetManager.h"
 #include "../scene/Scene.h"
 #include "../physics/ColliderUtils.h"
-#include <fstream>
-#include <sstream>
 #include <filesystem>
 #include <vector>
 
 namespace MipsyncEngine::Mips {
 
 namespace {
-
-bool ReadFile(const std::string& path, std::string& out) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file.is_open())
-        return false;
-    std::ostringstream buffer;
-    buffer << file.rdbuf();
-    out = buffer.str();
-    return true;
-}
-
-std::string FileNameOnly(const std::string& path) {
-    const size_t pos = path.find_last_of("/\\");
-    return pos == std::string::npos ? path : path.substr(pos + 1);
-}
-
-bool FileExists(const std::string& path) {
-    std::error_code ec;
-    return std::filesystem::exists(path, ec);
-}
-
-std::string ResolveScriptPath(const std::string& path) {
-    const std::string fileName = FileNameOnly(path);
-
-    static const char* kRoots[] = {
-        ".",
-        "..",
-        "../..",
-        "../../..",
-        "../../../..",
-    };
-
-    std::vector<std::string> candidates;
-    candidates.push_back(path);
-
-    for (const char* root : kRoots) {
-        candidates.push_back(std::string(root) + "/" + path);
-        candidates.push_back(std::string(root) + "/scripts/" + fileName);
-        candidates.push_back(std::string(root) + "/examples/" + fileName);
-    }
-
-    for (const auto& candidate : candidates) {
-        if (FileExists(candidate))
-            return candidate;
-    }
-
-    return path;
-}
 
 void InvokeLifecycle(VM& vm, ScriptInstance& instance, const char* method,
                      std::vector<std::string>& errors) {
@@ -89,26 +37,8 @@ void SyncFieldValuesFromModule(MipsScriptComponent& script) {
 
 std::shared_ptr<CompiledModule> MipsRuntime::CompileScriptFile(const std::string& path,
                                                              std::vector<std::string>& errors) {
-    const std::string resolved = ResolveScriptPath(path);
-    std::string source;
-    if (!ReadFile(resolved, source)) {
-        errors.push_back("failed to open script: " + path + " (resolved: " + resolved + ")");
-        return nullptr;
-    }
-
-    Lexer lexer(source, resolved);
-    const std::vector<Token>& tokens = lexer.Tokenize();
-    errors.insert(errors.end(), lexer.GetErrors().begin(), lexer.GetErrors().end());
-    if (!lexer.GetErrors().empty())
-        return nullptr;
-
-    Parser parser(tokens, resolved);
-    auto program = parser.ParseProgram();
-    errors.insert(errors.end(), parser.GetErrors().begin(), parser.GetErrors().end());
-    if (!program || program->classes.empty() || !parser.GetErrors().empty())
-        return nullptr;
-
-    return CompileClass(*program->classes[0], program.get(), resolved, errors);
+    return MipsScriptLoader::CompileFile(
+        PathUtf8::FromString(AssetManager::Get().GetProjectRoot()), path, errors);
 }
 
 void MipsRuntime::ResetScriptsByFileName(Scene& scene, const std::string& fileName) {
@@ -184,40 +114,7 @@ void MipsRuntime::ApplyFieldOverrides(Entity* entity, const MipsScriptComponent&
 void MipsRuntime::SyncEditSnapshot(Scene& scene) {
     if (m_Playing)
         return;
-    CaptureSceneSnapshot(scene);
-}
-
-void MipsRuntime::CaptureSceneSnapshot(Scene& scene) {
-    m_EditSnapshot.clear();
-    for (const auto& entityPtr : scene.GetEntities()) {
-        Entity* entity = entityPtr.get();
-        if (!entity->IsActive()) continue;
-        auto* transform = entity->GetComponent<TransformComponent>();
-        if (!transform)
-            continue;
-        TransformSnapshot snap;
-        snap.entityId = entity->GetID();
-        snap.position = transform->position;
-        snap.rotation = transform->rotation;
-        snap.scale = transform->scale;
-        m_EditSnapshot.push_back(snap);
-    }
-}
-
-void MipsRuntime::RestoreSceneSnapshot(Scene& scene) {
-    for (const TransformSnapshot& snap : m_EditSnapshot) {
-        for (const auto& entityPtr : scene.GetEntities()) {
-            Entity* entity = entityPtr.get();
-            if (entity->GetID() != snap.entityId)
-                continue;
-            if (auto* transform = entity->GetComponent<TransformComponent>()) {
-                transform->position = snap.position;
-                transform->rotation = snap.rotation;
-                transform->scale = snap.scale;
-            }
-            break;
-        }
-    }
+    m_EditSnapshot.Capture(scene);
 }
 
 void MipsRuntime::CollectInstances(Scene& scene) {
@@ -360,7 +257,7 @@ void MipsRuntime::OnPlayStarted(Scene& scene) {
     m_ScriptFileTimes.clear();
     // The currently visible edit scene is authoritative. Restoring a cached
     // baseline here caused an immediate jump when Play was pressed.
-    CaptureSceneSnapshot(scene);
+    m_EditSnapshot.Capture(scene);
 
     m_Playing = true;
     m_Paused = false;
@@ -391,9 +288,9 @@ void MipsRuntime::OnPlayStopped(Scene& scene) {
             MIPSYNC_WARN("[Mips#] {}", e);
     }
 
-    if (!m_EditSnapshot.empty())
-        RestoreSceneSnapshot(scene);
-    CaptureSceneSnapshot(scene);
+    if (!m_EditSnapshot.Empty())
+        m_EditSnapshot.Restore(scene);
+    m_EditSnapshot.Capture(scene);
 
     m_Instances.clear();
     m_Playing = false;
@@ -439,6 +336,46 @@ void MipsRuntime::DispatchPhysicsEvents(Scene& scene) {
     for (const auto& e : errors)
         MIPSYNC_WARN("[Mips#] {}", e);
     m_PhysicsEvents.Clear();
+}
+
+bool MipsRuntime::InvokeButtonEvent(Scene& scene, uint32_t targetEntityId,
+                                    const std::string& scriptPath, const std::string& methodName,
+                                    std::vector<std::string>& errors) {
+    if (!m_Playing) {
+        errors.push_back("Button On Click can only run in Play mode");
+        return false;
+    }
+    if (targetEntityId == 0 || methodName.empty()) {
+        errors.push_back("Button On Click listener has no target or method");
+        return false;
+    }
+
+    if (m_Instances.empty())
+        CollectInstances(scene);
+
+    Entity* target = scene.FindEntity(targetEntityId);
+    if (!target) {
+        errors.push_back("Button On Click target entity no longer exists");
+        return false;
+    }
+
+    m_VM.SetScene(&scene);
+    m_VM.SetPhysicsWorld(m_PhysicsWorld);
+    m_VM.SetActiveInstances(&m_Instances);
+    for (auto& instance : m_Instances) {
+        if (instance.entity != target || !instance.module || !instance.sourceComponent)
+            continue;
+        if (!scriptPath.empty() && instance.sourceComponent->scriptPath != scriptPath)
+            continue;
+        const CompiledMethod* method = instance.module->FindMethod(methodName);
+        if (!method || !method->isPublic || method->parameterCount != 0 ||
+            method->returnType != "void")
+            continue;
+        return m_VM.RunMethod(instance, methodName, errors);
+    }
+
+    errors.push_back("Button On Click method is unavailable on target: " + methodName);
+    return false;
 }
 
 void MipsRuntime::Update(Scene& scene, float deltaTime) {

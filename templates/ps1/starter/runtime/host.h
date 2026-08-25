@@ -7,10 +7,9 @@
 /*
  * Host-function dispatch for the PS1 mini-VM. Mirrors HostFunc enum from
  * src/mips/Bytecode.h. Each handler pops the right number of args from the
- * VM stack and pushes its return value. Unimplemented host calls (most of
- * the Animator / Physics / Scene / Save subset) push 0 and append a
- * diagnostic to the on-screen log so we can iterate incrementally rather
- * than aborting at startup.
+ * VM stack and pushes its return value. The desktop exporter rejects known
+ * unsupported calls before generating a PS1 build. The fallback diagnostic
+ * remains as a defensive check for malformed or version-mismatched bytecode.
  */
 
 /* Stack value tag. Matches the Tag enum from src/mips/Value.h with the

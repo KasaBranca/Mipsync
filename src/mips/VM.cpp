@@ -251,11 +251,34 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
         m_Locals.assign(method.localCount, Value{});
         m_RuntimeStrings.clear();
     }
+    m_RuntimeStringBytes = 0;
+    for (const std::string& value : m_RuntimeStrings)
+        m_RuntimeStringBytes += value.size();
+    m_RuntimeStringLimitExceeded = false;
 
     const auto& code = method.code;
     size_t ip = coroutine ? coroutine->instruction : 0;
+    size_t executedInstructions = 0;
 
     while (ip < code.size()) {
+        if (++executedInstructions > m_Limits.maxInstructionsPerInvocation) {
+            outErrors.push_back("instruction budget exceeded in " + method.name);
+            if (coroutine)
+                coroutine->completed = true;
+            return false;
+        }
+        if (m_Stack.size() > m_Limits.maxStackValues) {
+            outErrors.push_back("VM stack limit exceeded in " + method.name);
+            if (coroutine)
+                coroutine->completed = true;
+            return false;
+        }
+        if (m_RuntimeStringLimitExceeded) {
+            outErrors.push_back("runtime string memory limit exceeded in " + method.name);
+            if (coroutine)
+                coroutine->completed = true;
+            return false;
+        }
         const OpCode op = static_cast<OpCode>(code[ip++]);
 
         switch (op) {
@@ -1186,6 +1209,10 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
         }
         case OpCode::NewArray: {
             const uint16_t count = ReadU16(code, ip);
+            if (count > m_Limits.maxArrayElements) {
+                outErrors.push_back("array element limit exceeded");
+                return false;
+            }
             Value result;
             result.tag = Value::Tag::Array;
             result.array = std::make_shared<ArrayValue>();
@@ -1197,7 +1224,14 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
         }
         case OpCode::NewArraySized: {
             const Value sizeValue = Pop();
-            const int size = std::clamp(static_cast<int>(NumberValue(sizeValue)), 0, 4096);
+            const double requested = NumberValue(sizeValue);
+            if (!std::isfinite(requested) || requested < 0.0 ||
+                requested > static_cast<double>(m_Limits.maxArrayElements)) {
+                outErrors.push_back("array element limit exceeded");
+                return false;
+            }
+            const int requestedSize = static_cast<int>(requested);
+            const int size = requestedSize;
             Value result;
             result.tag = Value::Tag::Array;
             result.array = std::make_shared<ArrayValue>();
@@ -1239,8 +1273,13 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
         case OpCode::ArrayAdd: {
             const Value value = Pop();
             const Value array = Pop();
-            if (array.tag == Value::Tag::Array && array.array)
+            if (array.tag == Value::Tag::Array && array.array) {
+                if (array.array->elements.size() >= m_Limits.maxArrayElements) {
+                    outErrors.push_back("array element limit exceeded");
+                    return false;
+                }
                 array.array->elements.push_back(value);
+            }
             else
                 outErrors.push_back("Add() target is not an array");
             Push(Value{});
@@ -1370,10 +1409,17 @@ const std::string& VM::ResolveString(const Value& value) const {
 
 Value VM::MakeRuntimeString(const std::string& text) {
     Value v;
+    if (m_RuntimeStrings.size() >= m_Limits.maxRuntimeStrings ||
+        text.size() > m_Limits.maxRuntimeStringBytes -
+            std::min(m_RuntimeStringBytes, m_Limits.maxRuntimeStringBytes)) {
+        m_RuntimeStringLimitExceeded = true;
+        return v;
+    }
     v.tag = Value::Tag::String;
     v.runtimeString = true;
     v.stringIndex = static_cast<uint16_t>(m_RuntimeStrings.size());
     m_RuntimeStrings.push_back(text);
+    m_RuntimeStringBytes += text.size();
     return v;
 }
 

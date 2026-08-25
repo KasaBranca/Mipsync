@@ -5,6 +5,9 @@ static ps1_entity s_runtime_entities[128];
 static uint32_t s_vertex_anim_time_q16[128];
 static uint32_t s_rigid_anim_time_q16[128];
 static uint32_t s_transform_anim_time_q16[128];
+static fix16_t s_previous_position[128][3];
+static fix16_t s_previous_rotation[128][3];
+static fix16_t s_previous_scale[128][3];
 static unsigned int s_runtime_count = 0;
 static int16_t s_runtime_lookup[4096];
 static const ps1_mesh* s_meshes = 0;
@@ -14,6 +17,7 @@ static int s_pending_camera_index = -1;
 static uint8_t s_pending_camera_frames = 0;
 
 static void rotate_scaled_vec(const ps1_entity* e, const fix16_t local_scaled[3], fix16_t out[3]);
+static void inverse_rotate_vec(const fix16_t rotation[3], const fix16_t world[3], fix16_t out[3]);
 static void rotate_half_extents(const ps1_entity* e, fix16_t half[3]);
 static fix16_t abs_fix(fix16_t v);
 static void select_rigid_clip(ps1_entity* e, int aiming, int moving);
@@ -181,6 +185,35 @@ static void rotate_scaled_vec(const ps1_entity* e, const fix16_t local_scaled[3]
                        fix16_mul(forward_z, local_scaled[2]));
 }
 
+static void inverse_rotate_vec(const fix16_t rotation[3], const fix16_t world[3], fix16_t out[3]) {
+    ps1_entity basis_entity;
+    fix16_t axis[3];
+    fix16_t right[3];
+    fix16_t up[3];
+    fix16_t forward[3];
+    memset(&basis_entity, 0, sizeof(basis_entity));
+    basis_entity.rotation[0] = rotation[0];
+    basis_entity.rotation[1] = rotation[1];
+    basis_entity.rotation[2] = rotation[2];
+
+    axis[0] = FIX16_ONE; axis[1] = 0; axis[2] = 0;
+    rotate_scaled_vec(&basis_entity, axis, right);
+    axis[0] = 0; axis[1] = FIX16_ONE; axis[2] = 0;
+    rotate_scaled_vec(&basis_entity, axis, up);
+    axis[0] = 0; axis[1] = 0; axis[2] = FIX16_ONE;
+    rotate_scaled_vec(&basis_entity, axis, forward);
+
+    out[0] = fix16_add(fix16_add(fix16_mul(world[0], right[0]),
+                                 fix16_mul(world[1], right[1])),
+                       fix16_mul(world[2], right[2]));
+    out[1] = fix16_add(fix16_add(fix16_mul(world[0], up[0]),
+                                 fix16_mul(world[1], up[1])),
+                       fix16_mul(world[2], up[2]));
+    out[2] = fix16_add(fix16_add(fix16_mul(world[0], forward[0]),
+                                 fix16_mul(world[1], forward[1])),
+                       fix16_mul(world[2], forward[2]));
+}
+
 static void rotate_half_extents(const ps1_entity* e, fix16_t half[3]) {
     const fix16_t p = fix16_div(e->rotation[0], FIX16_FROM_INT(360));
     const fix16_t y = fix16_div(e->rotation[1], FIX16_FROM_INT(360));
@@ -232,7 +265,8 @@ void ps1_scene_init(void) {
                    src->rigid_idle_frame_count > 0 || src->rigid_walk_frame_count > 0 ||
                    src->rigid_aim_frame_count > 0 || src->transform_anim_key_count > 0) {
             need_runtime = 1;
-        } else if (src->has_camera || src->collider_camera_shot_trigger) {
+        } else if (src->has_camera || src->collider_camera_shot_trigger ||
+                   src->parent_entity_index >= 0) {
             need_runtime = 1;
         } else {
             for (unsigned int bi = 0; bi < g_ps1_scene.binding_count; ++bi) {
@@ -268,12 +302,82 @@ void ps1_scene_init(void) {
     }
 
     s_runtime_count = r_count;
+    for (unsigned int i = 0; i < s_runtime_count; ++i) {
+        for (unsigned int axis = 0; axis < 3u; ++axis) {
+            s_previous_position[i][axis] = s_runtime_entities[i].position[axis];
+            s_previous_rotation[i][axis] = s_runtime_entities[i].rotation[axis];
+            s_previous_scale[i][axis] = s_runtime_entities[i].scale[axis];
+        }
+    }
     s_meshes = g_ps1_scene.meshes;
     s_mesh_count = g_ps1_scene.mesh_count;
     s_active_camera_index = g_ps1_scene.camera_entity_index;
     s_pending_camera_index = -1;
     s_pending_camera_frames = 0;
     ps1_scene_begin_frame();
+}
+
+void ps1_scene_resolve_hierarchy(void) {
+    for (unsigned int runtime_index = 0; runtime_index < s_runtime_count; ++runtime_index) {
+        ps1_entity* child = &s_runtime_entities[runtime_index];
+        const int parent_source_index = child->parent_entity_index;
+        int16_t parent_runtime_index;
+        ps1_entity* parent;
+        fix16_t world_delta[3];
+        fix16_t local_unscaled[3];
+        fix16_t local_scaled[3];
+        fix16_t rotated[3];
+
+        if (parent_source_index < 0 ||
+            (unsigned int)parent_source_index >= g_ps1_scene.entity_count)
+            continue;
+        parent_runtime_index = s_runtime_lookup[(unsigned int)parent_source_index];
+        if (parent_runtime_index < 0)
+            continue;
+        parent = &s_runtime_entities[parent_runtime_index];
+        if (parent->position[0] == s_previous_position[parent_runtime_index][0] &&
+            parent->position[1] == s_previous_position[parent_runtime_index][1] &&
+            parent->position[2] == s_previous_position[parent_runtime_index][2] &&
+            parent->rotation[0] == s_previous_rotation[parent_runtime_index][0] &&
+            parent->rotation[1] == s_previous_rotation[parent_runtime_index][1] &&
+            parent->rotation[2] == s_previous_rotation[parent_runtime_index][2] &&
+            parent->scale[0] == s_previous_scale[parent_runtime_index][0] &&
+            parent->scale[1] == s_previous_scale[parent_runtime_index][1] &&
+            parent->scale[2] == s_previous_scale[parent_runtime_index][2])
+            continue;
+
+        world_delta[0] = fix16_sub(child->position[0], s_previous_position[parent_runtime_index][0]);
+        world_delta[1] = fix16_sub(child->position[1], s_previous_position[parent_runtime_index][1]);
+        world_delta[2] = fix16_sub(child->position[2], s_previous_position[parent_runtime_index][2]);
+        inverse_rotate_vec(s_previous_rotation[parent_runtime_index], world_delta, local_unscaled);
+
+        for (unsigned int axis = 0; axis < 3u; ++axis) {
+            const fix16_t previous_parent_scale = s_previous_scale[parent_runtime_index][axis];
+            if (previous_parent_scale != 0)
+                local_unscaled[axis] = fix16_div(local_unscaled[axis], previous_parent_scale);
+            local_scaled[axis] = fix16_mul(local_unscaled[axis], parent->scale[axis]);
+        }
+        rotate_scaled_vec(parent, local_scaled, rotated);
+        for (unsigned int axis = 0; axis < 3u; ++axis) {
+            const fix16_t previous_parent_scale = s_previous_scale[parent_runtime_index][axis];
+            child->position[axis] = fix16_add(parent->position[axis], rotated[axis]);
+            child->rotation[axis] = fix16_add(
+                child->rotation[axis],
+                fix16_sub(parent->rotation[axis], s_previous_rotation[parent_runtime_index][axis]));
+            if (previous_parent_scale != 0) {
+                child->scale[axis] = fix16_mul(
+                    child->scale[axis], fix16_div(parent->scale[axis], previous_parent_scale));
+            }
+        }
+    }
+
+    for (unsigned int i = 0; i < s_runtime_count; ++i) {
+        for (unsigned int axis = 0; axis < 3u; ++axis) {
+            s_previous_position[i][axis] = s_runtime_entities[i].position[axis];
+            s_previous_rotation[i][axis] = s_runtime_entities[i].rotation[axis];
+            s_previous_scale[i][axis] = s_runtime_entities[i].scale[axis];
+        }
+    }
 }
 
 void ps1_scene_update_vertex_anims(fix16_t delta_time) {

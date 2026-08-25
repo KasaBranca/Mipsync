@@ -32,6 +32,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -2073,6 +2074,11 @@ static bool RegisterRigidBonePartsFromJson(const json& skinned, Ps1SceneExportRe
         }
 
         Ps1ExportedEntity part = baseEntity;
+        // Rigid parts already carry baked world transforms and follow their
+        // animation control root through rigid_root_entity_index.
+        part.sourceEntityId = 0;
+        part.parentEntityId = 0;
+        part.parentEntityIndex = -1;
         const std::string boneName =
             static_cast<size_t>(group.bone) < model->bones.size()
             ? model->bones[static_cast<size_t>(group.bone)].name
@@ -2818,11 +2824,14 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
                        const std::unordered_map<uint32_t, Ps1ResolvedAnimator>* flatAnimatorContexts = nullptr,
                        const json* inheritedAnimator = nullptr,
                        uint32_t inheritedControlRootEntityId = 0,
-                       std::unordered_map<uint32_t, uint32_t>* flatControlRoots = nullptr) {
+                       std::unordered_map<uint32_t, uint32_t>* flatControlRoots = nullptr,
+                       uint32_t parentSourceEntityId = 0) {
     Ps1ExportedEntity e;
     e.id = nextId++;
     e.name = ent.value("name", std::string{"Entity"});
     const uint32_t sourceId = ent.value("id", 0u);
+    e.sourceEntityId = sourceId;
+    e.parentEntityId = ent.value("parent", parentSourceEntityId);
     uint32_t controlRootEntityId = inheritedControlRootEntityId;
     if (controlRootEntityId == 0 && flatControlRoots) {
         const uint32_t sourceParentId = ent.value("parent", 0u);
@@ -3045,7 +3054,7 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
         for (const json& child : ent["children"])
             FlattenEntityJson(child, result, nextId, worldPosition, worldRotation, worldScale,
                               flatWorldTransforms, flatAnimatorContexts, currentAnimator,
-                              controlRootEntityId, flatControlRoots);
+                              controlRootEntityId, flatControlRoots, sourceId);
     }
 }
 
@@ -3079,13 +3088,17 @@ struct Ps1UiNode {
     std::string imageTexturePath;
     bool imagePreserveAspect = false;
     bool hasButton = false;
+    bool buttonInteractable = true;
     glm::vec4 buttonColor{ 1.0f };
     std::string buttonTexturePath;
     bool buttonPreserveAspect = false;
+    std::vector<Ps1ExportedUiButtonAction> buttonActions;
     bool hasButtonGroup = false;
     int buttonGroupSelectedIndex = 0;
     bool buttonGroupWrapNavigation = true;
     bool buttonGroupGamepadNavigation = true;
+    bool buttonGroupGamepadConfirm = true;
+    uint8_t buttonGroupConfirmButton = 0;
     std::string cursorTexturePath;
     glm::vec2 cursorOffset{ -28.0f, 0.0f };
     glm::vec2 cursorSize{ 24.0f, 24.0f };
@@ -3183,9 +3196,23 @@ static void AddUiNodeFromJson(const json& ent, uint32_t inheritedParent,
     if (ent.contains("uiButton") && ent["uiButton"].is_object()) {
         const json& bt = ent["uiButton"];
         node.hasButton = bt.value("enabled", true);
+        node.buttonInteractable = bt.value("interactable", true);
         ReadVec4Json(bt.value("normalColor", json::array({ 1.0f, 1.0f, 1.0f, 1.0f })), node.buttonColor);
         node.buttonTexturePath = bt.value("backgroundTexture", std::string{});
         node.buttonPreserveAspect = bt.value("preserveAspect", false);
+        if (bt.contains("onClick") && bt["onClick"].is_array()) {
+            for (const json& actionJson : bt["onClick"]) {
+                if (!actionJson.is_object() || !actionJson.value("enabled", true))
+                    continue;
+                Ps1ExportedUiButtonAction action;
+                action.targetSourceEntityId = actionJson.value("targetEntity", 0u);
+                action.scriptPath = actionJson.value("script", std::string{});
+                action.methodName = actionJson.value("method", std::string{});
+                if (action.targetSourceEntityId != 0 && !action.scriptPath.empty() &&
+                    !action.methodName.empty())
+                    node.buttonActions.push_back(std::move(action));
+            }
+        }
     }
 
     if (ent.contains("uiButtonGroup") && ent["uiButtonGroup"].is_object()) {
@@ -3194,6 +3221,9 @@ static void AddUiNodeFromJson(const json& ent, uint32_t inheritedParent,
         node.buttonGroupSelectedIndex = bg.value("selectedIndex", 0);
         node.buttonGroupWrapNavigation = bg.value("wrapNavigation", true);
         node.buttonGroupGamepadNavigation = bg.value("gamepadNavigation", true);
+        node.buttonGroupGamepadConfirm = bg.value("gamepadConfirm", true);
+        node.buttonGroupConfirmButton = static_cast<uint8_t>(
+            std::clamp(bg.value("confirmButton", 0), 0, 4));
         node.cursorTexturePath = bg.value("cursorTexture", std::string{});
         ReadVec2Json(bg.value("cursorOffset", json::array({ -28.0f, 0.0f })), node.cursorOffset);
         ReadVec2Json(bg.value("cursorSize", json::array({ 24.0f, 24.0f })), node.cursorSize);
@@ -3349,6 +3379,8 @@ static void ExtractUiElements(const json& root, Ps1SceneExportResult& outResult)
                         static_cast<int>(buttonChildren.size()) - 1));
                     group.wrapNavigation = node.buttonGroupWrapNavigation ? 1 : 0;
                     group.gamepadNavigation = node.buttonGroupGamepadNavigation ? 1 : 0;
+                    group.gamepadConfirm = node.buttonGroupGamepadConfirm ? 1 : 0;
+                    group.confirmButton = node.buttonGroupConfirmButton;
                     group.buttonRectOffset = static_cast<uint16_t>(
                         std::min<size_t>(outResult.uiButtonRects.size(), 65535));
                     group.buttonCount = static_cast<uint8_t>(
@@ -3364,8 +3396,16 @@ static void ExtractUiElements(const json& root, Ps1SceneExportResult& outResult)
                     group.cursorTexturePath = node.cursorTexturePath;
                     for (size_t bi = 0; bi < buttonChildren.size() && bi < 255; ++bi) {
                         Ps1ExportedUiButtonRect rr;
+                        const Ps1UiNode& buttonNode = nodes[buttonChildren[bi].first];
                         if (ConvertPs1UiRect(buttonChildren[bi].second, layoutW, layoutH,
                                              rr.x, rr.y, rr.w, rr.h)) {
+                            rr.interactable = buttonNode.buttonInteractable ? 1 : 0;
+                            rr.actionOffset = static_cast<uint16_t>(
+                                std::min<size_t>(outResult.uiButtonActions.size(), 65535));
+                            rr.actionCount = static_cast<uint8_t>(
+                                std::min<size_t>(buttonNode.buttonActions.size(), 255));
+                            for (size_t ai = 0; ai < buttonNode.buttonActions.size() && ai < 255; ++ai)
+                                outResult.uiButtonActions.push_back(buttonNode.buttonActions[ai]);
                             outResult.uiButtonRects.push_back(rr);
                         } else if (group.buttonCount > 0) {
                             --group.buttonCount;
@@ -3745,6 +3785,7 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
             const auto& e = data.entities[i];
             out << "    { " << e.id << "u, "
                 << "\"" << e.name << "\", "
+                << e.parentEntityIndex << ", "
                 << "{" << ToFixed16(e.position[0]) << ", "
                 << ToFixed16(e.position[1]) << ", "
                 << ToFixed16(e.position[2]) << "}, "
@@ -3927,7 +3968,17 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
         out << "static const ps1_ui_button_rect k_ps1_ui_button_rects[] = {\n";
         for (const auto& rect : data.uiButtonRects) {
             out << "    { " << rect.x << ", " << rect.y << ", "
-                << rect.w << ", " << rect.h << " },\n";
+                << rect.w << ", " << rect.h << ", " << rect.actionOffset << "u, "
+                << static_cast<int>(rect.actionCount) << ", "
+                << static_cast<int>(rect.interactable) << " },\n";
+        }
+        out << "};\n\n";
+
+        out << "static const ps1_ui_button_action k_ps1_ui_button_actions[] = {\n";
+        for (const auto& action : data.uiButtonActions) {
+            out << "    { " << action.targetEntityIndex << "u, "
+                << static_cast<int>(action.moduleIndex) << "u, \""
+                << EscapeCString(action.methodName) << "\" },\n";
         }
         out << "};\n\n";
 
@@ -3936,7 +3987,9 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
             out << "    { "
                 << static_cast<int>(group.selectedIndex) << ", "
                 << static_cast<int>(group.wrapNavigation) << ", "
-                << static_cast<int>(group.gamepadNavigation) << ", 0, "
+                << static_cast<int>(group.gamepadNavigation) << ", "
+                << static_cast<int>(group.gamepadConfirm) << ", "
+                << static_cast<int>(group.confirmButton) << ", "
                 << group.buttonRectOffset << "u, "
                 << static_cast<int>(group.buttonCount) << ", "
                 << group.cursorOffsetX << ", "
@@ -3987,6 +4040,8 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                "    " << data.uiButtonGroups.size() << "u,\n"
                "    k_ps1_ui_button_rects,\n"
                "    " << data.uiButtonRects.size() << "u,\n"
+               "    k_ps1_ui_button_actions,\n"
+               "    " << data.uiButtonActions.size() << "u,\n"
                "    " << static_cast<int>(data.backgroundTextureIndex) << "u\n"
                "};\n";
         return out.good();
@@ -5928,9 +5983,12 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
                 std::vector<std::string> compileErrors;
                 mod = MipsRuntime::CompileScriptFile(PathUtf8::ToString(absScript), compileErrors);
                 if (!mod) {
+                    std::ostringstream message;
+                    message << "PS1 script compilation failed for " << script.path;
                     for (const auto& err : compileErrors)
-                        MIPSYNC_WARN("PS1 export script {}: {}", script.path, err);
-                    continue;
+                        message << "\n - " << err;
+                    outError = message.str();
+                    return false;
                 }
                 moduleByPath[script.path] = mod;
             }
@@ -5965,9 +6023,60 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
         }
 
         std::unordered_map<uint32_t, int> entityIndexById;
+        std::unordered_map<uint32_t, int> entityIndexBySourceId;
         entityIndexById.reserve(outResult.entities.size());
-        for (size_t i = 0; i < outResult.entities.size(); ++i)
+        entityIndexBySourceId.reserve(outResult.entities.size());
+        for (size_t i = 0; i < outResult.entities.size(); ++i) {
             entityIndexById[outResult.entities[i].id] = static_cast<int>(i);
+            if (outResult.entities[i].sourceEntityId != 0)
+                entityIndexBySourceId[outResult.entities[i].sourceEntityId] = static_cast<int>(i);
+        }
+
+        for (Ps1ExportedUiButtonAction& action : outResult.uiButtonActions) {
+            const auto entityIt = entityIndexBySourceId.find(action.targetSourceEntityId);
+            if (entityIt == entityIndexBySourceId.end()) {
+                outError = "PS1 Button On Click target entity is missing for method " + action.methodName;
+                return false;
+            }
+            const Ps1ExportedEntity& target = outResult.entities[static_cast<size_t>(entityIt->second)];
+            const Ps1ExportedScript* targetScript = nullptr;
+            for (const Ps1ExportedScript& script : target.scripts) {
+                if (script.path == action.scriptPath) {
+                    targetScript = &script;
+                    break;
+                }
+            }
+            if (!targetScript) {
+                outError = "PS1 Button On Click script is missing on target: " + action.scriptPath;
+                return false;
+            }
+            const auto moduleIt = moduleIndexByClass.find(targetScript->className);
+            if (moduleIt == moduleIndexByClass.end() || moduleIt->second > 255) {
+                outError = "PS1 Button On Click module is unavailable: " + targetScript->className;
+                return false;
+            }
+            const CompiledModule& module = outResult.modules[moduleIt->second];
+            const CompiledMethod* method = module.FindMethod(action.methodName);
+            if (!method || !method->isPublic || method->parameterCount != 0 ||
+                method->returnType != "void") {
+                outError = "PS1 Button On Click requires an argument-free void method: " +
+                           targetScript->className + "." + action.methodName;
+                return false;
+            }
+            action.targetEntityIndex = static_cast<uint16_t>(entityIt->second);
+            action.moduleIndex = static_cast<uint8_t>(moduleIt->second);
+        }
+
+        // Keep enough hierarchy information to propagate runtime parent
+        // transform changes after the scene's render transforms are flattened.
+        for (auto& e : outResult.entities) {
+            e.parentEntityIndex = -1;
+            if (e.parentEntityId == 0)
+                continue;
+            const auto parentIt = entityIndexBySourceId.find(e.parentEntityId);
+            if (parentIt != entityIndexBySourceId.end())
+                e.parentEntityIndex = parentIt->second;
+        }
 
         // Resolve camera shot trigger references and pick the initial camera by priority.
         int bestPrimaryCamera = -1;
@@ -5975,13 +6084,13 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
         for (size_t i = 0; i < outResult.entities.size(); ++i) {
             auto& e = outResult.entities[i];
             if (e.hasCamera && e.cameraShotTriggerId != 0) {
-                auto it = entityIndexById.find(e.cameraShotTriggerId);
-                if (it != entityIndexById.end())
+                auto it = entityIndexBySourceId.find(e.cameraShotTriggerId);
+                if (it != entityIndexBySourceId.end())
                     e.cameraShotTriggerEntityIndex = it->second;
             }
             if (e.colliderCameraTargetId != 0) {
-                auto it = entityIndexById.find(e.colliderCameraTargetId);
-                if (it != entityIndexById.end())
+                auto it = entityIndexBySourceId.find(e.colliderCameraTargetId);
+                if (it != entityIndexBySourceId.end())
                     e.colliderCameraTargetEntityIndex = it->second;
             }
             if (e.rigidRootEntityId != 0) {
@@ -6009,6 +6118,9 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
             for (const auto& script : e.scripts)
                 if (!script.className.empty()) ++outResult.bindingCount;
         }
+
+        if (!ValidatePs1Target(outResult.modules, outResult.bindingCount, outError))
+            return false;
 
         ScriptsDataEmit scriptStats{};
         const fs::path scriptsC = PathUtf8::FromString(generatedDir) / "scripts_data.c";

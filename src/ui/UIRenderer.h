@@ -25,6 +25,9 @@ public:
                   Framebuffer* targetFBO, uint32_t activeCameraEntityId, bool sceneView3D = false,
                   int layoutWidth = 0, int layoutHeight = 0);
 
+    /// Supplies pointer coordinates in canvas layout space (origin at bottom-left).
+    void SetPointerState(bool active, float x, float y, bool held, bool pressed, bool released);
+
 private:
     void CreateShaders();
     void BeginPass(int viewportWidth, int viewportHeight, Framebuffer* targetFBO);
@@ -46,6 +49,12 @@ private:
     int m_ViewportHeight = 1;
     bool m_InPass = false;
     Framebuffer* m_ActiveFBO = nullptr;
+    bool m_PointerActive = false;
+    bool m_PointerHeld = false;
+    bool m_PointerPressed = false;
+    bool m_PointerReleased = false;
+    glm::vec2 m_PointerPosition{};
+    uint32_t m_PointerPressedButtonEntityId = 0;
 };
 
 } // namespace MipsyncEngine

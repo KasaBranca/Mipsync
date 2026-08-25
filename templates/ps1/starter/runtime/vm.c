@@ -8,57 +8,10 @@
 #include <stdint.h>
 #include <string.h>
 
-/*
- * Bytecode opcodes — kept in lockstep with src/mips/Bytecode.h::OpCode.
- * Any change there must be reflected here.
- */
 enum {
-    OP_PUSH_CONST = 0,
-    OP_PUSH_BOOL,
-    OP_PUSH_STRING,
-    OP_PUSH_FIELD,
-    OP_SET_FIELD,
-    OP_PUSH_LOCAL,
-    OP_SET_LOCAL,
-    OP_POP,
-    OP_GET_GLOBAL,
-    OP_GET_COMPONENT,
-    OP_GET_MEMBER,
-    OP_GET_VEC3_AXIS,
-    OP_SET_VEC3_AXIS,
-    OP_SET_VEC3_FROM_VALUE,
-    OP_ADD,
-    OP_SUB,
-    OP_MUL,
-    OP_DIV,
-    OP_MOD,
-    OP_NEG,
-    OP_NOT,
-    OP_EQ,
-    OP_NE,
-    OP_LT,
-    OP_GT,
-    OP_LE,
-    OP_GE,
-    OP_AND,
-    OP_OR,
-    OP_CALL_HOST,
-    OP_RETURN,
-    OP_JUMP,
-    OP_JUMP_IF_FALSE,
-    OP_NEW_ARRAY,
-    OP_NEW_ARRAY_SIZED,
-    OP_GET_INDEX,
-    OP_SET_INDEX,
-    OP_ARRAY_LENGTH,
-    OP_ARRAY_ADD,
-    OP_ARRAY_REMOVE_AT,
-    OP_ARRAY_CLEAR,
-    OP_START_COROUTINE,
-    OP_STOP_ALL_COROUTINES,
-    OP_YIELD_NEXT,
-    OP_YIELD_SECONDS,
-    OP_YIELD_BREAK
+#define MIPSYNC_C_OPCODE(cName, cppName, value) OP_##cName = value,
+    MIPSYNC_OPCODE_LIST(MIPSYNC_C_OPCODE)
+#undef MIPSYNC_C_OPCODE
 };
 
 /* ------------------------------------------------------------------------ */
@@ -124,7 +77,7 @@ static void str_copy_n(char* dst, int cap, const uint8_t* src, int n) {
 }
 
 int mbc_decode(const uint8_t* data, uint32_t size, mbc_module* out) {
-    if (!data || size < 16) { host_log("[VM] mbc too small"); return 0; }
+    if (!data || !out || size < 20) { host_log("[VM] mbc too small"); return 0; }
     if (data[0] != 'M' || data[1] != 'B' || data[2] != 'C' || data[3] != '1') {
         host_log("[VM] bad mbc magic");
         return 0;
@@ -139,7 +92,7 @@ int mbc_decode(const uint8_t* data, uint32_t size, mbc_module* out) {
     uint16_t fieldCount    = rd_u16(data + off); off += 2;
     uint16_t methodCount   = rd_u16(data + off); off += 2;
     off += 2; /* reserved */
-    (void)version;
+    if (version != 1) { host_log("[VM] unsupported mbc version"); return 0; }
 
     if (numberCount > VM_NUMBER_CAP || stringCount > VM_STRING_CAP ||
         nameCount   > VM_NAME_CAP   || fieldCount  > VM_FIELD_CAP  ||
@@ -149,6 +102,7 @@ int mbc_decode(const uint8_t* data, uint32_t size, mbc_module* out) {
     }
 
     /* Class name. */
+    if (classNameLen >= VM_CLASS_NAME_LEN) { host_log("[VM] class name too long"); return 0; }
     if (off + classNameLen > size) { host_log("[VM] mbc trunc cls"); return 0; }
     str_copy_n(out->class_name, sizeof(out->class_name), data + off, classNameLen);
     off += classNameLen;
@@ -166,6 +120,7 @@ int mbc_decode(const uint8_t* data, uint32_t size, mbc_module* out) {
     for (uint16_t i = 0; i < stringCount; ++i) {
         if (off + 2 > size) { host_log("[VM] mbc trunc str"); return 0; }
         uint16_t len = rd_u16(data + off); off += 2;
+        if (len >= VM_STRING_LEN) { host_log("[VM] string too long"); return 0; }
         if (off + len > size) { host_log("[VM] mbc trunc str body"); return 0; }
         str_copy_n(out->strings[i], VM_STRING_LEN, data + off, len);
         off += len;
@@ -176,6 +131,7 @@ int mbc_decode(const uint8_t* data, uint32_t size, mbc_module* out) {
     for (uint16_t i = 0; i < nameCount; ++i) {
         if (off + 2 > size) { host_log("[VM] mbc trunc name"); return 0; }
         uint16_t len = rd_u16(data + off); off += 2;
+        if (len >= VM_NAME_LEN) { host_log("[VM] name too long"); return 0; }
         if (off + len > size) { host_log("[VM] mbc trunc name body"); return 0; }
         str_copy_n(out->names[i], VM_NAME_LEN, data + off, len);
         off += len;
@@ -186,6 +142,7 @@ int mbc_decode(const uint8_t* data, uint32_t size, mbc_module* out) {
     for (uint16_t i = 0; i < fieldCount; ++i) {
         if (off + 2 > size) { host_log("[VM] mbc trunc field"); return 0; }
         uint16_t nameLen = rd_u16(data + off); off += 2;
+        if (nameLen >= VM_FIELD_NAME_LEN) { host_log("[VM] field name too long"); return 0; }
         if (off + nameLen + 4 > size) { host_log("[VM] mbc trunc field body"); return 0; }
         str_copy_n(out->fields[i].name, VM_FIELD_NAME_LEN, data + off, nameLen);
         off += nameLen;
@@ -199,15 +156,21 @@ int mbc_decode(const uint8_t* data, uint32_t size, mbc_module* out) {
     for (uint16_t i = 0; i < methodCount; ++i) {
         if (off + 2 > size) { host_log("[VM] mbc trunc m"); return 0; }
         uint16_t nameLen = rd_u16(data + off); off += 2;
+        if (nameLen >= VM_METHOD_NAME_LEN) { host_log("[VM] method name too long"); return 0; }
         if (off + nameLen + 4 > size) { host_log("[VM] mbc trunc m head"); return 0; }
         str_copy_n(out->methods[i].name, VM_METHOD_NAME_LEN, data + off, nameLen);
         off += nameLen;
         uint32_t codeLen = rd_u32(data + off); off += 4;
+        if (codeLen > VM_METHOD_CODE_CAP) { host_log("[VM] method code too large"); return 0; }
         if (off + codeLen + 4 > size) { host_log("[VM] mbc trunc m body"); return 0; }
         out->methods[i].code = data + off;
         out->methods[i].code_size = codeLen;
         off += codeLen;
         out->methods[i].local_count = rd_u16(data + off); off += 2;
+        if (out->methods[i].local_count > VM_LOCAL_CAP) {
+            host_log("[VM] too many method locals");
+            return 0;
+        }
         off += 2; /* pad */
     }
 

@@ -15,6 +15,14 @@ struct MipsScriptComponent;
 
 namespace Mips {
 
+struct VMExecutionLimits {
+    size_t maxInstructionsPerInvocation = 100000;
+    size_t maxStackValues = 4096;
+    size_t maxArrayElements = 4096;
+    size_t maxRuntimeStrings = 1024;
+    size_t maxRuntimeStringBytes = 1024 * 1024;
+};
+
 struct CoroutineState {
     std::string methodName;
     size_t instruction = 0;
@@ -43,6 +51,8 @@ public:
     void SetPhysicsWorld(MipsyncEngine::PhysicsWorld* world) { m_PhysicsWorld = world; }
     void SetActiveInstances(std::vector<ScriptInstance>* instances) { m_ActiveInstances = instances; }
     void SetPhysicsOtherEntityId(uint32_t entityId) { m_PhysicsOtherEntityId = entityId; }
+    void SetExecutionLimits(const VMExecutionLimits& limits) { m_Limits = limits; }
+    const VMExecutionLimits& GetExecutionLimits() const { return m_Limits; }
 
     bool RunMethod(ScriptInstance& instance, const std::string& methodName,
                    std::vector<std::string>& outErrors);
@@ -67,6 +77,9 @@ private:
     std::vector<Value> m_Stack;
     std::vector<Value> m_Locals; // re-used per Execute (supports Host refs)
     std::vector<std::string> m_RuntimeStrings;
+    VMExecutionLimits m_Limits;
+    size_t m_RuntimeStringBytes = 0;
+    bool m_RuntimeStringLimitExceeded = false;
 
     const std::string& ResolveString(const Value& value) const;
     Value MakeRuntimeString(const std::string& text);

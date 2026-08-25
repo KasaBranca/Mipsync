@@ -1,5 +1,7 @@
 # Build output and fetched dependencies
 build/
+!src/build/
+!src/build/**
 build-debug/
 out/
 cmake-build-*/

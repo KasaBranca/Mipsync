@@ -61,6 +61,25 @@ bool TryOpenWithCommand(const wchar_t* command, const std::string& args) {
                                            SW_SHOWNORMAL);
     return reinterpret_cast<intptr_t>(result) > 32;
 }
+
+bool TryRunWithCommandAndWait(const wchar_t* command, const std::string& args) {
+    const std::wstring wArgs = PathUtf8::FromString(args).wstring();
+    SHELLEXECUTEINFOW info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+    info.lpVerb = L"open";
+    info.lpFile = command;
+    info.lpParameters = wArgs.c_str();
+    info.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&info) || !info.hProcess)
+        return false;
+    const DWORD wait = WaitForSingleObject(info.hProcess, 30000);
+    DWORD exitCode = 1;
+    if (wait == WAIT_OBJECT_0)
+        GetExitCodeProcess(info.hProcess, &exitCode);
+    CloseHandle(info.hProcess);
+    return wait == WAIT_OBJECT_0 && exitCode == 0;
+}
 #endif
 
 MipsEditorDiagnostic ParseDiagnosticLine(const std::string& line) {
@@ -145,87 +164,34 @@ fs::path UserProfileDirectory() {
 void SyncBundledMipsIdeExtension() {
     const fs::path exeDir = GetExeDirectory();
     const fs::path extensionSource = exeDir / "tools" / "vscode-mips";
-    const fs::path serverSource = exeDir / "tools" / "mips-language-server";
     const fs::path packageJson = extensionSource / "package.json";
     std::error_code ec;
     if (!fs::is_regular_file(packageJson, ec))
         return;
 
-    const fs::path profile = UserProfileDirectory();
-    if (profile.empty())
+    fs::path vsix;
+    for (const auto& entry : fs::directory_iterator(extensionSource, ec)) {
+        if (ec) break;
+        if (entry.is_regular_file(ec) && entry.path().extension() == ".vsix" &&
+            (vsix.empty() || entry.path().filename() > vsix.filename()))
+            vsix = entry.path();
+    }
+    if (vsix.empty()) {
+        EDITOR_WARN("[Mips# IDE] Bundled VSIX is missing: {}", PathUtf8::ToString(extensionSource));
         return;
-
-    std::string publisher = "mipsync";
-    std::string name = "mipsync-mipssharp-vscode";
-    std::string version = "0.0.0";
-    try {
-        std::ifstream in(packageJson, std::ios::binary);
-        json packageRoot;
-        in >> packageRoot;
-        if (packageRoot.contains("publisher") && packageRoot["publisher"].is_string())
-            publisher = packageRoot["publisher"].get<std::string>();
-        if (packageRoot.contains("name") && packageRoot["name"].is_string())
-            name = packageRoot["name"].get<std::string>();
-        if (packageRoot.contains("version") && packageRoot["version"].is_string())
-            version = packageRoot["version"].get<std::string>();
-    } catch (...) {
     }
 
-    const fs::path installName = publisher + "." + name + "-" + version;
-    const fs::path legacyInstallName = publisher + "." + name;
-    const std::array<fs::path, 2> extensionRoots = {
-        profile / ".vscode" / "extensions",
-        profile / ".cursor" / "extensions",
-    };
-
-    for (const fs::path& root : extensionRoots) {
-        const fs::path installDir = root / installName;
-        const fs::path backupRoot = root.parent_path() / "mipsync-extension-backups";
-        fs::create_directories(backupRoot, ec);
-        if (fs::is_directory(root, ec)) {
-            for (auto it = fs::directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
-                 it != fs::directory_iterator(); it.increment(ec)) {
-                if (ec) {
-                    ec.clear();
-                    continue;
-                }
-                if (!it->is_directory(ec))
-                    continue;
-                const fs::path candidate = it->path();
-                if (candidate == installDir)
-                    continue;
-                const std::string dirName = candidate.filename().string();
-                const bool isOldMipsExtension =
-                    dirName.rfind("mipsync.mipsync-mips-vscode", 0) == 0;
-                const bool isOldUnversionedNewExtension =
-                    dirName == (publisher + "." + name);
-                if (!isOldMipsExtension && !isOldUnversionedNewExtension)
-                    continue;
-                fs::path backupDir = backupRoot / dirName;
-                if (fs::exists(backupDir, ec))
-                    backupDir = backupRoot / (dirName + ".old");
-                fs::rename(candidate, backupDir, ec);
-                ec.clear();
-            }
-        }
-
-        const fs::path legacyDir = root / legacyInstallName;
-        if (legacyDir != installDir && fs::is_directory(legacyDir, ec)) {
-            const fs::path backupDir = backupRoot / legacyInstallName;
-            fs::rename(legacyDir, backupDir, ec);
-            ec.clear();
-        }
-
-        const bool extensionOk = CopyDirectoryContents(extensionSource, installDir);
-        bool serverOk = true;
-        if (fs::is_directory(serverSource, ec))
-            serverOk = CopyDirectoryContents(serverSource, installDir / "mips-language-server");
-        if (extensionOk && serverOk)
-            EDITOR_INFO("[Mips# IDE] Synced extension: {}", PathUtf8::ToString(installDir));
-        else
-            EDITOR_WARN("[Mips# IDE] Failed to fully sync extension: {}",
-                        PathUtf8::ToString(installDir));
+    const std::string installArgs = "--install-extension " + QuoteArg(PathUtf8::ToString(vsix)) + " --force";
+    if (TryRunWithCommandAndWait(L"code.cmd", installArgs) ||
+        TryRunWithCommandAndWait(L"code", installArgs)) {
+        EDITOR_INFO("[Mips# IDE] Installed VS Code extension: {}", PathUtf8::ToString(vsix));
+        return;
     }
+    if (TryRunWithCommandAndWait(L"cursor.cmd", installArgs) ||
+        TryRunWithCommandAndWait(L"cursor", installArgs))
+        EDITOR_INFO("[Mips# IDE] Installed Cursor extension: {}", PathUtf8::ToString(vsix));
+    else
+        EDITOR_WARN("[Mips# IDE] Could not install bundled extension in VS Code or Cursor");
 }
 
 fs::path ResolveCurrentProjectRoot(const std::string& resolvedScriptPath) {
@@ -284,6 +250,14 @@ void EnsureMipsSharpWorkspaceSettings(const fs::path& projectRoot) {
         settings["files.associations"] = json::object();
     settings["files.associations"]["*.mips"] = "mipssharp";
     settings["editor.semanticHighlighting.enabled"] = true;
+    const fs::path bundledCli = GetExeDirectory() / "mipsync.exe";
+    std::error_code cliEc;
+    if (fs::is_regular_file(bundledCli, cliEc))
+        settings["mipsync.cliPath"] = PathUtf8::ToString(bundledCli);
+    const fs::path currentEngine = GetExeDirectory() / "MipsyncEngine.exe";
+    std::error_code engineEc;
+    if (fs::is_regular_file(currentEngine, engineEc))
+        settings["mipsync.enginePath"] = PathUtf8::ToString(currentEngine);
 
     if (SaveJsonObject(settingsPath, settings)) {
         EDITOR_INFO("[Mips# IDE] Wrote workspace language association: {}",
@@ -373,13 +347,18 @@ bool MipsEditorIntegration::OpenScriptInIde(const std::string& projectOrAbsolute
     const int safeColumn = std::max(1, column);
     const std::string target = resolved + ":" + std::to_string(safeLine) +
                                ":" + std::to_string(safeColumn);
-    const std::string vscodeArgs = "--reuse-window --goto " + QuoteArg(target);
+    std::string vscodeArgs = "--reuse-window ";
+    if (!projectRoot.empty()) vscodeArgs += QuoteArg(PathUtf8::ToString(projectRoot)) + " ";
+    vscodeArgs += "--goto " + QuoteArg(target);
     if (TryOpenWithCommand(L"code.cmd", vscodeArgs) || TryOpenWithCommand(L"code", vscodeArgs))
         return true;
     if (TryOpenWithCommand(L"cursor.cmd", vscodeArgs) || TryOpenWithCommand(L"cursor", vscodeArgs))
         return true;
 
-    return ShellOpen(resolved);
+    // Never fall back to the Windows .mips file association. Older installs
+    // associated .mips with MipsyncEngine.exe, which launches the boot UI
+    // instead of an IDE and can repeat as language diagnostics run.
+    return false;
 #else
     (void)line;
     (void)column;

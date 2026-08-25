@@ -45,6 +45,7 @@ typedef struct ps1_mesh {
 typedef struct ps1_entity {
     uint32_t    id;
     const char* name;
+    int16_t     parent_entity_index; /* source scene index, -1 for root */
     fix16_t     position[3];
     fix16_t     rotation[3]; /* euler degrees */
     fix16_t     scale[3];
@@ -175,13 +176,23 @@ typedef struct ps1_ui_glyph {
 
 typedef struct ps1_ui_button_rect {
     int16_t x, y, w, h;
+    uint16_t action_offset;
+    uint8_t action_count;
+    uint8_t interactable;
 } ps1_ui_button_rect;
+
+typedef struct ps1_ui_button_action {
+    uint16_t target_entity_index;
+    uint8_t module_index;
+    const char* method_name;
+} ps1_ui_button_action;
 
 typedef struct ps1_ui_button_group {
     uint8_t selected_index;
     uint8_t wrap_navigation;
     uint8_t gamepad_navigation;
-    uint8_t reserved;
+    uint8_t gamepad_confirm;
+    uint8_t confirm_button;
     uint16_t button_rect_offset;
     uint8_t button_count;
     int16_t cursor_offset_x;
@@ -220,6 +231,8 @@ typedef struct ps1_scene {
     unsigned int              ui_button_group_count;
     const ps1_ui_button_rect* ui_button_rects;
     unsigned int              ui_button_rect_count;
+    const ps1_ui_button_action* ui_button_actions;
+    unsigned int              ui_button_action_count;
     unsigned int              background_texture_index;
 } ps1_scene;
 
@@ -228,6 +241,8 @@ extern const ps1_mesh  g_ps1_meshes[];
 extern const unsigned int g_ps1_mesh_count;
 
 void ps1_scene_init(void);
+/* Apply runtime parent transform deltas to flattened descendants. */
+void ps1_scene_resolve_hierarchy(void);
 void ps1_scene_begin_frame(void);
 void ps1_scene_update_vertex_anims(fix16_t delta_time);
 void ps1_scene_set_animator_float(unsigned int root_index, const char* name, fix16_t value);

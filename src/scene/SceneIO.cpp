@@ -538,6 +538,7 @@ json EntityComponentsToJson(const Entity& entity) {
 
     if (const auto* button = const_cast<Entity&>(entity).GetComponent<UIButtonComponent>()) {
         json buttonJson = {
+            { "interactable", button->interactable },
             { "label", button->label },
             { "preserveAspect", button->preserveAspect },
             { "normalColor", Vec4ToJson(button->normalColor) },
@@ -550,6 +551,17 @@ json EntityComponentsToJson(const Entity& entity) {
             buttonJson["enabled"] = false;
         if (!button->backgroundTexturePath.empty())
             buttonJson["backgroundTexture"] = button->backgroundTexturePath;
+        if (!button->onClick.empty()) {
+            buttonJson["onClick"] = json::array();
+            for (const UIButtonClickEvent& listener : button->onClick) {
+                buttonJson["onClick"].push_back({
+                    { "enabled", listener.enabled },
+                    { "targetEntity", listener.targetEntityId },
+                    { "script", listener.scriptPath },
+                    { "method", listener.methodName },
+                });
+            }
+        }
         ent["uiButton"] = buttonJson;
     }
 
@@ -1066,6 +1078,7 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         const json& buttonJson = ent["uiButton"];
         auto& button = entity.AddComponent<UIButtonComponent>();
         button.enabled = buttonJson.value("enabled", true);
+        button.interactable = buttonJson.value("interactable", true);
         button.label = buttonJson.value("label", button.label);
         button.backgroundTexturePath = buttonJson.value("backgroundTexture", std::string{});
         button.preserveAspect = buttonJson.value("preserveAspect", button.preserveAspect);
@@ -1078,6 +1091,18 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         if (buttonJson.contains("textColor"))
             Vec4FromJson(buttonJson["textColor"], button.textColor);
         button.fontSize = buttonJson.value("fontSize", button.fontSize);
+        if (buttonJson.contains("onClick") && buttonJson["onClick"].is_array()) {
+            for (const json& listenerJson : buttonJson["onClick"]) {
+                if (!listenerJson.is_object())
+                    continue;
+                UIButtonClickEvent listener;
+                listener.enabled = listenerJson.value("enabled", true);
+                listener.targetEntityId = listenerJson.value("targetEntity", 0u);
+                listener.scriptPath = listenerJson.value("script", std::string{});
+                listener.methodName = listenerJson.value("method", std::string{});
+                button.onClick.push_back(std::move(listener));
+            }
+        }
         if (!button.backgroundTexturePath.empty())
             button.backgroundTexture = AssetManager::Get().GetTexture(button.backgroundTexturePath);
     }

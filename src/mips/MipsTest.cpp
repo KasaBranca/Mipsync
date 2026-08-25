@@ -2,6 +2,9 @@
 #include "MipsRuntime.h"
 #include "VM.h"
 #include "../core/Log.h"
+#include "../scene/Scene.h"
+#include "../scene/SceneIO.h"
+#include <filesystem>
 #include <vector>
 
 namespace MipsyncEngine::Mips {
@@ -80,6 +83,60 @@ bool RunMipsRuntimeRegressionTests(const char* scriptPath,
     vm.RunMethod(instance, "BoundsError", boundsErrors);
     if (boundsErrors.empty()) {
         errors.push_back("array regression: out-of-range write was not diagnosed");
+        return false;
+    }
+
+    // A malformed or hostile gameplay loop must fail deterministically instead
+    // of hanging the editor process.
+    auto loopModule = std::make_shared<CompiledModule>();
+    loopModule->className = "InfiniteLoop";
+    CompiledMethod loopMethod;
+    loopMethod.name = "Run";
+    BytecodeWriter loopWriter;
+    loopWriter.EmitOp(OpCode::Jump);
+    loopWriter.EmitI32(-5);
+    loopMethod.code = loopWriter.Code();
+    loopModule->methods.push_back(std::move(loopMethod));
+    ScriptInstance loopInstance;
+    loopInstance.module = loopModule;
+    VM limitedVm;
+    VMExecutionLimits limits;
+    limits.maxInstructionsPerInvocation = 64;
+    limitedVm.SetExecutionLimits(limits);
+    std::vector<std::string> limitErrors;
+    if (limitedVm.RunMethod(loopInstance, "Run", limitErrors) || limitErrors.empty()) {
+        errors.push_back("VM safety regression: infinite loop did not hit instruction budget");
+        return false;
+    }
+
+    // Scene event bindings must survive the same serialization path used by
+    // editor Save/Load and Undo snapshots.
+    Scene sourceScene;
+    Entity* target = sourceScene.CreateEntity("Target");
+    auto& targetScript = target->AddComponent<MipsScriptComponent>();
+    targetScript.scriptPath = "assets/scripts/Target.mips";
+    Entity* buttonEntity = sourceScene.CreateEntity("Button");
+    auto& button = buttonEntity->AddComponent<UIButtonComponent>();
+    button.onClick.push_back({ true, target->GetID(), targetScript.scriptPath, "HandleClick" });
+
+    const std::filesystem::path scenePath =
+        std::filesystem::temp_directory_path() / "mipsync_scene_roundtrip_test.nscene";
+    std::string sceneError;
+    if (!SceneIO::SaveToFile(sourceScene, scenePath.string(), sceneError)) {
+        errors.push_back("scene serialization regression: " + sceneError);
+        return false;
+    }
+    Scene loadedScene;
+    const bool loaded = SceneIO::LoadFromFile(loadedScene, scenePath.string(), sceneError);
+    std::error_code removeError;
+    std::filesystem::remove(scenePath, removeError);
+    Entity* loadedButtonEntity = loadedScene.FindEntity(buttonEntity->GetID());
+    UIButtonComponent* loadedButton = loadedButtonEntity
+        ? loadedButtonEntity->GetComponent<UIButtonComponent>() : nullptr;
+    if (!loaded || !loadedButton || loadedButton->onClick.size() != 1 ||
+        loadedButton->onClick.front().targetEntityId != target->GetID() ||
+        loadedButton->onClick.front().methodName != "HandleClick") {
+        errors.push_back("scene serialization regression: Button On Click did not round-trip");
         return false;
     }
     return errors.empty();

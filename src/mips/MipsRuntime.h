@@ -2,6 +2,7 @@
 
 #include "Bytecode.h"
 #include "MipsPhysicsEvents.h"
+#include "MipsSceneSnapshot.h"
 #include "VM.h"
 #include <cstdint>
 #include <filesystem>
@@ -51,24 +52,21 @@ public:
     MipsPhysicsEventQueue& PhysicsEvents() { return m_PhysicsEvents; }
     void DispatchPhysicsEvents(MipsyncEngine::Scene& scene);
 
-private:
-    struct TransformSnapshot {
-        uint32_t entityId = 0;
-        glm::vec3 position{};
-        glm::vec3 rotation{};
-        glm::vec3 scale{1.0f};
-    };
+    /// Invokes a persistent UI listener on a script attached to targetEntityId.
+    /// Returns false when the target/script/method is unavailable or play mode is inactive.
+    bool InvokeButtonEvent(MipsyncEngine::Scene& scene, uint32_t targetEntityId,
+                           const std::string& scriptPath, const std::string& methodName,
+                           std::vector<std::string>& errors);
 
+private:
     void CollectInstances(MipsyncEngine::Scene& scene);
-    void CaptureSceneSnapshot(MipsyncEngine::Scene& scene);
-    void RestoreSceneSnapshot(MipsyncEngine::Scene& scene);
     void InvokeLifecycleAll(const char* method, MipsyncEngine::Scene& scene, float deltaTime);
 
     VM m_VM;
     MipsPhysicsEventQueue m_PhysicsEvents;
     std::unordered_map<std::string, std::filesystem::file_time_type> m_ScriptFileTimes;
     std::vector<ScriptInstance> m_Instances;
-    std::vector<TransformSnapshot> m_EditSnapshot;
+    MipsSceneSnapshot m_EditSnapshot;
     MipsyncEngine::PhysicsWorld* m_PhysicsWorld = nullptr;
     bool m_Playing = false;
     bool m_Paused = false;

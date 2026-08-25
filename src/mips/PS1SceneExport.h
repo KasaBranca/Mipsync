@@ -36,7 +36,13 @@ struct Ps1TransformAnimKey {
 /// Flattened entity record extracted from a `.nscene` file for PS1 runtime.
 struct Ps1ExportedEntity {
     uint32_t id = 0;
+    uint32_t sourceEntityId = 0;
     std::string name;
+    // Source-scene hierarchy. Transforms below remain flattened world-space
+    // values for the renderer; the PS1 runtime uses this relationship to
+    // propagate runtime parent transform changes to flattened descendants.
+    uint32_t parentEntityId = 0;
+    int parentEntityIndex = -1;
     float position[3] = { 0, 0, 0 };
     float rotation[3] = { 0, 0, 0 };
     float scale[3]    = { 1, 1, 1 };
@@ -142,13 +148,25 @@ struct Ps1ExportedUiButtonRect {
     int16_t y = 0;
     int16_t w = 0;
     int16_t h = 0;
+    uint16_t actionOffset = 0;
+    uint8_t actionCount = 0;
+    uint8_t interactable = 1;
+};
+
+struct Ps1ExportedUiButtonAction {
+    uint32_t targetSourceEntityId = 0;
+    std::string scriptPath;
+    std::string methodName;
+    uint16_t targetEntityIndex = 0;
+    uint8_t moduleIndex = 0;
 };
 
 struct Ps1ExportedUiButtonGroup {
     uint8_t selectedIndex = 0;
     uint8_t wrapNavigation = 1;
     uint8_t gamepadNavigation = 1;
-    uint8_t reserved = 0;
+    uint8_t gamepadConfirm = 1;
+    uint8_t confirmButton = 0;
     uint16_t buttonRectOffset = 0;
     uint8_t buttonCount = 0;
     int16_t cursorOffsetX = -28;
@@ -265,6 +283,7 @@ struct Ps1SceneExportResult {
     std::vector<Ps1ExportedUiElement> uiElements;
     std::vector<Ps1ExportedUiButtonGroup> uiButtonGroups;
     std::vector<Ps1ExportedUiButtonRect> uiButtonRects;
+    std::vector<Ps1ExportedUiButtonAction> uiButtonActions;
     std::string uiTextBlob;
     std::vector<Ps1ExportedUiGlyph> uiGlyphs;
     std::vector<uint16_t> uiGlyphRows;

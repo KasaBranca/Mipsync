@@ -5,6 +5,13 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace MipsyncEngine::Ps1 {
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -72,6 +79,44 @@ bool SaveEditorPrefs(const EditorPrefs& prefs, std::string& outError) {
     }
 }
 
+namespace {
+
+fs::path ExecutableDir() {
+#ifdef _WIN32
+    wchar_t buf[MAX_PATH * 2] = {};
+    const DWORD n = GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(std::size(buf)));
+    if (n == 0)
+        return {};
+    return fs::path(buf).parent_path();
+#else
+    return fs::current_path();
+#endif
+}
+
+} // namespace
+
+std::string FindBundledEmulator() {
+    std::error_code ec;
+    const fs::path exeDir = ExecutableDir();
+    if (exeDir.empty())
+        return {};
+    const fs::path bundled = exeDir / "ps1_runtime" / "emulator" / "pcsx-redux.exe";
+    if (fs::is_regular_file(bundled, ec))
+        return PathUtf8::ToString(bundled);
+    return {};
+}
+
+std::string FindBundledOpenBios() {
+    std::error_code ec;
+    const fs::path exeDir = ExecutableDir();
+    if (exeDir.empty())
+        return {};
+    const fs::path bundled = exeDir / "ps1_runtime" / "bios" / "openbios.bin";
+    if (fs::is_regular_file(bundled, ec))
+        return PathUtf8::ToString(bundled);
+    return {};
+}
+
 std::string ResolveEmulatorPath(const EditorPrefs& prefs) {
     auto exists = [](const std::string& p) {
         std::error_code ec;
@@ -85,6 +130,10 @@ std::string ResolveEmulatorPath(const EditorPrefs& prefs) {
         if (exists(env))
             return env;
     }
+
+    // Bundled PCSX-Redux next to the editor executable (ships OpenBIOS internally).
+    if (auto bundled = FindBundledEmulator(); !bundled.empty())
+        return bundled;
 
 #ifdef _WIN32
     const wchar_t* candidates[] = {

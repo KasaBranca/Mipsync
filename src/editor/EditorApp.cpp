@@ -44,6 +44,7 @@
 #include "../assets/Material.h"
 #include "../core/OsFileDrop.h"
 #include "../core/RuntimePaths.h"
+#include "../command/EditorCommandHost.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cctype>
@@ -70,6 +71,17 @@ namespace MipsyncEngine {
 namespace {
 
 EditorApp* s_EditorForWindowClose = nullptr;
+
+bool IsUIButtonCallableMethod(const Mips::CompiledMethod& method) {
+    if (!method.isPublic || method.parameterCount != 0 || method.returnType != "void")
+        return false;
+    static constexpr const char* kLifecycleMethods[] = {
+        "Awake", "Start", "Update", "LateUpdate", "OnDestroy",
+        "OnCollisionEnter", "OnCollisionExit", "OnTriggerEnter", "OnTriggerExit",
+    };
+    return std::none_of(std::begin(kLifecycleMethods), std::end(kLifecycleMethods),
+                        [&](const char* name) { return method.name == name; });
+}
 
 class ScopedDrawListClipRect {
 public:
@@ -799,7 +811,9 @@ void EditorApp::Init() {
 
     MIPSYNC_INFO("Editor paths: layout={}, scene={}", m_LayoutIniPath, m_SceneFilePath);
     
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    // Gameplay UI reads keys through Input directly. Dear ImGui keyboard
+    // navigation would otherwise make arrow keys move focus around editor UI.
+    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 
@@ -847,20 +861,32 @@ void EditorApp::Init() {
     m_UndoStack.Clear();
     m_UndoStack.PushState(m_Engine->GetScene());
     m_HadActiveEdit = false;
+
+    if (!m_Engine->IsPlayerMode()) {
+        m_CommandHost = std::make_unique<Command::EditorCommandHost>(*m_Engine);
+        std::string commandError;
+        if (!m_CommandHost->Start(commandError))
+            MIPSYNC_WARN("Command Platform IPC unavailable: {}", commandError);
+        else
+            MIPSYNC_INFO("Command Platform ready for project: {}", m_Engine->GetProjectPath());
+    }
 }
 
 void EditorApp::Shutdown() {
+    if (m_CommandHost) {
+        m_CommandHost->Stop();
+        m_CommandHost.reset();
+    }
     if (s_EditorForWindowClose == this)
         s_EditorForWindowClose = nullptr;
 
     if (ImGui::GetCurrentContext() != nullptr) {
         if (const char* iniPath = ImGui::GetIO().IniFilename)
             ImGui::SaveIniSettingsToDisk(iniPath);
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
     }
-
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplGlfw_Shutdown();
-    ImGui::DestroyContext();
 }
 
 void EditorApp::TickPendingPlaySetup() {
@@ -990,11 +1016,12 @@ void EditorApp::TickAutoPlayOnStart() {
         return;
     m_AutoPlayTriggered = true;
     StartPlayMode();
-    if (m_Engine->IsPlayerMode())
-        Input::SetCursorLocked(true);
 }
 
 void EditorApp::BeginFrame() {
+
+    if (m_CommandHost)
+        m_CommandHost->Pump();
 
     const ImVec4 clear = EditorTheme::GetClearColor();
     glViewport(0, 0, m_Engine->GetWindow().GetWidth(), m_Engine->GetWindow().GetHeight());
@@ -1651,6 +1678,12 @@ void EditorApp::ApplySavedTabSelections() {
 }
 
 void EditorApp::SaveScene() {
+    std::string error;
+    if (!CommandSaveScene(error))
+        MIPSYNC_WARN("Scene save failed: {}", error);
+}
+
+bool EditorApp::CommandSaveScene(std::string& outError) {
     if (m_IsPlaying) {
         m_Engine->GetMipsRuntime().OnPlayStopped(m_Engine->GetScene());
         m_Engine->GetAudioSystem().EndPlay();
@@ -1662,15 +1695,14 @@ void EditorApp::SaveScene() {
         Input::SetCursorLocked(false);
     }
 
-    std::string error;
-    if (SceneIO::SaveToFile(m_Engine->GetScene(), m_SceneFilePath, error)) {
+    if (SceneIO::SaveToFile(m_Engine->GetScene(), m_SceneFilePath, outError)) {
         MIPSYNC_INFO("Scene saved: {}", m_SceneFilePath);
         PersistEditorLastScene();
         m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
         RefreshSavedSceneState();
-    } else {
-        MIPSYNC_WARN("Scene save failed: {}", error);
+        return true;
     }
+    return false;
 }
 
 void EditorApp::PersistEditorLastScene() {
@@ -1748,8 +1780,6 @@ void EditorApp::LoadScene(bool restartPlayIfWasActive) {
 
         if (restartPlayIfWasActive && wasPlaying) {
             StartPlayMode();
-            if (m_Engine->IsPlayerMode())
-                Input::SetCursorLocked(true);
         }
     } else {
         MIPSYNC_WARN("Scene load failed: {}", error);
@@ -2283,6 +2313,8 @@ void EditorApp::RenderSceneToFramebuffer(Framebuffer& fbo, const Camera& camera,
         fbo.Resize(width, height);
 
     Scene& scene = m_Engine->GetScene();
+    if (sceneView3D)
+        m_Engine->GetUIRenderer().SetPointerState(false, 0.0f, 0.0f, false, false, false);
     PS1Settings& psx = m_Engine->GetRenderer().GetPS1Settings();
     const PS1Settings savedPsx = psx;
     ApplyPostProcessVolumeSettings(psx);
@@ -2429,6 +2461,47 @@ void EditorApp::SelectSingleEntity(uint32_t entityId) {
     if (m_AssetBrowser)
         m_AssetBrowser->ClearAssetSelection();
     SyncAnimatorWindowToSelectedEntity();
+}
+
+void EditorApp::CommandRevealEntity(uint32_t entityId, bool frameInSceneView) {
+    Entity* entity = m_Engine->GetScene().FindEntity(entityId);
+    if (!entity)
+        return;
+
+    SelectSingleEntity(entityId);
+    m_ForceSceneViewTab = true;
+    if (frameInSceneView)
+        FrameEntityInSceneView(*entity);
+}
+
+bool EditorApp::CommandUndo(std::string& outError) {
+    if (m_IsPlaying) {
+        outError = "Undo is unavailable during Play Mode.";
+        return false;
+    }
+    if (!m_UndoStack.CanUndo()) {
+        outError = "Nothing to undo.";
+        return false;
+    }
+    if (!m_UndoStack.Undo(m_Engine->GetScene(), outError))
+        return false;
+    AfterSceneRestoredFromHistory();
+    return true;
+}
+
+bool EditorApp::CommandRedo(std::string& outError) {
+    if (m_IsPlaying) {
+        outError = "Redo is unavailable during Play Mode.";
+        return false;
+    }
+    if (!m_UndoStack.CanRedo()) {
+        outError = "Nothing to redo.";
+        return false;
+    }
+    if (!m_UndoStack.Redo(m_Engine->GetScene(), outError))
+        return false;
+    AfterSceneRestoredFromHistory();
+    return true;
 }
 
 void EditorApp::SyncAnimatorWindowToSelectedEntity() {
@@ -3459,6 +3532,20 @@ void EditorApp::DrawPlayerModeUI() {
 
     ImVec2 panelSize = ImGui::GetContentRegionAvail();
     if (panelSize.x > 1.0f && panelSize.y > 1.0f) {
+        const ImVec2 panelMin = ImGui::GetCursorScreenPos();
+        const ImVec2 panelMax{ panelMin.x + panelSize.x, panelMin.y + panelSize.y };
+        ImGuiIO& io = ImGui::GetIO();
+        const bool pointerActive = !Input::IsCursorLocked() &&
+            io.MousePos.x >= panelMin.x && io.MousePos.x < panelMax.x &&
+            io.MousePos.y >= panelMin.y && io.MousePos.y < panelMax.y;
+        const float pointerX = (io.MousePos.x - panelMin.x) / std::max(panelSize.x, 1.0f) * panelSize.x;
+        const float pointerY = (1.0f - (io.MousePos.y - panelMin.y) /
+                                      std::max(panelSize.y, 1.0f)) * panelSize.y;
+        m_Engine->GetUIRenderer().SetPointerState(
+            pointerActive, pointerX, pointerY, io.MouseDown[ImGuiMouseButton_Left],
+            pointerActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left),
+            ImGui::IsMouseReleased(ImGuiMouseButton_Left));
+
         Scene& scene = m_Engine->GetScene();
         Entity* cameraEntity = ResolveActiveShotCameraEntity(m_IsPlaying || m_Engine->IsPlayerMode());
         Camera activeCamera = m_FallbackGameCamera;
@@ -3484,17 +3571,11 @@ void EditorApp::DrawPlayerModeUI() {
         RenderSceneToFramebuffer(m_GameViewFBO, activeCamera, panelSize, 0, activeCamId, false,
                                  renderW, renderH);
 
-        const ImVec2 panelMin = ImGui::GetCursorScreenPos();
-        const ImVec2 panelMax{ panelMin.x + panelSize.x, panelMin.y + panelSize.y };
         ImGui::GetWindowDrawList()->AddImage(
             (ImTextureID)(intptr_t)m_GameViewFBO.GetColorAttachment(), panelMin, panelMax,
             ImVec2{ 0, 1 }, ImVec2{ 1, 0 });
 
         m_GameViewHovered = true;
-        if (m_IsPlaying && m_GameViewHovered && !m_PlayCursorLocked) {
-            m_PlayCursorLocked = true;
-            Input::SetCursorLocked(true);
-        }
     }
 
     ImGui::End();
@@ -3539,9 +3620,6 @@ void EditorApp::DrawGameViewPanel() {
         const ImVec2 renderSize{ static_cast<float>(m_GameViewSettings.renderWidth),
                                  static_cast<float>(m_GameViewSettings.renderHeight) };
         const uint32_t activeCamId = cameraEntity ? cameraEntity->GetID() : 0u;
-        RenderSceneToFramebuffer(m_GameViewFBO, activeCamera, renderSize, 0, activeCamId, false,
-                                 m_GameViewSettings.renderWidth, m_GameViewSettings.renderHeight);
-
         const ImVec2 panelMin = ImGui::GetCursorScreenPos();
         const GameViewLetterbox letterbox =
             ComputeGameViewLetterbox(panelMin, viewportPanelSize, m_GameViewSettings);
@@ -3564,9 +3642,22 @@ void EditorApp::DrawGameViewPanel() {
             io.MousePos.y >= letterbox.displayMin.y && io.MousePos.y < displayMax.y;
         m_GameViewHovered = windowHovered && mouseInDisplay;
 
+        const float pointerX = (io.MousePos.x - letterbox.displayMin.x) /
+            std::max(letterbox.displaySize.x, 1.0f) *
+            static_cast<float>(m_GameViewSettings.renderWidth);
+        const float pointerY = (1.0f - (io.MousePos.y - letterbox.displayMin.y) /
+            std::max(letterbox.displaySize.y, 1.0f)) *
+            static_cast<float>(m_GameViewSettings.renderHeight);
+        const bool pointerActive = m_GameViewHovered && !Input::IsCursorLocked();
+        m_Engine->GetUIRenderer().SetPointerState(
+            pointerActive, pointerX, pointerY, io.MouseDown[ImGuiMouseButton_Left],
+            pointerActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left),
+            ImGui::IsMouseReleased(ImGuiMouseButton_Left));
+
+        RenderSceneToFramebuffer(m_GameViewFBO, activeCamera, renderSize, 0, activeCamId, false,
+                                 m_GameViewSettings.renderWidth, m_GameViewSettings.renderHeight);
+
         if (m_IsPlaying && m_GameViewHovered) {
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-                m_PlayCursorLocked = true;
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Right))
                 m_PlayCursorLocked = true;
         }
@@ -3577,7 +3668,7 @@ void EditorApp::DrawGameViewPanel() {
     }
 
     if (m_IsPlaying && m_GameViewHovered && !m_PlayCursorLocked) {
-        ImGui::SetTooltip("Click to capture mouse (Esc to release)");
+        ImGui::SetTooltip("Right-click to capture mouse (Esc to release)");
     }
 
     ImGui::PopStyleVar();
@@ -4148,19 +4239,27 @@ void EditorApp::DrawHierarchyEntityNode(Entity& entity) {
 
     bool opened = ImGui::TreeNodeEx((void*)(uint64_t)entity.GetID(), flags, "%s", name.c_str());
 
-    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
-        HandleHierarchySelection(entity.GetID());
-    }
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen())
+        m_PendingHierarchyClickEntityID = entity.GetID();
 
     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        m_PendingHierarchyClickEntityID = 0;
         SelectSingleEntity(entity.GetID());
         FrameEntityInSceneView(entity);
     }
 
+    if (m_PendingHierarchyClickEntityID == entity.GetID() && ImGui::IsItemHovered() &&
+        ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+        !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        m_PendingHierarchyClickEntityID = 0;
+        HandleHierarchySelection(entity.GetID());
+    }
+
     if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
-        if (!IsEntitySelected(entity.GetID()))
-            SelectSingleEntity(entity.GetID());
-        const std::vector<uint32_t> roots = GetSelectedHierarchyRootIDs(entity.GetID());
+        m_PendingHierarchyClickEntityID = 0;
+        const std::vector<uint32_t> roots = IsEntitySelected(entity.GetID())
+            ? GetSelectedHierarchyRootIDs(entity.GetID())
+            : std::vector<uint32_t>{ entity.GetID() };
         ImGui::SetDragDropPayload(DragDrop::kEntityId, roots.data(),
                                   roots.size() * sizeof(uint32_t));
         ImGui::Text("%zu object%s", roots.size(), roots.size() == 1 ? "" : "s");
@@ -4438,6 +4537,9 @@ void EditorApp::DrawHierarchyPanel() {
             m_SceneDirty = true;
         }
     }
+
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+        m_PendingHierarchyClickEntityID = 0;
 
     ImGui::End();
 }
@@ -5514,6 +5616,12 @@ void EditorApp::DrawInspectorPanel() {
                 removeComponent = false;
                 const bool open = BeginInspectableComponent("Button", *uiButton, removeComponent, this);
                 if (!removeComponent && open) {
+                    bool interactable = uiButton->interactable;
+                    if (EditorTheme::Checkbox("Interactable", &interactable)) {
+                        RecordUndoSnapshot();
+                        uiButton->interactable = interactable;
+                        m_SceneDirty = true;
+                    }
                     DrawUIButtonBackgroundSlot(*uiButton);
                     if (EditorTheme::Checkbox("Preserve Aspect", &uiButton->preserveAspect))
                         RecordUndoSnapshot();
@@ -5555,6 +5663,131 @@ void EditorApp::DrawInspectorPanel() {
                     if (!FindButtonGroupAncestor(m_Engine->GetScene(), selectedEntity))
                         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f),
                                            "Button is not under a Button Group.");
+
+                    ImGui::Spacing();
+                    ImGui::SeparatorText("On Click ()");
+                    ImGui::TextDisabled("Persistent listeners run in Play mode.");
+
+                    int removeListener = -1;
+                    Scene& scene = m_Engine->GetScene();
+                    for (size_t listenerIndex = 0; listenerIndex < uiButton->onClick.size(); ++listenerIndex) {
+                        UIButtonClickEvent& listener = uiButton->onClick[listenerIndex];
+                        ImGui::PushID(static_cast<int>(listenerIndex));
+                        ImGui::BeginGroup();
+
+                        bool listenerEnabled = listener.enabled;
+                        if (EditorTheme::Checkbox("##Enabled", &listenerEnabled)) {
+                            RecordUndoSnapshot();
+                            listener.enabled = listenerEnabled;
+                            m_SceneDirty = true;
+                        }
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("Runtime Only");
+                        ImGui::SameLine();
+                        const float removeWidth = 24.0f;
+                        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
+                            ImGui::GetWindowContentRegionMax().x - removeWidth));
+                        if (ImGui::SmallButton("-") )
+                            removeListener = static_cast<int>(listenerIndex);
+
+                        Entity* target = listener.targetEntityId != 0
+                            ? scene.FindEntity(listener.targetEntityId) : nullptr;
+                        std::string targetLabel = "None (Object)";
+                        if (target) {
+                            if (const auto* tag = target->GetComponent<TagComponent>())
+                                targetLabel = tag->tag;
+                            else
+                                targetLabel = "Entity #" + std::to_string(target->GetID());
+                        }
+                        ImGui::SetNextItemWidth(-1.0f);
+                        ImGui::Button(targetLabel.c_str(), ImVec2(-1.0f, 0.0f));
+                        if (ImGui::BeginDragDropTarget()) {
+                            if (const ImGuiPayload* payload =
+                                    ImGui::AcceptDragDropPayload(DragDrop::kEntityId)) {
+                                if (payload->DataSize >= static_cast<int>(sizeof(uint32_t))) {
+                                    const uint32_t droppedId =
+                                        *static_cast<const uint32_t*>(payload->Data);
+                                    if (scene.FindEntity(droppedId)) {
+                                        RecordUndoSnapshot();
+                                        listener.targetEntityId = droppedId;
+                                        listener.scriptPath.clear();
+                                        listener.methodName.clear();
+                                        m_SceneDirty = true;
+                                    }
+                                }
+                            }
+                            ImGui::EndDragDropTarget();
+                        }
+                        if (target && ImGui::BeginPopupContextItem("ObjectContext")) {
+                            if (ImGui::MenuItem("Clear")) {
+                                RecordUndoSnapshot();
+                                listener.targetEntityId = 0;
+                                listener.scriptPath.clear();
+                                listener.methodName.clear();
+                                m_SceneDirty = true;
+                            }
+                            ImGui::EndPopup();
+                        }
+
+                        const std::string functionPreview = listener.methodName.empty()
+                            ? "No Function" : listener.methodName;
+                        ImGui::SetNextItemWidth(-1.0f);
+                        if (ImGui::BeginCombo("##Function", functionPreview.c_str())) {
+                            if (ImGui::Selectable("No Function", listener.methodName.empty())) {
+                                RecordUndoSnapshot();
+                                listener.scriptPath.clear();
+                                listener.methodName.clear();
+                                m_SceneDirty = true;
+                            }
+                            if (target) {
+                                for (MipsScriptComponent* script :
+                                     target->GetComponents<MipsScriptComponent>()) {
+                                    std::vector<std::string> errors;
+                                    if (!Mips::MipsRuntime::EnsureScriptReady(*script, errors) ||
+                                        !script->module)
+                                        continue;
+                                    bool openedClass = false;
+                                    for (const Mips::CompiledMethod& method : script->module->methods) {
+                                        if (!IsUIButtonCallableMethod(method))
+                                            continue;
+                                        if (!openedClass) {
+                                            ImGui::SeparatorText(script->module->className.c_str());
+                                            openedClass = true;
+                                        }
+                                        const bool selected = listener.scriptPath == script->scriptPath &&
+                                                              listener.methodName == method.name;
+                                        if (ImGui::Selectable(method.name.c_str(), selected)) {
+                                            RecordUndoSnapshot();
+                                            listener.scriptPath = script->scriptPath;
+                                            listener.methodName = method.name;
+                                            m_SceneDirty = true;
+                                        }
+                                    }
+                                }
+                            }
+                            ImGui::EndCombo();
+                        }
+                        if (!target)
+                            ImGui::TextDisabled("Drag a scene object here.");
+                        else if (target->GetComponents<MipsScriptComponent>().empty())
+                            ImGui::TextDisabled("The object has no Mips# Script.");
+
+                        ImGui::EndGroup();
+                        ImGui::Separator();
+                        ImGui::PopID();
+                    }
+                    if (removeListener >= 0) {
+                        RecordUndoSnapshot();
+                        uiButton->onClick.erase(uiButton->onClick.begin() + removeListener);
+                        m_SceneDirty = true;
+                    }
+                    if (EditorTheme::AeroButton("+ Add On Click Listener",
+                                                ImVec2(-1.0f, EditorTheme::ButtonHeight),
+                                                AeroButtonKind::Secondary)) {
+                        RecordUndoSnapshot();
+                        uiButton->onClick.emplace_back();
+                        m_SceneDirty = true;
+                    }
                 }
                 EndInspectableComponent(*uiButton);
                 if (removeComponent) {
@@ -6409,7 +6642,8 @@ void EditorApp::DrawConsolePanel() {
 
     auto entries = Log::GetRecentEntries();
     
-    ImGui::BeginChild("LogRegion", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+    const float commandHeight = m_CommandHost ? ImGui::GetFrameHeightWithSpacing() : 0.0f;
+    ImGui::BeginChild("LogRegion", ImVec2(0, -commandHeight), false, ImGuiWindowFlags_HorizontalScrollbar);
     for (const auto& entry : entries) {
         ImVec4 color = EditorTheme::TextPrimary;
         if (entry.level == spdlog::level::trace) color = EditorTheme::TextSecondary;
@@ -6424,6 +6658,22 @@ void EditorApp::DrawConsolePanel() {
         ImGui::SetScrollHereY(1.0f);
 
     ImGui::EndChild();
+
+    if (m_CommandHost) {
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::InputTextWithHint("##CommandInput", "Command Platform: help, search, describe, entity list...",
+                                     m_CommandInput, sizeof(m_CommandInput),
+                                     ImGuiInputTextFlags_EnterReturnsTrue)) {
+            const std::string command = m_CommandInput;
+            m_CommandInput[0] = '\0';
+            if (!command.empty()) {
+                MIPSYNC_INFO("> {}", command);
+                const std::string output = m_CommandHost->ExecuteConsoleLine(command);
+                if (!output.empty()) MIPSYNC_INFO("{}", output);
+            }
+            ImGui::SetKeyboardFocusHere(-1);
+        }
+    }
     ImGui::End();
 }
 
