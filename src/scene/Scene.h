@@ -436,7 +436,15 @@ struct UIButtonGroupComponent : public Component {
 
 /// Selectable UI button. Buttons are intended to live under a Button Group;
 /// editor creation helpers automatically create / reparent into one.
+struct UIButtonClickEvent {
+    bool enabled = true;
+    uint32_t targetEntityId = 0;
+    std::string scriptPath;
+    std::string methodName;
+};
+
 struct UIButtonComponent : public Component {
+    bool interactable = true;
     std::string label = "Button";
     std::string backgroundTexturePath;
     std::shared_ptr<Texture> backgroundTexture;
@@ -446,6 +454,7 @@ struct UIButtonComponent : public Component {
     glm::vec4 pressedColor{ 0.10f, 0.70f, 0.45f, 1.0f };
     glm::vec4 textColor{ 1.0f, 1.0f, 1.0f, 1.0f };
     float fontSize = 24.0f;
+    std::vector<UIButtonClickEvent> onClick;
 };
 
 /// Runtime audio visualizer. A sourceEntityId of 0 follows the first playing

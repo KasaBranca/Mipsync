@@ -1,0 +1,35 @@
+class ArraysCoroutines : MonoBehaviour {
+    public float result = 0;
+    public int[] persistent;
+
+    void Start() {
+        int[] values = [1, 2, 3];
+        values[1] = 5;
+        values.Add(7);
+        values.RemoveAt(0);
+        result = values.Length + values[0];
+        values.Clear();
+        values.Add(4);
+        result = result + values.Count + values[0];
+        int[] sized = new int[2];
+        sized[0] = 9;
+        result = result + sized.Length + sized[0];
+        persistent = [4, 5];
+        result = result + persistent.Length + persistent[1];
+        StartCoroutine(Pulse());
+    }
+
+    public IEnumerator Pulse() {
+        result = result + 1;
+        yield return null;
+        result = result + 10;
+        yield return new WaitForSeconds(0.05);
+        result = result + 100;
+        yield break;
+    }
+
+    void BoundsError() {
+        int[] tiny = new int[2];
+        tiny[2] = 99;
+    }
+}

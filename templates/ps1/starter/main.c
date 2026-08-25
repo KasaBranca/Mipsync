@@ -62,9 +62,9 @@
  * data also lives there. The renderer clips safely when this fills. */
 #define PACKET_LEN 73728
 
-#define MAX_MODULES   4
+#define MAX_MODULES   MIPSYNC_PS1_MODULE_CAP
 
-#define MAX_INSTANCES 32
+#define MAX_INSTANCES MIPSYNC_PS1_INSTANCE_CAP
 
 
 
@@ -96,6 +96,25 @@ static int              g_start_pending[MAX_INSTANCES];
 static int              g_instance_count;
 
 static vm_state         g_vm;
+
+void mipsync_ui_invoke(uint16_t entity_index, uint8_t module_index, const char* method_name) {
+    int i;
+    mbc_module* module;
+    const mbc_method* method;
+    if (!method_name || module_index >= (uint8_t)g_module_count)
+        return;
+    module = &g_modules[module_index];
+    method = mbc_find_method(module, method_name);
+    if (!method)
+        return;
+    for (i = 0; i < g_instance_count; ++i) {
+        script_instance* instance = &g_instances[i];
+        if (instance->entity_index == entity_index && instance->module == module) {
+            vm_run_method(&g_vm, module, instance, method);
+            return;
+        }
+    }
+}
 
 
 
@@ -368,6 +387,7 @@ int main(void) {
     BindSceneScripts();
 
     RunPendingStarts();
+    ps1_scene_resolve_hierarchy();
     last_vblank = VSync(-1);
 
 
@@ -394,10 +414,9 @@ int main(void) {
 
         RunUpdates(delta_time);
         ps1_audio_update();
-
-        ps1_scene_begin_frame();
-
         ps1_scene_update_vertex_anims(delta_time);
+        ps1_scene_resolve_hierarchy();
+        ps1_scene_begin_frame();
 
         ps1_render_frame(s_ot[db], &s_nextpri, s_packet[db] + PACKET_LEN);
 

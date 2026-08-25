@@ -24,6 +24,8 @@
 
 namespace MipsyncEngine {
 
+namespace Command { class EditorCommandHost; }
+
 class Engine;
 class Entity;
 class AssetBrowserPanel;
@@ -76,6 +78,14 @@ public:
     void UpdatePlayInputState();
 
     bool IsSceneDirty() const { return m_SceneDirty; }
+    void CommandStartPlayMode() { StartPlayMode(); }
+    void CommandStopPlayMode() { StopPlayMode(); }
+    void CommandMarkSceneDirty() { m_SceneDirty = true; }
+    bool CommandSaveScene(std::string& outError);
+    /// Select an entity changed by the live CLI session and reveal it in Scene View.
+    void CommandRevealEntity(uint32_t entityId, bool frameInSceneView);
+    bool CommandUndo(std::string& outError);
+    bool CommandRedo(std::string& outError);
     /// GLFW close callback: return true to cancel window close (show save prompt).
     bool OnWindowCloseRequested();
 
@@ -265,6 +275,7 @@ private:
     std::unordered_set<uint32_t> m_PendingSelectedEntityIDs;
     std::unordered_set<uint32_t> m_SelectedEntityIDs;
     uint32_t m_HierarchySelectionAnchor = 0;
+    uint32_t m_PendingHierarchyClickEntityID = 0;
     std::vector<uint32_t> m_HierarchyOrder;
     std::vector<uint32_t> m_HierarchyClipboardEntityIDs;
     ImGuizmo::OPERATION m_GizmoOperation = ImGuizmo::TRANSLATE;
@@ -338,6 +349,8 @@ private:
 
     std::unique_ptr<AssetBrowserPanel> m_AssetBrowser;
     std::unique_ptr<EditorBuildSettings> m_BuildSettings;
+    std::unique_ptr<Command::EditorCommandHost> m_CommandHost;
+    char m_CommandInput[512]{};
 
     std::string m_AnimatorControllerWindowPath;
     bool m_AnimatorControllerDockEnsured = false;

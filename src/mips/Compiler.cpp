@@ -39,6 +39,49 @@ bool TryEvalFieldDefault(const Ast::Expr& expr, double& out) {
     return false;
 }
 
+bool ContainsStringLiteral(const Ast::Expr& expr) {
+    switch (expr.kind) {
+    case Ast::Expr::Kind::Literal:
+        return expr.literal && expr.literal->kind == Ast::LiteralExpr::Kind::String;
+    case Ast::Expr::Kind::Binary:
+        return expr.binary &&
+               ((expr.binary->left && ContainsStringLiteral(*expr.binary->left)) ||
+                (expr.binary->right && ContainsStringLiteral(*expr.binary->right)));
+    case Ast::Expr::Kind::Unary:
+        return expr.unary && expr.unary->operand && ContainsStringLiteral(*expr.unary->operand);
+    case Ast::Expr::Kind::Call:
+        if (!expr.call) return false;
+        if (expr.call->callee && ContainsStringLiteral(*expr.call->callee)) return true;
+        for (const auto& arg : expr.call->arguments)
+            if (arg && ContainsStringLiteral(*arg)) return true;
+        return false;
+    case Ast::Expr::Kind::Member:
+        return expr.member && expr.member->object && ContainsStringLiteral(*expr.member->object);
+    case Ast::Expr::Kind::GenericCall:
+        if (!expr.genericCall) return false;
+        for (const auto& arg : expr.genericCall->arguments)
+            if (arg && ContainsStringLiteral(*arg)) return true;
+        return false;
+    case Ast::Expr::Kind::ArrayLiteral:
+        if (!expr.arrayLiteral) return false;
+        for (const auto& element : expr.arrayLiteral->elements)
+            if (element && ContainsStringLiteral(*element)) return true;
+        return false;
+    case Ast::Expr::Kind::Index:
+        return expr.index &&
+               ((expr.index->object && ContainsStringLiteral(*expr.index->object)) ||
+                (expr.index->index && ContainsStringLiteral(*expr.index->index)));
+    case Ast::Expr::Kind::New:
+        if (!expr.newExpr) return false;
+        if (expr.newExpr->arraySize && ContainsStringLiteral(*expr.newExpr->arraySize)) return true;
+        for (const auto& arg : expr.newExpr->arguments)
+            if (arg && ContainsStringLiteral(*arg)) return true;
+        return false;
+    default:
+        return false;
+    }
+}
+
 } // namespace
 
 namespace {
@@ -218,8 +261,12 @@ void Compiler::CompileMethod(const Ast::MethodDecl& method) {
 
     CompiledMethod compiled;
     compiled.name = method.name;
+    compiled.returnType = method.returnType;
     compiled.code = m_Writer.Code();
     compiled.localCount = m_LocalCount;
+    compiled.parameterCount = static_cast<uint16_t>(
+        std::min<size_t>(method.parameters.size(), 0xFFFFu));
+    compiled.isPublic = method.isPublic;
     m_Module->methods.push_back(std::move(compiled));
 }
 
@@ -396,6 +443,13 @@ void Compiler::CompileAssignment(const Ast::Expr& lhs, const Ast::Expr& rhs) {
         else isAudioProperty = false;
 
         if (isAudioProperty) {
+            if (setter == HostFunc::AudioSource_SetClip) {
+                m_Module->ps1CompatibilityErrors.push_back(
+                    m_FileName + "(" + std::to_string(lhs.location.line) + "," +
+                    std::to_string(lhs.location.column) +
+                    "): AudioSource.clip runtime assignment is not available on PS1; "
+                    "configure the clip in scene/build data");
+            }
             CompileExpression(*lhs.member->object);
             CompileExpression(rhs);
             m_Writer.EmitOp(OpCode::CallHost);
@@ -510,6 +564,12 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
         if (expr.binary->op == Ast::BinaryOp::Assign) {
             CompileAssignment(*expr.binary->left, *expr.binary->right);
             break;
+        }
+        if (expr.binary->op == Ast::BinaryOp::Add && ContainsStringLiteral(expr)) {
+            m_Module->ps1CompatibilityErrors.push_back(
+                m_FileName + "(" + std::to_string(expr.location.line) + "," +
+                std::to_string(expr.location.column) +
+                "): string concatenation is not available on the PS1 runtime");
         }
         CompileExpression(*expr.binary->left);
         CompileExpression(*expr.binary->right);

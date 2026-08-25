@@ -7,8 +7,7 @@
 #include "../physics/ColliderUtils.h"
 #include "../audio/AudioSystem.h"
 #include "../scene/SceneIO.h"
-#include "../project/Project.h"
-#include "../build/BuildManifest.h"
+#include "../bootstrap/ProjectBootstrap.h"
 #include "../assets/AssetManager.h"
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -17,6 +16,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <utility>
 
 namespace MipsyncEngine {
 
@@ -29,64 +29,14 @@ Engine::Engine(const std::string& projectPath, EngineLaunchMode launchMode,
     if (!Log::GetEngineLogger())
         Log::Init();
 
-    ProjectInfo projectInfo;
-    std::string projectError;
-    std::string startupSceneRel;
-
-    if (!m_PlayerDataDirectory.empty()) {
-        const std::filesystem::path dataDir = std::filesystem::absolute(
-            PathUtf8::FromString(m_PlayerDataDirectory));
-        m_PlayerDataDirectory = PathUtf8::ToString(dataDir);
-        m_ProjectPath = PathUtf8::ToString(dataDir / "Project");
-        std::error_code ec;
-        std::filesystem::current_path(PathUtf8::FromString(m_ProjectPath), ec);
-
-        BuildManifest manifest;
-        const std::string bootPath = PathUtf8::ToString(dataDir / "boot.json");
-        std::string bootError;
-        if (BuildManifestIO::LoadFromFile(bootPath, manifest, bootError)) {
-            m_ProjectName = manifest.productName.empty() ? "Game" : manifest.productName;
-            m_BuildScenes = manifest.scenesInBuild;
-            startupSceneRel = manifest.StartupScenePath();
-            MIPSYNC_INFO("Player build: {} ({} scenes)", m_ProjectName, m_BuildScenes.size());
-        } else {
-            MIPSYNC_WARN("boot.json load failed: {}", bootError);
-            m_ProjectName = PathUtf8::ToString(dataDir.filename());
-        }
-    } else if (!projectPath.empty()) {
-        std::error_code ec;
-        std::filesystem::path projP = PathUtf8::FromString(projectPath);
-        std::filesystem::current_path(projP, ec);
-        m_ProjectPath = PathUtf8::ToString(std::filesystem::absolute(projP));
-    } else {
-        m_ProjectPath = PathUtf8::ToString(std::filesystem::current_path());
-    }
-
-    if (m_PlayerDataDirectory.empty()) {
-        if (Project::LoadFromDir(m_ProjectPath, projectInfo, projectError)) {
-            m_ProjectName = (m_LaunchMode == EngineLaunchMode::Player &&
-                             !projectInfo.player.productName.empty())
-                ? projectInfo.player.productName
-                : projectInfo.name;
-            m_BuildScenes = projectInfo.player.scenesInBuild;
-            if (m_LaunchMode == EngineLaunchMode::Player)
-                startupSceneRel = projectInfo.player.scenesInBuild.empty()
-                    ? projectInfo.defaultScene
-                    : projectInfo.player
-                          .scenesInBuild[static_cast<size_t>(std::clamp(
-                              projectInfo.player.startupSceneIndex, 0,
-                              static_cast<int>(projectInfo.player.scenesInBuild.size()) - 1))];
-            MIPSYNC_INFO("Project: {} ({})", projectInfo.name, m_ProjectPath);
-        } else {
-            m_ProjectName = PathUtf8::ToString(PathUtf8::FromString(m_ProjectPath).filename());
-            if (m_ProjectName.empty())
-                m_ProjectName = "Untitled";
-        }
-    } else if (Project::LoadFromDir(m_ProjectPath, projectInfo, projectError)) {
-        // Merge disk project metadata; boot manifest wins for scenes/title.
-        if (m_BuildScenes.empty())
-            m_BuildScenes = projectInfo.player.scenesInBuild;
-    }
+    ProjectBootstrapResult bootstrap = ProjectBootstrap::Resolve(
+        projectPath, m_PlayerDataDirectory, m_LaunchMode == EngineLaunchMode::Player);
+    m_ProjectPath = std::move(bootstrap.projectPath);
+    m_PlayerDataDirectory = std::move(bootstrap.playerDataDirectory);
+    m_ProjectName = std::move(bootstrap.projectName);
+    m_BuildScenes = std::move(bootstrap.buildScenes);
+    std::string startupSceneRel = std::move(bootstrap.startupSceneRelativePath);
+    ProjectInfo projectInfo = std::move(bootstrap.projectInfo);
 
     MIPSYNC_INFO("Creating Mipsync Engine...");
 
@@ -113,13 +63,7 @@ Engine::Engine(const std::string& projectPath, EngineLaunchMode launchMode,
     AssetManager::Get().SetProjectRoot(m_ProjectPath);
     Log::AddFileSink(PathUtf8::ToString(PathUtf8::FromString(m_ProjectPath) / "mipsync.log"));
 
-    for (const char* sub : { "assets/textures", "assets/materials", "assets/prefabs",
-                             "assets/models", "assets/scripts", "assets/animations",
-                             "assets/audio", "saves" }) {
-        std::error_code subEc;
-        std::filesystem::create_directories(
-            PathUtf8::FromString(m_ProjectPath) / sub, subEc);
-    }
+    ProjectBootstrap::EnsureProjectDirectories(m_ProjectPath);
 
     const bool builtinScriptsUpdated = EnsureBuiltinScripts();
     const bool demoContentUpdated = EnsureDemoContent();
@@ -185,9 +129,18 @@ Engine::Engine(const std::string& projectPath, EngineLaunchMode launchMode,
 }
 
 Engine::~Engine() {
-    m_AudioSystem->EndPlay();
-    m_Editor->Shutdown();
-    m_Renderer->Shutdown();
+    // Construction performs several fallible platform/graphics operations.
+    // Keep teardown valid even when an exception interrupts initialization.
+    if (m_AudioSystem)
+        m_AudioSystem->EndPlay();
+    if (m_Editor)
+        m_Editor->Shutdown();
+    if (m_UIRenderer)
+        m_UIRenderer->Shutdown();
+    if (m_Renderer)
+        m_Renderer->Shutdown();
+    if (s_Instance == this)
+        s_Instance = nullptr;
     Log::Shutdown();
 }
 

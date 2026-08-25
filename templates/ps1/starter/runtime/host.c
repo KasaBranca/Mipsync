@@ -131,66 +131,10 @@ static void push_bool(struct vm_state* vm, int b) {
     vm_push(vm, v);
 }
 
-/* HostFunc enum mirror (must match src/mips/Bytecode.h). Only the calls we
- * actually service in Milestone A are handled by name; everything else
- * falls through to the unimplemented stub. */
 enum {
-    HF_LOG_INFO            = 0,
-    HF_TIME_DELTATIME      = 1,
-    HF_INPUT_GETKEY        = 2,
-    HF_INPUT_MOUSEDX       = 3,
-    HF_INPUT_MOUSEDY       = 4,
-    HF_INPUT_SETCURSORLOCK = 5,
-    HF_INPUT_GETCURSORLOCK = 6,
-    HF_MATHF_SIN           = 7,
-    HF_MATHF_COS           = 8,
-    HF_MATHF_SQRT          = 9,
-    HF_MATHF_ABS           = 10,
-    HF_MATHF_CLAMP         = 11,
-    HF_VEC3_CREATE         = 12,
-    HF_VEC3_ADD            = 13,
-    HF_VEC3_SUB            = 14,
-    HF_VEC3_SCALE          = 15,
-    HF_VEC3_LENGTH         = 16,
-    HF_VEC3_NORMALIZE      = 17,
-    HF_VEC3_UP             = 18,
-    HF_VEC3_FORWARD        = 19,
-    HF_VEC3_RIGHT          = 20,
-    HF_PHYSICS_RAYCAST     = 21,
-    HF_PHYSICS_MOVE        = 22,
-    HF_PHYSICS_IS_GROUNDED = 23,
-    HF_INPUT_GETKEYDOWN    = 24,
-    HF_ENTITY_GETID        = 25,
-    HF_ENTITY_GETNAME      = 26,
-    HF_ANIMATOR_SETFLOAT   = 27,
-    HF_ANIMATOR_SETBOOL    = 28,
-    HF_ANIMATOR_SETINT     = 29,
-    HF_ANIMATOR_SETTRIGGER = 30,
-    HF_CAMERA_RIGHTX       = 45,
-    HF_CAMERA_RIGHTZ       = 46,
-    HF_CAMERA_FORWARDX     = 47,
-    HF_CAMERA_FORWARDZ     = 48,
-    HF_CAMERA_YAW          = 49,
-    HF_MATHF_ATAN2         = 50,
-    HF_AUDIO_PLAY          = 51,
-    HF_AUDIO_STOP          = 52,
-    HF_AUDIO_PAUSE         = 53,
-    HF_AUDIO_UNPAUSE       = 54,
-    HF_AUDIO_SET_CLIP      = 55,
-    HF_AUDIO_SET_VOLUME    = 56,
-    HF_AUDIO_SET_LOOP      = 57,
-    HF_AUDIO_SET_MUTE      = 58,
-    HF_AUDIO_SET_AWAKE     = 59,
-    HF_AUDIO_SET_ENABLED   = 60,
-    HF_INPUT_GETKEYUP      = 61,
-    HF_INPUT_GETAXIS       = 62,
-    HF_MATHF_MIN           = 63,
-    HF_MATHF_MAX           = 64,
-    HF_MATHF_LERP          = 65,
-    HF_MATHF_FLOOR         = 66,
-    HF_MATHF_CEIL          = 67,
-    HF_MATHF_ROUND         = 68,
-    HF_MATHF_SIGN          = 69,
+#define MIPSYNC_C_HOST_FUNC(cName, cppName, value) HF_##cName = value,
+    MIPSYNC_HOST_FUNC_LIST(MIPSYNC_C_HOST_FUNC)
+#undef MIPSYNC_C_HOST_FUNC
 };
 
 /* Fast fixed-point atan2 approximation. The result is in radians, matching
@@ -265,10 +209,10 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
             push_number(vm, s_delta_q16_16);
             return 1;
         case HF_MATHF_SIN:
-            push_number(vm, fix16_sin(argc >= 1 ? (fix16_t)a[0].ival : 0));
+            push_number(vm, fix16_sin_radians(argc >= 1 ? (fix16_t)a[0].ival : 0));
             return 1;
         case HF_MATHF_COS:
-            push_number(vm, fix16_cos(argc >= 1 ? (fix16_t)a[0].ival : 0));
+            push_number(vm, fix16_cos_radians(argc >= 1 ? (fix16_t)a[0].ival : 0));
             return 1;
         case HF_MATHF_SQRT:
             push_number(vm, fix16_sqrt(argc >= 1 ? (fix16_t)a[0].ival : 0));
@@ -316,8 +260,7 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
         }
         case HF_MATHF_ROUND: {
             fix16_t v = argc >= 1 ? (fix16_t)a[0].ival : 0;
-            push_number(vm, (v + (v >= 0 ? FIX16_ONE / 2 : -FIX16_ONE / 2)) &
-                            (fix16_t)0xFFFF0000);
+            push_number(vm, fix16_round(v));
             return 1;
         }
         case HF_MATHF_SIGN: {

@@ -13,6 +13,16 @@ static uint8_t s_spectrum_display[32];
 static uint8_t s_button_group_selected[32];
 static uint8_t s_button_groups_initialized = 0;
 
+static const char* confirm_button_name(uint8_t button) {
+    switch (button) {
+    case 1: return "Circle";
+    case 2: return "Square";
+    case 3: return "Triangle";
+    case 4: return "Start";
+    default: return "Jump";
+    }
+}
+
 static uint8_t clamp_ui_uv(int v) {
     if (v < 0)
         return 0;
@@ -425,31 +435,58 @@ void ps1_ui_update(void) {
     unsigned int i;
     int nav_up;
     int nav_down;
+    int confirm;
     init_button_group_state();
     nav_up = ps1_input_key_down("Up");
     nav_down = ps1_input_key_down("Down");
-    if (!nav_up && !nav_down)
+    confirm = ps1_input_key_down("Jump") || ps1_input_key_down("Circle") ||
+              ps1_input_key_down("Square") || ps1_input_key_down("Triangle") ||
+              ps1_input_key_down("Start");
+    if (!nav_up && !nav_down && !confirm)
         return;
     for (i = 0; i < g_ps1_scene.ui_button_group_count && i < 32u; ++i) {
         const ps1_ui_button_group* group = &g_ps1_scene.ui_button_groups[i];
         uint8_t selected;
-        if (!group->gamepad_navigation || group->button_count == 0)
+        if (group->button_count == 0)
+            continue;
+        confirm = group->gamepad_confirm
+            ? ps1_input_key_down(confirm_button_name(group->confirm_button)) : 0;
+        if (!group->gamepad_navigation && !confirm)
             continue;
         selected = s_button_group_selected[i];
         if (selected >= group->button_count)
             selected = 0;
-        if (nav_up) {
+        if (group->gamepad_navigation && nav_up) {
             if (selected > 0)
                 --selected;
             else if (group->wrap_navigation)
                 selected = (uint8_t)(group->button_count - 1u);
-        } else if (nav_down) {
+        } else if (group->gamepad_navigation && nav_down) {
             if (selected + 1u < group->button_count)
                 ++selected;
             else if (group->wrap_navigation)
                 selected = 0;
         }
         s_button_group_selected[i] = selected;
+        if (confirm) {
+            unsigned int rect_index = (unsigned int)group->button_rect_offset + selected;
+            if (rect_index < g_ps1_scene.ui_button_rect_count) {
+                const ps1_ui_button_rect* rect = &g_ps1_scene.ui_button_rects[rect_index];
+                unsigned int action_index;
+                if (!rect->interactable)
+                    continue;
+                for (action_index = 0; action_index < rect->action_count; ++action_index) {
+                    unsigned int absolute = (unsigned int)rect->action_offset + action_index;
+                    if (absolute >= g_ps1_scene.ui_button_action_count)
+                        break;
+                    {
+                        const ps1_ui_button_action* action = &g_ps1_scene.ui_button_actions[absolute];
+                        mipsync_ui_invoke(action->target_entity_index, action->module_index,
+                                          action->method_name);
+                    }
+                }
+            }
+        }
     }
 }
 

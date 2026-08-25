@@ -165,8 +165,11 @@ int main(int argc, char** argv) {
 
         if (!args.validateMipsPath.empty()) {
             std::vector<std::string> errors;
+            const std::string validationPath = MipsyncEngine::PathUtf8::ToString(
+                std::filesystem::absolute(
+                    MipsyncEngine::PathUtf8::FromString(args.validateMipsPath)));
             const auto module = MipsyncEngine::Mips::MipsRuntime::CompileScriptFile(
-                args.validateMipsPath, errors);
+                validationPath, errors);
             for (const auto& error : errors)
                 std::cerr << error << std::endl;
             if (!module || !errors.empty())

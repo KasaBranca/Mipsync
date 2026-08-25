@@ -253,7 +253,7 @@ void AssetManager::ApplyMaterialToMeshRenderer(MeshRendererComponent& mr, const 
     mr.texture = mat.texturePath.empty() ? nullptr : GetTexture(mat.texturePath);
     mr.ps1PreviewTexture.reset();
     mr.ps1PreviewTexturePath.clear();
-    if (!mr.texture)
+    if (!mat.texturePath.empty() && !mr.texture)
         mr.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
 }
 
@@ -276,7 +276,7 @@ void AssetManager::ApplyMaterialToSkinnedMeshRenderer(SkinnedMeshRendererCompone
     mr.textureTiling = mat.mainTextureTiling;
     mr.textureOffset = mat.mainTextureOffset;
     mr.texture = mat.texturePath.empty() ? nullptr : GetTexture(mat.texturePath);
-    if (!mr.texture)
+    if (!mat.texturePath.empty() && !mr.texture)
         mr.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
 }
 

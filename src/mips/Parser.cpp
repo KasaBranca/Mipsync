@@ -148,7 +148,7 @@ std::unique_ptr<Ast::ClassDecl> Parser::ParseClass() {
             if (LooksLikeField()) {
                 decl->fields.push_back(ParseField());
             } else {
-                decl->methods.push_back(ParseMethod());
+                decl->methods.push_back(ParseMethod(true));
             }
         } else if (Check(TokenType::KwVoid)) {
             decl->methods.push_back(ParseMethod());
@@ -229,7 +229,7 @@ std::unique_ptr<Ast::FieldDecl> Parser::ParseField() {
     return field;
 }
 
-std::unique_ptr<Ast::MethodDecl> Parser::ParseMethod() {
+std::unique_ptr<Ast::MethodDecl> Parser::ParseMethod(bool isPublic) {
     if (!Check(TokenType::KwVoid) && !Check(TokenType::Identifier)) {
         Error(Peek(), "expected return type or 'void'");
         return nullptr;
@@ -242,6 +242,7 @@ std::unique_ptr<Ast::MethodDecl> Parser::ParseMethod() {
     method->location = nameToken.location;
     method->name = nameToken.lexeme;
     method->returnType = returnType;
+    method->isPublic = isPublic;
 
     Consume(TokenType::LParen, "expected '(' after method name");
     if (!Check(TokenType::RParen)) {

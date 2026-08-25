@@ -8,6 +8,7 @@
 #include "../core/Log.h"
 #include "../core/Engine.h"
 #include "../core/Input.h"
+#include "../mips/MipsRuntime.h"
 #include "../audio/AudioSystem.h"
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -243,7 +244,28 @@ UIRect FitRectToAspect(const UIRect& rect, float aspect) {
     return out;
 }
 
+bool PointInTriangle(const glm::vec2& p, const glm::vec2& a,
+                     const glm::vec2& b, const glm::vec2& c) {
+    const float d1 = (p.x - b.x) * (a.y - b.y) - (a.x - b.x) * (p.y - b.y);
+    const float d2 = (p.x - c.x) * (b.y - c.y) - (b.x - c.x) * (p.y - c.y);
+    const float d3 = (p.x - a.x) * (c.y - a.y) - (c.x - a.x) * (p.y - a.y);
+    const bool hasNegative = d1 < 0.0f || d2 < 0.0f || d3 < 0.0f;
+    const bool hasPositive = d1 > 0.0f || d2 > 0.0f || d3 > 0.0f;
+    return !(hasNegative && hasPositive);
+}
+
 } // namespace
+
+void UIRenderer::SetPointerState(bool active, float x, float y, bool held,
+                                 bool pressed, bool released) {
+    m_PointerActive = active;
+    m_PointerPosition = { x, y };
+    m_PointerHeld = held;
+    m_PointerPressed = pressed;
+    m_PointerReleased = released;
+    if (!active && released)
+        m_PointerPressedButtonEntityId = 0;
+}
 
 UIRenderer::UIRenderer() = default;
 
@@ -460,8 +482,11 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
         canvases.push_back({ entityPtr.get(), canvas, canvas->sortOrder });
     }
 
-    if (canvases.empty())
+    if (canvases.empty()) {
+        m_PointerPressed = false;
+        m_PointerReleased = false;
         return;
+    }
 
     std::sort(canvases.begin(), canvases.end(),
               [](const CanvasEntry& a, const CanvasEntry& b) { return a.sortOrder < b.sortOrder; });
@@ -477,6 +502,26 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
     const glm::mat4 ortho = glm::ortho(0.0f, vpW, 0.0f, vpH);
     const glm::mat4 view = camera.GetViewMatrix();
     const glm::mat4 proj = camera.GetProjectionMatrix();
+    const bool acceptRuntimeInput = !sceneView3D &&
+        Engine::Get().GetMipsRuntime().IsPlaying();
+    if (!acceptRuntimeInput)
+        m_PointerPressedButtonEntityId = 0;
+
+    auto invokeButton = [&](UIButtonComponent& button) {
+        if (!button.enabled || !button.interactable)
+            return;
+        if (!Engine::Get().GetMipsRuntime().IsPlaying())
+            return;
+        for (const UIButtonClickEvent& listener : button.onClick) {
+            if (!listener.enabled || listener.targetEntityId == 0 || listener.methodName.empty())
+                continue;
+            std::vector<std::string> errors;
+            Engine::Get().GetMipsRuntime().InvokeButtonEvent(
+                scene, listener.targetEntityId, listener.scriptPath, listener.methodName, errors);
+            for (const std::string& error : errors)
+                MIPSYNC_WARN("[UI Button] {}", error);
+        }
+    };
 
     auto buildQuadMvp = [&](const UIRect& rect, bool pixelSpace, const glm::mat4& canvasWorld,
                             Entity* entity = nullptr) {
@@ -633,16 +678,78 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
             if (auto* button = entity.GetComponent<UIButtonComponent>(); button && button->enabled) {
                 Entity* groupEntity = FindButtonGroupAncestor(scene, &entity);
                 auto* group = groupEntity ? groupEntity->GetComponent<UIButtonGroupComponent>() : nullptr;
-                if (!group || !group->enabled)
-                    return;
                 const size_t index = buttons.size();
-                buttons.push_back({ &entity, button, group, groupEntity->GetID(), rect });
+                buttons.push_back({ &entity, button, group, groupEntity ? groupEntity->GetID() : 0u, rect });
                 buttonIndexByEntity[entity.GetID()] = index;
-                groups[groupEntity->GetID()].entity = groupEntity;
-                groups[groupEntity->GetID()].group = group;
-                groups[groupEntity->GetID()].buttonIndices.push_back(index);
+                if (group && group->enabled) {
+                    groups[groupEntity->GetID()].entity = groupEntity;
+                    groups[groupEntity->GetID()].group = group;
+                    groups[groupEntity->GetID()].buttonIndices.push_back(index);
+                }
             }
         });
+
+        uint32_t hoveredButtonId = 0;
+        size_t hoveredButtonIndex = 0;
+        if (acceptRuntimeInput && m_PointerActive) {
+            auto containsPointer = [&](const ButtonEntry& buttonEntry) {
+                if (pixelSpace) {
+                    const UIRect& rect = buttonEntry.rect;
+                    return m_PointerPosition.x >= rect.minX && m_PointerPosition.x <= rect.maxX &&
+                           m_PointerPosition.y >= rect.minY && m_PointerPosition.y <= rect.maxY;
+                }
+
+                const glm::mat4 mvp = buildQuadMvp(buttonEntry.rect, false, canvasWorld,
+                                                   buttonEntry.entity);
+                const glm::vec2 unitCorners[4] = {
+                    { -1.0f, -1.0f }, { 1.0f, -1.0f },
+                    { 1.0f, 1.0f }, { -1.0f, 1.0f },
+                };
+                glm::vec2 screenCorners[4];
+                for (int corner = 0; corner < 4; ++corner) {
+                    const glm::vec4 clip = mvp * glm::vec4(unitCorners[corner], 0.0f, 1.0f);
+                    if (clip.w <= 0.0001f)
+                        return false;
+                    const glm::vec2 ndc{ clip.x / clip.w, clip.y / clip.w };
+                    screenCorners[corner] = {
+                        (ndc.x * 0.5f + 0.5f) * vpW,
+                        (ndc.y * 0.5f + 0.5f) * vpH,
+                    };
+                }
+                const glm::vec2 pointerViewport{
+                    m_PointerPosition.x / std::max(layoutWf, 1.0f) * vpW,
+                    m_PointerPosition.y / std::max(layoutHf, 1.0f) * vpH,
+                };
+                return PointInTriangle(pointerViewport, screenCorners[0], screenCorners[1], screenCorners[2]) ||
+                       PointInTriangle(pointerViewport, screenCorners[0], screenCorners[2], screenCorners[3]);
+            };
+
+            for (size_t i = 0; i < buttons.size(); ++i) {
+                const ButtonEntry& buttonEntry = buttons[i];
+                if (!buttonEntry.button->interactable)
+                    continue;
+                if (containsPointer(buttonEntry)) {
+                    hoveredButtonId = buttonEntry.entity->GetID();
+                    hoveredButtonIndex = i;
+                }
+            }
+
+            if (m_PointerPressed && hoveredButtonId != 0) {
+                m_PointerPressedButtonEntityId = hoveredButtonId;
+                ButtonEntry& hovered = buttons[hoveredButtonIndex];
+                if (hovered.group) {
+                    auto groupIt = groups.find(hovered.groupEntityId);
+                    if (groupIt != groups.end()) {
+                        const auto indexIt = std::find(groupIt->second.buttonIndices.begin(),
+                                                       groupIt->second.buttonIndices.end(),
+                                                       hoveredButtonIndex);
+                        if (indexIt != groupIt->second.buttonIndices.end())
+                            hovered.group->selectedIndex = static_cast<int>(
+                                std::distance(groupIt->second.buttonIndices.begin(), indexIt));
+                    }
+                }
+            }
+        }
 
         for (auto& [groupId, state] : groups) {
             if (!state.group || state.buttonIndices.empty())
@@ -652,7 +759,7 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
             group.selectedIndex = std::clamp(group.selectedIndex, 0, std::max(count - 1, 0));
             group.pressedThisFrame = false;
 
-            if (!sceneView3D) {
+            if (acceptRuntimeInput) {
                 bool moveUp = false;
                 bool moveDown = false;
                 bool confirm = false;
@@ -688,6 +795,11 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
                         group.selectedIndex = 0;
                 }
                 group.pressedThisFrame = confirm;
+                if (confirm) {
+                    const size_t selectedButtonIndex = state.buttonIndices[static_cast<size_t>(
+                        std::clamp(group.selectedIndex, 0, count - 1))];
+                    invokeButton(*buttons[selectedButtonIndex].button);
+                }
             }
         }
 
@@ -700,8 +812,11 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
                     groupIt->second.buttonIndices[static_cast<size_t>(
                         std::clamp(groupIt->second.group->selectedIndex, 0,
                                    static_cast<int>(groupIt->second.buttonIndices.size()) - 1))] == it->second;
-                const bool pressed = selected && groupIt != groups.end() &&
+                const bool keyboardPressed = selected && groupIt != groups.end() &&
                     groupIt->second.group && groupIt->second.group->pressedThisFrame;
+                const bool pointerPressed = m_PointerHeld && hoveredButtonId == entity.GetID() &&
+                    m_PointerPressedButtonEntityId == entity.GetID();
+                const bool pressed = keyboardPressed || pointerPressed;
                 const glm::vec4 bg = pressed ? b.button->pressedColor :
                     (selected ? b.button->selectedColor : b.button->normalColor);
                 const Texture* bgTexture = b.button->backgroundTexture.get();
@@ -801,9 +916,17 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
                          glm::vec4(1.0f), pixelSpace, canvasWorld);
             }
         }
+
+        if (acceptRuntimeInput && m_PointerReleased) {
+            if (hoveredButtonId != 0 && hoveredButtonId == m_PointerPressedButtonEntityId)
+                invokeButton(*buttons[hoveredButtonIndex].button);
+            m_PointerPressedButtonEntityId = 0;
+        }
     }
 
     EndPass();
+    m_PointerPressed = false;
+    m_PointerReleased = false;
 }
 
 } // namespace MipsyncEngine

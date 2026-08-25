@@ -119,7 +119,9 @@ void EditorBuildSettings::DrawPs1EmulatorSettings() {
     ImGui::Spacing();
     ImGui::TextUnformatted("Editor: PS1 Emulator (preview only)");
     ImGui::Separator();
-    ImGui::TextDisabled("Configure a legally obtained BIOS file when your emulator requires one.");
+    ImGui::TextDisabled(
+        "BIOS defaults to OpenBIOS (configured in the Hub, or built into PCSX-Redux).");
+    ImGui::TextDisabled("Set a path below only to override with a retail BIOS dump.");
 
     char emuPath[512]{};
     std::strncpy(emuPath, m_Ps1Prefs.emulatorPath.c_str(), sizeof(emuPath) - 1);

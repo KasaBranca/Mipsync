@@ -1,0 +1,26 @@
+class ControlFlow : MipsBehaviour
+{
+    public int result = 0;
+
+    void Start()
+    {
+        int total = 0;
+        for (int i = 0; i < 10; i = i + 1)
+        {
+            if (i == 2) continue;
+            if (i == 7) break;
+            total = total + i;
+        }
+
+        int countdown = 3;
+        while (countdown > 0)
+        {
+            countdown = countdown - 1;
+        }
+        result = total + countdown;
+        float horizontal = Input.GetAxis("Horizontal");
+        bool released = Input.GetKeyUp("Space");
+        result = result + Mathf.Round(Mathf.Lerp(0.0, 10.0, 0.5));
+        Debug.Log("Mips# control flow result: ", result);
+    }
+}

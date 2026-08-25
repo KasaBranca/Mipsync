@@ -60,6 +60,7 @@ struct MethodDecl {
     std::string name;
     std::vector<std::pair<std::string, std::string>> parameters; // type, name
     std::unique_ptr<BlockStmt> body;
+    bool isPublic = false;
 };
 
 struct BlockStmt {

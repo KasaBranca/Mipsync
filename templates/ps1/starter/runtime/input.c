@@ -109,6 +109,10 @@ int ps1_input_key_held(const char* name) {
         return button_held(PAD_RIGHT) || stick_held(0, 0);
     if (strcmp(name, "Space") == 0 || strcmp(name, "Jump") == 0)
         return button_held(PAD_CROSS);
+    if (strcmp(name, "Circle") == 0) return button_held(PAD_CIRCLE);
+    if (strcmp(name, "Square") == 0) return button_held(PAD_SQUARE);
+    if (strcmp(name, "Triangle") == 0) return button_held(PAD_TRIANGLE);
+    if (strcmp(name, "Start") == 0) return button_held(PAD_START);
     if (strcmp(name, "LeftShift") == 0 ||
         strcmp(name, "Aim") == 0 ||
         strcmp(name, "L1") == 0)
@@ -127,6 +131,10 @@ int ps1_input_key_down(const char* name) {
     if (strcmp(name, "D") == 0 || strcmp(name, "Right") == 0)
         return button_down(PAD_RIGHT) || ((s_curr_stick_nav & 8u) && !(s_prev_stick_nav & 8u));
     if (strcmp(name, "Space") == 0 || strcmp(name, "Jump") == 0) return button_down(PAD_CROSS);
+    if (strcmp(name, "Circle") == 0) return button_down(PAD_CIRCLE);
+    if (strcmp(name, "Square") == 0) return button_down(PAD_SQUARE);
+    if (strcmp(name, "Triangle") == 0) return button_down(PAD_TRIANGLE);
+    if (strcmp(name, "Start") == 0) return button_down(PAD_START);
     if (strcmp(name, "LeftShift") == 0 ||
         strcmp(name, "Aim") == 0 ||
         strcmp(name, "L1") == 0) return button_down(PAD_L1);
@@ -140,6 +148,10 @@ int ps1_input_key_up(const char* name) {
     if (strcmp(name, "A") == 0 || strcmp(name, "Left") == 0) return button_up(PAD_LEFT);
     if (strcmp(name, "D") == 0 || strcmp(name, "Right") == 0) return button_up(PAD_RIGHT);
     if (strcmp(name, "Space") == 0 || strcmp(name, "Jump") == 0) return button_up(PAD_CROSS);
+    if (strcmp(name, "Circle") == 0) return button_up(PAD_CIRCLE);
+    if (strcmp(name, "Square") == 0) return button_up(PAD_SQUARE);
+    if (strcmp(name, "Triangle") == 0) return button_up(PAD_TRIANGLE);
+    if (strcmp(name, "Start") == 0) return button_up(PAD_START);
     if (strcmp(name, "LeftShift") == 0 || strcmp(name, "Aim") == 0 ||
         strcmp(name, "L1") == 0) return button_up(PAD_L1);
     return 0;

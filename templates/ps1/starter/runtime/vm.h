@@ -3,19 +3,19 @@
 
 #include "fixedp.h"
 #include "host.h"
+#include "bytecode_abi.h"
 #include <stdint.h>
 
 /*
  * PS1 mini-VM for Mipsync bytecode (.mbc format). Stack machine, fixed-
  * point numerics, bounded buffers — no heap, no STL.
  *
- * Memory budget (per instance):
- *   stack:  64 host_value × 16 bytes ≈ 1 KiB
- *   locals: 64 host_value           ≈ 1 KiB
- *   fields: 64 fix16_t              ≈ 256 B
- * Plus the immutable module data (decoded once at boot).
+ * A script_instance also owns its runtime fields, eight fixed arrays, and
+ * four coroutine snapshots (each snapshot has a full stack and locals).
+ * On the 32-bit PS1 ABI this is roughly 16 KiB per instance, not counting
+ * the shared vm_state or immutable module data decoded once at boot.
  *
- * Hard limits (raise as needed; static asserts in vm.c catch overflow):
+ * Hard limits (the exporter and decoder reject data that exceeds them):
  *   numbers : 128 constants
  *   strings : 128 strings (max len 96)
  *   names   : 128 names   (max len 32)
@@ -23,21 +23,6 @@
  *   methods : 16
  *   code    : 4 KiB per method
  */
-
-#define VM_STACK_CAP         64
-#define VM_LOCAL_CAP         64
-#define VM_FIELD_CAP         32
-#define VM_NUMBER_CAP        128
-#define VM_STRING_CAP        128
-#define VM_STRING_LEN        96
-#define VM_NAME_CAP          128
-#define VM_NAME_LEN          32
-#define VM_METHOD_CAP        16
-#define VM_METHOD_NAME_LEN   24
-#define VM_FIELD_NAME_LEN    24
-#define VM_ARRAY_CAP          8
-#define VM_ARRAY_LENGTH      32
-#define VM_COROUTINE_CAP     4
 
 typedef struct mbc_method {
     char            name[VM_METHOD_NAME_LEN];
@@ -53,7 +38,7 @@ typedef struct mbc_field {
 } mbc_field;
 
 typedef struct mbc_module {
-    char        class_name[32];
+    char        class_name[VM_CLASS_NAME_LEN];
     uint16_t    number_count;
     fix16_t     numbers[VM_NUMBER_CAP];
     uint16_t    string_count;

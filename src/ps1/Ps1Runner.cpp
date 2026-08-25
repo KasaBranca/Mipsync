@@ -69,8 +69,9 @@ LaunchResult LaunchInEmulator(const LaunchRequest& request) {
     const std::string emulator = ResolveEmulatorPath(request.prefs);
     if (emulator.empty()) {
         result.message =
-            "PS1 emulator not found. Set MIPSYNC_PS1_EMULATOR or configure "
-            "Build Settings → PS1 Emulator manually.";
+            "PS1 emulator not found. The Mipsync release bundles PCSX-Redux next to the "
+            "engine; check that ps1_runtime/emulator/pcsx-redux.exe exists, or set "
+            "MIPSYNC_PS1_EMULATOR / Build Settings → PS1 Emulator manually.";
         return result;
     }
 
@@ -97,8 +98,15 @@ LaunchResult LaunchInEmulator(const LaunchRequest& request) {
 
     // BIOS resolution order:
     //   1. editor override (request.prefs.biosPath, set in Build Settings),
-    //   2. MIPSYNC_OPENBIOS_PATH environment variable.
+    //   2. MIPSYNC_OPENBIOS_PATH env (set by the Hub),
+    //   3. bundled OpenBIOS image shipped under ps1_runtime/bios/openbios.bin.
+    // PCSX-Redux does NOT ship OpenBIOS inside its executable: it expects an
+    // external BIOS file (or a configured `pcsx.json`). Without (3) the
+    // emulator launches, but `pcsx-redux.main` halts with "No BIOS loaded".
     std::string biosArg = ResolveBiosOverride(request, ec);
+    if (biosArg.empty()) {
+        biosArg = FindBundledOpenBios();
+    }
 
     std::ostringstream args;
     if (family == EmulatorFamily::PcsxRedux) {

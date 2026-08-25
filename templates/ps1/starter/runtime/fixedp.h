@@ -40,9 +40,15 @@ fix16_t fix16_from_float_bits(uint32_t bits);
 fix16_t fix16_sin(fix16_t turns);
 fix16_t fix16_cos(fix16_t turns);
 
+/* Mips# Mathf uses radians, matching the desktop VM and C/C++ math APIs. */
+fix16_t fix16_sin_radians(fix16_t radians);
+fix16_t fix16_cos_radians(fix16_t radians);
+
 fix16_t fix16_sqrt(fix16_t a);
 fix16_t fix16_abs(fix16_t a);
 fix16_t fix16_clamp(fix16_t v, fix16_t lo, fix16_t hi);
+/* Nearest integer, with exact halves rounded away from zero (std::round). */
+fix16_t fix16_round(fix16_t v);
 
 /* Pretty-print to a NUL-terminated buffer (sign + at most 5 frac digits).
  * `out` should be at least 16 bytes. Returns chars written (excluding NUL). */

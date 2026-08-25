@@ -262,6 +262,38 @@ fs::path ResolveTemplatesRoot(const std::string& engineRoot) {
     return {};
 }
 
+// Copy the pre-built starter PSX.EXE (and optional .cue / .bin disc image) into
+// the build output, so "Build & Run in Emulator" always has something runnable
+// even when PSn00bSDK isn't installed yet.
+bool ApplyPrebuiltFallback(const fs::path& templates, const fs::path& outDir,
+                           Ps1BuildResult& result) {
+    if (templates.empty())
+        return false;
+    const fs::path prebuiltDir = templates / "starter" / "prebuilt";
+    const fs::path prebuiltExe = prebuiltDir / "PSX.EXE";
+    std::error_code ec;
+    if (!fs::is_regular_file(prebuiltExe, ec))
+        return false;
+
+    fs::create_directories(outDir, ec);
+    fs::copy_file(prebuiltExe, outDir / "PSX.EXE",
+                  fs::copy_options::overwrite_existing, ec);
+    if (ec)
+        return false;
+    result.psxExePath = PathUtf8::ToString(outDir / "PSX.EXE");
+
+    const fs::path prebuiltCue = prebuiltDir / "game.cue";
+    const fs::path prebuiltBin = prebuiltDir / "game.bin";
+    if (fs::is_regular_file(prebuiltCue, ec) && fs::is_regular_file(prebuiltBin, ec)) {
+        fs::copy_file(prebuiltCue, outDir / "game.cue",
+                      fs::copy_options::overwrite_existing, ec);
+        fs::copy_file(prebuiltBin, outDir / "game.bin",
+                      fs::copy_options::overwrite_existing, ec);
+        result.discCuePath = PathUtf8::ToString(outDir / "game.cue");
+    }
+    return true;
+}
+
 #ifdef _WIN32
 bool RunPowerShellBuild(const fs::path& script, const fs::path& workingDir,
                         const fs::path& engineDir, const std::string& sdkRoot,
@@ -470,13 +502,14 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
         const fs::path script = productRoot / "build.ps1";
         std::string log;
         bool sdkBuilt = false;
+        bool fellBack = false;
         const auto sdkRoot = ResolvePsn00bsdkRoot(engineDir);
         const std::string sdkRootStr =
             sdkRoot ? PathUtf8::ToString(*sdkRoot) : std::string{};
 
         if (fs::is_regular_file(script, ec)) {
             if (sdkRootStr.empty() && result.scriptCount > 0) {
-                log = "PSn00bSDK not found. Set PSN00BSDK to an SDK root, then rebuild.";
+                log = "PSn00bSDK not found. Install it from the Hub (PS1 Toolchain), then rebuild.";
             } else {
                 const bool ran = RunPowerShellBuild(script, productRoot, engineDir, sdkRootStr, log);
                 const fs::path psx = outDir / "PSX.EXE";
@@ -492,19 +525,22 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
         }
 
         if (result.psxExePath.empty()) {
-            result.success = false;
-            result.outputDirectory = PathUtf8::ToString(productRoot);
-            result.message =
-                "Scene exported (" + std::to_string(result.scriptCount) + " script" +
-                (result.scriptCount == 1 ? "" : "s") + ", " +
-                std::to_string(result.entityCount) + " entit" +
-                (result.entityCount == 1 ? "y" : "ies") +
-                ") but PSX.EXE was not compiled.\n" +
-                (sdkRootStr.empty()
-                     ? "Install PSn00bSDK, set PSN00BSDK to its root, then Build PS1 again."
-                     : "PSn00bSDK build failed — open Builds/PS1/<Product>/build.log for details.") +
-                (log.empty() ? "" : "\n" + SummarizeBuildLog(log));
-            return result;
+            if (result.scriptCount > 0) {
+                result.success = false;
+                result.outputDirectory = PathUtf8::ToString(productRoot);
+                result.message =
+                    "Scene exported (" + std::to_string(result.scriptCount) + " script" +
+                    (result.scriptCount == 1 ? "" : "s") + ", " +
+                    std::to_string(result.entityCount) + " entit" +
+                    (result.entityCount == 1 ? "y" : "ies") +
+                    ") but PSX.EXE was not compiled.\n" +
+                    (sdkRootStr.empty()
+                         ? "Install PSn00bSDK from the Hub (PS1 Toolchain tab), then Build PS1 again."
+                         : "PSn00bSDK build failed — open Builds/PS1/<Product>/build.log for details.") +
+                    (log.empty() ? "" : "\n" + SummarizeBuildLog(log));
+                return result;
+            }
+            fellBack = ApplyPrebuiltFallback(templates, outDir, result);
         }
 
         result.success = !result.psxExePath.empty();
@@ -518,8 +554,16 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
             ? ""
             : "\n⚠ No PS1 license file found — disc will NOT boot on PS2 (POPStarter)."
               "\n  Place licensea.dat in your project folder and rebuild.";
-        if (sdkBuilt) {
+        if (sdkBuilt && !fellBack) {
             result.message = "PS1 build OK: " + result.psxExePath + scriptSummary + licenseNote;
+            MIPSYNC_INFO("{}", result.message);
+        } else if (result.success && fellBack) {
+            result.message =
+                "PSn00bSDK build unavailable — staged pre-built Mipsync starter at " +
+                result.psxExePath +
+                scriptSummary +
+                "\n(Install PSn00bSDK from the Hub and rebuild to compile your scripts.)" +
+                licenseNote;
             MIPSYNC_INFO("{}", result.message);
         } else if (result.success) {
             result.message = "PS1 build OK: " + result.psxExePath + scriptSummary + licenseNote;
@@ -527,7 +571,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
         } else {
             result.message =
                 "Staged PS1 project at " + result.outputDirectory +
-                "\nSDK build did not produce PSX.EXE.\n" +
+                "\nSDK build did not produce PSX.EXE and no pre-built fallback is available.\n" +
                 (log.empty() ? "" : log.substr(0, std::min<size_t>(log.size(), 800)));
         }
         return result;

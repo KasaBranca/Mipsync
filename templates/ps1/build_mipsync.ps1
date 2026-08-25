@@ -26,7 +26,7 @@ if ($SdkRoot -and (Test-Path $SdkRoot)) {
 
 if (-not $env:PSN00BSDK -or -not (Test-Path $env:PSN00BSDK)) {
     Log "PSN00BSDK not set. Cannot compile scripts into PSX.EXE."
-    Log "Install PSn00bSDK, set the environment variable, then re-run."
+    Log "Install PSn00bSDK from the Hub or set the env var, then re-run."
     exit 2
 }
 
@@ -40,9 +40,19 @@ if (-not (Test-Path (Join-Path $psn00bLibs "cmake/sdk.cmake"))) {
 }
 $env:PSN00BSDK_LIBS = $psn00bLibs
 
-# Ninja is required by the PSn00bSDK preset and must be available on PATH.
+# Ninja is required by the PSn00bSDK preset. Prefer the copy shipped next to
+# MipsyncEngine.exe (tools/ninja.exe in release zips; dev checkouts may also
+# have third_party/.cache/ninja/ninja.exe in the source tree).
 $ninja = ""
 $ninjaCandidates = @("ninja.exe")
+if ($EngineRoot -and (Test-Path $EngineRoot)) {
+    $ninjaCandidates = @(
+        (Join-Path $EngineRoot "tools/ninja.exe"),
+        (Join-Path $EngineRoot "third_party/.cache/ninja/ninja.exe"),
+        (Join-Path $EngineRoot "../../third_party/.cache/ninja/ninja.exe"),
+        (Join-Path $EngineRoot "../../../third_party/.cache/ninja/ninja.exe")
+    ) + $ninjaCandidates
+}
 foreach ($candidate in $ninjaCandidates) {
     try {
         if (Test-Path $candidate) { $ninja = (Resolve-Path $candidate).Path; break }
@@ -51,7 +61,8 @@ foreach ($candidate in $ninjaCandidates) {
     } catch { }
 }
 if (-not $ninja) {
-    Log "ninja.exe not found. Install ninja-build and add it to PATH."
+    Log "ninja.exe not found. Expected tools/ninja.exe next to MipsyncEngine.exe."
+    Log "Update to the latest editor from the Hub, or install ninja-build and add it to PATH."
     exit 1
 }
 

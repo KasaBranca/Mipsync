@@ -1434,6 +1434,7 @@ Entity* Scene::DuplicateEntity(Entity& source) {
     if (auto* srcButton = src->GetComponent<UIButtonComponent>()) {
       auto& dstButton = copy->AddComponent<UIButtonComponent>();
       dstButton.enabled = srcButton->enabled;
+      dstButton.interactable = srcButton->interactable;
       dstButton.label = srcButton->label;
       dstButton.backgroundTexturePath = srcButton->backgroundTexturePath;
       dstButton.backgroundTexture = srcButton->backgroundTexture;
@@ -1443,6 +1444,7 @@ Entity* Scene::DuplicateEntity(Entity& source) {
       dstButton.pressedColor = srcButton->pressedColor;
       dstButton.textColor = srcButton->textColor;
       dstButton.fontSize = srcButton->fontSize;
+      dstButton.onClick = srcButton->onClick;
     }
 
     if (auto* srcSpectrum = src->GetComponent<UIAudioSpectrumComponent>()) {

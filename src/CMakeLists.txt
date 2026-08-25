@@ -1,11 +1,153 @@
-# Collect all source files
-file(GLOB_RECURSE SOURCES
-    "*.cpp"
-    "*.h"
+# Engine sources are explicit so temporary/generated .cpp files cannot become
+# part of a release merely by appearing under src/.
+set(MIPSYNC_ENGINE_SOURCES
+    animation/AnimatorControllerIO.cpp
+    animation/AnimatorRuntime.cpp
+    animation/SkeletalModel.cpp
+    animation/SkinnedMesh.cpp
+    assets/AssetManager.cpp
+    assets/AssetThumbnail.cpp
+    assets/Material.cpp
+    audio/AudioDecoder.cpp
+    audio/AudioSystem.cpp
+    audio/Ps1VagEncoder.cpp
+    bootstrap/ProjectBootstrap.cpp
+    build/BuildManifest.cpp
+    build/PlayerBuild.cpp
+    command/CommandExecutor.cpp
+    command/CommandLine.cpp
+    command/CommandRegistry.cpp
+    command/CommandTypes.cpp
+    command/CoreCommands.cpp
+    command/EditorCommandHost.cpp
+    command/IpcTransport.cpp
+    command/ResultRenderer.cpp
+    command/SymbolRegistry.cpp
+    core/BootSplash.cpp
+    core/Engine.cpp
+    core/Input.cpp
+    core/Log.cpp
+    core/OsFileDrop.cpp
+    core/RuntimePaths.cpp
+    core/Time.cpp
+    core/Win32AppIcon.cpp
+    core/Window.cpp
+    editor/AssetBrowserPanel.cpp
+    editor/EditorAnimationWindow.cpp
+    editor/EditorAnimatorControllerInspector.cpp
+    editor/EditorAnimatorDebug.cpp
+    editor/EditorAnimatorGraph.cpp
+    editor/EditorApp.cpp
+    editor/EditorApp.SceneView.cpp
+    editor/EditorAssetIcons.cpp
+    editor/EditorBuildSettings.cpp
+    editor/EditorCameraGizmo.cpp
+    editor/EditorCanvasGizmo.cpp
+    editor/EditorColliderGizmo.cpp
+    editor/EditorIcons.cpp
+    editor/EditorLightGizmo.cpp
+    editor/EditorRectTransformGizmo.cpp
+    editor/EditorSceneCamera.cpp
+    editor/EditorSceneFraming.cpp
+    editor/EditorTheme.cpp
+    editor/EditorUISnap.cpp
+    editor/EditorUndoStack.cpp
+    editor/GameViewSettings.cpp
+    editor/MipsEditorIntegration.cpp
+    editor/Raycast.cpp
+    game/GameSave.cpp
+    hub/HubApp.cpp
+    main.cpp
+    mips/AstPrinter.cpp
+    mips/Bytecode.cpp
+    mips/Compiler.cpp
+    mips/Lexer.cpp
+    mips/MipsPhysicsEvents.cpp
+    mips/MipsRuntime.cpp
+    mips/MipsSceneSnapshot.cpp
+    mips/MipsScriptLoader.cpp
+    mips/MipsTest.cpp
+    mips/Parser.cpp
+    mips/PS1Export.cpp
+    mips/PS1SceneExport.cpp
+    mips/PS1TextureExport.cpp
+    mips/Token.cpp
+    mips/VM.cpp
+    physics/ColliderUtils.cpp
+    physics/PhysicsWorld.cpp
+    project/Project.cpp
+    ps1/Ps1Build.cpp
+    ps1/Ps1EditorPrefs.cpp
+    ps1/Ps1Runner.cpp
+    ps1/Ps1Toolchain.cpp
+    renderer/Camera.cpp
+    renderer/Framebuffer.cpp
+    renderer/Mesh.cpp
+    renderer/Renderer.cpp
+    renderer/Shader.cpp
+    renderer/Texture.cpp
+    rhi/D3D12Context.cpp
+    rhi/Gfx.cpp
+    rhi/GfxImGui.cpp
+    scene/Scene.cpp
+    scene/SceneIO.cpp
+    scene/SceneUI.cpp
+    ui/RectTransform.cpp
+    ui/UICanvasLayout.cpp
+    ui/UILayout.cpp
+    ui/UIRenderer.cpp
 )
 
-# Main executable
-add_executable(MipsyncEngine ${SOURCES})
+add_executable(MipsyncEngine ${MIPSYNC_ENGINE_SOURCES})
+
+set(MIPSYNC_COMMAND_SOURCES
+    command/CommandTypes.cpp
+    command/CommandRegistry.cpp
+    command/SymbolRegistry.cpp
+    command/CommandExecutor.cpp
+    command/CommandLine.cpp
+    command/ResultRenderer.cpp
+    command/IpcTransport.cpp
+    command/CoreCommands.cpp
+    mips/Token.cpp
+    mips/Lexer.cpp
+    mips/Parser.cpp
+    mips/Bytecode.cpp
+    mips/Compiler.cpp
+    mips/MipsScriptLoader.cpp
+    project/Project.cpp
+    core/Log.cpp
+)
+
+add_executable(MipsyncCLI cli/main.cpp ${MIPSYNC_COMMAND_SOURCES})
+set_target_properties(MipsyncCLI PROPERTIES OUTPUT_NAME mipsync)
+target_compile_features(MipsyncCLI PRIVATE cxx_std_20)
+target_include_directories(MipsyncCLI PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR}/generated
+)
+target_link_libraries(MipsyncCLI PRIVATE
+    nlohmann_json::nlohmann_json
+    spdlog::spdlog
+)
+add_executable(MipsyncCommandTests
+    ${CMAKE_SOURCE_DIR}/tests/CommandPlatformTests.cpp
+    ${MIPSYNC_COMMAND_SOURCES}
+)
+target_compile_features(MipsyncCommandTests PRIVATE cxx_std_20)
+target_include_directories(MipsyncCommandTests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR}/generated
+)
+target_link_libraries(MipsyncCommandTests PRIVATE
+    nlohmann_json::nlohmann_json
+    spdlog::spdlog
+)
+enable_testing()
+add_test(NAME MipsyncCommandPlatform COMMAND MipsyncCommandTests)
+add_test(NAME MipsyncRuntimeRegression
+    COMMAND $<TARGET_FILE:MipsyncEngine>
+            --test-mips-runtime "${CMAKE_SOURCE_DIR}/tests/mips/ArraysCoroutines.mips")
 
 # Target properties
 target_compile_features(MipsyncEngine PRIVATE cxx_std_20)
