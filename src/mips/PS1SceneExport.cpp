@@ -1718,7 +1718,20 @@ struct Ps1AnimatorClipSet {
     Ps1AnimatorClipSelection idle;
     Ps1AnimatorClipSelection walk;
     Ps1AnimatorClipSelection aim;
+    Ps1AnimatorClipSelection trigger;
+    uint16_t triggerParameterHash = 0;
 };
+
+static uint16_t AnimatorParameterHash(const std::string& name) {
+    uint32_t hash = 2166136261u;
+    for (const unsigned char c : name) {
+        hash ^= static_cast<uint32_t>(c);
+        hash *= 16777619u;
+    }
+    hash ^= hash >> 16u;
+    const uint16_t folded = static_cast<uint16_t>(hash & 0xFFFFu);
+    return folded != 0 ? folded : 1u;
+}
 
 static Ps1AnimatorClipSet ResolvePs1AnimatorClips(
     const std::string& meshModelPath,
@@ -1740,6 +1753,8 @@ static Ps1AnimatorClipSet ResolvePs1AnimatorClips(
 
     const AnimatorStateDef* walkState = nullptr;
     const AnimatorStateDef* aimState = nullptr;
+    const AnimatorStateDef* triggerState = nullptr;
+    std::string triggerParameter;
     for (const AnimatorTransitionDef& transition : controller->transitions) {
         for (const AnimatorTransitionCondition& condition : transition.conditions) {
             const bool positiveCondition =
@@ -1748,6 +1763,17 @@ static Ps1AnimatorClipSet ResolvePs1AnimatorClips(
                 (condition.mode == AnimatorConditionMode::Equals && condition.threshold > 0.5f);
             if (!positiveCondition)
                 continue;
+            const auto parameterIt = std::find_if(
+                controller->parameters.begin(), controller->parameters.end(),
+                [&](const AnimatorParameterDef& parameter) {
+                    return parameter.name == condition.parameter;
+                });
+            if (!triggerState && parameterIt != controller->parameters.end() &&
+                parameterIt->type == AnimatorParamType::Trigger) {
+                triggerState = FindAnimatorStateForPs1(*controller, transition.toState);
+                triggerParameter = condition.parameter;
+                continue;
+            }
             if (!walkState && (condition.parameter == "Speed" || condition.parameter == "Moving")) {
                 walkState = FindAnimatorStateForPs1(*controller, transition.toState);
             } else if (!aimState && (condition.parameter == "Aim" ||
@@ -1761,10 +1787,15 @@ static Ps1AnimatorClipSet ResolvePs1AnimatorClips(
         meshModelPath, meshModel, animator, *controller, walkState);
     clips.aim = ResolvePs1AnimatorStateClip(
         meshModelPath, meshModel, animator, *controller, aimState);
-    MIPSYNC_INFO("PS1 rigid animator clips: idle='{}', walk='{}', aim='{}'",
+    clips.trigger = ResolvePs1AnimatorStateClip(
+        meshModelPath, meshModel, animator, *controller, triggerState);
+    if (!clips.trigger.stateName.empty() && !triggerParameter.empty())
+        clips.triggerParameterHash = AnimatorParameterHash(triggerParameter);
+    MIPSYNC_INFO("PS1 rigid animator clips: idle='{}', walk='{}', aim='{}', trigger='{}'",
                  clips.idle.stateName,
                  clips.walk.stateName,
-                 clips.aim.stateName);
+                 clips.aim.stateName,
+                 clips.trigger.stateName);
     return clips;
 }
 
@@ -2168,6 +2199,12 @@ static bool RegisterRigidBonePartsFromJson(const json& skinned, Ps1SceneExportRe
             part.rigidAimFirstFrame,
             part.rigidAimFrameCount,
             part.rigidAimFps);
+        appendClipFrames(
+            clips.trigger,
+            part.rigidTriggerFirstFrame,
+            part.rigidTriggerFrameCount,
+            part.rigidTriggerFps);
+        part.animatorTriggerParameterHash = clips.triggerParameterHash;
 
         if (part.rigidIdleFrameCount == 0) {
             part.rigidIdleFirstFrame =
@@ -3011,6 +3048,7 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
         e.colliderRadius = col.value("radius", 0.0f);
         e.colliderCapsuleHeight = col.value("capsuleHeight", 0.0f);
         e.colliderIsTrigger = col.value("isTrigger", false);
+        e.colliderConvex = col.value("convex", true);
         e.colliderCameraShotTrigger =
             col.value("cameraTrigger", col.value("shotTrigger", IsCameraTriggerTag(ent)));
         e.colliderCameraTargetId = col.value("cameraTarget", 0u);
@@ -3844,6 +3882,10 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                 << e.rigidAimFirstFrame << "u, "
                 << e.rigidAimFrameCount << "u, "
                 << static_cast<int>(e.rigidAimFps) << ", "
+                << e.rigidTriggerFirstFrame << "u, "
+                << e.rigidTriggerFrameCount << "u, "
+                << static_cast<int>(e.rigidTriggerFps) << ", "
+                << e.animatorTriggerParameterHash << "u, 0u, "
                 << e.rigidRootEntityIndex << ", "
                 << "0, 0, "
                 << e.transformAnimFirstKey << "u, "
@@ -3870,6 +3912,7 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                 << ToFixed16(e.colliderRadius) << ", "
                 << ToFixed16(e.colliderCapsuleHeight) << ", "
                 << (e.colliderIsTrigger ? 1 : 0) << ", "
+                << (e.colliderConvex ? 1 : 0) << ", "
                 << (e.colliderCameraShotTrigger ? 1 : 0) << ", "
                 << e.colliderCameraTargetEntityIndex << ", "
                 << static_cast<int>(e.audioClipIndex) << ", "
@@ -4224,6 +4267,119 @@ struct SimplifiedMesh {
     std::vector<Vertex> verts;
     std::vector<uint32_t> indices; // tri list
 };
+
+static Vertex InterpolateUvClipVertex(const Vertex& a, const Vertex& b, float t) {
+    Vertex out{};
+    t = std::clamp(t, 0.0f, 1.0f);
+    out.position = glm::mix(a.position, b.position, t);
+    out.normal = glm::mix(a.normal, b.normal, t);
+    out.uv = glm::mix(a.uv, b.uv, t);
+    out.color = glm::mix(a.color, b.color, t);
+    return out;
+}
+
+static std::vector<Vertex> ClipUvPolygon(const std::vector<Vertex>& input,
+                                         int axis, float boundary,
+                                         bool keepGreater) {
+    std::vector<Vertex> output;
+    if (input.empty())
+        return output;
+    output.reserve(input.size() + 1u);
+    auto coordinate = [axis](const Vertex& vertex) {
+        return axis == 0 ? vertex.uv.x : vertex.uv.y;
+    };
+    auto inside = [&](const Vertex& vertex) {
+        const float value = coordinate(vertex);
+        return keepGreater ? value >= boundary - 1e-5f
+                           : value <= boundary + 1e-5f;
+    };
+    Vertex previous = input.back();
+    bool previousInside = inside(previous);
+    for (const Vertex& current : input) {
+        const bool currentInside = inside(current);
+        if (currentInside != previousInside) {
+            const float a = coordinate(previous);
+            const float b = coordinate(current);
+            const float denominator = b - a;
+            const float t = std::abs(denominator) > 1e-8f
+                ? (boundary - a) / denominator : 0.0f;
+            output.push_back(InterpolateUvClipVertex(previous, current, t));
+        }
+        if (currentInside)
+            output.push_back(current);
+        previous = current;
+        previousInside = currentInside;
+    }
+    return output;
+}
+
+// PS1 polygon UVs are 8-bit and cannot wrap inside a triangle like desktop
+// GL_REPEAT. Split ProModeler faces at every integer UV boundary, then each
+// emitted triangle occupies one texture repeat without stretching across it.
+static bool SplitProModelerUvRepeats(SimplifiedMesh& mesh,
+                                     const float tiling[2],
+                                     const float offset[2],
+                                     size_t maxTriangles,
+                                     size_t maxVertices) {
+    SimplifiedMesh tiled;
+    tiled.verts.reserve(mesh.verts.size());
+    tiled.indices.reserve(std::min(maxTriangles * 3u, mesh.indices.size() * 4u));
+
+    for (size_t triangle = 0; triangle + 2u < mesh.indices.size(); triangle += 3u) {
+        Vertex source[3];
+        for (int corner = 0; corner < 3; ++corner) {
+            const uint32_t index = mesh.indices[triangle + static_cast<size_t>(corner)];
+            if (index >= mesh.verts.size())
+                return false;
+            source[corner] = mesh.verts[index];
+            source[corner].uv.x = source[corner].uv.x * tiling[0] + offset[0];
+            source[corner].uv.y = source[corner].uv.y * tiling[1] + offset[1];
+        }
+        const float minU = std::min({ source[0].uv.x, source[1].uv.x, source[2].uv.x });
+        const float maxU = std::max({ source[0].uv.x, source[1].uv.x, source[2].uv.x });
+        const float minV = std::min({ source[0].uv.y, source[1].uv.y, source[2].uv.y });
+        const float maxV = std::max({ source[0].uv.y, source[1].uv.y, source[2].uv.y });
+        const int firstU = static_cast<int>(std::floor(minU));
+        const int lastU = static_cast<int>(std::floor(maxU - 1e-5f));
+        const int firstV = static_cast<int>(std::floor(minV));
+        const int lastV = static_cast<int>(std::floor(maxV - 1e-5f));
+        if (lastU - firstU > 31 || lastV - firstV > 31)
+            return false;
+
+        for (int cellV = firstV; cellV <= std::max(firstV, lastV); ++cellV) {
+            for (int cellU = firstU; cellU <= std::max(firstU, lastU); ++cellU) {
+                std::vector<Vertex> polygon{ source[0], source[1], source[2] };
+                polygon = ClipUvPolygon(polygon, 0, static_cast<float>(cellU), true);
+                polygon = ClipUvPolygon(polygon, 0, static_cast<float>(cellU + 1), false);
+                polygon = ClipUvPolygon(polygon, 1, static_cast<float>(cellV), true);
+                polygon = ClipUvPolygon(polygon, 1, static_cast<float>(cellV + 1), false);
+                if (polygon.size() < 3u)
+                    continue;
+                const size_t addedTriangles = polygon.size() - 2u;
+                if (tiled.indices.size() / 3u + addedTriangles > maxTriangles ||
+                    tiled.verts.size() + polygon.size() > maxVertices)
+                    return false;
+                const uint32_t base = static_cast<uint32_t>(tiled.verts.size());
+                for (Vertex& vertex : polygon) {
+                    vertex.uv.x = std::clamp(vertex.uv.x - static_cast<float>(cellU), 0.0f, 1.0f);
+                    vertex.uv.y = std::clamp(vertex.uv.y - static_cast<float>(cellV), 0.0f, 1.0f);
+                    if (vertex.uv.x > 0.99999f) vertex.uv.x = 0.999999f;
+                    if (vertex.uv.y > 0.99999f) vertex.uv.y = 0.999999f;
+                    tiled.verts.push_back(vertex);
+                }
+                for (uint32_t fan = 1; fan + 1u < polygon.size(); ++fan) {
+                    tiled.indices.push_back(base);
+                    tiled.indices.push_back(base + fan);
+                    tiled.indices.push_back(base + fan + 1u);
+                }
+            }
+        }
+    }
+    if (tiled.indices.empty())
+        return false;
+    mesh = std::move(tiled);
+    return true;
+}
 
 struct ClusterAccum {
     glm::vec3 posSum{ 0.0f };
@@ -5343,6 +5499,27 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 continue;
             }
 
+            if (exportUvs && rel.rfind("promodelerdata://", 0) == 0 &&
+                (std::abs(meshTiling[0] - 1.0f) > 1e-5f ||
+                 std::abs(meshTiling[1] - 1.0f) > 1e-5f ||
+                 std::abs(meshOffset[0]) > 1e-5f ||
+                 std::abs(meshOffset[1]) > 1e-5f)) {
+                const size_t sourceTriangles = simp.indices.size() / 3u;
+                if (SplitProModelerUvRepeats(
+                        simp, meshTiling, meshOffset, meshMaxTris, meshMaxVerts)) {
+                    WeldMeshVerts(simp.verts, simp.indices, 1e-5f, true);
+                    MIPSYNC_INFO(
+                        "PS1 ProModeler UV repeats: {} triangles -> {} tiled triangles",
+                        sourceTriangles, simp.indices.size() / 3u);
+                    meshTiling[0] = meshTiling[1] = 1.0f;
+                    meshOffset[0] = meshOffset[1] = 0.0f;
+                } else {
+                    MIPSYNC_WARN(
+                        "PS1 ProModeler UV repeat split exceeded mesh budget for '{}'; using wrapped UV fallback",
+                        rel);
+                }
+            }
+
             RefitMeshHalfExtent(simp.verts, sourceHalf);
             FinalizeExportedMesh(simp);
             bool forceFlip = false;
@@ -6183,6 +6360,32 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
         const fs::path scriptsC = PathUtf8::FromString(generatedDir) / "scripts_data.c";
         if (!EmitScriptsDataC(outResult.modules, PathUtf8::ToString(scriptsC), scriptStats, outError))
             return false;
+
+        const fs::path runtimeLimitsH =
+            PathUtf8::FromString(generatedDir) / "runtime_limits.h";
+        {
+            std::ofstream limits(runtimeLimitsH, std::ios::trunc);
+            if (!limits.is_open()) {
+                outError = "cannot open runtime_limits.h: " +
+                           PathUtf8::ToString(runtimeLimitsH);
+                return false;
+            }
+            // Preserve the public PS1 maxima for validation, but reserve VM
+            // storage only for this project's actual modules and bindings.
+            // A full 32-instance pool costs over 500 KiB of PS1 RAM.
+            limits << "#ifndef MIPSYNC_GENERATED_RUNTIME_LIMITS_H\n"
+                      "#define MIPSYNC_GENERATED_RUNTIME_LIMITS_H\n\n"
+                      "#define MIPSYNC_GENERATED_MODULE_CAP "
+                   << std::max<size_t>(1, outResult.modules.size()) << "\n"
+                      "#define MIPSYNC_GENERATED_INSTANCE_CAP "
+                   << std::max<uint32_t>(1, outResult.bindingCount) << "\n\n"
+                      "#endif /* MIPSYNC_GENERATED_RUNTIME_LIMITS_H */\n";
+            if (!limits.good()) {
+                outError = "failed to write runtime_limits.h: " +
+                           PathUtf8::ToString(runtimeLimitsH);
+                return false;
+            }
+        }
 
         ResolveEntityAppearances(projectRoot, scenePath, outResult);
 

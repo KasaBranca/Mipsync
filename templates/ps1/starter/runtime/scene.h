@@ -82,6 +82,11 @@ typedef struct ps1_entity {
     uint16_t    rigid_aim_first_frame;
     uint16_t    rigid_aim_frame_count;
     uint8_t     rigid_aim_fps;
+    uint16_t    rigid_trigger_first_frame;
+    uint16_t    rigid_trigger_frame_count;
+    uint8_t     rigid_trigger_fps;
+    uint16_t    animator_trigger_parameter_hash;
+    uint16_t    animator_active_trigger_hash;
     int16_t     rigid_root_entity_index;
     fix16_t     animator_speed;
     fix16_t     animator_aim;
@@ -105,6 +110,7 @@ typedef struct ps1_entity {
     fix16_t     collider_radius;
     fix16_t     collider_capsule_height;
     uint8_t     collider_is_trigger;
+    uint8_t     collider_convex;
     uint8_t     collider_camera_shot_trigger;
     int16_t     collider_camera_target_index;
     uint8_t     audio_clip_index;
@@ -247,6 +253,7 @@ void ps1_scene_resolve_hierarchy(void);
 void ps1_scene_begin_frame(void);
 void ps1_scene_update_vertex_anims(fix16_t delta_time);
 void ps1_scene_set_animator_float(unsigned int root_index, const char* name, fix16_t value);
+void ps1_scene_set_animator_trigger(unsigned int root_index, const char* name);
 ps1_entity*       ps1_scene_mutable_entity(unsigned int index);
 const ps1_entity* ps1_scene_entity(unsigned int index);
 const ps1_entity* ps1_scene_source_entity(unsigned int index);

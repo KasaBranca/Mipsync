@@ -207,6 +207,137 @@ static void get_world_aabb(const ps1_entity* e, fix16_t min_out[3], fix16_t max_
     max_out[2] = fix16_add(center[2], half[2]);
 }
 
+static const ps1_mesh* nonconvex_mesh_data(const ps1_entity* entity) {
+    if (!entity || entity->collider_shape != 3 || entity->collider_convex ||
+        entity->mesh != PS1_MESH_CUSTOM || entity->mesh_index == 0 ||
+        entity->mesh_index > g_ps1_mesh_count)
+        return 0;
+    return &g_ps1_meshes[entity->mesh_index - 1u];
+}
+
+static void mesh_vertex_world(const ps1_entity* entity,
+                              const ps1_mesh* mesh,
+                              const SVECTOR* vertex,
+                              const fix16_t right[3],
+                              const fix16_t up[3],
+                              const fix16_t forward[3],
+                              fix16_t out[3]) {
+    fix16_t local[3];
+    /* Exported custom vertices are normalized to +/-1024. scale_q12 restores
+     * source size in PSX units (64 units per world unit), hence /4 here. */
+    local[0] = fix16_mul(
+        (fix16_t)(((int64_t)vertex->vx * mesh->scale_q12) >> 2),
+        entity->scale[0]);
+    local[1] = fix16_mul(
+        (fix16_t)(((int64_t)vertex->vy * mesh->scale_q12) >> 2),
+        entity->scale[1]);
+    local[2] = fix16_mul(
+        (fix16_t)(((int64_t)vertex->vz * mesh->scale_q12) >> 2),
+        entity->scale[2]);
+    out[0] = fix16_add(entity->position[0],
+        fix16_add(fix16_add(fix16_mul(right[0], local[0]),
+                            fix16_mul(up[0], local[1])),
+                  fix16_mul(forward[0], local[2])));
+    out[1] = fix16_add(entity->position[1],
+        fix16_add(fix16_add(fix16_mul(right[1], local[0]),
+                            fix16_mul(up[1], local[1])),
+                  fix16_mul(forward[1], local[2])));
+    out[2] = fix16_add(entity->position[2],
+        fix16_add(fix16_add(fix16_mul(right[2], local[0]),
+                            fix16_mul(up[2], local[1])),
+                  fix16_mul(forward[2], local[2])));
+}
+
+/* Return the highest triangle surface under X/Z without allocating a cooked
+ * collider. This keeps concave ProModeler floors and ramps usable on PS1. */
+static int nonconvex_mesh_floor_height(const ps1_entity* entity,
+                                       fix16_t point_x,
+                                       fix16_t point_z,
+                                       fix16_t max_surface,
+                                       fix16_t* out_height) {
+    const ps1_mesh* mesh = nonconvex_mesh_data(entity);
+    fix16_t best = (fix16_t)0x80000000;
+    fix16_t right[3], up[3], forward[3];
+    int found = 0;
+    if (!mesh || !mesh->verts || !mesh->tris)
+        return 0;
+    collider_rotation_axes(entity, right, up, forward);
+
+    for (uint16_t i = 0; i < mesh->tri_count; ++i) {
+        const ps1_mesh_tri* triangle = &mesh->tris[i];
+        fix16_t world[3][3];
+        int64_t x0, x1, x2, z0, z1, z2, px, pz;
+        int64_t denominator, w0, w1, w2;
+        fix16_t height;
+        if (triangle->i0 >= mesh->vert_count ||
+            triangle->i1 >= mesh->vert_count ||
+            triangle->i2 >= mesh->vert_count)
+            continue;
+        mesh_vertex_world(entity, mesh, &mesh->verts[triangle->i0],
+                          right, up, forward, world[0]);
+        mesh_vertex_world(entity, mesh, &mesh->verts[triangle->i1],
+                          right, up, forward, world[1]);
+        mesh_vertex_world(entity, mesh, &mesh->verts[triangle->i2],
+                          right, up, forward, world[2]);
+
+        /* Q8 X/Z keeps barycentric products inside int64 on large levels. */
+        x0 = world[0][0] >> 8; x1 = world[1][0] >> 8; x2 = world[2][0] >> 8;
+        z0 = world[0][2] >> 8; z1 = world[1][2] >> 8; z2 = world[2][2] >> 8;
+        px = point_x >> 8; pz = point_z >> 8;
+        if (px < (x0 < x1 ? (x0 < x2 ? x0 : x2) : (x1 < x2 ? x1 : x2)) ||
+            px > (x0 > x1 ? (x0 > x2 ? x0 : x2) : (x1 > x2 ? x1 : x2)) ||
+            pz < (z0 < z1 ? (z0 < z2 ? z0 : z2) : (z1 < z2 ? z1 : z2)) ||
+            pz > (z0 > z1 ? (z0 > z2 ? z0 : z2) : (z1 > z2 ? z1 : z2)))
+            continue;
+        denominator = (z1 - z2) * (x0 - x2) + (x2 - x1) * (z0 - z2);
+        if (denominator > -4 && denominator < 4)
+            continue;
+        w0 = (z1 - z2) * (px - x2) + (x2 - x1) * (pz - z2);
+        w1 = (z2 - z0) * (px - x2) + (x0 - x2) * (pz - z2);
+        w2 = denominator - w0 - w1;
+        if (denominator > 0) {
+            if (w0 < 0 || w1 < 0 || w2 < 0)
+                continue;
+        } else if (w0 > 0 || w1 > 0 || w2 > 0) {
+            continue;
+        }
+        height = (fix16_t)((w0 * world[0][1] +
+                            w1 * world[1][1] +
+                            w2 * world[2][1]) / denominator);
+        if (height <= max_surface && (!found || height > best)) {
+            best = height;
+            found = 1;
+        }
+    }
+    if (found && out_height)
+        *out_height = best;
+    return found;
+}
+
+static int resolve_nonconvex_mesh_floor(ps1_entity* active,
+                                        const ps1_entity* floor_entity,
+                                        fix16_t disp,
+                                        const fix16_t previous_min[3],
+                                        fix16_t min_a[3],
+                                        fix16_t max_a[3]) {
+    const fix16_t tolerance = FIX16_ONE / 20;
+    const fix16_t point_x = fix16_div(fix16_add(min_a[0], max_a[0]), FIX16_FROM_INT(2));
+    const fix16_t point_z = fix16_div(fix16_add(min_a[2], max_a[2]), FIX16_FROM_INT(2));
+    fix16_t surface;
+    if (disp >= 0 || !nonconvex_mesh_floor_height(
+            floor_entity, point_x, point_z,
+            fix16_add(previous_min[1], tolerance), &surface))
+        return 0;
+    if (previous_min[1] < fix16_sub(surface, tolerance) ||
+        min_a[1] > fix16_add(surface, tolerance))
+        return 0;
+    active->position[1] = fix16_add(active->position[1],
+                                    fix16_sub(surface, min_a[1]));
+    s_vertical_vel = 0;
+    get_world_aabb(active, min_a, max_a);
+    return 1;
+}
+
 static void rebuild_collider_cache(void) {
     const unsigned int count = ps1_scene_entity_count();
     unsigned int i;
@@ -391,6 +522,20 @@ void ps1_physics_move(fix16_t vx, fix16_t vy, fix16_t vz, fix16_t dt) {
                 if (collider_is_related(e, other->entity_index,
                                         other->rigid_root_entity_index))
                     continue;
+                {
+                    const ps1_entity* mesh_entity =
+                        ps1_scene_entity(other->entity_index);
+                    if (nonconvex_mesh_data(mesh_entity)) {
+                        if (axis == 1 && resolve_nonconvex_mesh_floor(
+                                e, mesh_entity, disp, previous_min, min_a, max_a))
+                            stop_axis = 1;
+                        /* A concave mesh cannot use its whole bounding box:
+                         * that fills holes and often contains the player. */
+                        if (stop_axis)
+                            break;
+                        continue;
+                    }
+                }
                 if (axis != 1 && other->shape == 3 &&
                     other->min_q6[1] == other->max_q6[1])
                     continue;
@@ -416,6 +561,14 @@ void ps1_physics_move(fix16_t vx, fix16_t vy, fix16_t vz, fix16_t dt) {
                 if (collider_is_related(e, other_index,
                                         other->rigid_root_entity_index))
                     continue;
+                if (nonconvex_mesh_data(other)) {
+                    if (axis == 1 && resolve_nonconvex_mesh_floor(
+                            e, other, disp, previous_min, min_a, max_a))
+                        stop_axis = 1;
+                    if (stop_axis)
+                        break;
+                    continue;
+                }
                 if (axis != 1 && other->collider_shape == 3 &&
                     other->collider_half_extents[1] == 0)
                     continue;
@@ -455,6 +608,23 @@ int ps1_physics_is_grounded(void) {
         if (collider_is_related(e, other->entity_index,
                                 other->rigid_root_entity_index))
             continue;
+        {
+            const ps1_entity* mesh_entity =
+                ps1_scene_entity(other->entity_index);
+            if (nonconvex_mesh_data(mesh_entity)) {
+                const fix16_t point_x = fix16_div(
+                    fix16_add(min_a[0], max_a[0]), FIX16_FROM_INT(2));
+                const fix16_t point_z = fix16_div(
+                    fix16_add(min_a[2], max_a[2]), FIX16_FROM_INT(2));
+                fix16_t surface;
+                if (nonconvex_mesh_floor_height(
+                        mesh_entity, point_x, point_z,
+                        fix16_add(min_a[1], FIX16_ONE / 10), &surface) &&
+                    fix16_abs(fix16_sub(min_a[1], surface)) <= FIX16_ONE / 10)
+                    return 1;
+                continue;
+            }
+        }
         cached_collider_bounds(other, min_b, max_b);
         if (aabb_overlaps(min_a, max_a, min_b, max_b))
             return 1;
@@ -473,6 +643,19 @@ int ps1_physics_is_grounded(void) {
         if (collider_is_related(e, other_index,
                                 other->rigid_root_entity_index))
             continue;
+        if (nonconvex_mesh_data(other)) {
+            const fix16_t point_x = fix16_div(
+                fix16_add(min_a[0], max_a[0]), FIX16_FROM_INT(2));
+            const fix16_t point_z = fix16_div(
+                fix16_add(min_a[2], max_a[2]), FIX16_FROM_INT(2));
+            fix16_t surface;
+            if (nonconvex_mesh_floor_height(
+                    other, point_x, point_z,
+                    fix16_add(min_a[1], FIX16_ONE / 10), &surface) &&
+                fix16_abs(fix16_sub(min_a[1], surface)) <= FIX16_ONE / 10)
+                return 1;
+            continue;
+        }
         get_world_aabb(other, min_b, max_b);
         if (aabb_overlaps(min_a, max_a, min_b, max_b))
             return 1;

@@ -43,6 +43,8 @@
 
 #include "runtime/vm.h"
 
+#include "generated/runtime_limits.h"
+
 
 
 #define SCREEN_W 320
@@ -62,9 +64,9 @@
  * data also lives there. The renderer clips safely when this fills. */
 #define PACKET_LEN 73728
 
-#define MAX_MODULES   MIPSYNC_PS1_MODULE_CAP
+#define MAX_MODULES   MIPSYNC_GENERATED_MODULE_CAP
 
-#define MAX_INSTANCES MIPSYNC_PS1_INSTANCE_CAP
+#define MAX_INSTANCES MIPSYNC_GENERATED_INSTANCE_CAP
 
 
 

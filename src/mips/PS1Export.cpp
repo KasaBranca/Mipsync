@@ -76,8 +76,6 @@ const char* UnsupportedHostReason(HostFunc func) {
         return "Physics.Raycast is not available on the PS1 runtime yet (Physics.Move and Physics.IsGrounded are supported)";
     case HostFunc::Entity_GetName:
         return "Entity.name is not available on the PS1 runtime yet";
-    case HostFunc::Animator_SetTrigger:
-        return "Animator.SetTrigger is not available on the PS1 runtime yet";
     case HostFunc::Scene_Load:
     case HostFunc::Scene_LoadBuildIndex:
         return "Scene loading from Mips# is not available on the PS1 runtime yet";

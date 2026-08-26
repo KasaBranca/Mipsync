@@ -79,6 +79,10 @@ struct Ps1ExportedEntity {
     uint16_t rigidAimFirstFrame = 0;
     uint16_t rigidAimFrameCount = 0;
     uint8_t rigidAimFps = 0;
+    uint16_t rigidTriggerFirstFrame = 0;
+    uint16_t rigidTriggerFrameCount = 0;
+    uint8_t rigidTriggerFps = 0;
+    uint16_t animatorTriggerParameterHash = 0;
     uint32_t rigidRootEntityId = 0;
     int rigidRootEntityIndex = -1;
 
@@ -108,6 +112,7 @@ struct Ps1ExportedEntity {
     float colliderRadius = 0.0f;
     float colliderCapsuleHeight = 0.0f;
     bool colliderIsTrigger = false;
+    bool colliderConvex = true;
     bool colliderCameraShotTrigger = false;
     uint32_t colliderCameraTargetId = 0;
     int colliderCameraTargetEntityIndex = -1;

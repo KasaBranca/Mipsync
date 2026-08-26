@@ -378,9 +378,17 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
             push_nil(vm);
             return 1;
         }
-        case HF_ANIMATOR_SETTRIGGER:
+        case HF_ANIMATOR_SETTRIGGER: {
+            const char* name = argc >= 1 && a[0].tag == HOST_VAL_STRING
+                ? vm_module_string(vm, a[0].str_idx)
+                : 0;
+            if (name) {
+                ps1_scene_set_animator_trigger(
+                    (unsigned int)vm_instance_entity_index(vm), name);
+            }
             push_nil(vm);
             return 1;
+        }
         case HF_AUDIO_PLAY:
         case HF_AUDIO_STOP:
         case HF_AUDIO_PAUSE:

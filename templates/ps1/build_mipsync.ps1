@@ -97,6 +97,32 @@ try {
     & $cmake.Source --build build 2>&1 | Tee-Object -FilePath $log -Append
     if ($LASTEXITCODE -ne 0) { throw "cmake build failed ($LASTEXITCODE)" }
 
+    # PSn00bSDK can successfully link an executable whose loaded image plus
+    # BSS extends past the console's 2 MiB RAM. Such a disc boots to a black
+    # screen, so reject it here with an actionable memory diagnostic.
+    $map = Get-ChildItem (Join-Path $src "build") -Filter "*.map" -Recurse |
+        Select-Object -First 1
+    if ($map) {
+        $endMatch = Select-String -Path $map.FullName -Pattern '^_end\s+\S+\s+([0-9a-fA-F]+)' |
+            Select-Object -First 1
+        if ($endMatch -and $endMatch.Matches.Count -gt 0) {
+            $endHex = $endMatch.Matches[0].Groups[1].Value
+            if ($endHex.Length -gt 8) { $endHex = $endHex.Substring($endHex.Length - 8) }
+            $endAddress = [Convert]::ToUInt64($endHex, 16)
+            $ramStart = [Convert]::ToUInt64("80010000", 16)
+            $ramEnd = [Convert]::ToUInt64("80200000", 16)
+            $usedBytes = $endAddress - $ramStart
+            if ($endAddress -gt $ramEnd) {
+                $overBytes = $endAddress - $ramEnd
+                Log "PS1 RAM budget exceeded by $overBytes bytes (end=0x$($endAddress.ToString('X8')), limit=0x$($ramEnd.ToString('X8')))."
+                Log "Reduce baked animation frames, scene content, or script VM usage."
+                throw "PS1 RAM budget exceeded by $overBytes bytes"
+            }
+            $freeBytes = $ramEnd - $endAddress
+            Log "PS1 RAM image: $usedBytes bytes used, $freeBytes bytes free (end=0x$($endAddress.ToString('X8')))."
+        }
+    }
+
     $exe = Get-ChildItem (Join-Path $src "build") -Filter "*.exe" -Recurse | Select-Object -First 1
     if (-not $exe) {
         $exe = Get-ChildItem (Join-Path $src "build") -Filter "*.psexe" -Recurse | Select-Object -First 1
