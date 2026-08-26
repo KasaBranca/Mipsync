@@ -338,6 +338,93 @@ static int resolve_nonconvex_mesh_floor(ps1_entity* active,
     return 1;
 }
 
+static int resolve_nonconvex_mesh_wall(ps1_entity* active,
+                                       const ps1_entity* mesh_entity,
+                                       int axis,
+                                       fix16_t disp,
+                                       const fix16_t previous_min[3],
+                                       const fix16_t previous_max[3],
+                                       fix16_t min_a[3],
+                                       fix16_t max_a[3]) {
+    const ps1_mesh* mesh = nonconvex_mesh_data(mesh_entity);
+    fix16_t right[3], up[3], forward[3];
+    fix16_t boundary = 0;
+    const fix16_t tolerance = FIX16_ONE / 100;
+    int found = 0;
+    const int side_axis = axis == 0 ? 2 : 0;
+    if (!mesh || (axis != 0 && axis != 2) || disp == 0)
+        return 0;
+    collider_rotation_axes(mesh_entity, right, up, forward);
+
+    for (uint16_t i = 0; i < mesh->tri_count; ++i) {
+        const ps1_mesh_tri* triangle = &mesh->tris[i];
+        fix16_t world[3][3];
+        fix16_t tri_min[3], tri_max[3];
+        int64_t ab[3], ac[3], nx, ny, nz, horizontal;
+        if (triangle->i0 >= mesh->vert_count ||
+            triangle->i1 >= mesh->vert_count ||
+            triangle->i2 >= mesh->vert_count)
+            continue;
+        mesh_vertex_world(mesh_entity, mesh, &mesh->verts[triangle->i0],
+                          right, up, forward, world[0]);
+        mesh_vertex_world(mesh_entity, mesh, &mesh->verts[triangle->i1],
+                          right, up, forward, world[1]);
+        mesh_vertex_world(mesh_entity, mesh, &mesh->verts[triangle->i2],
+                          right, up, forward, world[2]);
+        for (int component = 0; component < 3; ++component) {
+            tri_min[component] = min_fix16(world[0][component],
+                min_fix16(world[1][component], world[2][component]));
+            tri_max[component] = max_fix16(world[0][component],
+                max_fix16(world[1][component], world[2][component]));
+            ab[component] = (world[1][component] - world[0][component]) >> 8;
+            ac[component] = (world[2][component] - world[0][component]) >> 8;
+        }
+        nx = ab[1] * ac[2] - ab[2] * ac[1];
+        ny = ab[2] * ac[0] - ab[0] * ac[2];
+        nz = ab[0] * ac[1] - ab[1] * ac[0];
+        if (nx < 0) nx = -nx;
+        if (ny < 0) ny = -ny;
+        if (nz < 0) nz = -nz;
+        horizontal = nx > nz ? nx : nz;
+        if (horizontal == 0 || ny > horizontal)
+            continue; /* Floor/ceiling: vertical motion owns this triangle. */
+        if (max_a[1] <= tri_min[1] || min_a[1] >= tri_max[1] ||
+            max_a[side_axis] <= tri_min[side_axis] ||
+            min_a[side_axis] >= tri_max[side_axis])
+            continue;
+
+        if (disp > 0) {
+            const fix16_t candidate = tri_min[axis];
+            if (previous_max[axis] > fix16_add(candidate, tolerance) ||
+                max_a[axis] < candidate)
+                continue;
+            if (!found || candidate < boundary) {
+                boundary = candidate;
+                found = 1;
+            }
+        } else {
+            const fix16_t candidate = tri_max[axis];
+            if (previous_min[axis] < fix16_sub(candidate, tolerance) ||
+                min_a[axis] > candidate)
+                continue;
+            if (!found || candidate > boundary) {
+                boundary = candidate;
+                found = 1;
+            }
+        }
+    }
+    if (!found)
+        return 0;
+    if (disp > 0)
+        active->position[axis] = fix16_add(active->position[axis],
+                                           fix16_sub(boundary, max_a[axis]));
+    else
+        active->position[axis] = fix16_add(active->position[axis],
+                                           fix16_sub(boundary, min_a[axis]));
+    get_world_aabb(active, min_a, max_a);
+    return 1;
+}
+
 static void rebuild_collider_cache(void) {
     const unsigned int count = ps1_scene_entity_count();
     unsigned int i;
@@ -526,8 +613,11 @@ void ps1_physics_move(fix16_t vx, fix16_t vy, fix16_t vz, fix16_t dt) {
                     const ps1_entity* mesh_entity =
                         ps1_scene_entity(other->entity_index);
                     if (nonconvex_mesh_data(mesh_entity)) {
-                        if (axis == 1 && resolve_nonconvex_mesh_floor(
-                                e, mesh_entity, disp, previous_min, min_a, max_a))
+                        if ((axis == 1 && resolve_nonconvex_mesh_floor(
+                                 e, mesh_entity, disp, previous_min, min_a, max_a)) ||
+                            (axis != 1 && resolve_nonconvex_mesh_wall(
+                                 e, mesh_entity, axis, disp,
+                                 previous_min, previous_max, min_a, max_a)))
                             stop_axis = 1;
                         /* A concave mesh cannot use its whole bounding box:
                          * that fills holes and often contains the player. */
@@ -562,8 +652,11 @@ void ps1_physics_move(fix16_t vx, fix16_t vy, fix16_t vz, fix16_t dt) {
                                         other->rigid_root_entity_index))
                     continue;
                 if (nonconvex_mesh_data(other)) {
-                    if (axis == 1 && resolve_nonconvex_mesh_floor(
-                            e, other, disp, previous_min, min_a, max_a))
+                    if ((axis == 1 && resolve_nonconvex_mesh_floor(
+                             e, other, disp, previous_min, min_a, max_a)) ||
+                        (axis != 1 && resolve_nonconvex_mesh_wall(
+                             e, other, axis, disp,
+                             previous_min, previous_max, min_a, max_a)))
                         stop_axis = 1;
                     if (stop_axis)
                         break;
