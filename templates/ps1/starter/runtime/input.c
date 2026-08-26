@@ -113,6 +113,12 @@ int ps1_input_key_held(const char* name) {
     if (strcmp(name, "Square") == 0) return button_held(PAD_SQUARE);
     if (strcmp(name, "Triangle") == 0) return button_held(PAD_TRIANGLE);
     if (strcmp(name, "Start") == 0) return button_held(PAD_START);
+    if (strcmp(name, "Run") == 0) return button_held(PAD_SQUARE);
+    if (strcmp(name, "StrafeLeft") == 0) return button_held(PAD_L1);
+    if (strcmp(name, "StrafeRight") == 0) return button_held(PAD_R1);
+    if (strcmp(name, "QuickTurn") == 0)
+        return button_held(PAD_L1) && button_held(PAD_R1);
+    if (strcmp(name, "Aim") == 0) return button_held(PAD_R2);
     if (strcmp(name, "LeftShift") == 0 ||
         strcmp(name, "Aim") == 0 ||
         strcmp(name, "L1") == 0)
@@ -135,6 +141,13 @@ int ps1_input_key_down(const char* name) {
     if (strcmp(name, "Square") == 0) return button_down(PAD_SQUARE);
     if (strcmp(name, "Triangle") == 0) return button_down(PAD_TRIANGLE);
     if (strcmp(name, "Start") == 0) return button_down(PAD_START);
+    if (strcmp(name, "Run") == 0) return button_down(PAD_SQUARE);
+    if (strcmp(name, "StrafeLeft") == 0) return button_down(PAD_L1);
+    if (strcmp(name, "StrafeRight") == 0) return button_down(PAD_R1);
+    if (strcmp(name, "QuickTurn") == 0)
+        return (button_down(PAD_L1) && button_held(PAD_R1)) ||
+               (button_down(PAD_R1) && button_held(PAD_L1));
+    if (strcmp(name, "Aim") == 0) return button_down(PAD_R2);
     if (strcmp(name, "LeftShift") == 0 ||
         strcmp(name, "Aim") == 0 ||
         strcmp(name, "L1") == 0) return button_down(PAD_L1);
@@ -152,6 +165,12 @@ int ps1_input_key_up(const char* name) {
     if (strcmp(name, "Square") == 0) return button_up(PAD_SQUARE);
     if (strcmp(name, "Triangle") == 0) return button_up(PAD_TRIANGLE);
     if (strcmp(name, "Start") == 0) return button_up(PAD_START);
+    if (strcmp(name, "Run") == 0) return button_up(PAD_SQUARE);
+    if (strcmp(name, "StrafeLeft") == 0) return button_up(PAD_L1);
+    if (strcmp(name, "StrafeRight") == 0) return button_up(PAD_R1);
+    if (strcmp(name, "QuickTurn") == 0)
+        return button_up(PAD_L1) || button_up(PAD_R1);
+    if (strcmp(name, "Aim") == 0) return button_up(PAD_R2);
     if (strcmp(name, "LeftShift") == 0 || strcmp(name, "Aim") == 0 ||
         strcmp(name, "L1") == 0) return button_up(PAD_L1);
     return 0;

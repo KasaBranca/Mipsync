@@ -28,7 +28,7 @@ struct CompiledMethod {
     bool isPublic = false;
 };
 
-enum class FieldValueKind : uint8_t { Number = 0, Bool, AudioClip, Array };
+enum class FieldValueKind : uint8_t { Number = 0, Bool, AudioClip, Array, EntityReference };
 
 struct CompiledField {
     std::string name;

@@ -134,7 +134,8 @@ void MipsRuntime::CollectInstances(Scene& scene) {
         if (!script->module)
             continue;
 
-        if (script->module->className == "FirstPersonController") {
+        if (script->module->className == "FirstPersonController" ||
+            script->module->className == "SilentHillController") {
             ColliderUtils::EnsureFirstPersonPhysics(*entity);
         } else if (script->module->className == "RadioController") {
             // Migrate scenes that still carry the old CharacterVirtual flag.
