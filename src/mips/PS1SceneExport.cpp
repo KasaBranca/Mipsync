@@ -6032,6 +6032,45 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
                 entityIndexBySourceId[outResult.entities[i].sourceEntityId] = static_cast<int>(i);
         }
 
+        // Scene object references are authored as stable source entity IDs.
+        // The PS1 runtime addresses the flattened entity table, so rewrite
+        // references to one-based runtime handles (zero remains None).
+        for (Ps1ExportedEntity& owner : outResult.entities) {
+            for (Ps1ExportedScript& script : owner.scripts) {
+                const auto moduleIt = moduleIndexByClass.find(script.className);
+                if (moduleIt == moduleIndexByClass.end())
+                    continue;
+                const CompiledModule& module = outResult.modules[moduleIt->second];
+                for (size_t fi = 0; fi < module.fields.size() &&
+                                    fi < script.fieldValuesQ16.size(); ++fi) {
+                    const CompiledField& field = module.fields[fi];
+                    if (field.valueKind != FieldValueKind::EntityReference)
+                        continue;
+                    const int32_t sourceId = script.fieldValuesQ16[fi] / 65536;
+                    if (sourceId == 0) {
+                        script.fieldValuesQ16[fi] = 0;
+                        continue;
+                    }
+                    const auto referencedIt = entityIndexBySourceId.find(
+                        static_cast<uint32_t>(sourceId));
+                    if (referencedIt == entityIndexBySourceId.end()) {
+                        outError = "PS1 script field '" + field.name +
+                                   "' references a missing scene object";
+                        return false;
+                    }
+                    const size_t referencedIndex = static_cast<size_t>(referencedIt->second);
+                    if (field.typeName == "Camera" &&
+                        !outResult.entities[referencedIndex].hasCamera) {
+                        outError = "PS1 script field '" + field.name +
+                                   "' requires an object with a Camera component";
+                        return false;
+                    }
+                    script.fieldValuesQ16[fi] = ToFixed16(
+                        static_cast<double>(referencedIndex + 1));
+                }
+            }
+        }
+
         for (Ps1ExportedUiButtonAction& action : outResult.uiButtonActions) {
             const auto entityIt = entityIndexBySourceId.find(action.targetSourceEntityId);
             if (entityIt == entityIndexBySourceId.end()) {

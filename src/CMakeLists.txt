@@ -148,6 +148,9 @@ add_test(NAME MipsyncCommandPlatform COMMAND MipsyncCommandTests)
 add_test(NAME MipsyncRuntimeRegression
     COMMAND $<TARGET_FILE:MipsyncEngine>
             --test-mips-runtime "${CMAKE_SOURCE_DIR}/tests/mips/ArraysCoroutines.mips")
+add_test(NAME MipsyncSilentHillControllerValidation
+    COMMAND $<TARGET_FILE:MipsyncEngine>
+            --validate-mips "${CMAKE_SOURCE_DIR}/tests/mips/SilentHillController.mips")
 
 # Target properties
 target_compile_features(MipsyncEngine PRIVATE cxx_std_20)

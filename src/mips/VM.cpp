@@ -160,7 +160,9 @@ int MapKeyName(const std::string& name) {
         {"G", GLFW_KEY_G}, {"H", GLFW_KEY_H}, {"I", GLFW_KEY_I}, {"J", GLFW_KEY_J},
         {"K", GLFW_KEY_K}, {"L", GLFW_KEY_L},
         {"Space", GLFW_KEY_SPACE},
-        {"Aim", GLFW_KEY_LEFT_SHIFT}, {"L1", GLFW_KEY_LEFT_SHIFT},
+        {"Run", GLFW_KEY_LEFT_SHIFT}, {"Aim", GLFW_KEY_RIGHT_SHIFT},
+        {"StrafeLeft", GLFW_KEY_Q}, {"StrafeRight", GLFW_KEY_E},
+        {"QuickTurn", GLFW_KEY_SPACE}, {"L1", GLFW_KEY_LEFT_SHIFT},
         {"LeftShift", GLFW_KEY_LEFT_SHIFT}, {"RightShift", GLFW_KEY_RIGHT_SHIFT},
         {"LeftControl", GLFW_KEY_LEFT_CONTROL}, {"RightControl", GLFW_KEY_RIGHT_CONTROL},
         {"LeftAlt", GLFW_KEY_LEFT_ALT}, {"RightAlt", GLFW_KEY_RIGHT_ALT},
@@ -939,6 +941,59 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                 const glm::vec3 forward = axes.second;
                 pushNumber(static_cast<double>(
                     glm::degrees(std::atan2(-forward.x, -forward.z))));
+                break;
+            }
+            case HostFunc::Camera_Follow: {
+                // Camera.Follow(cameraEntityId, controllerYaw, distance,
+                //               height, lookHeight, sharpness)
+                if (argc < 6 || !m_Scene || !m_Instance || !m_Instance->entity) {
+                    pushNumber(0.0);
+                    break;
+                }
+
+                const uint32_t cameraId = static_cast<uint32_t>(
+                    std::max(0.0, std::round(NumberValue(args[0]))));
+                Entity* cameraEntity = cameraId != 0 ? m_Scene->FindEntity(cameraId) : nullptr;
+                auto* cameraTransform = GetTransform(cameraEntity);
+                auto* cameraComponent = cameraEntity
+                    ? cameraEntity->GetComponent<CameraComponent>() : nullptr;
+                auto* targetTransform = GetTransform(m_Instance->entity);
+                if (!cameraTransform || !cameraComponent || !targetTransform) {
+                    pushNumber(0.0);
+                    break;
+                }
+
+                const float yaw = static_cast<float>(NumberValue(args[1]));
+                const float distance = std::max(0.0f, static_cast<float>(NumberValue(args[2])));
+                const float height = static_cast<float>(NumberValue(args[3]));
+                const float lookHeight = static_cast<float>(NumberValue(args[4]));
+                const float sharpness = std::max(0.0f, static_cast<float>(NumberValue(args[5])));
+                const float yawRadians = glm::radians(yaw);
+
+                const glm::vec3 targetPosition = targetTransform->position;
+                const glm::vec3 desiredPosition(
+                    targetPosition.x + std::sin(yawRadians) * distance,
+                    targetPosition.y + height,
+                    targetPosition.z + std::cos(yawRadians) * distance);
+                const float blend = sharpness <= 0.0f
+                    ? 1.0f : std::clamp(sharpness * m_DeltaTime, 0.0f, 1.0f);
+                cameraTransform->position = glm::mix(
+                    cameraTransform->position, desiredPosition, blend);
+
+                const glm::vec3 lookTarget = targetPosition + glm::vec3(0.0f, lookHeight, 0.0f);
+                const glm::vec3 direction = lookTarget - cameraTransform->position;
+                const float horizontal = std::sqrt(direction.x * direction.x +
+                                                   direction.z * direction.z);
+                if (horizontal > 1e-5f || std::abs(direction.y) > 1e-5f) {
+                    cameraTransform->rotation.x = glm::degrees(
+                        std::atan2(direction.y, horizontal));
+                    cameraTransform->rotation.y = glm::degrees(
+                        std::atan2(-direction.x, -direction.z));
+                    cameraTransform->rotation.z = 0.0f;
+                }
+                cameraComponent->camera.SyncFromTransform(
+                    cameraTransform->position, cameraTransform->rotation);
+                pushNumber(1.0);
                 break;
             }
             case HostFunc::Physics_IsGrounded: {

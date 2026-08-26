@@ -123,7 +123,8 @@
     X(MATHF_FLOOR, Mathf_Floor, 66) \
     X(MATHF_CEIL, Mathf_Ceil, 67) \
     X(MATHF_ROUND, Mathf_Round, 68) \
-    X(MATHF_SIGN, Mathf_Sign, 69)
+    X(MATHF_SIGN, Mathf_Sign, 69) \
+    X(CAMERA_FOLLOW, Camera_Follow, 70)
 
 /* PS1 runtime capacities. The exporter validates these before emitting C. */
 #define MIPSYNC_PS1_MODULE_CAP      4
@@ -139,7 +140,7 @@
 #define VM_CLASS_NAME_LEN          32
 #define VM_METHOD_CAP              16
 #define VM_METHOD_NAME_LEN         24
-#define VM_FIELD_NAME_LEN          24
+#define VM_FIELD_NAME_LEN          32
 #define VM_METHOD_CODE_CAP       4096
 #define VM_ARRAY_CAP                8
 #define VM_ARRAY_LENGTH            32

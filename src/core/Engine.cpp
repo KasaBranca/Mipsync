@@ -114,6 +114,7 @@ Engine::Engine(const std::string& projectPath, EngineLaunchMode launchMode,
     if (builtinScriptsUpdated) {
         m_MipsRuntime->ResetScriptsByFileName(*m_Scene, "FirstPersonController.mips");
         m_MipsRuntime->ResetScriptsByFileName(*m_Scene, "RadioController.mips");
+        m_MipsRuntime->ResetScriptsByFileName(*m_Scene, "SilentHillController.mips");
     }
     if (demoContentUpdated)
         m_MipsRuntime->ResetScriptsByFileName(*m_Scene, "AnimatedCharacter.mips");
@@ -149,11 +150,13 @@ bool Engine::EnsureBuiltinScripts() {
     const fs::path scriptsDir = PathUtf8::FromString(m_ProjectPath) / "assets" / "scripts";
     const fs::path fpsPath = scriptsDir / "FirstPersonController.mips";
     const fs::path radioPath = scriptsDir / "RadioController.mips";
+    const fs::path silentHillPath = scriptsDir / "SilentHillController.mips";
 
     // Bump this any time the embedded source below changes; existing files with
     // an older marker will be overwritten so users get fixes automatically.
     static constexpr const char* kFpsScriptVersion = "// @mipsync-builtin v9";
     static constexpr const char* kRadioScriptVersion = "// @mipsync-builtin-radio v22";
+    static constexpr const char* kSilentHillScriptVersion = "// @mipsync-builtin-silent-hill v3";
 
     static constexpr const char* kFpsScript = R"(// @mipsync-builtin v9
 class FirstPersonController : MipsBehaviour
@@ -471,6 +474,156 @@ class RadioController : MipsBehaviour
 }
 )";
 
+    static constexpr const char* kSilentHillScript = R"(// @mipsync-builtin-silent-hill v3
+// Classic survival-horror tank controls for fixed or cinematic cameras.
+// PC: W/S move, A/D turn, Left Shift run, Q/E sidestep,
+//     Space jump, Right Shift aim.
+// PS1: D-pad/left stick move and turn, Square run, L1/R1 sidestep,
+//      L1+R1 jump, R2 aim.
+class SilentHillController : MipsBehaviour
+{
+    public float walkSpeed = 1.8;
+    public float runSpeed = 4.2;
+    public float backwardSpeed = 1.25;
+    public float sidestepSpeed = 1.6;
+    public float turnSpeed = 110.0;
+    public float runningTurnMultiplier = 0.82;
+    public float jumpSpeed = 5.5;
+    public float gravity = 18.0;
+    public float modelForwardYawOffset = 0.0;
+    public float fixedY = 0.0;
+    public int lockY = 0;
+    public int allowSidestep = 1;
+    public int allowJump = 1;
+    public int reverseSteeringWhileBacking = 1;
+    public int aimStopsMovement = 0;
+    public int driveAnimator = 1;
+    public float walkThreshold = 0.01;
+    public float verticalVelocity = 0.0;
+    public Camera followCamera;
+    public int followCameraEnabled = 1;
+    public float cameraDistance = 5.0;
+    public float cameraHeight = 2.2;
+    public float cameraLookHeight = 1.2;
+    public float cameraFollowSharpness = 8.0;
+
+    void Update()
+    {
+        var dt = Time.deltaTime;
+        if (dt > 0.1) dt = 0.1;
+
+        var forwardInput = 0.0;
+        if (Input.GetKey("W")) forwardInput = forwardInput + 1.0;
+        if (Input.GetKey("S")) forwardInput = forwardInput - 1.0;
+
+        var turnInput = 0.0;
+        if (Input.GetKey("A")) turnInput = turnInput + 1.0;
+        if (Input.GetKey("D")) turnInput = turnInput - 1.0;
+
+        var strafeInput = 0.0;
+        if (allowSidestep != 0)
+        {
+            if (Input.GetKey("StrafeLeft")) strafeInput = strafeInput - 1.0;
+            if (Input.GetKey("StrafeRight")) strafeInput = strafeInput + 1.0;
+        }
+
+        var running = Input.GetKey("Run");
+        var aiming = Input.GetKey("Aim");
+        var controllerYaw = transform.rotation.y - modelForwardYawOffset;
+        if (controllerYaw > 180.0) controllerYaw = controllerYaw - 360.0;
+        if (controllerYaw < -180.0) controllerYaw = controllerYaw + 360.0;
+
+        var grounded = Physics.IsGrounded();
+        if (lockY == 0)
+        {
+            if (grounded != 0)
+            {
+                if (allowJump != 0)
+                {
+                    if (Input.GetKeyDown("QuickTurn"))
+                    {
+                        verticalVelocity = jumpSpeed;
+                        if (driveAnimator != 0) Animator.SetTrigger("Jump");
+                    }
+                }
+                if (verticalVelocity < 0.0) verticalVelocity = 0.0;
+            }
+            else
+            {
+                verticalVelocity = verticalVelocity - gravity * dt;
+            }
+        }
+        else
+        {
+            verticalVelocity = 0.0;
+        }
+
+        var steering = turnInput;
+        if (reverseSteeringWhileBacking != 0)
+        {
+            if (forwardInput < 0.0) steering = 0.0 - steering;
+        }
+        var currentTurnSpeed = turnSpeed;
+        if (running != 0) currentTurnSpeed = currentTurnSpeed * runningTurnMultiplier;
+        controllerYaw = controllerYaw + steering * currentTurnSpeed * dt;
+
+        if (controllerYaw > 180.0) controllerYaw = controllerYaw - 360.0;
+        if (controllerYaw < -180.0) controllerYaw = controllerYaw + 360.0;
+        transform.rotation.y = controllerYaw + modelForwardYawOffset;
+
+        var yawRadians = controllerYaw * 0.0174532925;
+        var sinYaw = Mathf.Sin(yawRadians);
+        var cosYaw = Mathf.Cos(yawRadians);
+        var forwardX = 0.0 - sinYaw;
+        var forwardZ = 0.0 - cosYaw;
+        var rightX = cosYaw;
+        var rightZ = 0.0 - sinYaw;
+
+        var moveSpeed = walkSpeed;
+        if (forwardInput < 0.0) moveSpeed = backwardSpeed;
+        else if (running != 0) moveSpeed = runSpeed;
+
+        var velocityX = forwardX * forwardInput * moveSpeed;
+        var velocityZ = forwardZ * forwardInput * moveSpeed;
+        velocityX = velocityX + rightX * strafeInput * sidestepSpeed;
+        velocityZ = velocityZ + rightZ * strafeInput * sidestepSpeed;
+
+        if (aiming != 0)
+        {
+            if (aimStopsMovement != 0)
+            {
+                velocityX = 0.0;
+                velocityZ = 0.0;
+            }
+        }
+
+        Physics.Move(velocityX, verticalVelocity, velocityZ);
+        if (lockY != 0) transform.position.y = fixedY;
+
+        if (followCameraEnabled != 0)
+        {
+            Camera.Follow(followCamera, controllerYaw, cameraDistance,
+                          cameraHeight, cameraLookHeight, cameraFollowSharpness);
+        }
+
+        if (driveAnimator != 0)
+        {
+            var moving = 0.0;
+            if (forwardInput != 0.0) moving = 1.0;
+            if (strafeInput != 0.0) moving = 1.0;
+            Animator.SetFloat("Speed", moving);
+            Animator.SetBool("Moving", moving > walkThreshold);
+            Animator.SetBool("Running", running != 0);
+            Animator.SetBool("Backward", forwardInput < 0.0);
+            Animator.SetBool("Aiming", aiming != 0);
+            Animator.SetFloat("Move", forwardInput);
+            Animator.SetFloat("Turn", turnInput);
+            Animator.SetFloat("Strafe", strafeInput);
+        }
+    }
+}
+)";
+
     std::error_code ec;
     fs::create_directories(scriptsDir, ec);
 
@@ -500,6 +653,8 @@ class RadioController : MipsBehaviour
     bool updated = false;
     updated |= writeIfMissingOrStale(fpsPath, kFpsScriptVersion, kFpsScript);
     updated |= writeIfMissingOrStale(radioPath, kRadioScriptVersion, kRadioScript);
+    updated |= writeIfMissingOrStale(
+        silentHillPath, kSilentHillScriptVersion, kSilentHillScript);
     return updated;
 }
 

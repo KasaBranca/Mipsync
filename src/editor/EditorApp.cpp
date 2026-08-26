@@ -5856,6 +5856,8 @@ void EditorApp::DrawInspectorPanel() {
                             const bool isBool = field.typeName == "bool";
                             const bool isAudio = field.valueKind == Mips::FieldValueKind::AudioClip;
                             const bool isArray = field.valueKind == Mips::FieldValueKind::Array;
+                            const bool isEntityReference =
+                                field.valueKind == Mips::FieldValueKind::EntityReference;
                             if (isAudio) {
                                 if (i >= mipsScript->fieldAssetPaths.size())
                                     mipsScript->fieldAssetPaths.resize(mipsScript->module->fields.size());
@@ -5869,6 +5871,61 @@ void EditorApp::DrawInspectorPanel() {
                                 ImGui::Text("%s", field.name.c_str());
                                 ImGui::SameLine();
                                 ImGui::TextDisabled("Array (initialized by script)");
+                                continue;
+                            }
+                            if (isEntityReference) {
+                                Scene& scene = m_Engine->GetScene();
+                                const uint32_t referencedId = i < mipsScript->fieldValues.size()
+                                    ? static_cast<uint32_t>(std::max(0.0, std::round(mipsScript->fieldValues[i])))
+                                    : 0u;
+                                Entity* referenced = referencedId != 0
+                                    ? scene.FindEntity(referencedId) : nullptr;
+                                std::string label = "None (" + field.typeName + ")";
+                                if (referenced) {
+                                    if (const auto* tag = referenced->GetComponent<TagComponent>())
+                                        label = tag->tag + " (" + field.typeName + ")";
+                                    else
+                                        label = "Entity #" + std::to_string(referencedId);
+                                }
+
+                                ImGui::PushID(static_cast<int>(i));
+                                ImGui::AlignTextToFramePadding();
+                                ImGui::TextUnformatted(field.name.c_str());
+                                ImGui::SameLine();
+                                ImGui::SetNextItemWidth(-1.0f);
+                                ImGui::Button(label.c_str(), ImVec2(-1.0f, 0.0f));
+                                if (ImGui::BeginDragDropTarget()) {
+                                    if (const ImGuiPayload* payload =
+                                            ImGui::AcceptDragDropPayload(DragDrop::kEntityId)) {
+                                        if (payload->DataSize >= static_cast<int>(sizeof(uint32_t))) {
+                                            const uint32_t droppedId =
+                                                *static_cast<const uint32_t*>(payload->Data);
+                                            Entity* dropped = scene.FindEntity(droppedId);
+                                            const bool compatible = dropped &&
+                                                (field.typeName != "Camera" ||
+                                                 dropped->HasComponent<CameraComponent>());
+                                            if (compatible) {
+                                                RecordUndoSnapshot();
+                                                mipsScript->fieldValues[i] =
+                                                    static_cast<double>(droppedId);
+                                                m_SceneDirty = true;
+                                            }
+                                        }
+                                    }
+                                    ImGui::EndDragDropTarget();
+                                }
+                                if (referenced && ImGui::BeginPopupContextItem("ReferenceContext")) {
+                                    if (ImGui::MenuItem("Clear")) {
+                                        RecordUndoSnapshot();
+                                        mipsScript->fieldValues[i] = 0.0;
+                                        m_SceneDirty = true;
+                                    }
+                                    ImGui::EndPopup();
+                                }
+                                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
+                                    field.typeName == "Camera")
+                                    ImGui::SetTooltip("Drag a Scene object with a Camera component here.");
+                                ImGui::PopID();
                                 continue;
                             }
                             if (isBool) {

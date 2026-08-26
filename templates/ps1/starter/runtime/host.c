@@ -466,6 +466,80 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
             push_number(vm, v);
             return 1;
         }
+        case HF_CAMERA_FOLLOW: {
+            /* Camera.Follow(cameraHandle, controllerYaw, distance, height,
+             *               lookHeight, sharpness). Entity-reference fields
+             * are exported as one-based scene indices so zero remains None. */
+            const fix16_t radians_to_degrees = (fix16_t)3754936;
+            const int camera_handle = argc >= 1 ?
+                (int)((fix16_t)a[0].ival / FIX16_ONE) : 0;
+            const int camera_index = camera_handle - 1;
+            const int target_index = vm_instance_entity_index(vm);
+            ps1_entity* camera;
+            ps1_entity* target;
+            fix16_t yaw;
+            fix16_t distance;
+            fix16_t height;
+            fix16_t look_height;
+            fix16_t sharpness;
+            fix16_t turn;
+            fix16_t sy;
+            fix16_t cy;
+            fix16_t desired[3];
+            fix16_t alpha;
+            fix16_t direction[3];
+            fix16_t horizontal;
+
+            if (camera_index < 0 || target_index < 0) {
+                push_bool(vm, 0);
+                return 1;
+            }
+            camera = ps1_scene_mutable_entity((unsigned int)camera_index);
+            target = ps1_scene_mutable_entity((unsigned int)target_index);
+            if (!camera || !target || !camera->has_camera) {
+                push_bool(vm, 0);
+                return 1;
+            }
+
+            yaw = argc >= 2 ? (fix16_t)a[1].ival : 0;
+            distance = argc >= 3 ? (fix16_t)a[2].ival : 0;
+            height = argc >= 4 ? (fix16_t)a[3].ival : 0;
+            look_height = argc >= 5 ? (fix16_t)a[4].ival : 0;
+            sharpness = argc >= 6 ? (fix16_t)a[5].ival : 0;
+            if (distance < 0) distance = 0;
+            if (sharpness < 0) sharpness = 0;
+
+            turn = fix16_div(yaw, FIX16_FROM_INT(360));
+            sy = fix16_sin(turn);
+            cy = fix16_cos(turn);
+            desired[0] = fix16_add(target->position[0], fix16_mul(sy, distance));
+            desired[1] = fix16_add(target->position[1], height);
+            desired[2] = fix16_add(target->position[2], fix16_mul(cy, distance));
+            alpha = sharpness <= 0
+                ? FIX16_ONE
+                : fix16_clamp(fix16_mul(sharpness, s_delta_q16_16), 0, FIX16_ONE);
+            for (int axis = 0; axis < 3; ++axis) {
+                camera->position[axis] = fix16_add(
+                    camera->position[axis],
+                    fix16_mul(fix16_sub(desired[axis], camera->position[axis]), alpha));
+            }
+
+            direction[0] = fix16_sub(target->position[0], camera->position[0]);
+            direction[1] = fix16_sub(
+                fix16_add(target->position[1], look_height), camera->position[1]);
+            direction[2] = fix16_sub(target->position[2], camera->position[2]);
+            horizontal = fix16_sqrt(fix16_add(
+                fix16_mul(direction[0], direction[0]),
+                fix16_mul(direction[2], direction[2])));
+            camera->rotation[0] = fix16_mul(
+                host_atan2(direction[1], horizontal), radians_to_degrees);
+            camera->rotation[1] = fix16_mul(
+                host_atan2(fix16_neg(direction[0]), fix16_neg(direction[2])),
+                radians_to_degrees);
+            camera->rotation[2] = 0;
+            push_bool(vm, 1);
+            return 1;
+        }
         default: {
             /* Log unimplemented host calls only the first few times. */
             static uint32_t s_unimpl_count[64];

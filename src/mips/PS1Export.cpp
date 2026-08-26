@@ -204,7 +204,7 @@ void ValidateMethodBytecode(const CompiledModule& module,
             if (!need(3)) break;
             const uint16_t id = readU16();
             ++pc; // argc
-            if (id > static_cast<uint16_t>(HostFunc::Mathf_Sign)) {
+            if (id > static_cast<uint16_t>(HostFunc::Camera_Follow)) {
                 AddUniqueError(errors, where + ": unknown PS1 host function #" +
                                        std::to_string(id));
             } else if (const char* reason = UnsupportedHostReason(static_cast<HostFunc>(id))) {

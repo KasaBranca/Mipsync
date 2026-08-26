@@ -229,6 +229,8 @@ std::unique_ptr<CompiledModule> Compiler::Compile() {
             cf.valueKind = FieldValueKind::Bool;
         else if (field->typeName == "AudioClip")
             cf.valueKind = FieldValueKind::AudioClip;
+        else if (field->typeName == "Entity" || field->typeName == "Camera")
+            cf.valueKind = FieldValueKind::EntityReference;
         else if (field->typeName.size() >= 2 &&
                  field->typeName.compare(field->typeName.size() - 2, 2, "[]") == 0)
             cf.valueKind = FieldValueKind::Array;
@@ -921,6 +923,10 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
     }
     if (targetName == "Physics" && methodName == "IsGrounded" && argc == 0) {
         emit(HostFunc::Physics_IsGrounded, 0);
+        return true;
+    }
+    if (targetName == "Camera" && methodName == "Follow" && argc == 6) {
+        emit(HostFunc::Camera_Follow, 6);
         return true;
     }
     if (targetName == "Vector3") {
