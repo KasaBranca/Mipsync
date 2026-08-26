@@ -151,6 +151,8 @@ add_test(NAME MipsyncRuntimeRegression
 add_test(NAME MipsyncSilentHillControllerValidation
     COMMAND $<TARGET_FILE:MipsyncEngine>
             --validate-mips "${CMAKE_SOURCE_DIR}/tests/mips/SilentHillController.mips")
+add_test(NAME MipsyncMeshCollider
+    COMMAND $<TARGET_FILE:MipsyncEngine> --test-mesh-collider)
 
 # Target properties
 target_compile_features(MipsyncEngine PRIVATE cxx_std_20)

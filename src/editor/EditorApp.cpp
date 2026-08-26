@@ -5400,7 +5400,7 @@ void EditorApp::DrawInspectorPanel() {
                 removeComponent = false;
                 const bool open = BeginInspectableComponent("Collider", *collider, removeComponent, this);
                 if (!removeComponent && open) {
-                    const char* shapeNames[] = { "Box", "Sphere", "Capsule", "Mesh (Convex)" };
+                    const char* shapeNames[] = { "Box", "Sphere", "Capsule", "Mesh" };
                     int shapeIdx = static_cast<int>(collider->shape);
                     if (shapeIdx > 3) shapeIdx = 0;
                     if (ImGui::Combo("Shape", &shapeIdx, shapeNames, IM_ARRAYSIZE(shapeNames)))
@@ -5417,8 +5417,23 @@ void EditorApp::DrawInspectorPanel() {
 
                     ImGui::DragFloat3("Center", glm::value_ptr(collider->center), 0.01f);
                     if (collider->shape == ColliderShape::Box || collider->shape == ColliderShape::Mesh) {
-                        if (collider->shape == ColliderShape::Mesh)
-                            ImGui::TextDisabled("Mesh uses convex hull; AABB shown for edit");
+                        if (collider->shape == ColliderShape::Mesh) {
+                            if (EditorTheme::Checkbox("Convex", &collider->convex)) {
+                                m_SceneDirty = true;
+                                if (m_IsPlaying)
+                                    m_Engine->GetPhysicsWorld().RefreshBodies(m_Engine->GetScene());
+                            }
+                            if (collider->convex) {
+                                ImGui::TextDisabled("Uses a convex hull; AABB shown for edit");
+                            } else {
+                                ImGui::TextDisabled("Uses source triangles; static physics only");
+                                if (auto* rb = selectedEntity->GetComponent<RigidbodyComponent>();
+                                    rb && rb->enabled && rb->bodyType != RigidbodyType::Static) {
+                                    ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.25f, 1.0f),
+                                                       "Non-convex mesh colliders are forced static");
+                                }
+                            }
+                        }
                         ImGui::DragFloat3("Half Extents", glm::value_ptr(collider->halfExtents), 0.01f, 0.01f, 100.0f);
                     } else {
                         ImGui::DragFloat("Radius", &collider->radius, 0.01f, 0.01f, 50.0f);
@@ -6118,7 +6133,7 @@ void EditorApp::DrawInspectorPanel() {
                         addCollider(ColliderShape::Sphere);
                     if (ImGui::MenuItem("Capsule"))
                         addCollider(ColliderShape::Capsule);
-                    if (ImGui::MenuItem("Mesh (Convex)"))
+                    if (ImGui::MenuItem("Mesh Collider"))
                         addCollider(ColliderShape::Mesh);
                     ImGui::EndMenu();
                     }

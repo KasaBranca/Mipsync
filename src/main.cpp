@@ -4,11 +4,16 @@
 #include "project/Project.h"
 #include "ps1/Ps1Build.h"
 #include "assets/AssetManager.h"
+#include "physics/ColliderUtils.h"
+#include "renderer/Mesh.h"
 #include "mips/MipsRuntime.h"
 #include "mips/MipsTest.h"
+#include <array>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <string>
+#include <Jolt/Core/Memory.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -30,6 +35,7 @@ struct CliArgs {
     bool buildDiscOnly = false;
     std::string validateMipsPath;
     std::string testMipsRuntimePath;
+    bool testMeshCollider = false;
 };
 
 CliArgs ParseArgs(int argc, char** argv) {
@@ -56,6 +62,9 @@ CliArgs ParseArgs(int argc, char** argv) {
             args.skipHub = true;
         } else if (a == "--test-mips-runtime" && i + 1 < argc) {
             args.testMipsRuntimePath = argv[++i];
+            args.skipHub = true;
+        } else if (a == "--test-mesh-collider") {
+            args.testMeshCollider = true;
             args.skipHub = true;
         } else if (a == "--play" || a == "--player" || a == "--data-dir" || a == "--data") {
             args.skipHub = true;
@@ -140,6 +149,50 @@ bool TryLaunchMipsyncHub() {
 #endif
 }
 
+bool RunMeshColliderRegression() {
+    using namespace MipsyncEngine;
+    JPH::RegisterDefaultAllocator();
+
+    const glm::vec3 positions[] = {
+        {-1.0f, -1.0f, -1.0f}, { 1.0f, -1.0f, -1.0f},
+        { 1.0f,  1.0f, -1.0f}, {-1.0f,  1.0f, -1.0f},
+        {-1.0f, -1.0f,  1.0f}, { 1.0f, -1.0f,  1.0f},
+        { 1.0f,  1.0f,  1.0f}, {-1.0f,  1.0f,  1.0f},
+    };
+    std::vector<Vertex> vertices;
+    vertices.reserve(std::size(positions));
+    for (const glm::vec3& position : positions) {
+        Vertex vertex{};
+        vertex.position = position;
+        vertices.push_back(vertex);
+    }
+    const std::vector<uint32_t> indices = {
+        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7,
+        0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2,
+        0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5,
+        0, 0, 0, 999, 1, 2,
+    };
+    Mesh mesh(vertices, indices, false, true);
+    ColliderComponent collider;
+    collider.shape = ColliderShape::Mesh;
+    collider.center = {0.25f, 0.0f, 0.0f};
+
+    collider.convex = false;
+    const auto triangleMesh = ColliderUtils::CreateShape(collider, &mesh, glm::vec3(1.0f));
+    if (!triangleMesh || triangleMesh->GetSubType() != JPH::EShapeSubType::Mesh) {
+        std::cerr << "Non-convex collider did not create a triangle mesh shape." << std::endl;
+        return false;
+    }
+
+    collider.convex = true;
+    const auto convexHull = ColliderUtils::CreateShape(collider, &mesh, glm::vec3(1.0f));
+    if (!convexHull || convexHull->GetSubType() != JPH::EShapeSubType::ConvexHull) {
+        std::cerr << "Convex collider did not create a convex hull shape." << std::endl;
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -187,6 +240,15 @@ int main(int argc, char** argv) {
             if (!ok)
                 return 1;
             std::cout << "Mips# runtime tests OK: " << args.testMipsRuntimePath << std::endl;
+            return 0;
+        }
+
+        if (args.testMeshCollider) {
+            if (!RunMeshColliderRegression()) {
+                std::cerr << "Mesh collider regression failed." << std::endl;
+                return 1;
+            }
+            std::cout << "Mesh collider regression OK." << std::endl;
             return 0;
         }
 

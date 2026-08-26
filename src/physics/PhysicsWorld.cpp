@@ -430,13 +430,14 @@ JPH::Ref<JPH::CharacterVirtual> CreateCharacterController(
     return character;
 }
 
-void ConfigureBodySettings(JPH::BodyCreationSettings& settings, const RigidbodyComponent* rb) {
+void ConfigureBodySettings(JPH::BodyCreationSettings& settings, const RigidbodyComponent* rb,
+                           RigidbodyType effectiveBodyType) {
     if (!rb || !rb->enabled) return;
     settings.mFriction = 0.5f;
     settings.mRestitution = std::clamp(rb->bounciness, 0.0f, 1.0f);
     settings.mLinearDamping = std::max(0.0f, rb->linearDrag);
     settings.mGravityFactor = rb->useGravity ? 1.0f : 0.0f;
-    if (rb->bodyType == RigidbodyType::Dynamic) {
+    if (effectiveBodyType == RigidbodyType::Dynamic) {
         settings.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
         settings.mMassPropertiesOverride.mMass = std::max(0.001f, rb->mass);
     }
@@ -473,7 +474,14 @@ void PhysicsWorld::RebuildBodies(Scene& scene) {
     auto addRigidBody = [&](Entity* entity) {
         auto* collider = entity->GetComponent<ColliderComponent>();
         auto* rb = entity->GetComponent<RigidbodyComponent>();
-        const RigidbodyType bodyType = ResolveBodyType(*entity);
+        const RigidbodyType requestedBodyType = ResolveBodyType(*entity);
+        RigidbodyType bodyType = requestedBodyType;
+        if (collider->shape == ColliderShape::Mesh && !collider->convex &&
+            bodyType != RigidbodyType::Static) {
+            MIPSYNC_WARN("Physics: non-convex mesh collider on '{}' requires static physics; "
+                         "ignoring its moving Rigidbody mode", EntityDebugName(*entity));
+            bodyType = RigidbodyType::Static;
+        }
         const ColliderUtils::ColliderWorldPose pose =
             ColliderUtils::ComputePhysicsWorldPose(scene, *entity, *collider, rb);
         const Mesh* mesh = ResolveMeshForCollider(*entity, *collider);
@@ -485,7 +493,7 @@ void PhysicsWorld::RebuildBodies(Scene& scene) {
 
         JPH::BodyCreationSettings settings(shape, ToJoltPos(pose.center), ToJoltQuat(pose.rotation),
                                            ToJoltMotion(bodyType), ToObjectLayer(bodyType));
-        ConfigureBodySettings(settings, rb);
+        ConfigureBodySettings(settings, rb, bodyType);
         if (collider->isTrigger) settings.mIsSensor = true;
         settings.mUserData = static_cast<JPH::uint64>(entity->GetID());
 

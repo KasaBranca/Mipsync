@@ -384,6 +384,7 @@ json EntityComponentsToJson(const Entity& entity) {
         colJson["halfExtents"] = Vec3ToJson(col->halfExtents);
         colJson["radius"] = col->radius;
         colJson["capsuleHeight"] = col->capsuleHeight;
+        colJson["convex"] = col->convex;
         colJson["isTrigger"] = col->isTrigger;
         if (col->cameraShotTrigger)
             colJson["cameraTrigger"] = true;
@@ -982,6 +983,7 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         if (colJson.contains("halfExtents")) Vec3FromJson(colJson["halfExtents"], col.halfExtents);
         col.radius = colJson.value("radius", col.radius);
         col.capsuleHeight = colJson.value("capsuleHeight", col.capsuleHeight);
+        col.convex = colJson.value("convex", true);
         col.isTrigger = colJson.value("isTrigger", false);
         col.cameraShotTrigger =
             colJson.value("cameraTrigger", colJson.value("shotTrigger", IsCameraTriggerTag(ent)));

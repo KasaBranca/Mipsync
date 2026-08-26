@@ -254,7 +254,7 @@ enum class ColliderShape : uint8_t {
     Box = 0,
     Sphere,
     Capsule,
-    Mesh, ///< Convex hull from MeshRenderer (up to 256 verts).
+    Mesh, ///< MeshRenderer geometry; convex hull or static triangle mesh.
 };
 
 struct ColliderComponent : public Component {
@@ -265,6 +265,8 @@ struct ColliderComponent : public Component {
     float radius = 0.5f;
     /// Capsule: height of cylindrical section (excluding hemisphere caps).
     float capsuleHeight = 1.0f;
+    /// Mesh only. When false, preserve the source triangles as a concave static collider.
+    bool convex = true;
     bool isTrigger = false;
     bool cameraShotTrigger = false;
     uint32_t cameraTargetEntityId = 0;

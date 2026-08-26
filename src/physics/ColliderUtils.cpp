@@ -7,8 +7,10 @@
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
+#include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace MipsyncEngine {
@@ -104,7 +106,9 @@ static JPH::RefConst<JPH::Shape> CreateBoundsBoxShape(const glm::vec3& boundsMin
     return box.Create().Get();
 }
 
-static JPH::RefConst<JPH::Shape> CreateConvexMeshShape(const Mesh& mesh, const glm::vec3& lossyScale) {
+static JPH::RefConst<JPH::Shape> CreateConvexMeshShape(const ColliderComponent& col,
+                                                       const Mesh& mesh,
+                                                       const glm::vec3& lossyScale) {
     const auto& verts = mesh.GetVertices();
     if (verts.empty())
         return nullptr;
@@ -120,7 +124,7 @@ static JPH::RefConst<JPH::Shape> CreateConvexMeshShape(const Mesh& mesh, const g
 
     const size_t stride = std::max<size_t>(1, verts.size() / kMaxHullPoints);
     for (size_t i = 0; i < verts.size() && points.size() < static_cast<size_t>(kMaxHullPoints); i += stride) {
-        const glm::vec3 p = verts[i].position * lossyScale;
+        const glm::vec3 p = (verts[i].position - col.center) * lossyScale;
         points.emplace_back(p.x, p.y, p.z);
     }
 
@@ -135,6 +139,64 @@ static JPH::RefConst<JPH::Shape> CreateConvexMeshShape(const Mesh& mesh, const g
     return result.Get();
 }
 
+static JPH::RefConst<JPH::Shape> CreateTriangleMeshShape(const ColliderComponent& col,
+                                                         const Mesh& mesh,
+                                                         const glm::vec3& lossyScale) {
+    const auto& sourceVertices = mesh.GetVertices();
+    const auto& sourceIndices = mesh.GetIndices();
+    if (sourceVertices.empty())
+        return nullptr;
+
+    constexpr JPH::uint32 kInvalidIndex = std::numeric_limits<JPH::uint32>::max();
+    JPH::VertexList vertices;
+    vertices.reserve(sourceVertices.size());
+    std::vector<JPH::uint32> remap(sourceVertices.size(), kInvalidIndex);
+    std::vector<glm::vec3> scaledPositions;
+    scaledPositions.reserve(sourceVertices.size());
+
+    for (size_t i = 0; i < sourceVertices.size(); ++i) {
+        const glm::vec3 p = (sourceVertices[i].position - col.center) * lossyScale;
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+            continue;
+        remap[i] = static_cast<JPH::uint32>(vertices.size());
+        vertices.emplace_back(p.x, p.y, p.z);
+        scaledPositions.push_back(p);
+    }
+
+    JPH::IndexedTriangleList triangles;
+    const size_t indexCount = sourceIndices.empty() ? sourceVertices.size() : sourceIndices.size();
+    triangles.reserve(indexCount / 3u);
+    for (size_t i = 0; i + 2u < indexCount; i += 3u) {
+        const uint32_t source[3] = {
+            sourceIndices.empty() ? static_cast<uint32_t>(i) : sourceIndices[i],
+            sourceIndices.empty() ? static_cast<uint32_t>(i + 1u) : sourceIndices[i + 1u],
+            sourceIndices.empty() ? static_cast<uint32_t>(i + 2u) : sourceIndices[i + 2u],
+        };
+        if (source[0] >= remap.size() || source[1] >= remap.size() || source[2] >= remap.size())
+            continue;
+        const JPH::uint32 a = remap[source[0]];
+        const JPH::uint32 b = remap[source[1]];
+        const JPH::uint32 c = remap[source[2]];
+        if (a == kInvalidIndex || b == kInvalidIndex || c == kInvalidIndex ||
+            a == b || b == c || c == a)
+            continue;
+        const glm::vec3 cross = glm::cross(scaledPositions[b] - scaledPositions[a],
+                                           scaledPositions[c] - scaledPositions[a]);
+        if (glm::dot(cross, cross) <= 1e-12f)
+            continue;
+        triangles.emplace_back(a, b, c);
+    }
+
+    if (triangles.empty())
+        return CreateBoundsBoxShape(mesh.GetBoundsMin(), mesh.GetBoundsMax(), lossyScale);
+
+    JPH::MeshShapeSettings settings(std::move(vertices), std::move(triangles));
+    auto result = settings.Create();
+    if (result.HasError())
+        return CreateBoundsBoxShape(mesh.GetBoundsMin(), mesh.GetBoundsMax(), lossyScale);
+    return result.Get();
+}
+
 JPH::RefConst<JPH::Shape> CreateShape(const ColliderComponent& col, const Mesh* mesh,
                                       const glm::vec3& lossyScale) {
     switch (col.shape) {
@@ -143,8 +205,11 @@ JPH::RefConst<JPH::Shape> CreateShape(const ColliderComponent& col, const Mesh* 
     case ColliderShape::Capsule:
         return CreateCapsuleShape(col, lossyScale);
     case ColliderShape::Mesh:
-        if (mesh)
-            return CreateConvexMeshShape(*mesh, lossyScale);
+        if (mesh) {
+            if (col.convex)
+                return CreateConvexMeshShape(col, *mesh, lossyScale);
+            return CreateTriangleMeshShape(col, *mesh, lossyScale);
+        }
         return CreateBoxShape(col, lossyScale);
     case ColliderShape::Box:
     default:

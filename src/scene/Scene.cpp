@@ -1358,6 +1358,7 @@ Entity* Scene::DuplicateEntity(Entity& source) {
       dstCol.halfExtents = srcCol->halfExtents;
       dstCol.radius = srcCol->radius;
       dstCol.capsuleHeight = srcCol->capsuleHeight;
+      dstCol.convex = srcCol->convex;
       dstCol.isTrigger = srcCol->isTrigger;
       dstCol.cameraShotTrigger = srcCol->cameraShotTrigger;
       dstCol.cameraTargetEntityId = srcCol->cameraTargetEntityId;
