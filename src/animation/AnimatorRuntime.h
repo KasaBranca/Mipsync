@@ -23,7 +23,7 @@ std::vector<AnimatorTransitionProbe> ProbeOutgoingTransitions(const AnimatorComp
 void ForceAnimatorState(AnimatorComponent& animator, const std::string& stateName);
 
 void SampleAnimatorBoneMatrices(const AnimatorComponent& animator, glm::mat4 out[kMaxBones]);
-/// Sample frame zero of the controller's default state for edit-mode preview.
+/// Sample the controller default state's configured starting pose for edit-mode preview.
 void SampleAnimatorDefaultStateBoneMatrices(AnimatorComponent& animator,
                                             glm::mat4 out[kMaxBones]);
 

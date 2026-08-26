@@ -178,10 +178,17 @@ const TransformClipAsset* ResolveStateTransformClip(const AnimatorComponent& ani
     return LoadTransformClip(ResolveStateClipPath(anim, state));
 }
 
+float NormalizedStartOffset(const AnimatorStateDef& state) {
+    return std::isfinite(state.startOffset)
+        ? std::clamp(state.startOffset, 0.0f, 1.0f)
+        : 0.0f;
+}
+
 float TransformClipFrame(const TransformClipAsset& clip, const AnimatorStateDef& state,
                          float stateTime) {
-    const float raw = stateTime * std::max(0.0f, state.speed) * static_cast<float>(clip.fps);
     const float end = static_cast<float>(std::max(1, clip.lengthFrames));
+    const float raw = stateTime * std::max(0.0f, state.speed) * static_cast<float>(clip.fps) +
+                      NormalizedStartOffset(state) * end;
     if (state.loop && end > 0.0f)
         return std::fmod(raw, end);
     return std::clamp(raw, 0.0f, end);
@@ -265,9 +272,11 @@ double ClipDurationForState(const SkeletalModelAsset& model, const AnimatorState
 
 double ClipTimeSeconds(const SkeletalModelAsset& model, const AnimatorStateDef& state, float stateTime) {
     const double duration = ClipDurationForState(model, state);
+    const double raw = static_cast<double>(stateTime) * state.speed +
+                       static_cast<double>(NormalizedStartOffset(state)) * duration;
     if (state.loop && duration > 0.0)
-        return std::fmod(static_cast<double>(stateTime) * state.speed, duration);
-    return std::min(static_cast<double>(stateTime) * state.speed, duration);
+        return std::fmod(raw, duration);
+    return std::clamp(raw, 0.0, duration);
 }
 
 void BlendBoneMatrices(const glm::mat4 a[kMaxBones], const glm::mat4 b[kMaxBones], float t,

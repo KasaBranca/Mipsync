@@ -632,6 +632,11 @@ void DrawStateProperties(AnimatorControllerAsset& asset, int stateIndex,
                           asset.sourceModelPath, model, availableClips, changed);
     if (ImGui::DragFloat("Speed", &st.speed, 0.01f, 0.0f, 10.0f))
         changed = true;
+    if (ImGui::DragFloat("Start Offset", &st.startOffset, 0.01f, 0.0f, 1.0f, "%.3f",
+                         ImGuiSliderFlags_AlwaysClamp))
+        changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Normalized clip position used when this state begins (0 to 1).");
     if (EditorTheme::Checkbox("Loop", &st.loop))
         changed = true;
     if (ImGui::Button("Set as Default State")) {

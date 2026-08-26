@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <unordered_map>
@@ -89,6 +90,7 @@ json ControllerToJson(const AnimatorControllerAsset& asset) {
             { "name", st.name },
             { "clip", st.clipName },
             { "speed", st.speed },
+            { "startOffset", st.startOffset },
             { "loop", st.loop },
         };
         if (st.clipStackIndex >= 0)
@@ -178,6 +180,12 @@ static bool IsTransformAnimationClipPath(const std::string& path) {
 }
 
 static void ValidateAnimatorController(AnimatorControllerAsset& asset) {
+    for (auto& state : asset.states) {
+        if (!std::isfinite(state.startOffset))
+            state.startOffset = 0.0f;
+        state.startOffset = std::clamp(state.startOffset, 0.0f, 1.0f);
+    }
+
     if (asset.defaultState.empty()) {
         if (!asset.states.empty())
             asset.defaultState = asset.states[0].name;
@@ -326,6 +334,7 @@ std::shared_ptr<AnimatorControllerAsset> LoadAnimatorController(const std::strin
                 st.clipSourceModelPath = s.value("clipModel", std::string{});
                 st.clipStackIndex = s.value("stack", -1);
                 st.speed = s.value("speed", 1.0f);
+                st.startOffset = s.value("startOffset", 0.0f);
                 st.loop = s.value("loop", true);
                 if (s.contains("position") && s["position"].is_array() && s["position"].size() >= 2) {
                     st.graphPosition.x = s["position"][0].get<float>();

@@ -86,6 +86,7 @@ struct Ps1ExportedEntity {
     uint16_t transformAnimFirstKey = 0;
     uint16_t transformAnimKeyCount = 0;
     uint16_t transformAnimLengthFrames = 0;
+    uint16_t transformAnimStartFrame = 0;
     uint8_t transformAnimFps = 0;
     bool transformAnimLoop = false;
 

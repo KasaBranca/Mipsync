@@ -2,9 +2,14 @@
 #include "MipsRuntime.h"
 #include "VM.h"
 #include "../core/Log.h"
+#include "../animation/AnimatorControllerIO.h"
+#include "../animation/AnimatorRuntime.h"
+#include "../assets/AssetManager.h"
 #include "../scene/Scene.h"
 #include "../scene/SceneIO.h"
+#include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <vector>
 
 namespace MipsyncEngine::Mips {
@@ -137,6 +142,71 @@ bool RunMipsRuntimeRegressionTests(const char* scriptPath,
         loadedButton->onClick.front().targetEntityId != target->GetID() ||
         loadedButton->onClick.front().methodName != "HandleClick") {
         errors.push_back("scene serialization regression: Button On Click did not round-trip");
+        return false;
+    }
+
+    // Animator state offsets must survive controller serialization and affect
+    // the first sampled frame. A normalized offset of 0.5 on a ten-frame clip
+    // should start halfway through it.
+    AssetManager& assets = AssetManager::Get();
+    const std::string previousProjectRoot = assets.GetProjectRoot();
+    const std::filesystem::path animatorTestRoot =
+        std::filesystem::temp_directory_path() / "mipsync_animator_start_offset_test";
+    std::error_code animatorFsError;
+    std::filesystem::remove_all(animatorTestRoot, animatorFsError);
+    animatorFsError.clear();
+    std::filesystem::create_directories(animatorTestRoot, animatorFsError);
+    bool animatorOffsetOk = !animatorFsError;
+    const std::filesystem::path clipPath = animatorTestRoot / "offset.nanim";
+    const std::filesystem::path controllerPath = animatorTestRoot / "offset.ncontroller";
+    if (animatorOffsetOk) {
+        std::ofstream clipFile(clipPath);
+        clipFile << R"({
+  "fps": 10,
+  "lengthFrames": 10,
+  "keys": [
+    { "frame": 0, "position": [0, 0, 0], "rotation": [0, 0, 0], "scale": [1, 1, 1] },
+    { "frame": 10, "position": [10, 0, 0], "rotation": [0, 0, 0], "scale": [1, 1, 1] }
+  ]
+})";
+        animatorOffsetOk = clipFile.good();
+    }
+
+    AnimatorControllerAsset offsetController;
+    AnimatorStateDef offsetState;
+    offsetState.name = "Offset";
+    offsetState.clipName = "offset";
+    offsetState.clipSourceModelPath = "offset.nanim";
+    offsetState.startOffset = 0.5f;
+    offsetController.defaultState = offsetState.name;
+    offsetController.states.push_back(offsetState);
+    std::string animatorError;
+    if (animatorOffsetOk)
+        animatorOffsetOk = SaveAnimatorController(
+            controllerPath.string(), offsetController, animatorError);
+    const auto loadedController = animatorOffsetOk
+        ? LoadAnimatorController(controllerPath.string(), animatorError)
+        : nullptr;
+    animatorOffsetOk = animatorOffsetOk && loadedController &&
+        loadedController->states.size() == 1 &&
+        std::abs(loadedController->states.front().startOffset - 0.5f) < 1e-6f;
+
+    if (animatorOffsetOk) {
+        assets.SetProjectRoot(animatorTestRoot.string());
+        Scene animatorScene;
+        Entity* animated = animatorScene.CreateEntity("Offset Animated");
+        auto& animator = animated->AddComponent<AnimatorComponent>();
+        animator.controller = loadedController;
+        AnimationSystem::Update(animatorScene, 0.0f);
+        const auto* transform = animated->GetComponent<TransformComponent>();
+        animatorOffsetOk = transform && std::abs(transform->position.x - 5.0f) < 0.001f;
+    }
+    assets.SetProjectRoot(previousProjectRoot);
+    std::filesystem::remove_all(animatorTestRoot, animatorFsError);
+    if (!animatorOffsetOk) {
+        errors.push_back("animator regression: state start offset did not round-trip and sample");
+        if (!animatorError.empty())
+            errors.push_back("animator regression detail: " + animatorError);
         return false;
     }
     return errors.empty();

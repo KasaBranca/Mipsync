@@ -1579,6 +1579,7 @@ struct Ps1AnimatorClipSelection {
     int stackIndex = -1;
     double duration = 0.0;
     float speed = 1.0f;
+    float startOffset = 0.0f;
     std::string stateName;
     std::string clipName;
     std::string clipModelPath;
@@ -1660,6 +1661,9 @@ static Ps1AnimatorClipSelection ResolvePs1AnimatorClip(const std::string& meshMo
     out.stackIndex = stackIndex;
     out.duration = clipModel->GetClipDurationByStackIndex(stackIndex);
     out.speed = std::isfinite(state->speed) && state->speed > 0.001f ? state->speed : 1.0f;
+    out.startOffset = std::isfinite(state->startOffset)
+        ? std::clamp(state->startOffset, 0.0f, 1.0f)
+        : 0.0f;
     out.stateName = state->name;
     out.clipName = state->clipName;
     MIPSYNC_INFO("PS1 rigid bone export: animator state '{}' clip '{}' model '{}' stack {}",
@@ -1702,6 +1706,9 @@ static Ps1AnimatorClipSelection ResolvePs1AnimatorStateClip(
     out.speed = std::isfinite(state->speed) && state->speed > 0.001f
         ? state->speed
         : 1.0f;
+    out.startOffset = std::isfinite(state->startOffset)
+        ? std::clamp(state->startOffset, 0.0f, 1.0f)
+        : 0.0f;
     out.stateName = state->name;
     out.clipName = state->clipName;
     return out;
@@ -2133,7 +2140,8 @@ static bool RegisterRigidBonePartsFromJson(const json& skinned, Ps1SceneExportRe
                 EvaluateRetargetedBoneMatrices(
                     *model, *selected.clipModel, selected.stackIndex,
                     std::fmod(
-                        time * static_cast<double>(selected.speed),
+                        time * static_cast<double>(selected.speed) +
+                            static_cast<double>(selected.startOffset) * selected.duration,
                         selected.duration),
                     bones);
                 const glm::mat4 boneDisplay =
@@ -2174,7 +2182,9 @@ static bool RegisterRigidBonePartsFromJson(const json& skinned, Ps1SceneExportRe
                 if (stackIndex >= 0 && duration > 0.0 && clip.clipModel) {
                     EvaluateRetargetedBoneMatrices(
                         *model, *clip.clipModel, stackIndex,
-                        std::fmod(time * static_cast<double>(clip.speed), duration),
+                        std::fmod(time * static_cast<double>(clip.speed) +
+                                     static_cast<double>(clip.startOffset) * duration,
+                                 duration),
                         bones);
                 } else {
                     model->EvaluateBoneMatrices({}, 0.0, bones);
@@ -2802,6 +2812,13 @@ static bool RegisterTransformAnimationFromAnimator(const json& animator,
     const int declaredLength = std::max(1, clipJson.value("lengthFrames", 1));
     entity.transformAnimLengthFrames = static_cast<uint16_t>(
         std::clamp(std::max(declaredLength, static_cast<int>(keys.back().frame)), 1, 65535));
+    entity.transformAnimStartFrame = static_cast<uint16_t>(std::clamp(
+        static_cast<int>(std::lround(
+            static_cast<double>(entity.transformAnimLengthFrames) *
+            static_cast<double>(std::isfinite(state->startOffset)
+                ? std::clamp(state->startOffset, 0.0f, 1.0f)
+                : 0.0f))),
+        0, static_cast<int>(entity.transformAnimLengthFrames)));
     const float effectiveFps = static_cast<float>(std::max(1, clipJson.value("fps", 30))) *
                                std::max(0.0f, state->speed) *
                                std::max(0.0f, animator.value("speed", 1.0f));
@@ -3832,6 +3849,7 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                 << e.transformAnimFirstKey << "u, "
                 << e.transformAnimKeyCount << "u, "
                 << e.transformAnimLengthFrames << "u, "
+                << e.transformAnimStartFrame << "u, "
                 << static_cast<int>(e.transformAnimFps) << ", "
                 << (e.transformAnimLoop ? 1 : 0) << ", "
                 << (e.hasCamera ? 1 : 0) << ", "

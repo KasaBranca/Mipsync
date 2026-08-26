@@ -43,7 +43,8 @@ static void sample_transform_animation(ps1_entity* e, uint32_t time_q16) {
         return;
 
     keys = g_ps1_scene.transform_anim_keys + e->transform_anim_first_key;
-    frame_q16 = (uint32_t)((uint64_t)time_q16 * (uint32_t)e->transform_anim_fps);
+    frame_q16 = (uint32_t)((uint64_t)time_q16 * (uint32_t)e->transform_anim_fps) +
+                ((uint32_t)e->transform_anim_start_frame << 16);
     end_q16 = (uint32_t)e->transform_anim_length_frames << 16;
     if (e->transform_anim_loop && end_q16 > 0)
         frame_q16 %= end_q16;

@@ -88,6 +88,7 @@ typedef struct ps1_entity {
     uint16_t    transform_anim_first_key;
     uint16_t    transform_anim_key_count;
     uint16_t    transform_anim_length_frames;
+    uint16_t    transform_anim_start_frame;
     uint8_t     transform_anim_fps;
     uint8_t     transform_anim_loop;
     uint8_t     has_camera;

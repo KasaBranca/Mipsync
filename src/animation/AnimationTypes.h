@@ -35,6 +35,8 @@ struct AnimatorStateDef {
     /// ufbx anim_stacks index; -1 = resolve from clipName only.
     int clipStackIndex = -1;
     float speed = 1.0f;
+    /// Normalized position within the clip used when the state begins (0..1).
+    float startOffset = 0.0f;
     bool loop = true;
     /// Visual editor node position (graph space pixels).
     glm::vec2 graphPosition{ 0.0f, 0.0f };
