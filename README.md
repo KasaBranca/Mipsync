@@ -16,10 +16,20 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/sponsors/KasaBranca">
+    <img alt="Sponsor KasaBranca" src="https://img.shields.io/badge/Sponsor-KasaBranca-ea4aaa?style=for-the-badge&amp;logo=githubsponsors&amp;logoColor=white">
+  </a>
+  <a href="https://discord.com/invite/snHHxK2B7G">
+    <img alt="Join the Mipsync Discord" src="https://img.shields.io/badge/Join-Discord-5865F2?style=for-the-badge&amp;logo=discord&amp;logoColor=white">
+  </a>
+</p>
+
+<p align="center">
   <a href="https://mipsyncweb.pages.dev/">Website</a> ·
   <a href="#build-for-playstation">PS1 target</a> ·
   <a href="#mips-scripting">Mips#</a> ·
-  <a href="#live-command-platform">Command-line tools</a>
+  <a href="#live-command-platform">Command-line tools</a> ·
+  <a href="https://discord.com/invite/snHHxK2B7G">Discord</a>
 </p>
 
 Mipsync brings a familiar scene-editor workflow to PlayStation homebrew. Build levels visually, write gameplay in Mips#, preview instantly on Windows, and export the same project to a real PS1 runtime.
