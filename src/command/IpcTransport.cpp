@@ -73,7 +73,8 @@ CommandResult ParseResponse(const std::string& payload, const std::string& reque
 Json EditorInstanceInfo::ToJson() const {
     return {
         {"instanceId", instanceId}, {"processId", processId}, {"projectPath", projectPath},
-        {"projectId", projectId}, {"engineVersion", engineVersion}, {"endpoint", endpoint},
+        {"projectId", projectId}, {"engineVersion", engineVersion},
+        {"executablePath", executablePath}, {"endpoint", endpoint},
         {"protocolVersion", protocolVersion},
     };
 }
@@ -85,6 +86,7 @@ EditorInstanceInfo EditorInstanceInfo::FromJson(const Json& value) {
     instance.projectPath = value.value("projectPath", std::string{});
     instance.projectId = value.value("projectId", std::string{});
     instance.engineVersion = value.value("engineVersion", std::string{});
+    instance.executablePath = value.value("executablePath", std::string{});
     instance.endpoint = value.value("endpoint", std::string{});
     instance.protocolVersion = value.value("protocolVersion", 0);
     return instance;

@@ -26,6 +26,7 @@
 //   public bool grounded = true;
 //   public int phase = 0;
 //   public AudioClip music;  // Inspector audio asset drag-and-drop
+//   public Vector3 travel = Vector3(0, 3, 0); // Inspector XYZ field
 //
 // Auto-properties (backing field, Unity-style):
 //   public float Speed { get; set; }
@@ -86,6 +87,11 @@
 //   Physics.Raycast(ox, oy, oz, dx, dy, dz, maxDist) -> entity id (0 = miss)
 //   Physics.Move(vx, vy, vz) — desired velocity in m/s (CharacterVirtual)
 //   Physics.IsGrounded() -> 1.0 / 0.0 (Jolt raycast from capsule feet)
+//   Physics.IsGroundedWithin(distance) -> floor is within distance below collider
+//   Physics.UseCharacterController() — configure before the first physics frame
+//   Physics.UseKinematicController() — script-driven movement without gravity
+//   Physics.MoveKinematic(vx, vy, vz) — move this kinematic body in m/s;
+//       grounded CharacterVirtuals inherit its platform velocity
 //   Physics.otherEntityId — other entity id during OnCollision*/OnTrigger* callbacks
 //
 // Scene / application:
@@ -102,6 +108,7 @@
 //   Input.GetKey("W"), Input.GetKeyDown("Space"), Input.GetKeyUp("Space")
 //   Input.GetAxis("Horizontal"), Input.GetAxis("Vertical")
 //   Input.mouseDeltaX / mouseDeltaY, Input.SetCursorLocked(1)
+//   Camera.Follow(camera, yaw, distance, height, lookHeight, sharpness[, pitchOffset])
 //
 // Common helpers:
 //   Debug.Log("value=", value)  // alias of Log.Info
@@ -112,6 +119,8 @@
 //   Animator.SetBool("Grounded", 1)
 //   Animator.SetInt("Phase", 2)
 //   Animator.SetTrigger("Jump")
+//   Animator.SetTriggerHeld("Jump")  // hold Exit Time pose until released
+//   Animator.ReleaseTrigger("Jump")
 //   var anim = GetComponent<Animator>();
 //   anim.SetFloat("Speed", 1.0);
 //

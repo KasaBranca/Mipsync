@@ -194,6 +194,8 @@ mipsync runtime play
 
 Use `mipsync help`, `mipsync search`, and `mipsync describe` to discover commands without memorizing the command surface.
 
+Agents use the versioned [`mipsync-cli` Skill](skills/mipsync-cli/SKILL.md) for safe project routing, structured inspection, verified scene authoring, Mips# validation, and playtest workflows. Opening a project installs it into the standard `.agents/skills` discovery path and adds a managed `AGENTS.md` rule requiring it for Mipsync project operations.
+
 ## Repository map
 
 | Path | What lives here |
@@ -201,9 +203,10 @@ Use `mipsync help`, `mipsync search`, and `mipsync describe` to discover command
 | `src/` | C++20 engine, editor, renderer, physics, asset pipeline, Mips# compiler and VM |
 | `templates/ps1/` | PS1 runtime and generated-build templates |
 | `hub-tauri/` | React + Tauri project Hub |
+| `skills/` | Reusable Agent Skills for operating Mipsync tooling |
 | `tests/` | Runtime, command-platform, modeling, physics, and scripting regressions |
 
-Release infrastructure, installers, generated builds, proprietary platform material, and private test projects are intentionally kept outside the public source scope.
+Generated binaries, proprietary platform material, and private test projects are intentionally kept outside the public source tree; release automation and manifests are maintained here for reproducible publishing.
 
 ## Contributing
 

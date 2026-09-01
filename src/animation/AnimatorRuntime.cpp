@@ -49,6 +49,8 @@ bool ConditionPasses(const AnimatorComponent& anim, const AnimatorTransitionCond
             return trigIt->second;
         return boolIt != anim.parameters.bools.end() && boolIt->second;
     case AnimatorConditionMode::IfFalse:
+        if (anim.heldTriggers.count(cond.parameter))
+            return false;
         if (const auto trigIt = anim.parameters.triggers.find(cond.parameter);
             trigIt != anim.parameters.triggers.end())
             return !trigIt->second;
@@ -194,11 +196,17 @@ float TransformClipFrame(const TransformClipAsset& clip, const AnimatorStateDef&
     return std::clamp(raw, 0.0f, end);
 }
 
-float TransformClipNormalizedTime(const TransformClipAsset& clip, const AnimatorStateDef& state,
-                                  float stateTime) {
+float TransformClipElapsedNormalizedTime(const TransformClipAsset& clip,
+                                         const AnimatorStateDef& state,
+                                         float stateTime) {
     const float end = static_cast<float>(std::max(1, clip.lengthFrames));
-    return end > 0.0f ? std::clamp(TransformClipFrame(clip, state, stateTime) / end, 0.0f, 1.0f)
-                      : 0.0f;
+    if (end <= 0.0f)
+        return 0.0f;
+
+    // Exit Time measures time elapsed since entering the state. Start Offset
+    // only selects the sampled pose, and looping must not wrap this clock.
+    return std::max(0.0f, stateTime) * std::max(0.0f, state.speed) *
+           static_cast<float>(clip.fps) / end;
 }
 
 void SampleTransformClipToEntity(const TransformClipAsset& clip, const AnimatorStateDef& state,
@@ -324,12 +332,17 @@ void EvaluateStatePose(AnimatorComponent& anim, const AnimatorStateDef& state, f
     }
 }
 
-double NormalizedStateTime(const SkeletalModelAsset& model, const AnimatorStateDef& state,
-                           float stateTime) {
+double ElapsedNormalizedStateTime(const SkeletalModelAsset& model,
+                                  const AnimatorStateDef& state,
+                                  float stateTime) {
     const double dur = ClipDurationForState(model, state);
     if (dur <= 0.0)
         return 0.0;
-    return ClipTimeSeconds(model, state, stateTime) / dur;
+
+    // Keep transition timing independent from pose sampling. In particular,
+    // do not add Start Offset or wrap looped clips back to normalized time 0.
+    return static_cast<double>(std::max(0.0f, stateTime)) *
+           static_cast<double>(std::max(0.0f, state.speed)) / dur;
 }
 
 bool TransitionExitTimeReached(const SkeletalModelAsset& model, const AnimatorStateDef& state,
@@ -339,7 +352,8 @@ bool TransitionExitTimeReached(const SkeletalModelAsset& model, const AnimatorSt
     const double dur = ClipDurationForState(model, state);
     if (dur <= 0.0)
         return true;
-    return NormalizedStateTime(model, state, stateTime) >= static_cast<double>(tr.exitTime);
+    return ElapsedNormalizedStateTime(model, state, stateTime) >=
+           static_cast<double>(tr.exitTime);
 }
 
 bool AnimatorTransitionExitTimeReached(const AnimatorComponent& anim,
@@ -349,10 +363,40 @@ bool AnimatorTransitionExitTimeReached(const AnimatorComponent& anim,
     if (!tr.hasExitTime)
         return true;
     if (const TransformClipAsset* clip = ResolveStateTransformClip(anim, state))
-        return TransformClipNormalizedTime(*clip, state, stateTime) >= tr.exitTime;
+        return TransformClipElapsedNormalizedTime(*clip, state, stateTime) >= tr.exitTime;
     if (const auto model = ResolveStateClipModel(anim, state))
         return TransitionExitTimeReached(*model, state, stateTime, tr);
     return true;
+}
+
+bool AnimatorStateTimeAtNormalizedExit(const AnimatorComponent& anim,
+                                       const AnimatorStateDef& state,
+                                       float normalizedExitTime,
+                                       float& outStateTime) {
+    if (!std::isfinite(normalizedExitTime) || normalizedExitTime < 0.0f)
+        return false;
+
+    const float stateSpeed = std::max(0.0f, state.speed);
+    if (stateSpeed <= 0.0f)
+        return false;
+
+    if (const TransformClipAsset* clip = ResolveStateTransformClip(anim, state)) {
+        const float fps = static_cast<float>(std::max(1, clip->fps));
+        const float frames = static_cast<float>(std::max(1, clip->lengthFrames));
+        outStateTime = normalizedExitTime * frames / (fps * stateSpeed);
+        return std::isfinite(outStateTime);
+    }
+
+    if (const auto model = ResolveStateClipModel(anim, state)) {
+        const double duration = ClipDurationForState(*model, state);
+        if (duration <= 0.0)
+            return false;
+        outStateTime = static_cast<float>(
+            static_cast<double>(normalizedExitTime) * duration /
+            static_cast<double>(stateSpeed));
+        return std::isfinite(outStateTime);
+    }
+    return false;
 }
 
 const char* ConditionModeLabel(AnimatorConditionMode mode) {
@@ -421,9 +465,11 @@ std::vector<AnimatorTransitionProbe> ProbeOutgoingTransitions(const AnimatorComp
         if (curState && !AnimatorTransitionExitTimeReached(animator, *curState, animator.stateTime, tr)) {
             float normalizedTime = 0.0f;
             if (const TransformClipAsset* clip = ResolveStateTransformClip(animator, *curState))
-                normalizedTime = TransformClipNormalizedTime(*clip, *curState, animator.stateTime);
+                normalizedTime = TransformClipElapsedNormalizedTime(
+                    *clip, *curState, animator.stateTime);
             else if (const auto curModel = ResolveStateClipModel(animator, *curState))
-                normalizedTime = static_cast<float>(NormalizedStateTime(*curModel, *curState, animator.stateTime));
+                normalizedTime = static_cast<float>(ElapsedNormalizedStateTime(
+                    *curModel, *curState, animator.stateTime));
             probe.detail = "exit time: norm " + std::to_string(normalizedTime) + " < " +
                            std::to_string(tr.exitTime);
             probes.push_back(probe);
@@ -525,6 +571,7 @@ void AnimatorComponent::ResetToDefaultState() {
     transitionDuration = 0.0f;
     transitionTime = 0.0f;
     inTransition = false;
+    heldTriggers.clear();
 
     if (controller && !controller->defaultState.empty() &&
         FindState(*controller, controller->defaultState)) {
@@ -663,6 +710,9 @@ void AnimationSystem::Update(Scene& scene, float deltaTime) {
 
         if (!animator->inTransition && animator->controller) {
             const AnimatorStateDef* curState = FindState(*animator->controller, animator->currentState);
+            float exitHoldStateTime = 0.0f;
+            bool shouldHoldAtExit = false;
+            bool transitionChosen = false;
 
             for (const auto& tr : animator->controller->transitions) {
                 if (tr.fromState != animator->currentState &&
@@ -681,8 +731,24 @@ void AnimationSystem::Update(Scene& scene, float deltaTime) {
                         break;
                     }
                 }
-                if (!allPass)
+                if (!allPass) {
+                    // Match the PS1 runtime: once an outgoing transition's
+                    // Exit Time has been reached, hold that pose until its
+                    // conditions pass. Any State transitions must not freeze
+                    // every state in the controller.
+                    if (curState && tr.hasExitTime &&
+                        tr.fromState == animator->currentState) {
+                        float candidateStateTime = 0.0f;
+                        if (AnimatorStateTimeAtNormalizedExit(
+                                *animator, *curState, tr.exitTime,
+                                candidateStateTime) &&
+                            (!shouldHoldAtExit || candidateStateTime < exitHoldStateTime)) {
+                            exitHoldStateTime = candidateStateTime;
+                            shouldHoldAtExit = true;
+                        }
+                    }
                     continue;
+                }
 
                 animator->nextState = tr.toState;
                 animator->transitionDuration = std::max(0.0f, tr.duration);
@@ -692,8 +758,12 @@ void AnimationSystem::Update(Scene& scene, float deltaTime) {
                     animator->currentState = animator->nextState;
                     animator->stateTime = 0.0f;
                 }
+                transitionChosen = true;
                 break;
             }
+
+            if (!transitionChosen && shouldHoldAtExit)
+                animator->stateTime = std::min(animator->stateTime, exitHoldStateTime);
         }
 
         if (animator->inTransition) {
@@ -734,6 +804,10 @@ void AnimationSystem::Update(Scene& scene, float deltaTime) {
                 EvaluateStatePose(*animator, *cur, animator->stateTime, animator->boneMatrices);
         }
 
+        /* Held triggers are still edge-triggered on entry. The heldTriggers
+         * set, not a perpetually true trigger bit, blocks an outgoing IfFalse
+         * condition until Mips# calls ReleaseTrigger. This prevents Any State
+         * transitions from restarting the held state every frame. */
         for (const std::string& trig : firedTriggers)
             animator->parameters.triggers[trig] = false;
     }

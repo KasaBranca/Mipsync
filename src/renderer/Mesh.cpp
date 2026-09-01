@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <unordered_map>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 
@@ -32,6 +33,82 @@ Mesh::Mesh(const std::vector<Vertex>& vertices, const std::vector<uint32_t>& ind
 }
 
 Mesh::~Mesh() { Cleanup(); }
+
+Mesh Mesh::CreateSubdivided(const Mesh& source, int maxLevels,
+                            float maxEdgeLength, const glm::vec3& worldScale,
+                            bool cpuOnly) {
+    std::vector<Vertex> vertices = source.GetVertices();
+    std::vector<uint32_t> indices = source.GetIndices();
+    maxLevels = std::clamp(maxLevels, 0, 4);
+    const glm::vec3 safeScale = glm::abs(worldScale);
+
+    auto midpoint = [&](uint32_t a, uint32_t b,
+                        std::unordered_map<uint64_t, uint32_t>& cache) -> uint32_t {
+        const uint32_t lo = std::min(a, b);
+        const uint32_t hi = std::max(a, b);
+        const uint64_t key = static_cast<uint64_t>(lo) |
+                             (static_cast<uint64_t>(hi) << 32u);
+        if (const auto found = cache.find(key); found != cache.end())
+            return found->second;
+        const Vertex& va = vertices[a];
+        const Vertex& vb = vertices[b];
+        Vertex vm{};
+        vm.position = (va.position + vb.position) * 0.5f;
+        vm.normal = va.normal + vb.normal;
+        const float normalLength = glm::length(vm.normal);
+        vm.normal = normalLength > 1e-6f
+            ? vm.normal / normalLength
+            : glm::vec3(0.0f, 1.0f, 0.0f);
+        vm.uv = (va.uv + vb.uv) * 0.5f;
+        vm.color = (va.color + vb.color) * 0.5f;
+        const uint32_t index = static_cast<uint32_t>(vertices.size());
+        vertices.push_back(vm);
+        cache.emplace(key, index);
+        return index;
+    };
+
+    for (int level = 0; level < maxLevels && indices.size() >= 3; ++level) {
+        if (maxEdgeLength > 0.0f) {
+            float longest = 0.0f;
+            for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+                const glm::vec3 p[3] = {
+                    vertices[indices[i]].position * safeScale,
+                    vertices[indices[i + 1]].position * safeScale,
+                    vertices[indices[i + 2]].position * safeScale,
+                };
+                longest = std::max(longest, glm::length(p[1] - p[0]));
+                longest = std::max(longest, glm::length(p[2] - p[1]));
+                longest = std::max(longest, glm::length(p[0] - p[2]));
+            }
+            if (longest <= maxEdgeLength)
+                break;
+        }
+
+        std::unordered_map<uint64_t, uint32_t> edgeMidpoints;
+        edgeMidpoints.reserve(indices.size());
+        std::vector<uint32_t> refined;
+        refined.reserve(indices.size() * 4u);
+        for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+            const uint32_t a = indices[i];
+            const uint32_t b = indices[i + 1];
+            const uint32_t c = indices[i + 2];
+            if (a >= vertices.size() || b >= vertices.size() || c >= vertices.size())
+                continue;
+            const uint32_t ab = midpoint(a, b, edgeMidpoints);
+            const uint32_t bc = midpoint(b, c, edgeMidpoints);
+            const uint32_t ca = midpoint(c, a, edgeMidpoints);
+            refined.insert(refined.end(), {
+                a, ab, ca,
+                ab, b, bc,
+                ca, bc, c,
+                ab, bc, ca,
+            });
+        }
+        indices = std::move(refined);
+    }
+
+    return Mesh(vertices, indices, false, cpuOnly);
+}
 
 Mesh::Mesh(Mesh&& o) noexcept
     : m_VAO(o.m_VAO), m_VBO(o.m_VBO), m_EBO(o.m_EBO),
@@ -125,7 +202,7 @@ void Mesh::Cleanup() {
 void Mesh::Bind() const { glBindVertexArray(m_VAO); }
 void Mesh::Unbind() const { glBindVertexArray(0); }
 
-Mesh Mesh::CreateCube(float size) {
+Mesh Mesh::CreateCube(float size, bool cpuOnly) {
     float h = size * 0.5f;
     glm::vec4 white(1.0f);
 
@@ -173,10 +250,10 @@ Mesh Mesh::CreateCube(float size) {
         indices.push_back(base + 3);
     }
 
-    return Mesh(vertices, indices);
+    return Mesh(vertices, indices, false, cpuOnly);
 }
 
-Mesh Mesh::CreatePlane(float size, int subdivisions) {
+Mesh Mesh::CreatePlane(float size, int subdivisions, bool cpuOnly) {
     float h = size * 0.5f;
     float step = size / static_cast<float>(subdivisions);
     glm::vec4 white(1.0f);
@@ -204,7 +281,7 @@ Mesh Mesh::CreatePlane(float size, int subdivisions) {
         }
     }
 
-    return Mesh(vertices, indices);
+    return Mesh(vertices, indices, false, cpuOnly);
 }
 
 Mesh Mesh::CreateTerrain(float size, int subdivisions, float heightScale, float noiseScale,

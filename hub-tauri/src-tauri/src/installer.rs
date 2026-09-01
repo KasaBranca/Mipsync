@@ -1,3 +1,4 @@
+use super::github::Asset;
 use super::settings::{ensure_dir, HubSettings};
 use std::collections::BTreeMap;
 use std::fs;
@@ -124,6 +125,35 @@ mod tests {
         assert!(versions_equal("v2026.7.9", "2026.7.9"));
         assert!(!versions_equal("v2026.7.9", "v2026.7.8"));
     }
+}
+
+pub fn install_release_asset(
+    settings: &HubSettings,
+    version: &str,
+    asset: &Asset,
+) -> Result<InstalledEditor, String> {
+    let installs_root = settings.installs_root_dir();
+    ensure_dir(&installs_root)?;
+
+    let dest_dir = installs_root.join(version);
+    if dest_dir.exists() {
+        // Overwrite by removing existing directory.
+        fs::remove_dir_all(&dest_dir).map_err(|e| e.to_string())?;
+    }
+    ensure_dir(&dest_dir)?;
+
+    let tmp_zip = dest_dir.join("_download.zip");
+    download_to_file(&asset.browser_download_url, &tmp_zip)?;
+
+    extract_zip(&tmp_zip, &dest_dir)?;
+    let _ = fs::remove_file(&tmp_zip);
+
+    let exe = find_engine_exe_in(&dest_dir);
+    Ok(InstalledEditor {
+        version: version.to_string(),
+        root_dir: dest_dir.to_string_lossy().into_owned(),
+        engine_exe: exe.map(|p| p.to_string_lossy().into_owned()),
+    })
 }
 
 pub fn install_from_url(

@@ -37,6 +37,12 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// Asset thumbnails often use the editor's blue accent themselves. Keep file
+// selection neutral so the artwork remains readable instead of merging into
+// a saturated blue tile.
+const ImVec4 kProjectSelectionBg = UiTokens::Hex(0x545454);
+const ImVec4 kProjectSelectionBorder = UiTokens::Hex(0x787878);
+
 bool StrEndsWithCI(const std::string& s, const std::string& suffix) {
     if (s.size() < suffix.size()) return false;
     for (size_t i = 0; i < suffix.size(); ++i) {
@@ -114,6 +120,9 @@ std::string JoinProjectRel(const std::string& a, const std::string& b) {
     if (b.empty()) return a;
     return a + "/" + b;
 }
+
+std::string MipsClassNameFromStem(const std::string& stem);
+std::string NewMipsScriptBody(const std::string& stem);
 
 /// Unity-style project panel roots (project filesystem root is hidden).
 constexpr const char* kAssetsRoot = "assets";
@@ -649,17 +658,223 @@ bool AssetBrowserPanel::RenameAssetAt(const std::string& projectRelPath, const s
     return true;
 }
 
+std::string AssetBrowserPanel::MakeUniqueAssetPath(const std::string& folder,
+                                                   const std::string& stem,
+                                                   const std::string& extension) const {
+    std::string fileName = stem + extension;
+    std::string rel = JoinProjectRel(folder, fileName);
+    std::error_code ec;
+    int suffix = 1;
+    while (fs::exists(PathUtf8::FromString(AssetManager::Get().ToAbsolute(rel)), ec)) {
+        ec.clear();
+        fileName = stem + " " + std::to_string(suffix++) + extension;
+        rel = JoinProjectRel(folder, fileName);
+    }
+    return rel;
+}
+
+bool AssetBrowserPanel::CreateScriptAsset(const std::string& requestedName,
+                                          std::string& outProjectRelPath,
+                                          std::string& outError) {
+    std::string stem = PathUtf8::ToString(PathUtf8::FromString(requestedName).stem());
+    if (stem.empty())
+        stem = "NewScript";
+    if (stem.find_first_of("\\/:*?\"<>|") != std::string::npos) {
+        outError = "invalid script name";
+        return false;
+    }
+
+    const std::string folder = "assets/scripts";
+    const fs::path folderAbs = PathUtf8::FromString(AssetManager::Get().ToAbsolute(folder));
+    std::error_code ec;
+    fs::create_directories(folderAbs, ec);
+    if (ec) {
+        outError = ec.message();
+        return false;
+    }
+
+    outProjectRelPath = MakeUniqueAssetPath(folder, stem, ".mips");
+    const fs::path absolute =
+        PathUtf8::FromString(AssetManager::Get().ToAbsolute(outProjectRelPath));
+    std::ofstream file(absolute, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "failed to create script";
+        outProjectRelPath.clear();
+        return false;
+    }
+    file << NewMipsScriptBody(stem);
+    file.close();
+    if (!file.good()) {
+        outError = "failed to write script";
+        outProjectRelPath.clear();
+        return false;
+    }
+    Refresh();
+    return true;
+}
+
+void AssetBrowserPanel::BeginInlineRename(const std::string& projectRelPath, bool createdAsset) {
+    if (projectRelPath.empty())
+        return;
+    m_RenameTargetPath = projectRelPath;
+    m_RenameCreatedAsset = createdAsset;
+    m_RenameFocusRequested = true;
+    const fs::path path = PathUtf8::FromString(projectRelPath);
+    const std::string editable =
+        ClassifyAssetByPath(projectRelPath) == AssetKind::Folder
+            ? PathUtf8::ToString(path.filename())
+            : PathUtf8::ToString(path.stem());
+    std::memset(m_RenameBuffer, 0, sizeof(m_RenameBuffer));
+    std::strncpy(m_RenameBuffer, editable.c_str(), sizeof(m_RenameBuffer) - 1);
+}
+
+void AssetBrowserPanel::CommitInlineRename(const AssetEntry& entry) {
+    if (entry.projectRelPath != m_RenameTargetPath)
+        return;
+
+    const fs::path oldPath = PathUtf8::FromString(entry.projectRelPath);
+    std::string newFileName = m_RenameBuffer;
+    if (!entry.isDirectory) {
+        const std::string extension = PathUtf8::ToString(oldPath.extension());
+        if (!StrEndsWithCI(newFileName, extension))
+            newFileName += extension;
+    }
+
+    if (newFileName == PathUtf8::ToString(oldPath.filename())) {
+        m_RenameTargetPath.clear();
+        m_RenameCreatedAsset = false;
+        return;
+    }
+
+    std::string error;
+    if (!RenameAssetAt(entry.projectRelPath, newFileName, error)) {
+        m_LastError = error;
+        m_RenameFocusRequested = true;
+        return;
+    }
+
+    InvalidateAssetCaches(entry.projectRelPath, entry.kind);
+    const std::string newRel = JoinProjectRel(
+        PathUtf8::ToString(oldPath.parent_path()), newFileName);
+
+    if (m_RenameCreatedAsset && entry.kind == AssetKind::Script) {
+        const fs::path renamedAbs =
+            PathUtf8::FromString(AssetManager::Get().ToAbsolute(newRel));
+        std::ifstream input(renamedAbs, std::ios::binary);
+        std::string body((std::istreambuf_iterator<char>(input)),
+                         std::istreambuf_iterator<char>());
+        input.close();
+        const size_t classStart = body.find("class ");
+        const size_t classEnd = classStart == std::string::npos
+            ? std::string::npos
+            : body.find(" : MipsBehaviour", classStart);
+        if (classEnd != std::string::npos) {
+            const size_t nameStart = classStart + 6;
+            body.replace(nameStart, classEnd - nameStart,
+                         MipsClassNameFromStem(PathUtf8::ToString(
+                             PathUtf8::FromString(newFileName).stem())));
+            std::ofstream output(renamedAbs, std::ios::binary | std::ios::trunc);
+            if (output.is_open())
+                output << body;
+        }
+    }
+
+    m_RenameTargetPath.clear();
+    m_RenameCreatedAsset = false;
+    m_LastError.clear();
+    m_LastInfo = "Renamed to: " + newFileName;
+    m_SelectedAssets.clear();
+    m_SelectedAssets.push_back(SelectedAsset{newRel, entry.kind});
+    m_SelectionAnchorIndex = SIZE_MAX;
+    RescanFolderTree();
+    Refresh();
+}
+
+void AssetBrowserPanel::CreateAssetAndBeginRename(AssetKind kind) {
+    std::string folder = NormalizeContentFolder(m_CurrentFolder);
+    if (kind == AssetKind::Scene) {
+        if (folder.rfind(kScenesRoot, 0) != 0)
+            folder = kScenesRoot;
+    } else if (kind != AssetKind::Folder && folder.rfind(kAssetsRoot, 0) != 0) {
+        folder = kAssetsRoot;
+    }
+
+    std::string stem;
+    std::string extension;
+    switch (kind) {
+    case AssetKind::Folder: stem = "New Folder"; break;
+    case AssetKind::Scene: stem = "New Scene"; extension = ".nscene"; break;
+    case AssetKind::Material: stem = "New Material"; extension = ".nmat"; break;
+    case AssetKind::AnimatorController:
+        stem = "New Animator Controller"; extension = ".ncontroller"; break;
+    case AssetKind::Script: stem = "NewScript"; extension = ".mips"; break;
+    default: return;
+    }
+
+    const std::string rel = MakeUniqueAssetPath(folder, stem, extension);
+    const fs::path absolute = PathUtf8::FromString(AssetManager::Get().ToAbsolute(rel));
+    std::error_code ec;
+    fs::create_directories(absolute.parent_path(), ec);
+    if (ec) {
+        m_LastError = ec.message();
+        return;
+    }
+
+    bool created = false;
+    std::string error;
+    if (kind == AssetKind::Folder) {
+        created = fs::create_directory(absolute, ec) && !ec;
+        if (ec) error = ec.message();
+    } else if (kind == AssetKind::Script) {
+        std::ofstream file(absolute, std::ios::binary | std::ios::trunc);
+        if (file.is_open()) {
+            file << NewMipsScriptBody(stem);
+            file.close();
+            created = file.good();
+        }
+        if (!created) error = "failed to write script";
+    } else if (kind == AssetKind::Material) {
+        Material material;
+        created = Material::Save(PathUtf8::ToString(absolute), material, error);
+    } else if (kind == AssetKind::AnimatorController) {
+        const auto controller = CreateEmptyController();
+        created = controller &&
+            SaveAnimatorController(PathUtf8::ToString(absolute), *controller, error);
+    } else if (kind == AssetKind::Scene) {
+        Scene scene;
+        Entity* camera = scene.CreateEntity("Main Camera");
+        auto& cameraComponent = camera->AddComponent<CameraComponent>();
+        cameraComponent.camera.fov = 60.0f;
+        cameraComponent.camera.nearClip = 0.1f;
+        cameraComponent.camera.farClip = 100.0f;
+        cameraComponent.primary = true;
+        camera->GetComponent<TransformComponent>()->position = {0.0f, 2.0f, 6.0f};
+        created = SceneIO::SaveToFile(scene, PathUtf8::ToString(absolute), error);
+    }
+
+    if (!created) {
+        m_LastError = error.empty() ? "asset creation failed" : error;
+        return;
+    }
+
+    m_CurrentFolder = folder;
+    ExpandTreeToFolder(folder);
+    m_SelectedAssets.clear();
+    m_SelectedAssets.push_back(SelectedAsset{rel, kind});
+    m_SelectionAnchorIndex = SIZE_MAX;
+    m_LastError.clear();
+    m_LastInfo = "Created: " + rel;
+    RescanFolderTree();
+    Refresh();
+    BeginInlineRename(rel, true);
+}
+
 void AssetBrowserPanel::OpenRenameDialogForSelection() {
     if (m_SelectedAssets.size() != 1)
         return;
     if (m_SelectedAssets.front().kind == AssetKind::AnimationClip)
         return;
-    m_RenameTargetPath = m_SelectedAssets.front().projectRelPath;
-    const fs::path p = PathUtf8::FromString(m_RenameTargetPath);
-    const std::string current = PathUtf8::ToString(p.filename());
-    std::memset(m_RenameBuffer, 0, sizeof(m_RenameBuffer));
-    std::strncpy(m_RenameBuffer, current.c_str(), sizeof(m_RenameBuffer) - 1);
-    m_OpenRenameDialog = true;
+    BeginInlineRename(m_SelectedAssets.front().projectRelPath);
 }
 
 void AssetBrowserPanel::DrawAssetContextMenu(const AssetEntry& entry, size_t entryIndex) {
@@ -671,7 +886,7 @@ void AssetBrowserPanel::DrawAssetContextMenu(const AssetEntry& entry, size_t ent
 
     const size_t selCount = m_SelectedAssets.size();
 
-    if (selCount == 1 && !entry.isSubAsset && ImGui::MenuItem("Rename..."))
+    if (selCount == 1 && !entry.isSubAsset && ImGui::MenuItem("Rename"))
         OpenRenameDialogForSelection();
 
     if (selCount == 1 && entry.kind == AssetKind::Scene && ImGui::MenuItem("Open Scene")) {
@@ -725,6 +940,8 @@ void AssetBrowserPanel::DrawAssetContextMenu(const AssetEntry& entry, size_t ent
 void AssetBrowserPanel::HandleGridKeyboardShortcuts() {
     if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows))
         return;
+    if (!m_RenameTargetPath.empty())
+        return;
 
     if (ImGui::IsKeyPressed(ImGuiKey_Delete))
         DeleteSelectedAssets();
@@ -733,50 +950,7 @@ void AssetBrowserPanel::HandleGridKeyboardShortcuts() {
 }
 
 void AssetBrowserPanel::DrawRenameDialog() {
-    if (m_OpenRenameDialog) {
-        ImGui::OpenPopup("Rename Asset");
-        m_OpenRenameDialog = false;
-    }
-
-    ImGui::SetNextWindowSize(ImVec2(380.0f, 0.0f), ImGuiCond_Appearing);
-    if (!ImGui::BeginPopupModal("Rename Asset", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
-        return;
-
-    ImGui::TextColored(EditorTheme::TextSecondary, "%s", m_RenameTargetPath.c_str());
-    ImGui::Spacing();
-    ImGui::PushItemWidth(-1.0f);
-    ImGui::InputText("##rename", m_RenameBuffer, sizeof(m_RenameBuffer));
-    ImGui::PopItemWidth();
-    ImGui::Spacing();
-
-    const float bw = 100.0f;
-    ImGui::SetCursorPosX(ImGui::GetWindowContentRegionMax().x - bw * 2.0f -
-                          ImGui::GetStyle().ItemSpacing.x);
-    if (EditorTheme::AeroButton("Cancel", ImVec2(bw, EditorTheme::ButtonHeight), AeroButtonKind::Secondary))
-        ImGui::CloseCurrentPopup();
-    ImGui::SameLine();
-    if (EditorTheme::AeroButton("Rename", ImVec2(bw, EditorTheme::ButtonHeight), AeroButtonKind::Primary)) {
-        std::string err;
-        AssetKind kind = AssetKind::Other;
-        for (const auto& e : m_Entries) {
-            if (e.projectRelPath == m_RenameTargetPath) {
-                kind = e.kind;
-                break;
-            }
-        }
-        if (RenameAssetAt(m_RenameTargetPath, m_RenameBuffer, err)) {
-            InvalidateAssetCaches(m_RenameTargetPath, kind);
-            m_LastInfo = "Renamed to: " + std::string(m_RenameBuffer);
-            m_LastError.clear();
-            ClearAssetSelection();
-            RescanFolderTree();
-            Refresh();
-            ImGui::CloseCurrentPopup();
-        } else {
-            m_LastError = err;
-        }
-    }
-    ImGui::EndPopup();
+    // Renaming is rendered directly over the selected grid item's filename.
 }
 
 void AssetBrowserPanel::RescanFolderTree() {
@@ -1122,16 +1296,16 @@ void AssetBrowserPanel::DrawPanelContextMenu() {
 
     if (ImGui::MenuItem("Refresh"))
         Refresh();
-    if (ImGui::MenuItem("New Folder..."))
-        m_OpenNewFolderDialog = true;
-    if (ImGui::MenuItem("New Scene..."))
-        m_OpenNewSceneDialog = true;
-    if (ImGui::MenuItem("New Material..."))
-        m_OpenNewMaterialDialog = true;
-    if (ImGui::MenuItem("New Animator Controller..."))
-        m_OpenNewAnimatorControllerDialog = true;
-    if (ImGui::MenuItem("New Script..."))
-        m_OpenNewScriptDialog = true;
+    if (ImGui::MenuItem("New Folder"))
+        CreateAssetAndBeginRename(AssetKind::Folder);
+    if (ImGui::MenuItem("New Scene"))
+        CreateAssetAndBeginRename(AssetKind::Scene);
+    if (ImGui::MenuItem("New Material"))
+        CreateAssetAndBeginRename(AssetKind::Material);
+    if (ImGui::MenuItem("New Animator Controller"))
+        CreateAssetAndBeginRename(AssetKind::AnimatorController);
+    if (ImGui::MenuItem("New Script"))
+        CreateAssetAndBeginRename(AssetKind::Script);
 #ifdef _WIN32
     if (ImGui::MenuItem("Import..."))
         m_OpenImportDialog = true;
@@ -1145,7 +1319,7 @@ void AssetBrowserPanel::DrawPanelContextMenu() {
 
     if (!m_SelectedAssets.empty()) {
         ImGui::Separator();
-        if (m_SelectedAssets.size() == 1 && ImGui::MenuItem("Rename Selected..."))
+        if (m_SelectedAssets.size() == 1 && ImGui::MenuItem("Rename Selected"))
             OpenRenameDialogForSelection();
         if (ImGui::MenuItem("Delete Selected"))
             DeleteSelectedAssets();
@@ -1173,11 +1347,17 @@ void AssetBrowserPanel::DrawFolderTreeNode(const std::string& projectRelPath, co
             if (sub.is_directory()) { hasChildren = true; break; }
         }
     }
-    if (!hasChildren)
+    if (!hasChildren) {
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+        // A leaf has no branch to communicate. Suppress ImGui's tiny terminal
+        // connector while keeping relationship lines on actual folder forks.
+        flags |= ImGuiTreeNodeFlags_DrawLinesNone;
+    }
 
+    ImGui::PushStyleColor(ImGuiCol_Header, kProjectSelectionBg);
     bool open = ImGui::TreeNodeEx(projectRelPath.empty() ? "(root)" : projectRelPath.c_str(),
-                                   flags, "%s", displayName.c_str());
+                                  flags, "%s", displayName.c_str());
+    ImGui::PopStyleColor();
 
     if (open)
         m_ExpandedTreeFolders.insert(projectRelPath);
@@ -1411,8 +1591,10 @@ void AssetBrowserPanel::DrawFileGridCell(const AssetEntry& entry, size_t display
         PointInScreenRect(io.MouseClickedPos[ImGuiMouseButton_Left], cellPos, expandMax);
 
     ImGui::SetCursorScreenPos(cellPos);
+    ImGui::PushStyleColor(ImGuiCol_Header, kProjectSelectionBg);
     ImGui::Selectable("##cell", isSelected, ImGuiSelectableFlags_AllowDoubleClick,
                       ImVec2(cellThumb, cellThumb));
+    ImGui::PopStyleColor();
     const bool cellHovered = ImGui::IsItemHovered();
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1437,7 +1619,7 @@ void AssetBrowserPanel::DrawFileGridCell(const AssetEntry& entry, size_t display
     }
 
     if (isSelected) {
-        const ImU32 sel = ImGui::ColorConvertFloat4ToU32(EditorTheme::Selection);
+        const ImU32 sel = ImGui::ColorConvertFloat4ToU32(kProjectSelectionBorder);
         dl->AddRect(cellPos, cellMax, sel, 0.0f, 0, 2.5f);
     }
 
@@ -1480,12 +1662,30 @@ void AssetBrowserPanel::DrawFileGridCell(const AssetEntry& entry, size_t display
 
     DrawAssetContextMenu(entry, displayIndex);
 
-    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + cellThumb);
-    if (entry.isSubAsset)
-        ImGui::TextColored(EditorTheme::TextMuted, "%s", entry.name.c_str());
-    else
-        ImGui::TextWrapped("%s", entry.name.c_str());
-    ImGui::PopTextWrapPos();
+    if (!entry.isSubAsset && entry.projectRelPath == m_RenameTargetPath) {
+        ImGui::SetNextItemWidth(cellThumb);
+        if (m_RenameFocusRequested)
+            ImGui::SetKeyboardFocusHere();
+        const bool submitted = ImGui::InputText(
+            "##inline_rename", m_RenameBuffer, sizeof(m_RenameBuffer),
+            ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_EnterReturnsTrue);
+        m_RenameFocusRequested = false;
+        const bool cancelled = ImGui::IsItemActive() && ImGui::IsKeyPressed(ImGuiKey_Escape);
+        const bool lostFocus = ImGui::IsItemDeactivated();
+        if (cancelled) {
+            m_RenameTargetPath.clear();
+            m_RenameCreatedAsset = false;
+        } else if (submitted || lostFocus) {
+            CommitInlineRename(entry);
+        }
+    } else {
+        ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + cellThumb);
+        if (entry.isSubAsset)
+            ImGui::TextColored(EditorTheme::TextMuted, "%s", entry.name.c_str());
+        else
+            ImGui::TextWrapped("%s", entry.name.c_str());
+        ImGui::PopTextWrapPos();
+    }
 
     ImGui::EndGroup();
     ImGui::PopID();
@@ -1961,6 +2161,35 @@ bool ImportExternalFileImpl(const fs::path& srcFile, const fs::path& destDir,
     if (outImportedPath)
         *outImportedPath = dest;
     return true;
+}
+
+std::string MipsClassNameFromStem(const std::string& stem) {
+    std::string result;
+    result.reserve(stem.size() + 1);
+    for (unsigned char c : stem) {
+        if (std::isalnum(c) || c == '_')
+            result.push_back(static_cast<char>(c));
+    }
+    if (result.empty())
+        result = "NewScript";
+    if (std::isdigit(static_cast<unsigned char>(result.front())))
+        result.insert(result.begin(), '_');
+    return result;
+}
+
+std::string NewMipsScriptBody(const std::string& stem) {
+    const std::string className = MipsClassNameFromStem(stem);
+    return
+        "class " + className + " : MipsBehaviour\n"
+        "{\n"
+        "    void Start()\n"
+        "    {\n"
+        "    }\n"
+        "\n"
+        "    void Update()\n"
+        "    {\n"
+        "    }\n"
+        "}\n";
 }
 
 bool IsFbxPath(const fs::path& path) {

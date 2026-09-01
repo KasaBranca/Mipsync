@@ -34,8 +34,11 @@ if (-not $env:PSN00BSDK -or -not (Test-Path $env:PSN00BSDK)) {
 # CMakePresets.json's $env{PSN00BSDK_LIBS} expansion picks the right path.
 $psn00bLibs = Join-Path $env:PSN00BSDK "lib/libpsn00b"
 if (-not (Test-Path (Join-Path $psn00bLibs "cmake/sdk.cmake"))) {
-    Log "PSn00bSDK CMake toolchain not found under: $psn00bLibs"
-    Log "Expected file: lib/libpsn00b/cmake/sdk.cmake"
+    $psn00bLibs = Join-Path $env:PSN00BSDK "libpsn00b"
+}
+if (-not (Test-Path (Join-Path $psn00bLibs "cmake/sdk.cmake"))) {
+    Log "PSn00bSDK CMake toolchain not found under: $env:PSN00BSDK"
+    Log "Expected file: lib/libpsn00b/cmake/sdk.cmake or libpsn00b/cmake/sdk.cmake"
     exit 1
 }
 $env:PSN00BSDK_LIBS = $psn00bLibs

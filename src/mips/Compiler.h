@@ -47,6 +47,7 @@ private:
 
     bool IsIdentifier(const Ast::Expr& expr, const char* name) const;
     bool IsMemberChain(const Ast::Expr& expr, const char* base, const char* member) const;
+    int FindVectorFieldAxis(const Ast::Expr& expr) const;
 
     const Ast::ClassDecl& m_Class;
     const Ast::Program* m_Program = nullptr;

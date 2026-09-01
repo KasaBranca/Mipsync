@@ -591,7 +591,10 @@ void Renderer::CreateShaders() {
 
 void Renderer::CreateDefaultResources() {
     m_ScreenQuad = Mesh::CreateScreenQuad();
-    m_DefaultTexture = Texture::CreateCheckerboard(64, 8);
+    // A material with no image is a color-only material. The white texel is
+    // neutral, so uMaterialColor becomes the visible surface color instead of
+    // silently introducing a checkerboard texture.
+    m_DefaultTexture = Texture::CreateSolid(255, 255, 255, 255);
     m_OutlineMaskFBO = Framebuffer(2, 2);
 
 }

@@ -11,6 +11,7 @@ set(MIPSYNC_ENGINE_SOURCES
     audio/AudioDecoder.cpp
     audio/AudioSystem.cpp
     audio/Ps1VagEncoder.cpp
+    bootstrap/AgentIntegration.cpp
     bootstrap/ProjectBootstrap.cpp
     build/BuildManifest.cpp
     build/PlayerBuild.cpp
@@ -101,6 +102,7 @@ set(MIPSYNC_ENGINE_SOURCES
 add_executable(MipsyncEngine ${MIPSYNC_ENGINE_SOURCES})
 
 set(MIPSYNC_COMMAND_SOURCES
+    bootstrap/AgentIntegration.cpp
     command/CommandTypes.cpp
     command/CommandRegistry.cpp
     command/SymbolRegistry.cpp
@@ -117,6 +119,7 @@ set(MIPSYNC_COMMAND_SOURCES
     mips/MipsScriptLoader.cpp
     project/Project.cpp
     core/Log.cpp
+    core/RuntimePaths.cpp
 )
 
 add_executable(MipsyncCLI cli/main.cpp ${MIPSYNC_COMMAND_SOURCES})
@@ -130,6 +133,17 @@ target_link_libraries(MipsyncCLI PRIVATE
     nlohmann_json::nlohmann_json
     spdlog::spdlog
 )
+option(MIPSYNC_DEPLOY_LATEST_INSTALL
+       "Copy local builds into the newest per-user Mipsync install" ON)
+if(WIN32 AND MIPSYNC_DEPLOY_LATEST_INSTALL)
+    add_custom_command(TARGET MipsyncCLI POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            -DCLI_EXE="$<TARGET_FILE:MipsyncCLI>"
+            -P "${CMAKE_SOURCE_DIR}/cmake/DeployLatestInstalledCli.cmake"
+        COMMENT "Deploying MipsyncCLI to newest installed version"
+    )
+endif()
+
 add_executable(MipsyncCommandTests
     ${CMAKE_SOURCE_DIR}/tests/CommandPlatformTests.cpp
     ${MIPSYNC_COMMAND_SOURCES}
@@ -151,6 +165,8 @@ add_test(NAME MipsyncRuntimeRegression
 add_test(NAME MipsyncSilentHillControllerValidation
     COMMAND $<TARGET_FILE:MipsyncEngine>
             --validate-mips "${CMAKE_SOURCE_DIR}/tests/mips/SilentHillController.mips")
+add_test(NAME MipsyncProModelerBevel
+    COMMAND $<TARGET_FILE:MipsyncEngine> --test-promodeler-bevel)
 add_test(NAME MipsyncMeshCollider
     COMMAND $<TARGET_FILE:MipsyncEngine> --test-mesh-collider)
 
@@ -193,7 +209,7 @@ target_compile_definitions(MipsyncEngine PRIVATE GLFW_INCLUDE_NONE)
 
 # Windows specific
 if(WIN32)
-    target_link_libraries(MipsyncEngine PRIVATE comdlg32 ole32 winmm mfplat mfreadwrite mfuuid)
+    target_link_libraries(MipsyncEngine PRIVATE comdlg32 ole32 oleaut32 shlwapi uuid winmm mfplat mfreadwrite mfuuid)
     if(EXISTS "${CMAKE_SOURCE_DIR}/resources/icons/app_icon.ico")
         enable_language(RC)
         target_sources(MipsyncEngine PRIVATE "${CMAKE_SOURCE_DIR}/resources/MipsyncEngine.rc")
@@ -223,6 +239,17 @@ if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/resources/fonts")
     )
 endif()
 
+# License notices for source adapted from third-party UI systems must ship
+# beside binary distributions as well as remain in the source files.
+if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/resources/licenses")
+    add_custom_command(TARGET MipsyncEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/resources/licenses"
+            "$<TARGET_FILE_DIR:MipsyncEngine>/resources/licenses"
+        COMMENT "Copying third-party license notices next to executable"
+    )
+endif()
+
 if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/resources/icons/project")
     add_custom_command(TARGET MipsyncEngine POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -232,11 +259,79 @@ if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/resources/icons/project")
     )
 endif()
 
+if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/tools/vscode-mips")
+    add_custom_command(TARGET MipsyncEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            -DSRC_DIR="${CMAKE_SOURCE_DIR}"
+            -DDST_DIR="$<TARGET_FILE_DIR:MipsyncEngine>"
+            -P "${CMAKE_SOURCE_DIR}/cmake/CopyMipsIdeTools.cmake"
+        COMMENT "Copying Mips# IDE integration tools next to executable"
+    )
+endif()
+
+# Ship reusable Agent Skills next to the editor so coding agents can install
+# the version that matches the bundled CLI protocol and command surface.
+if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/skills")
+    add_custom_command(TARGET MipsyncEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/skills"
+            "$<TARGET_FILE_DIR:MipsyncEngine>/skills"
+        COMMENT "Copying Mipsync Agent Skills next to executable"
+    )
+endif()
+
+# Copy Hub artifacts next to the engine so double-clicking the engine
+# launches the newest locally-built Hub (and updater) without manual copying.
+add_custom_command(TARGET MipsyncEngine POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+        -DSRC_DIR="${CMAKE_SOURCE_DIR}"
+        -DDST_DIR="$<TARGET_FILE_DIR:MipsyncEngine>"
+        -P "${CMAKE_SOURCE_DIR}/cmake/CopyHubArtifacts.cmake"
+    COMMENT "Copying Hub artifacts next to engine (if present)"
+)
+
 if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/templates/ps1")
     add_custom_command(TARGET MipsyncEngine POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_SOURCE_DIR}/templates/ps1"
             "$<TARGET_FILE_DIR:MipsyncEngine>/templates/ps1"
         COMMENT "Copying PS1 build templates next to executable"
+    )
+endif()
+
+# Bundle PCSX-Redux + OpenBIOS (built into pcsx-redux.exe) next to the engine
+# so a fresh Mipsync download can "Build & Run" PS1 targets with zero setup.
+# Populate third_party/ps1_runtime via scripts/fetch_ps1_runtime.ps1 first.
+if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/third_party/ps1_runtime/emulator")
+    add_custom_command(TARGET MipsyncEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/third_party/ps1_runtime"
+            "$<TARGET_FILE_DIR:MipsyncEngine>/ps1_runtime"
+        COMMENT "Bundling PCSX-Redux PS1 runtime next to executable"
+    )
+else()
+    message(STATUS "third_party/ps1_runtime not found; run scripts/fetch_ps1_runtime.ps1 to bundle PCSX-Redux + OpenBIOS.")
+endif()
+
+# Bundle Ninja next to the editor so Build PS1 works without a separate install.
+set(_MIPSYNC_NINJA "${CMAKE_SOURCE_DIR}/third_party/.cache/ninja/ninja.exe")
+if(EXISTS "${_MIPSYNC_NINJA}")
+    add_custom_command(TARGET MipsyncEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:MipsyncEngine>/tools"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_MIPSYNC_NINJA}"
+            "$<TARGET_FILE_DIR:MipsyncEngine>/tools/ninja.exe"
+        COMMENT "Copying Ninja next to executable for PS1 builds"
+    )
+endif()
+
+# Keep the newest per-user installed editor in sync with local builds. The
+# deployment script preserves install-only DLLs, Hub files, and user settings.
+if(WIN32 AND MIPSYNC_DEPLOY_LATEST_INSTALL)
+    add_custom_command(TARGET MipsyncEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILD_DIR="$<TARGET_FILE_DIR:MipsyncEngine>"
+            -P "${CMAKE_SOURCE_DIR}/cmake/DeployLatestInstalledEditor.cmake"
+        COMMENT "Deploying editor build to newest installed version"
     )
 endif()

@@ -4,42 +4,6 @@
 
 namespace MipsyncEngine {
 
-namespace {
-
-struct ResolutionPreset {
-    const char* label;
-    int width;
-    int height;
-};
-
-constexpr ResolutionPreset kPresets[] = {
-    { "16:9  1920 x 1080", 1920, 1080 },
-    { "16:9  1280 x 720",  1280, 720  },
-    { "16:9   960 x 540",   960, 540  },
-    { "16:10 1920 x 1200", 1920, 1200 },
-    { "4:3  1024 x 768",   1024, 768  },
-    { "Custom",               0, 0   },
-};
-
-constexpr int kPresetCount = static_cast<int>(sizeof(kPresets) / sizeof(kPresets[0]));
-
-} // namespace
-
-int GetGameViewResolutionPresetCount() { return kPresetCount; }
-
-const char* GetGameViewResolutionPresetLabel(int index) {
-    index = std::clamp(index, 0, kPresetCount - 1);
-    return kPresets[index].label;
-}
-
-void ApplyGameViewResolutionPreset(GameViewSettings& settings, int presetIndex) {
-    settings.resolutionPreset = std::clamp(presetIndex, 0, kPresetCount - 1);
-    if (settings.resolutionPreset != kPresetCount - 1) {
-        settings.renderWidth = kPresets[settings.resolutionPreset].width;
-        settings.renderHeight = kPresets[settings.resolutionPreset].height;
-    }
-}
-
 GameViewLetterbox ComputeGameViewLetterbox(const ImVec2& panelMin, const ImVec2& panelSize,
                                            const GameViewSettings& settings) {
     GameViewLetterbox result;
@@ -66,9 +30,6 @@ GameViewLetterbox ComputeGameViewLetterbox(const ImVec2& panelMin, const ImVec2&
 }
 
 void SyncSceneCanvasesToGameView(Scene& scene, const GameViewSettings& settings) {
-    if (!settings.syncCanvasReferenceResolution)
-        return;
-
     const glm::vec2 ref{ static_cast<float>(std::max(settings.renderWidth, 1)),
                          static_cast<float>(std::max(settings.renderHeight, 1)) };
 

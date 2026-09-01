@@ -39,6 +39,20 @@ bool TryEvalFieldDefault(const Ast::Expr& expr, double& out) {
     return false;
 }
 
+bool TryEvalVector3FieldDefault(const Ast::Expr& expr, double out[3]) {
+    if (expr.kind != Ast::Expr::Kind::Call || !expr.call || !expr.call->callee ||
+        expr.call->callee->kind != Ast::Expr::Kind::Identifier ||
+        expr.call->callee->identifier->name != "Vector3" ||
+        expr.call->arguments.size() != 3)
+        return false;
+    for (size_t axis = 0; axis < 3; ++axis) {
+        if (!expr.call->arguments[axis] ||
+            !TryEvalFieldDefault(*expr.call->arguments[axis], out[axis]))
+            return false;
+    }
+    return true;
+}
+
 bool ContainsStringLiteral(const Ast::Expr& expr) {
     switch (expr.kind) {
     case Ast::Expr::Kind::Literal:
@@ -146,6 +160,17 @@ bool Compiler::IsMemberChain(const Ast::Expr& expr, const char* base, const char
     return IsIdentifier(*expr.member->object, base);
 }
 
+int Compiler::FindVectorFieldAxis(const Ast::Expr& expr) const {
+    if (expr.kind != Ast::Expr::Kind::Member || !expr.member || !expr.member->object ||
+        expr.member->object->kind != Ast::Expr::Kind::Identifier)
+        return -1;
+    const std::string& axis = expr.member->member;
+    if (axis != "x" && axis != "y" && axis != "z")
+        return -1;
+    return m_Module->FindFieldIndex(
+        expr.member->object->identifier->name + "." + axis);
+}
+
 bool Compiler::IsTransformVecMemberAssign(const Ast::Expr& expr, std::string& outVecMember) const {
     if (expr.kind != Ast::Expr::Kind::Member)
         return false;
@@ -220,6 +245,23 @@ std::unique_ptr<CompiledModule> Compiler::Compile() {
     m_Module->className = m_Class.name;
 
     for (const auto& field : m_Class.fields) {
+        if (field->typeName == "Vector3") {
+            double defaults[3] = { 0.0, 0.0, 0.0 };
+            if (field->initializer)
+                TryEvalVector3FieldDefault(*field->initializer, defaults);
+            static constexpr const char* kAxes[3] = { "x", "y", "z" };
+            for (size_t axis = 0; axis < 3; ++axis) {
+                CompiledField component;
+                component.name = field->name + "." + kAxes[axis];
+                component.typeName = std::string("Vector3.") + kAxes[axis];
+                component.valueKind = FieldValueKind::Number;
+                component.defaultConstIndex = AddNumberConstant(defaults[axis]);
+                component.hasGetter = field->hasGetter;
+                component.hasSetter = field->hasSetter;
+                m_Module->fields.push_back(std::move(component));
+            }
+            continue;
+        }
         CompiledField cf;
         cf.name = field->name;
         cf.typeName = field->typeName;
@@ -322,8 +364,8 @@ void Compiler::CompileStatement(const Ast::Stmt& stmt) {
         CompileStatement(*stmt.whileStmt->body);
         for (size_t jump : m_Loops.back().continueJumps)
             m_Writer.PatchJump(jump, loopStart);
-        m_Writer.EmitOp(OpCode::Jump);
-        m_Writer.EmitI32(static_cast<int32_t>(loopStart) - static_cast<int32_t>(m_Writer.CurrentOffset() + 5));
+        const size_t jumpLoop = m_Writer.EmitJumpPlaceholder();
+        m_Writer.PatchJump(jumpLoop, loopStart);
         m_Writer.PatchJump(jumpExit, m_Writer.CurrentOffset());
         for (size_t jump : m_Loops.back().breakJumps)
             m_Writer.PatchJump(jump, m_Writer.CurrentOffset());
@@ -359,9 +401,8 @@ void Compiler::CompileStatement(const Ast::Stmt& stmt) {
                 m_Writer.EmitOp(OpCode::Pop);
             }
         }
-        m_Writer.EmitOp(OpCode::Jump);
-        m_Writer.EmitI32(static_cast<int32_t>(loopStart) -
-                         static_cast<int32_t>(m_Writer.CurrentOffset() + 5));
+        const size_t jumpLoop = m_Writer.EmitJumpPlaceholder();
+        m_Writer.PatchJump(jumpLoop, loopStart);
         const size_t loopEnd = m_Writer.CurrentOffset();
         m_Writer.PatchJump(jumpExit, loopEnd);
         for (size_t jump : m_Loops.back().breakJumps)
@@ -465,6 +506,12 @@ void Compiler::CompileAssignment(const Ast::Expr& lhs, const Ast::Expr& rhs) {
 }
 
 void Compiler::CompileLValueStore(const Ast::Expr& lhs) {
+    if (const int vectorFieldAxis = FindVectorFieldAxis(lhs); vectorFieldAxis >= 0) {
+        m_Writer.EmitOp(OpCode::SetField);
+        m_Writer.EmitU16(static_cast<uint16_t>(vectorFieldAxis));
+        return;
+    }
+
     std::string vecMember;
     if (IsTransformVecMemberAssign(lhs, vecMember)) {
         m_Writer.EmitOp(OpCode::GetGlobal);
@@ -600,6 +647,11 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
         break;
 
     case Ast::Expr::Kind::Member: {
+        if (const int vectorFieldAxis = FindVectorFieldAxis(expr); vectorFieldAxis >= 0) {
+            m_Writer.EmitOp(OpCode::PushField);
+            m_Writer.EmitU16(static_cast<uint16_t>(vectorFieldAxis));
+            break;
+        }
         if (expr.member->member == "Length" || expr.member->member == "Count") {
             CompileExpression(*expr.member->object);
             m_Writer.EmitOp(OpCode::ArrayLength);
@@ -799,6 +851,14 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
             emit(HostFunc::Animator_SetTrigger, hostArgc);
             return true;
         }
+        if (methodName == "SetTriggerHeld" && argc == 1) {
+            emit(HostFunc::Animator_SetTriggerHeld, hostArgc);
+            return true;
+        }
+        if (methodName == "ReleaseTrigger" && argc == 1) {
+            emit(HostFunc::Animator_ReleaseTrigger, hostArgc);
+            return true;
+        }
         return false;
     };
     auto tryAudioSourceMethods = [&](const Ast::Expr& objectExpr,
@@ -925,8 +985,24 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
         emit(HostFunc::Physics_IsGrounded, 0);
         return true;
     }
-    if (targetName == "Camera" && methodName == "Follow" && argc == 6) {
-        emit(HostFunc::Camera_Follow, 6);
+    if (targetName == "Physics" && methodName == "IsGroundedWithin" && argc == 1) {
+        emit(HostFunc::Physics_IsGroundedWithin, 1);
+        return true;
+    }
+    if (targetName == "Physics" && methodName == "UseCharacterController" && argc == 0) {
+        emit(HostFunc::Physics_UseCharacterController, 0);
+        return true;
+    }
+    if (targetName == "Physics" && methodName == "UseKinematicController" && argc == 0) {
+        emit(HostFunc::Physics_UseKinematicController, 0);
+        return true;
+    }
+    if (targetName == "Physics" && methodName == "MoveKinematic" && argc == 3) {
+        emit(HostFunc::Physics_MoveKinematic, 3);
+        return true;
+    }
+    if (targetName == "Camera" && methodName == "Follow" && (argc == 6 || argc == 7)) {
+        emit(HostFunc::Camera_Follow, static_cast<uint8_t>(argc));
         return true;
     }
     if (targetName == "Vector3") {

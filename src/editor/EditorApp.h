@@ -35,15 +35,6 @@ enum class DockLayoutPreset {
     SceneTopGameBottom,
 };
 
-/// Scene View only — toggles PS1-style post-vertex effects (Game View uses global PS1Settings).
-struct SceneViewPsxToggles {
-    bool vertexJitter    = true;
-    bool affineMapping   = true;
-    bool colorDepthLimit = true;
-    bool dithering       = true;
-    bool meshPreview     = true;
-};
-
 class EditorApp {
 public:
     EditorApp(Engine* engine);
@@ -191,11 +182,12 @@ private:
     void DrawUITextureSlot(class UIImageComponent& image);
     void DrawUIButtonBackgroundSlot(class UIButtonComponent& button);
     void DrawUIButtonGroupCursorSlot(class UIButtonGroupComponent& group);
-    void DrawAddComponentScriptMenu(class Entity& entity);
+    void DrawAddComponentScriptMenu(const std::vector<class Entity*>& entities);
     std::vector<std::string> CollectProjectScripts() const;
     void DrawInspectorPanel();
     void DrawMipsScriptAssetInspector(const std::string& projectRelPath);
     void DrawMipsScriptIdeActions(const std::string& projectRelPath);
+    void DrawMipsScriptIdeMenuItems(const std::string& projectRelPath);
     void DrawAnimatorControllerPanel();
     void DrawAnimationPanel();
     void DrawConsolePanel();
@@ -211,6 +203,8 @@ private:
     bool HandleProModelerSubobjectPick(const ImVec2& imageMin, const ImVec2& imageSize, bool viewportHovered);
     bool DrawProModelerSubobjectGizmo(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& camera);
     void DrawProModelerOverlay(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& camera);
+    bool RecenterProModelerPivot(class Entity& entity, struct ProModelerComponent& proModeler);
+    bool DeleteSelectedProModelerFaces();
     void ClearProModelerSelection();
     void AcceptPrefabDrop();
     void SpawnModelFromProjectAsset(const std::string& projectRelPath,
@@ -231,12 +225,12 @@ private:
     void HandleSceneViewControls(bool viewportHovered);
     void DrawGizmoToolbar();
     void DrawRenderModeSelector();
-    void DrawSceneViewPsxToolbar();
-    void ApplySceneViewPsxOverrides(PS1Settings& settings) const;
     void DrawGizmoControls(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& camera);
     void DrawCameraFrustumGizmo(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& camera);
     void DrawCanvasGizmo(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& camera);
     void DrawColliderGizmos(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& camera);
+    void DrawMeshSubdivisionPreview(const ImVec2& imageMin, const ImVec2& imageSize,
+                                    const Camera& camera);
     void DrawLightGizmos(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& camera);
     void FrameEntityInSceneView(class Entity& entity);
     void SyncSelectedCameraFromTransform(Entity* entity);
@@ -244,7 +238,10 @@ private:
 
     Entity* GetSelectedEntity();
     bool IsEntitySelected(uint32_t entityId) const;
+    glm::vec3 GetSceneViewSpawnPosition() const;
+    void PlaceNewSceneEntity(class Entity& entity, class Entity* parentForNew = nullptr);
     void SelectSingleEntity(uint32_t entityId);
+    void QueueHierarchyReveal(uint32_t entityId);
     void SyncAnimatorWindowToSelectedEntity();
     void HandleHierarchySelection(uint32_t entityId);
     void CollectHierarchyOrder(class Entity& entity, std::vector<uint32_t>& out) const;
@@ -276,9 +273,11 @@ private:
     std::unordered_set<uint32_t> m_SelectedEntityIDs;
     uint32_t m_HierarchySelectionAnchor = 0;
     uint32_t m_PendingHierarchyClickEntityID = 0;
+    std::unordered_set<uint32_t> m_PendingHierarchyExpansionIDs;
     std::vector<uint32_t> m_HierarchyOrder;
     std::vector<uint32_t> m_HierarchyClipboardEntityIDs;
     ImGuizmo::OPERATION m_GizmoOperation = ImGuizmo::TRANSLATE;
+    ImGuizmo::MODE m_GizmoMode = ImGuizmo::LOCAL;
     int m_ProModelerEditMode = 0; // 0=object, 1=vertex, 2=edge, 3=face
     uint32_t m_ProModelerSelectionEntityID = 0;
     std::vector<uint32_t> m_ProModelerSelectedVertices;
@@ -308,9 +307,6 @@ private:
     std::vector<std::string> m_PendingAssetBrowserTreeExpanded;
 
     RenderMode m_SceneRenderMode = RenderMode::Shaded;
-
-    SceneViewPsxToggles m_SceneViewPsx;
-    PS1Settings m_SceneViewPsxBaseline;
 
     bool m_IsPlaying = false;
     bool m_AutoPlayOnStart = false;

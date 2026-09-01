@@ -53,7 +53,7 @@ private:
     void EnsureInitialized();
     void DestroyAllBodies();
     void RebuildBodies(Scene& scene);
-    void SyncKinematicAndStaticFromScene(Scene& scene);
+    void SyncKinematicAndStaticFromScene(Scene& scene, float deltaTime);
     void SyncDynamicToScene(Scene& scene);
     void UpdateCharacters(Scene& scene, float deltaTime);
     void SyncCharactersToScene(Scene& scene);

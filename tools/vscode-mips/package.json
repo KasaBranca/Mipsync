@@ -1,0 +1,157 @@
+{
+  "name": "mipsync-mipssharp-vscode",
+  "displayName": "Mips# for Mipsync Engine",
+  "description": "Mips# language support for Mipsync Engine projects.",
+  "version": "0.2.2",
+  "publisher": "mipsync",
+  "engines": {
+    "vscode": "^1.88.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
+  },
+  "activationEvents": [
+    "onStartupFinished",
+    "workspaceContains:**/*.mips",
+    "onLanguage:mipssharp"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "mipssharp",
+        "aliases": [
+          "Mips#",
+          "Mips Sharp",
+          "Mipsync Mips#",
+          "MipsSharp",
+          "mipssharp",
+          "mips#",
+          "mips"
+        ],
+        "extensions": [
+          ".mips"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "mipssharp",
+        "scopeName": "source.mips",
+        "path": "./syntaxes/mips.tmLanguage.json"
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "mipssharp",
+        "scopes": {
+          "class": [
+            "entity.name.type.class.mips",
+            "support.class.mips"
+          ],
+          "enum": [
+            "entity.name.type.enum.mips"
+          ],
+          "function": [
+            "entity.name.function.mips",
+            "support.function.mips"
+          ],
+          "method": [
+            "support.function.member.mips"
+          ],
+          "property": [
+            "variable.other.member.mips",
+            "variable.other.property.mips"
+          ],
+          "variable": [
+            "variable.other.local.mips"
+          ],
+          "type": [
+            "support.type.mips",
+            "storage.type.mips"
+          ]
+        }
+      }
+    ],
+    "configurationDefaults": {
+      "files.associations": {
+        "*.mips": "mipssharp"
+      },
+      "editor.semanticHighlighting.enabled": true,
+      "editor.semanticTokenColorCustomizations": {
+        "enabled": true,
+        "rules": {
+          "class:mipssharp": "#4EC9B0",
+          "enum:mipssharp": "#4EC9B0",
+          "type:mipssharp": "#4EC9B0",
+          "function:mipssharp": "#DCDCAA",
+          "method:mipssharp": "#DCDCAA",
+          "property:mipssharp": "#9CDCFE",
+          "variable:mipssharp": "#9CDCFE"
+        }
+      },
+      "editor.tokenColorCustomizations": {
+        "textMateRules": [
+          {
+            "scope": "entity.name.type.class.mips, entity.name.type.enum.mips, support.type.mips, support.class.mips",
+            "settings": {
+              "foreground": "#4EC9B0"
+            }
+          },
+          {
+            "scope": "entity.name.function.mips, support.function.mips, support.function.member.mips",
+            "settings": {
+              "foreground": "#DCDCAA"
+            }
+          },
+          {
+            "scope": "variable.other.member.mips, variable.other.property.mips, variable.other.local.mips",
+            "settings": {
+              "foreground": "#9CDCFE"
+            }
+          }
+        ]
+      },
+      "[mipssharp]": {
+        "editor.semanticHighlighting.enabled": true
+      }
+    },
+    "configuration": {
+      "title": "Mips#",
+      "properties": {
+        "mipsync.cliPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to mipsync.exe used for headless Mips# diagnostics. The Editor writes this automatically."
+        },
+        "mipsync.enginePath": {
+          "type": "string",
+          "default": "",
+          "description": "Legacy setting. If present, the extension looks for mipsync.exe beside this Engine."
+        },
+        "mipsync.validationDebounceMs": {
+          "type": "number",
+          "default": 350,
+          "description": "Delay before running Mips# validation after edits."
+        },
+        "mipsync.validationTimeoutMs": {
+          "type": "number",
+          "default": 8000,
+          "description": "Timeout for mipsync language compile."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.9.2"
+  }
+}

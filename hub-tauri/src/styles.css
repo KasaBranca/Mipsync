@@ -149,7 +149,7 @@ select:focus-visible,
   left: 0;
   height: 42px;
   box-sizing: border-box;
-  border: 1px solid rgba(13, 153, 255, 0.78);
+  border: 0;
   border-radius: var(--radius-md);
   background: rgba(13, 153, 255, 0.22);
   pointer-events: none;
@@ -449,10 +449,18 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 8px;
+  overflow: hidden;
   color: var(--text-strong);
   font-size: 15px;
   font-weight: 600;
   letter-spacing: -0.01em;
+}
+
+.project-name-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .project-path,
@@ -747,9 +755,6 @@ button:disabled {
   backdrop-filter: blur(12px);
 }
 
-.toast-loud {
-  border-left: 3px solid var(--brand);
-}
 
 .toast-title {
   display: flex;

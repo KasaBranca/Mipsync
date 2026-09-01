@@ -3,6 +3,7 @@
 
 #include <psxapi.h>
 #include <psxpad.h>
+#include <hwregs_c.h>
 #include <string.h>
 
 static unsigned char s_pad_buf[2][34];
@@ -13,6 +14,101 @@ static uint8_t       s_curr_stick_nav = 0;
 static int           s_initialized = 0;
 
 #define LOOK_SCALE FIX16_FROM_INT(2)
+#define PAD_SPI_TIMEOUT 100000u
+
+static void pad_spi_delay(unsigned int cycles) {
+    while (cycles--)
+        __asm__ volatile("");
+}
+
+static int pad_spi_wait(uint16_t mask, int set) {
+    unsigned int timeout = PAD_SPI_TIMEOUT;
+    while (timeout--) {
+        if (!!(SIO_STAT(0) & mask) == !!set)
+            return 1;
+    }
+    return 0;
+}
+
+/* Send one controller command before the BIOS pad driver is started.  The
+ * return value is the actual response length: digital mode ends after five
+ * bytes, while config/analog mode returns nine or more. */
+static int pad_spi_command(const uint8_t* tx, uint8_t* rx, int tx_len) {
+    int i;
+
+    SIO_CTRL(0) = 0x0010;
+    while (SIO_STAT(0) & 0x0002)
+        (void)SIO_DATA(0);
+    pad_spi_delay(1000);
+    SIO_CTRL(0) = 0x0003;
+    pad_spi_delay(2000);
+
+    for (i = 0; i < tx_len; ++i) {
+        if (!pad_spi_wait(0x0001, 1))
+            break;
+        SIO_DATA(0) = tx[i];
+        if (!pad_spi_wait(0x0002, 1))
+            break;
+        rx[i] = SIO_DATA(0);
+
+        if (i + 1 == tx_len) {
+            SIO_CTRL(0) = 0x0000;
+            return tx_len;
+        }
+
+        /* No /ACK after the final response byte is normal, not an error. */
+        if (!pad_spi_wait(0x0080, 1)) {
+            SIO_CTRL(0) = 0x0000;
+            return i + 1;
+        }
+        if (!pad_spi_wait(0x0080, 0))
+            break;
+        SIO_CTRL(0) = 0x0013;
+        SIO_CTRL(0) = 0x0003;
+    }
+
+    SIO_CTRL(0) = 0x0000;
+    return i;
+}
+
+static void pad_restore_bios_sio(void) {
+    /* SIO reset also clears MODE and BAUD.  InitPAD() assumes the standard
+     * controller values are already present, so always restore them. */
+    SIO_CTRL(0) = 0x0040;
+    SIO_MODE(0) = 0x000d;
+    SIO_BAUD(0) = 0x0088;
+    SIO_CTRL(0) = 0x0000;
+}
+
+static void pad_force_analog_mode(void) {
+    static const uint8_t enter_config[9] = {
+        0x01, PAD_CMD_CONFIG_MODE, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    static const uint8_t set_analog[9] = {
+        0x01, PAD_CMD_SET_ANALOG, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00
+    };
+    static const uint8_t exit_config[9] = {
+        0x01, PAD_CMD_CONFIG_MODE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    uint8_t rx[9];
+    int i;
+
+    pad_restore_bios_sio();
+
+    /* 43h must be sent twice because the config response is delayed by one
+     * transaction.  Some third-party pads need a third attempt. */
+    for (i = 0; i < 3; ++i) {
+        memset(rx, 0, sizeof(rx));
+        (void)pad_spi_command(enter_config, rx, 9);
+        if (((rx[1] >> 4) & 0x0f) == PAD_ID_CONFIG_MODE && rx[2] == 0x5a) {
+            (void)pad_spi_command(set_analog, rx, 9);
+            (void)pad_spi_command(exit_config, rx, 9);
+            break;
+        }
+    }
+
+    pad_restore_bios_sio();
+}
 
 static PADTYPE* pad0(void) {
     return (PADTYPE*)&s_pad_buf[0][0];
@@ -36,6 +132,7 @@ static uint8_t raw_left_stick_nav_bits(void) {
 }
 
 void ps1_input_init(void) {
+    pad_force_analog_mode();
     InitPAD(&s_pad_buf[0][0], 34, &s_pad_buf[1][0], 34);
     StartPAD();
     ChangeClearPAD(0);
@@ -52,6 +149,7 @@ void ps1_input_poll(void) {
         pad->type == PAD_ID_ANALOG_STICK) {
         s_curr_btn = pad->btn;
     }
+
     s_prev_stick_nav = s_curr_stick_nav;
     s_curr_stick_nav = raw_left_stick_nav_bits();
 }
@@ -180,12 +278,15 @@ int32_t ps1_input_look_delta_x_q16(void) {
     if (!valid_right_stick()) return 0;
     int dx = (int)pad0()->rs_x - 128;
     if (dx > -8 && dx < 8) dx = 0;
-    return fix16_mul((fix16_t)(dx << 8), LOOK_SCALE);
+    /* Camera yaw uses the opposite handedness from the pad's raw X axis. */
+    return fix16_mul((fix16_t)((-dx) * 256), LOOK_SCALE);
 }
 
 int32_t ps1_input_look_delta_y_q16(void) {
     if (!valid_right_stick()) return 0;
     int dy = (int)pad0()->rs_y - 128;
     if (dy > -8 && dy < 8) dy = 0;
-    return fix16_mul((fix16_t)(dy << 8), LOOK_SCALE);
+    /* Match desktop Input.mouseDeltaY: stick up is positive. Multiplication
+     * avoids left-shifting a negative signed value. */
+    return fix16_mul((fix16_t)((-dy) * 256), LOOK_SCALE);
 }

@@ -6,6 +6,7 @@
 #include "../assets/Material.h"
 #include "../core/Engine.h"
 #include "../core/Log.h"
+#include "../core/RuntimePaths.h"
 #include "../editor/EditorApp.h"
 #include "../editor/MipsEditorIntegration.h"
 #include "../scene/Scene.h"
@@ -255,6 +256,7 @@ bool EditorCommandHost::Start(std::string& outError) {
     m_Instance.projectPath = m_Engine.GetProjectPath();
     m_Instance.projectId = std::filesystem::path(m_Instance.projectPath).filename().string();
     m_Instance.engineVersion = MIPSYNC_ENGINE_VERSION;
+    m_Instance.executablePath = PathUtf8::ToString(GetExecutablePath());
     m_Instance.endpoint = MakeEditorEndpoint(pid);
     if (!m_Server.Start(m_Instance.endpoint,
             [this](const std::string& payload) { return HandleIpcPayload(payload); }, outError))
@@ -579,7 +581,7 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
                 return CommandResult::Fail("MIPSYNC_PARENT_CYCLE", "Parenting would create a hierarchy cycle.");
         }
         editor.RecordUndoSnapshot();
-        if (!scene.SetParent(entity, parent))
+        if (!scene.SetParent(entity, parent, true))
             return CommandResult::Fail("MIPSYNC_PARENT_CYCLE", "Parenting would create an invalid hierarchy cycle.");
         editor.CommandMarkSceneDirty();
         editor.CommandRevealEntity(entity->GetID(), false);
@@ -665,7 +667,7 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         if (!entity) return CommandResult::Fail("MIPSYNC_ENTITY_NOT_FOUND", lookupError);
         auto* renderer = entity->GetComponent<MeshRendererComponent>();
         if (!renderer) return CommandResult::Fail("MIPSYNC_COMPONENT_NOT_FOUND", "Entity has no MeshRenderer component.");
-        const char* properties[] = {"primitive", "size", "material", "enabled", "editor-only", "view-model"};
+        const char* properties[] = {"primitive", "size", "material", "enabled", "editor-only", "type-preset", "view-model"};
         bool hasValue = false;
         for (const char* property : properties) hasValue |= request.arguments.contains(property);
         if (!hasValue) return CommandResult::Fail("MIPSYNC_MESH_SET_EMPTY", "Supply at least one renderer property.");
@@ -685,7 +687,24 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         }
         if (request.arguments.contains("enabled")) renderer->enabled = request.arguments.at("enabled").get<bool>();
         if (request.arguments.contains("editor-only")) renderer->editorOnly = request.arguments.at("editor-only").get<bool>();
-        if (request.arguments.contains("view-model")) renderer->viewModel = request.arguments.at("view-model").get<bool>();
+        if (request.arguments.contains("type-preset")) {
+            const std::string preset = Lower(request.arguments.at("type-preset").get<std::string>());
+            if (preset == "prop") renderer->typePreset = MeshRendererComponent::TypePreset::Prop;
+            else if (preset == "corridor") renderer->typePreset = MeshRendererComponent::TypePreset::Corridor;
+            else if (preset == "character") renderer->typePreset = MeshRendererComponent::TypePreset::Character;
+            else if (preset == "viewmodel" || preset == "view-model")
+                renderer->typePreset = MeshRendererComponent::TypePreset::Viewmodel;
+            else if (preset == "floor")
+                renderer->typePreset = MeshRendererComponent::TypePreset::Floor;
+            else
+                return CommandResult::Fail("MIPSYNC_RENDER_PRESET",
+                    "Type preset must be prop, corridor, character, viewmodel or floor.");
+        }
+        if (request.arguments.contains("view-model")) {
+            renderer->typePreset = request.arguments.at("view-model").get<bool>()
+                ? MeshRendererComponent::TypePreset::Viewmodel
+                : MeshRendererComponent::TypePreset::Prop;
+        }
         editor.CommandMarkSceneDirty();
         editor.CommandRevealEntity(entity->GetID(), false);
         return CommandResult::Ok(DescribeEntity(*entity));

@@ -81,7 +81,10 @@ pub fn default_projects_root() -> String {
     #[cfg(not(windows))]
     {
         if let Some(home) = dirs::home_dir() {
-            return home.join("MipsyncProjects").to_string_lossy().into_owned();
+            return home
+                .join("MipsyncProjects")
+                .to_string_lossy()
+                .into_owned();
         }
     }
     std::env::current_dir()

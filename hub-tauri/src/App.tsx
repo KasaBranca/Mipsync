@@ -8,11 +8,13 @@ import {
   installEditorRelease,
   listProjects,
   listEditorReleases,
+  checkHubUpdate,
   getPs1ToolchainState,
   installPs1Toolchain,
   getBiosState,
   setOpenbiosPath,
   pickFile,
+  updateHub,
   openProject,
   openKoFi,
   pickFolder,
@@ -22,6 +24,7 @@ import {
   uninstallEditorRelease,
   type EditorRelease,
   type BiosState,
+  type HubUpdateInfo,
   type InstallsState,
   type Ps1ToolchainState,
   type ProjectEntry,
@@ -229,7 +232,10 @@ export default function App() {
   const [releases, setReleases] = useState<EditorRelease[]>([]);
   const [installs, setInstalls] = useState<InstallsState | null>(null);
   const [installing, setInstalling] = useState<string | null>(null);
+  const [hubUpdate, setHubUpdate] = useState<HubUpdateInfo | null>(null);
+  const [updatingHub, setUpdatingHub] = useState(false);
   const [hasEditorUpdate, setHasEditorUpdate] = useState(false);
+  const [hasHubUpdate, setHasHubUpdate] = useState(false);
   const [showUpdateToast, setShowUpdateToast] = useState(true);
   const [ps1Toolchain, setPs1Toolchain] = useState<Ps1ToolchainState | null>(null);
   const [installingPs1Toolchain, setInstallingPs1Toolchain] = useState(false);
@@ -275,12 +281,15 @@ export default function App() {
         setNewEngineVersion(s.activeVersion ?? s.installed[0]?.version ?? "0.1.0");
 
         // Background update checks for sidebar badges.
-        const [r, tc, bs] = await Promise.all([
+        const [r, u, tc, bs] = await Promise.all([
           listEditorReleases(),
+          checkHubUpdate(),
           getPs1ToolchainState(),
           getBiosState(),
         ]);
         setReleases(r);
+        setHubUpdate(u);
+        setHasHubUpdate(!!u.isUpdateAvailable);
         setPs1Toolchain(tc);
         setBios(bs);
         const installedSet = new Set((s.installed ?? []).map((x) => x.version));
@@ -302,6 +311,7 @@ export default function App() {
         setError("");
         setReleases(await listEditorReleases());
         await refreshInstalls();
+        setHubUpdate(await checkHubUpdate());
         setPs1Toolchain(await getPs1ToolchainState());
         setBios(await getBiosState());
       } catch (e) {
@@ -318,6 +328,7 @@ export default function App() {
       unlisten = await win.onFocusChanged(({ payload: focused }) => {
         if (focused && !disposed) {
           void refreshInstalls();
+          void checkHubUpdate().then(setHubUpdate);
           void getPs1ToolchainState().then(setPs1Toolchain);
           void getBiosState().then(setBios);
         }
@@ -330,8 +341,8 @@ export default function App() {
   }, [refreshInstalls]);
 
   const updateToast =
-    showUpdateToast && hasEditorUpdate ? (
-      <div className="toast toast-loud">
+    showUpdateToast && (hasEditorUpdate || hasHubUpdate) ? (
+      <div className="toast">
         <div className="toast-title">
           Updates available
           <button
@@ -349,6 +360,11 @@ export default function App() {
               <strong>Editor</strong> has a new release.
             </div>
           )}
+          {hasHubUpdate && (
+            <div>
+              <strong>Hub</strong> update is available.
+            </div>
+          )}
         </div>
         <div className="toast-actions">
           <button
@@ -358,6 +374,46 @@ export default function App() {
           >
             Open Installs
           </button>
+          {hasHubUpdate && (
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={!hubUpdate?.downloadUrl || updatingHub}
+              onClick={async () => {
+                setError("");
+                setUpdatingHub(true);
+                try {
+                  await updateHub();
+                  // The Hub replaces itself and will usually restart.
+                  // Clear the badge/toast immediately so we do not show "update available"
+                  // forever when the embedded version is stale.
+                  setHasHubUpdate(false);
+                  setHubUpdate((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          currentVersion: prev.latestVersion,
+                          isUpdateAvailable: false,
+                        }
+                      : {
+                          currentVersion: "—",
+                          latestVersion: "—",
+                          assetName: null,
+                          downloadUrl: null,
+                          isUpdateAvailable: false,
+                        }
+                  );
+                  setShowUpdateToast(false);
+                } catch (e) {
+                  setError(String(e));
+                } finally {
+                  setUpdatingHub(false);
+                }
+              }}
+            >
+              {updatingHub ? "Updating…" : "Update Hub"}
+            </button>
+          )}
         </div>
       </div>
     ) : null;
@@ -510,7 +566,7 @@ export default function App() {
             onClick={() => setTab("installs")}
           >
             Installs
-            {hasEditorUpdate && <span className="nav-badge" />}
+            {(hasEditorUpdate || hasHubUpdate) && <span className="nav-badge" />}
           </button>
           <button type="button" className="nav-item" disabled>
             Learn
@@ -618,7 +674,9 @@ export default function App() {
                             !
                           </span>
                         )}
-                        {p.name}
+                        <span className="project-name-text" title={p.name}>
+                          {p.name}
+                        </span>
                       </div>
                       <div className="project-path">{p.path}</div>
                       <div className="project-engine">
@@ -679,6 +737,7 @@ export default function App() {
                     try {
                       setReleases(await listEditorReleases());
                       await refreshInstalls();
+                      setHubUpdate(await checkHubUpdate());
                       setPs1Toolchain(await getPs1ToolchainState());
                       setBios(await getBiosState());
                     } catch (e) {
@@ -693,6 +752,76 @@ export default function App() {
 
             <section className="content">
               {updateToast}
+
+              <h2 className="section-title">Hub</h2>
+              <div className="install-grid">
+                <article className="install-row">
+                  <div className="install-title">
+                    <strong>Mipsync Hub</strong>
+                    {hubUpdate?.isUpdateAvailable ? (
+                      <span className="badge-warn">update available</span>
+                    ) : (
+                      <span className="muted">up to date</span>
+                    )}
+                  </div>
+                  <div className="install-sub">
+                    <div className="muted">
+                      Installed:{" "}
+                      <span className="mono">{hubUpdate?.currentVersion ?? "—"}</span>
+                      {" · "}
+                      Latest:{" "}
+                      <span className="mono">{hubUpdate?.latestVersion ?? "—"}</span>
+                      {hubUpdate?.assetName ? (
+                        <>
+                          {" "}
+                          • <span className="mono">{hubUpdate.assetName}</span>
+                        </>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="install-actions">
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      disabled={
+                        !hubUpdate?.isUpdateAvailable ||
+                        updatingHub ||
+                        !hubUpdate.downloadUrl
+                      }
+                      onClick={async () => {
+                        setError("");
+                        setUpdatingHub(true);
+                        try {
+                          await updateHub();
+                        setHasHubUpdate(false);
+                        setHubUpdate((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                currentVersion: prev.latestVersion,
+                                isUpdateAvailable: false,
+                              }
+                            : {
+                                currentVersion: "—",
+                                latestVersion: "—",
+                                assetName: null,
+                                downloadUrl: null,
+                                isUpdateAvailable: false,
+                              }
+                        );
+                        setShowUpdateToast(false);
+                        } catch (e) {
+                          setError(String(e));
+                        } finally {
+                          setUpdatingHub(false);
+                        }
+                      }}
+                    >
+                      {updatingHub ? "Updating…" : "Update Hub"}
+                    </button>
+                  </div>
+                </article>
+              </div>
 
               <h2 className="section-title">PS1 Toolchain</h2>
               <div className="install-grid">

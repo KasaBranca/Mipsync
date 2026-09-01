@@ -47,6 +47,8 @@ private:
     std::unordered_map<std::string, std::shared_ptr<Texture>> m_MeshCache;
     std::unordered_map<std::string, std::shared_ptr<Texture>> m_MaterialCache;
     std::unordered_map<std::string, std::shared_ptr<Texture>> m_AudioCache;
+    /// Do not decode/write/load the same broken audio thumbnail every UI frame.
+    std::unordered_set<std::string> m_AudioThumbnailFailed;
     struct PrefabModelCacheEntry {
         std::string modelPath;
         long long sourceStamp = 0;

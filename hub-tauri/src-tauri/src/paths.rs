@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn normalize_path(path: &str) -> String {
     let input = PathBuf::from(path);
@@ -30,3 +30,6 @@ fn strip_extended_prefix(s: &str) -> String {
     out
 }
 
+pub fn normalize_path_buf(path: &Path) -> String {
+    normalize_path(&path.to_string_lossy())
+}

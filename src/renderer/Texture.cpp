@@ -1,9 +1,12 @@
 #include "Texture.h"
 #include "../core/Log.h"
+#include "../assets/AssetManager.h"
 #include <stb_image.h>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <vector>
 
 namespace MipsyncEngine {
@@ -52,7 +55,24 @@ Texture::Texture(const std::string& path, const TextureParams& params) {
     int srcW = 0;
     int srcH = 0;
     int srcChannels = 0;
-    unsigned char* loaded = stbi_load(path.c_str(), &srcW, &srcH, &srcChannels, 4);
+    // stb_image opens narrow paths through the Windows ANSI code page.  Read through
+    // std::filesystem instead so UTF-8 project paths (for example Japanese asset names)
+    // reach the wide Windows file API, then let stb decode the in-memory bytes.
+    std::ifstream file(PathUtf8::FromString(path), std::ios::binary | std::ios::ate);
+    std::vector<unsigned char> encoded;
+    if (file.is_open()) {
+        const std::streamoff length = file.tellg();
+        if (length > 0 && length <= static_cast<std::streamoff>(std::numeric_limits<int>::max())) {
+            encoded.resize(static_cast<size_t>(length));
+            file.seekg(0, std::ios::beg);
+            if (!file.read(reinterpret_cast<char*>(encoded.data()), length))
+                encoded.clear();
+        }
+    }
+    unsigned char* loaded = encoded.empty()
+        ? nullptr
+        : stbi_load_from_memory(encoded.data(), static_cast<int>(encoded.size()),
+                                &srcW, &srcH, &srcChannels, 4);
     if (!loaded) {
         MIPSYNC_ERROR("Failed to load texture: {0}", path);
         return;

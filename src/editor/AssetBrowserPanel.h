@@ -97,6 +97,10 @@ public:
     bool RevealAndSelectAsset(const std::string& projectOrAbsolutePath);
     /// When a virtual animation clip sub-asset is selected.
     bool GetSelectedAnimationClip(std::string& outModelPath, std::string& outClipName) const;
+    /// Creates a Mips# asset under assets/scripts. Used by Add Component's
+    /// Unity-style "Create New" flow, which immediately attaches the result.
+    bool CreateScriptAsset(const std::string& requestedName, std::string& outProjectRelPath,
+                           std::string& outError);
 
     static AssetKind ClassifyByExtension(const std::string& filename);
     static AssetKind ClassifyAssetByPath(const std::string& projectRelPath);
@@ -131,6 +135,11 @@ private:
     void HandleAssetClickSelection(const AssetEntry& entry, size_t entryIndex);
     void DrawAssetContextMenu(const AssetEntry& entry, size_t entryIndex);
     void OpenRenameDialogForSelection();
+    void BeginInlineRename(const std::string& projectRelPath, bool createdAsset = false);
+    void CommitInlineRename(const AssetEntry& entry);
+    void CreateAssetAndBeginRename(AssetKind kind);
+    std::string MakeUniqueAssetPath(const std::string& folder, const std::string& stem,
+                                    const std::string& extension) const;
     void DeleteSelectedAssets();
     bool DeleteAssetAt(const std::string& projectRelPath, AssetKind kind, std::string& outError);
     bool RenameAssetAt(const std::string& projectRelPath, const std::string& newName, std::string& outError);
@@ -170,7 +179,6 @@ private:
     bool m_OpenNewFolderDialog   = false;
     bool m_OpenNewSceneDialog    = false;
     bool m_OpenImportDialog      = false;
-    bool m_OpenRenameDialog      = false;
     char m_NewMaterialName[128] = "NewMaterial.nmat";
     char m_NewControllerName[128] = "NewController.ncontroller";
     char m_NewControllerModelPath[512] = {};
@@ -180,6 +188,8 @@ private:
     char m_NewSceneName[128]    = "NewScene.nscene";
     char m_RenameBuffer[256]    = {};
     std::string m_RenameTargetPath;
+    bool m_RenameFocusRequested = false;
+    bool m_RenameCreatedAsset = false;
 
     std::string m_LastError;
     std::string m_LastInfo;

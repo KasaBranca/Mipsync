@@ -1,0 +1,12 @@
+{
+  "name": "mipsync-engine-tools",
+  "private": true,
+  "scripts": {
+    "icon": "node scripts/convert_app_icon.mjs"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "sharp": "^0.33.5",
+    "to-ico": "^1.1.5"
+  }
+}

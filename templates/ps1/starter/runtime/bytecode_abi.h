@@ -124,7 +124,13 @@
     X(MATHF_CEIL, Mathf_Ceil, 67) \
     X(MATHF_ROUND, Mathf_Round, 68) \
     X(MATHF_SIGN, Mathf_Sign, 69) \
-    X(CAMERA_FOLLOW, Camera_Follow, 70)
+    X(CAMERA_FOLLOW, Camera_Follow, 70) \
+    X(PHYSICS_IS_GROUNDED_WITHIN, Physics_IsGroundedWithin, 71) \
+    X(ANIMATOR_SETTRIGGER_HELD, Animator_SetTriggerHeld, 72) \
+    X(ANIMATOR_RELEASE_TRIGGER, Animator_ReleaseTrigger, 73) \
+    X(PHYSICS_USE_CHARACTER_CONTROLLER, Physics_UseCharacterController, 74) \
+    X(PHYSICS_USE_KINEMATIC_CONTROLLER, Physics_UseKinematicController, 75) \
+    X(PHYSICS_MOVE_KINEMATIC, Physics_MoveKinematic, 76)
 
 /* PS1 runtime capacities. The exporter validates these before emitting C. */
 #define MIPSYNC_PS1_MODULE_CAP      4

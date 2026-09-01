@@ -109,7 +109,16 @@ bool CaptureFboToPng(Framebuffer& fbo, const std::string& thumbAbs) {
     glReadPixels(0, 0, kThumbSize, kThumbSize, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
     fbo.Unbind();
 
-    if (!stbi_write_png(thumbAbs.c_str(), kThumbSize, kThumbSize, 4, pixels.data(), kThumbSize * 4)) {
+    std::ofstream file(PathUtf8::FromString(thumbAbs), std::ios::binary | std::ios::trunc);
+    const int written = file.is_open()
+        ? stbi_write_png_to_func(
+              [](void* context, void* data, int size) {
+                  static_cast<std::ofstream*>(context)->write(
+                      static_cast<const char*>(data), static_cast<std::streamsize>(size));
+              },
+              &file, kThumbSize, kThumbSize, 4, pixels.data(), kThumbSize * 4)
+        : 0;
+    if (!written || !file.good()) {
         MIPSYNC_WARN("Failed to write thumbnail: {}", thumbAbs);
         return false;
     }
@@ -284,6 +293,8 @@ std::shared_ptr<Texture> AssetThumbnail::GetMaterialThumbnail(const std::string&
 std::shared_ptr<Texture> AssetThumbnail::GetAudioThumbnail(const std::string& projectRelativePath) {
     if (projectRelativePath.empty())
         return nullptr;
+    if (m_AudioThumbnailFailed.count(projectRelativePath))
+        return nullptr;
     const std::string sourceAbs = AssetManager::Get().ToAbsolute(projectRelativePath);
     const std::string thumbAbs = ThumbnailCachePath(projectRelativePath, "audio");
     auto it = m_AudioCache.find(projectRelativePath);
@@ -292,7 +303,10 @@ std::shared_ptr<Texture> AssetThumbnail::GetAudioThumbnail(const std::string& pr
             return it->second;
         DropAudioThumbnail(projectRelativePath);
     }
-    return LoadOrCreateAudio(projectRelativePath);
+    auto thumbnail = LoadOrCreateAudio(projectRelativePath);
+    if (!thumbnail)
+        m_AudioThumbnailFailed.insert(projectRelativePath);
+    return thumbnail;
 }
 
 std::shared_ptr<Texture> AssetThumbnail::GetPrefabThumbnail(
@@ -377,9 +391,24 @@ std::shared_ptr<Texture> AssetThumbnail::LoadOrCreateAudio(const std::string& pr
             pixels[p + 0] = 72; pixels[p + 1] = 196; pixels[p + 2] = 211; pixels[p + 3] = 255;
         }
     }
-    if (!stbi_write_png(thumbAbs.c_str(), kThumbSize, kThumbSize, 4,
-                        pixels.data(), kThumbSize * 4))
+    std::ofstream file(PathUtf8::FromString(thumbAbs), std::ios::binary | std::ios::trunc);
+    const int written = file.is_open()
+        ? stbi_write_png_to_func(
+              [](void* context, void* data, int size) {
+                  static_cast<std::ofstream*>(context)->write(
+                      static_cast<const char*>(data), static_cast<std::streamsize>(size));
+              },
+              &file, kThumbSize, kThumbSize, 4, pixels.data(), kThumbSize * 4)
+        : 0;
+    if (!written || !file.good())
         return nullptr;
+    // Close before Texture opens the same PNG below.  Leaving the stream alive until
+    // function exit made the first load race its buffered output and permanently cache
+    // a false failure for this audio asset.
+    file.flush();
+    if (!file.good())
+        return nullptr;
+    file.close();
     return LoadThumbnailTexture(thumbAbs, m_AudioCache, projectRelativePath);
 }
 
@@ -543,6 +572,7 @@ void AssetThumbnail::DropMaterialThumbnail(const std::string& projectRelativePat
 
 void AssetThumbnail::DropAudioThumbnail(const std::string& projectRelativePath) {
     m_AudioCache.erase(projectRelativePath);
+    m_AudioThumbnailFailed.erase(projectRelativePath);
     const std::string thumbAbs = ThumbnailCachePath(projectRelativePath, "audio");
     if (!thumbAbs.empty()) {
         std::error_code ec;
@@ -558,6 +588,7 @@ void AssetThumbnail::Clear() {
     m_MeshCache.clear();
     m_MaterialCache.clear();
     m_AudioCache.clear();
+    m_AudioThumbnailFailed.clear();
     m_PrefabModelCache.clear();
     m_MeshThumbnailFailed.clear();
     m_MeshThumbnailSkipped.clear();

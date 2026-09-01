@@ -79,9 +79,19 @@ bool RunMipsRuntimeRegressionTests(const char* scriptPath,
         errors.push_back("coroutine regression: WaitForSeconds resumed too early");
         return false;
     }
-    vm.ResumeCoroutines(instance, 0.02f, errors);
-    if (result() != 142.0 || !instance.coroutines.empty()) {
-        errors.push_back("coroutine regression: completion or yield break failed");
+    vm.ResumeCoroutines(instance, 0.02f, errors); // enter looping coroutine section
+    if (result() != 1142.0 || instance.coroutines.empty()) {
+        errors.push_back("coroutine regression: loop did not reach its first yield");
+        return false;
+    }
+    for (int iteration = 0; iteration < 2; ++iteration) {
+        vm.ResumeCoroutines(instance, 0.016f, errors); // consume frame wait
+        vm.ResumeCoroutines(instance, 0.016f, errors); // execute next loop iteration
+    }
+    vm.ResumeCoroutines(instance, 0.016f, errors); // consume final frame wait
+    vm.ResumeCoroutines(instance, 0.016f, errors); // exit loop and yield break
+    if (result() != 3142.0 || !instance.coroutines.empty()) {
+        errors.push_back("coroutine regression: yielded loop or completion failed");
         return false;
     }
     std::vector<std::string> boundsErrors;

@@ -1,16 +1,20 @@
 #include "command/CommandExecutor.h"
 #include "command/CommandLine.h"
 #include "command/CoreCommands.h"
+#include "command/IpcTransport.h"
 #include "command/SymbolRegistry.h"
 #include "EngineVersion.h"
 #include "mips/Compiler.h"
 #include "mips/Lexer.h"
 #include "mips/Parser.h"
 #include "mips/MipsScriptLoader.h"
+#include "bootstrap/AgentIntegration.h"
+#include "project/Project.h"
 
 #include <iostream>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 
 using namespace MipsyncEngine::Command;
 
@@ -191,6 +195,68 @@ int main() {
                 roundTrip.command == protocolRequest.command &&
                 roundTrip.arguments == protocolRequest.arguments,
                 "versioned IPC request round-trips through JSON");
+
+    EditorInstanceInfo instanceInfo;
+    instanceInfo.instanceId = "123";
+    instanceInfo.projectPath = "project";
+    instanceInfo.executablePath = "C:/Mipsync/v1/MipsyncEngine.exe";
+    const auto instanceRoundTrip = EditorInstanceInfo::FromJson(instanceInfo.ToJson());
+    ok &= Check(instanceRoundTrip.executablePath == instanceInfo.executablePath,
+                "Editor executable path round-trips for version-matched Skill setup");
+
+    {
+        namespace fs = std::filesystem;
+        const fs::path root = fs::temp_directory_path() / "mipsync_agent_integration_test";
+        std::error_code ec;
+        fs::remove_all(root, ec);
+        fs::create_directories(root, ec);
+        {
+            std::ofstream project(root / MipsyncEngine::Project::kProjectFile);
+            project << "{}";
+        }
+        {
+            std::ofstream instructions(root / "AGENTS.md");
+            instructions << "# User instructions\n\nKeep this text.\n";
+        }
+
+        const fs::path repositoryRoot = fs::path(__FILE__).parent_path().parent_path();
+        const fs::path installRoot = root / "fake_editor_version";
+        fs::create_directories(installRoot / "skills", ec);
+        fs::copy(repositoryRoot / "skills" / "mipsync-cli",
+                 installRoot / "skills" / "mipsync-cli",
+                 fs::copy_options::recursive, ec);
+        {
+            std::ofstream cli(installRoot / "mipsync.exe");
+            cli << "test";
+        }
+
+        const auto first = MipsyncEngine::EnsureAgentIntegration(root, installRoot);
+        ok &= Check(first.success, "project Agent Skill setup succeeds");
+        ok &= Check(fs::is_regular_file(root / ".agents" / "skills" /
+                                        "mipsync-cli" / "SKILL.md"),
+                    "project Agent Skill is installed in the discovery directory");
+
+        std::ifstream instructions(root / "AGENTS.md");
+        const std::string contents((std::istreambuf_iterator<char>(instructions)),
+                                   std::istreambuf_iterator<char>());
+        ok &= Check(contents.find("Keep this text.") != std::string::npos,
+                    "existing AGENTS.md instructions are preserved");
+        ok &= Check(contents.find("MUST invoke `$mipsync-cli`") != std::string::npos,
+                    "AGENTS.md requires the Mipsync Skill");
+
+        std::ifstream runtimeBinding(root / ".agents" / "skills" / "mipsync-cli" /
+                                     "references" / "runtime.md");
+        const std::string runtimeContents((std::istreambuf_iterator<char>(runtimeBinding)),
+                                          std::istreambuf_iterator<char>());
+        ok &= Check(runtimeContents.find((installRoot / "mipsync.exe").string()) !=
+                        std::string::npos,
+                    "Agent Skill records the matching Editor version CLI path");
+
+        const auto second = MipsyncEngine::EnsureAgentIntegration(root, installRoot);
+        ok &= Check(second.success && !second.skillUpdated && !second.instructionsUpdated,
+                    "project Agent Skill setup is idempotent");
+        fs::remove_all(root, ec);
+    }
 
     if (ok) std::cout << "Command Platform tests passed\n";
     return ok ? 0 : 1;

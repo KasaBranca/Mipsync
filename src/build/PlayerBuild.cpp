@@ -137,6 +137,11 @@ std::string PlayerBuild::GetRunningEngineDirectory() {
 
 PlayerBuildResult PlayerBuild::BuildWindows(const PlayerBuildRequest& request) {
     PlayerBuildResult result;
+    const auto progress = [&](float fraction, const char* stage) {
+        if (request.progress)
+            request.progress(fraction, stage);
+    };
+    progress(0.03f, "Validating PC build settings");
     PlayerSettings settings = request.settings;
     settings.productName = SanitizeProductName(settings.productName);
     if (settings.scenesInBuild.empty()) {
@@ -170,17 +175,20 @@ PlayerBuildResult PlayerBuild::BuildWindows(const PlayerBuildRequest& request) {
 
     std::string error;
     try {
+        progress(0.12f, "Preparing output folders");
         fs::create_directories(buildRoot, ec);
         fs::create_directories(dataDir, ec);
         fs::create_directories(projectCopy, ec);
         fs::create_directories(resourcesDir, ec);
 
+        progress(0.25f, "Copying project assets");
         CopyProjectTree(projectRoot, projectCopy, error);
         if (!error.empty()) {
             result.message = error;
             return result;
         }
 
+        progress(0.48f, "Writing player manifest");
         const BuildManifest manifest = BuildManifestIO::FromPlayerSettings(settings);
         const fs::path bootPath = dataDir / "boot.json";
         if (!BuildManifestIO::SaveToFile(PathUtf8::ToString(bootPath), manifest, error)) {
@@ -188,6 +196,7 @@ PlayerBuildResult PlayerBuild::BuildWindows(const PlayerBuildRequest& request) {
             return result;
         }
 
+        progress(0.62f, "Packaging player executable");
         const fs::path builtExe = buildRoot / (settings.productName + ".exe");
         fs::copy_file(engineExe, builtExe, fs::copy_options::overwrite_existing, ec);
         if (ec) {
@@ -205,6 +214,7 @@ PlayerBuildResult PlayerBuild::BuildWindows(const PlayerBuildRequest& request) {
                           fs::copy_options::overwrite_existing, ec);
         }
 
+        progress(0.78f, "Copying runtime resources");
         CopyIfExists(engineDir / "resources", resourcesDir, true, error);
         if (!error.empty()) {
             result.message = error;
@@ -227,6 +237,7 @@ PlayerBuildResult PlayerBuild::BuildWindows(const PlayerBuildRequest& request) {
         result.outputDirectory = PathUtf8::ToString(buildRoot);
         result.executablePath = PathUtf8::ToString(builtExe);
         result.message = "Build succeeded: " + result.outputDirectory;
+        progress(0.98f, "Finalizing PC build");
         MIPSYNC_INFO("Player build: {}", result.message);
     } catch (const std::exception& ex) {
         result.message = ex.what();

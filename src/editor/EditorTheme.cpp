@@ -1,3 +1,26 @@
+/*
+ * Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md).
+ * Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #include "EditorTheme.h"
 #include "../core/RuntimePaths.h"
 #include <filesystem>
@@ -164,28 +187,43 @@ void EditorTheme::SetDarkMode(bool dark) {
 }
 
 void EditorTheme::DrawButtonBevel(ImDrawList* drawList, ImVec2 min, ImVec2 max, bool pressed) {
-    // UI3 communicates affordance with a clean one-pixel outline and fill state,
-    // not a bevel, gloss, or drop shadow.
+    // Godot StyleBoxFlat button border & focus ring rendering:
+    // Crisp 1px border around rounded box (4px radius).
+    const ImU32 borderCol = U32(pressed ? BorderStrong : BorderLight);
     drawList->AddRect({min.x + 0.5f, min.y + 0.5f},
                       {max.x - 0.5f, max.y - 0.5f},
-                      U32(pressed ? BorderStrong : BorderLight),
-                      ShapeCornerSmall, 0, 1.0f);
+                      borderCol, ShapeCornerSmall, 0, 1.0f);
 }
 
 void EditorTheme::DrawTitleBar(ImDrawList* drawList, ImVec2 min, ImVec2 max, const char* title) {
-    const float h = 32.0f;
+    // Godot section panel title header with clean bottom separator
+    const float h = 30.0f;
     const ImVec2 barMax(max.x, min.y + h);
     drawList->AddRectFilled(min, barMax, U32(PanelFace));
     drawList->AddLine(ImVec2(min.x, barMax.y), ImVec2(max.x, barMax.y), U32(BorderLight));
 
     if (title && title[0]) {
-        const ImVec2 textPos(min.x + 12.0f, min.y + 8.0f);
+        const ImVec2 textPos(min.x + 10.0f, min.y + 7.0f);
         drawList->AddText(textPos, U32(EditorTheme::TextSecondary), title);
     }
 }
 
 void EditorTheme::DrawCanvasBackground(ImDrawList* drawList, ImVec2 min, ImVec2 max) {
     drawList->AddRectFilled(min, max, U32(WorkArea));
+}
+
+void EditorTheme::DrawFocusRing(ImDrawList* drawList, ImVec2 min, ImVec2 max,
+                                float rounding) {
+    if (!drawList)
+        return;
+
+    // Godot's editor theme uses a separate, expanded StyleBoxFlat for focus
+    // instead of replacing the control's normal/hover/pressed style box.
+    // ImGui already owns the item geometry, so draw that outside outline here.
+    constexpr float expand = 1.0f;
+    drawList->AddRect(ImVec2(min.x - expand, min.y - expand),
+                      ImVec2(max.x + expand, max.y + expand),
+                      U32(Accent), rounding + expand, 0, 2.0f);
 }
 
 ImVec4 EditorTheme::GetClearColor() {
@@ -234,7 +272,7 @@ bool EditorTheme::StyledButton(const char* label, const ImVec2& size, AeroButton
     }
 
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, rounding);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12.0f, 5.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 4.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, std::max(1.0f, borderSize));
     ImGui::PushStyleColor(ImGuiCol_Border, border);
     ImGui::PushStyleColor(ImGuiCol_Button, face);
@@ -245,6 +283,10 @@ bool EditorTheme::StyledButton(const char* label, const ImVec2& size, AeroButton
     const bool pressed = ImGui::Button(label, ImVec2(size.x, h));
     DrawButtonBevel(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(),
                     ImGui::GetItemRectMax(), ImGui::IsItemActive());
+    if (ImGui::IsItemFocused()) {
+        DrawFocusRing(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(),
+                      ImGui::GetItemRectMax(), rounding);
+    }
 
     ImGui::PopStyleColor(5);
     ImGui::PopStyleVar(3);
@@ -256,13 +298,17 @@ bool EditorTheme::Checkbox(const char* label, bool* value) {
         return false;
 
     const ImGuiStyle& style = ImGui::GetStyle();
-    const float size = ImGui::GetFrameHeight();
+    const float hitHeight = ImGui::GetFrameHeight();
+    // Keep a full-height hit target, but use the compact visual size found in
+    // Godot's inspector. The old square filled the entire row and collided
+    // visually with component-card borders.
+    const float size = std::max(14.0f, std::floor(hitHeight * 0.68f));
     const ImVec2 labelSize = ImGui::CalcTextSize(label, nullptr, true);
     const float labelGap = labelSize.x > 0.0f ? style.ItemInnerSpacing.x : 0.0f;
-    const ImVec2 min = ImGui::GetCursorScreenPos();
+    const ImVec2 itemMin = ImGui::GetCursorScreenPos();
+    const ImVec2 min(itemMin.x, itemMin.y + std::floor((hitHeight - size) * 0.5f));
     const ImVec2 max(min.x + size, min.y + size);
-    const ImVec2 itemSize(size + labelGap + labelSize.x,
-                          std::max(size, labelSize.y));
+    const ImVec2 itemSize(size + labelGap + labelSize.x, hitHeight);
 
     const bool pressed = ImGui::InvisibleButton(label, itemSize);
     if (pressed)
@@ -277,10 +323,10 @@ bool EditorTheme::Checkbox(const char* label, bool* value) {
         fill = *value ? AccentHover : BtnFaceLight;
 
     ImDrawList* drawList = ImGui::GetWindowDrawList();
-    drawList->AddRectFilled(min, max, ImGui::GetColorU32(fill), ShapeCornerSmall);
+    drawList->AddRectFilled(min, max, ImGui::GetColorU32(fill), ShapeCornerExtraSmall);
     drawList->AddRect(min, max,
                       ImGui::GetColorU32(*value ? Selection : BorderLight),
-                      ShapeCornerSmall, 0, 1.0f);
+                      ShapeCornerExtraSmall, 0, 1.0f);
 
     if (*value) {
         const float scale = size / 18.0f;
@@ -298,36 +344,40 @@ bool EditorTheme::Checkbox(const char* label, bool* value) {
         while (*renderedEnd && !(renderedEnd[0] == '#' && renderedEnd[1] == '#'))
             ++renderedEnd;
         const ImVec2 textPos(max.x + labelGap,
-                             min.y + (size - labelSize.y) * 0.5f);
+                             itemMin.y + (hitHeight - labelSize.y) * 0.5f);
         drawList->AddText(textPos, ImGui::GetColorU32(ImGuiCol_Text),
                           label, renderedEnd);
     }
+
+    if (ImGui::IsItemFocused())
+        DrawFocusRing(drawList, min, max, ShapeCornerExtraSmall);
 
     return pressed;
 }
 
 void EditorTheme::Apply() {
+    // Godot 4 Editor Theme StyleBoxFlat configuration
     ImGuiStyle& s = ImGui::GetStyle();
     ImVec4* c = s.Colors;
 
-    const float rSm = ShapeCornerSmall;
+    const float rSm = ShapeCornerSmall; // 4.0f
 
     s.WindowRounding = 0.0f;
-    s.ChildRounding = 0.0f;
+    s.ChildRounding = 3.0f;
     s.FrameRounding = rSm;
-    s.PopupRounding = ShapeCornerMedium;
-    s.ScrollbarRounding = ShapeCornerSmall;
-    s.GrabRounding = ShapeCornerSmall;
-    s.TabRounding = ShapeCornerSmall;
+    s.PopupRounding = ShapeCornerMedium; // 6.0f
+    s.ScrollbarRounding = rSm;
+    s.GrabRounding = rSm;
+    s.TabRounding = rSm;
 
-    s.WindowPadding = ImVec2(6.0f, 6.0f);
-    s.FramePadding = ImVec2(6.0f, 3.0f);
+    s.WindowPadding = ImVec2(8.0f, 8.0f);
+    s.FramePadding = ImVec2(8.0f, 4.0f);
     s.ItemSpacing = ImVec2(6.0f, 4.0f);
-    s.ItemInnerSpacing = ImVec2(5.0f, 3.0f);
+    s.ItemInnerSpacing = ImVec2(6.0f, 4.0f);
     s.CellPadding = ImVec2(6.0f, 3.0f);
-    s.ScrollbarSize = 13.0f;
+    s.ScrollbarSize = 11.0f;
     s.GrabMinSize = 8.0f;
-    s.IndentSpacing = 15.0f;
+    s.IndentSpacing = 14.0f;
 
     s.WindowBorderSize = 1.0f;
     s.ChildBorderSize = 1.0f;
@@ -335,9 +385,27 @@ void EditorTheme::Apply() {
     s.FrameBorderSize = 1.0f;
     s.TabBorderSize = 1.0f;
     s.TabBarBorderSize = 1.0f;
-    // Keep the selected state in the tab fill only. ImGui's selected-tab
-    // overline creates a detached accent stroke above docked window tabs.
+    // Dock tabs get a custom straight, inset overline in EditorApp. ImGui's
+    // built-in overline follows TabRounding and produces an unwanted blue arc.
     s.TabBarOverlineSize = 0.0f;
+    // Godot's editor exposes parent/child relationships instead of relying on
+    // indentation alone. Dear ImGui's native tree-line renderer gives us the
+    // same behavior without changing any row or dock geometry.
+    s.TreeLinesFlags = ImGuiTreeNodeFlags_DrawLinesToNodes;
+    s.TreeLinesSize = 1.0f;
+    s.TreeLinesRounding = ShapeCornerSmall;
+    s.SeparatorTextBorderSize = 1.0f;
+    s.SeparatorTextAlign = ImVec2(0.0f, 0.5f);
+    s.SeparatorTextPadding = ImVec2(8.0f, s.FramePadding.y);
+    s.CircleTessellationMaxError = 0.20f;
+    s.CurveTessellationTol = 1.0f;
+    // UI chrome is made from one-pixel rules. Line antialiasing spreads those
+    // rules over neighbouring pixels and makes compact inputs/buttons look as
+    // though the whole editor was rendered at a lower resolution. Keep filled
+    // rounded corners antialiased, but rasterize borders and icon strokes crisply.
+    s.AntiAliasedLines = false;
+    s.AntiAliasedLinesUseTex = false;
+    s.AntiAliasedFill = true;
 
     c[ImGuiCol_Text] = TextPrimary;
     c[ImGuiCol_TextDisabled] = TextDisabled;
@@ -382,13 +450,13 @@ void EditorTheme::Apply() {
     c[ImGuiCol_ResizeGripHovered] = Accent;
     c[ImGuiCol_ResizeGripActive] = AccentHover;
 
-    c[ImGuiCol_Tab] = PanelFace;
+    c[ImGuiCol_Tab] = PanelAlt;
     c[ImGuiCol_TabHovered] = SurfaceHover;
     c[ImGuiCol_TabSelected] = SurfaceContainerHigh;
-    c[ImGuiCol_TabSelectedOverline] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_TabSelectedOverline] = Brand;
     c[ImGuiCol_TabDimmed] = PanelAlt;
     c[ImGuiCol_TabDimmedSelected] = SurfaceContainerHigh;
-    c[ImGuiCol_TabDimmedSelectedOverline] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_TabDimmedSelectedOverline] = UiTokens::WithAlpha(Brand, 0.6f);
 
     c[ImGuiCol_TabActive] = SurfaceContainerHigh;
     c[ImGuiCol_TabUnfocused] = PanelAlt;
@@ -405,7 +473,12 @@ void EditorTheme::Apply() {
 
     c[ImGuiCol_PlotLines] = Accent;
     c[ImGuiCol_PlotHistogram] = UiTokens::Component;
-    c[ImGuiCol_NavHighlight] = Accent;
+    c[ImGuiCol_NavCursor] = Accent;
+    c[ImGuiCol_NavWindowingHighlight] = Accent;
+    c[ImGuiCol_InputTextCursor] = TextPrimary;
+    c[ImGuiCol_TextLink] = LinkCyan;
+    c[ImGuiCol_TreeLines] = UiTokens::WithAlpha(BorderStrong, 0.65f);
+    c[ImGuiCol_ModalWindowDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.55f);
 
     c[ImGuiCol_DragDropTarget] = UiTokens::WithAlpha(Accent, 0.45f);
     c[ImGuiCol_TextSelectedBg] = UiTokens::WithAlpha(Accent, 0.35f);
@@ -418,20 +491,20 @@ float EditorTheme::GetDefaultFontSizeForDisplay() {
     if (hdc) {
         const int dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
         ReleaseDC(nullptr, hdc);
-        // 96 DPI = 100% = 12px baseline
-        // Scale proportionally: size = 12 * (dpi / 96)
+        // 96 DPI = 100% = 13px baseline
+        // Scale proportionally: size = 13 * (dpi / 96)
         const float scale = static_cast<float>(dpiX) / 96.0f;
         // Also factor in vertical resolution for very high-res displays.
         const int screenH = GetSystemMetrics(SM_CYSCREEN);
-        float sizeFromRes = 12.0f;
+        float sizeFromRes = 13.0f;
         if (screenH >= 2160)      sizeFromRes = 16.0f; // 4K
         else if (screenH >= 1440) sizeFromRes = 14.0f; // 1440p
-        else                      sizeFromRes = 12.0f; // 1080p and below
+        else                      sizeFromRes = 13.0f; // 1080p and below
         // Take the larger of DPI-scaled and resolution-based values.
-        return std::max(sizeFromRes, std::round(12.0f * scale));
+        return std::max(sizeFromRes, std::round(13.0f * scale));
     }
 #endif
-    return 12.0f;
+    return 13.0f;
 }
 
 static void LoadFontsInternal(float fontSize) {
@@ -441,6 +514,7 @@ static void LoadFontsInternal(float fontSize) {
     cfg.OversampleH = 2;
     cfg.OversampleV = 2;
     cfg.PixelSnapH = true;
+    cfg.RasterizerMultiply = 1.10f;
 
     const std::filesystem::path regular = ResolveBundledFont("Inter-Regular.ttf");
 
@@ -473,6 +547,8 @@ static void LoadFontsInternal(float fontSize) {
     cjkCfg.MergeMode = true;
     cjkCfg.OversampleH = 2;
     cjkCfg.OversampleV = 2;
+    cjkCfg.PixelSnapH = true;
+    cjkCfg.RasterizerMultiply = 1.10f;
     for (const char* path : cjkPaths) {
         if (std::filesystem::exists(path)) {
             io.Fonts->AddFontFromFileTTF(path, fontSize, &cjkCfg,

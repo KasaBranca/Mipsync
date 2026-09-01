@@ -65,7 +65,7 @@ void DrawGizmoIcon(GizmoIcon icon, ImDrawList* drawList, ImVec2 center, float si
 }
 
 bool DrawGizmoIconButton(GizmoIcon icon, ImGuizmo::OPERATION operation, ImGuizmo::OPERATION current, ImGuizmo::OPERATION& selected) {
-    const ImVec2 buttonSize{ 32.0f, 28.0f };
+    const ImVec2 buttonSize{ 25.0f, 22.0f };
     const bool active = current == operation;
 
     ImGui::PushID(static_cast<int>(operation));
@@ -88,7 +88,7 @@ bool DrawGizmoIconButton(GizmoIcon icon, ImGuizmo::OPERATION operation, ImGuizmo
 
     ImU32 iconColor = active ? ImGui::ColorConvertFloat4ToU32(EditorTheme::Accent)
                              : ImGui::ColorConvertFloat4ToU32(EditorTheme::TextPrimary);
-    DrawGizmoIcon(icon, ImGui::GetWindowDrawList(), center, 14.0f, iconColor);
+    DrawGizmoIcon(icon, ImGui::GetWindowDrawList(), center, 11.0f, iconColor);
 
     ImGui::PopStyleColor(3);
     ImGui::PopID();

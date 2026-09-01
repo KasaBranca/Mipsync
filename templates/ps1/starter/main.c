@@ -92,6 +92,7 @@ static int              g_module_count;
 static script_instance  g_instances[MAX_INSTANCES];
 
 static const mbc_method* g_update[MAX_INSTANCES];
+static const mbc_method* g_late_update[MAX_INSTANCES];
 
 static int              g_start_pending[MAX_INSTANCES];
 
@@ -205,6 +206,9 @@ static void PresentFrame(void) {
         draw[db].isbg = 0;
     } else {
         draw[db].isbg = 1;
+        if (g_ps1_scene.fog_enabled) {
+            setRGB0(&draw[db], g_ps1_scene.fog_r, g_ps1_scene.fog_g, g_ps1_scene.fog_b);
+        }
     }
 
     PutDrawEnv(&draw[db]);
@@ -293,6 +297,7 @@ static void BindSceneScripts(void) {
 
 
         g_update[g_instance_count] = mbc_find_method(mod, "Update");
+        g_late_update[g_instance_count] = mbc_find_method(mod, "LateUpdate");
 
         g_start_pending[g_instance_count] = mbc_find_method(mod, "Start") ? 1 : 0;
 
@@ -334,6 +339,14 @@ static void RunUpdates(fix16_t delta_time) {
 
     }
 
+}
+
+static void RunLateUpdates(void) {
+    for (int i = 0; i < g_instance_count; ++i) {
+        if (g_late_update[i])
+            vm_run_method(&g_vm, g_instances[i].module, &g_instances[i],
+                          g_late_update[i]);
+    }
 }
 
 
@@ -414,7 +427,12 @@ int main(void) {
 
         host_set_delta_q16_16(delta_time);
 
+        ps1_physics_begin_frame();
         RunUpdates(delta_time);
+        /* Update/coroutines may move kinematic platforms and carry their
+         * passengers. Follow cameras run afterwards so they use the final
+         * character position from this frame rather than lagging one step. */
+        RunLateUpdates();
         ps1_audio_update();
         ps1_scene_update_vertex_anims(delta_time);
         ps1_scene_resolve_hierarchy();

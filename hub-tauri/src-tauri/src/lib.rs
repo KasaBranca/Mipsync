@@ -1,8 +1,9 @@
+mod github;
 mod installer;
 mod manifest;
 mod paths;
-mod project;
 mod ps1_toolchain;
+mod project;
 mod registry;
 mod settings;
 
@@ -13,6 +14,40 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
+
+#[cfg(windows)]
+fn shell_execute_runas(exe: &Path, args: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::HINSTANCE;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+
+    fn w(s: &std::ffi::OsStr) -> Vec<u16> {
+        let mut v: Vec<u16> = s.encode_wide().collect();
+        v.push(0);
+        v
+    }
+
+    let verb = w(std::ffi::OsStr::new("runas"));
+    let file = w(exe.as_os_str());
+    let params = w(std::ffi::OsStr::new(args));
+
+    let result: HINSTANCE = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            1,
+        )
+    };
+
+    let code = result as isize;
+    if code <= 32 {
+        return Err(format!("ShellExecuteW failed: {code}"));
+    }
+    Ok(())
+}
 
 #[cfg(windows)]
 fn shell_open_url(url: &str) -> Result<(), String> {
@@ -40,9 +75,7 @@ fn shell_open_url(url: &str) -> Result<(), String> {
     };
     let code = result as isize;
     if code <= 32 {
-        return Err(format!(
-            "Could not open the default browser (ShellExecuteW: {code})"
-        ));
+        return Err(format!("Could not open the default browser (ShellExecuteW: {code})"));
     }
     Ok(())
 }
@@ -133,11 +166,12 @@ fn is_date_version(version: &str) -> bool {
 }
 
 fn semver_is_less(current: &str, latest: &str) -> bool {
-    match (parse_semver_triplet(current), parse_semver_triplet(latest)) {
+    match (
+        parse_semver_triplet(current),
+        parse_semver_triplet(latest),
+    ) {
         (Some(a), Some(b)) => a < b,
-        _ => {
-            current != latest && current != format!("v{latest}") && format!("v{current}") != latest
-        }
+        _ => current != latest && current != format!("v{latest}") && format!("v{current}") != latest,
     }
 }
 
@@ -147,11 +181,10 @@ fn reconcile_active_editor(settings: &mut settings::HubSettings) -> Result<(), S
         return Ok(());
     }
 
-    let active_ok = settings.active_version.as_ref().is_some_and(|active| {
-        installed
-            .iter()
-            .any(|e| installer::versions_equal(&e.version, active))
-    });
+    let active_ok = settings
+        .active_version
+        .as_ref()
+        .is_some_and(|active| installed.iter().any(|e| installer::versions_equal(&e.version, active)));
 
     if active_ok {
         if let Some(active) = settings.active_version.clone() {
@@ -237,8 +270,10 @@ fn find_engine_exe(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     #[cfg(debug_assertions)]
     {
         let dev_candidates = [
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/src/MipsyncEngine.exe"),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/src/MipsyncEngine"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../build/src/MipsyncEngine.exe"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../build/src/MipsyncEngine"),
         ];
         for candidate in dev_candidates {
             if candidate.is_file() {
@@ -247,7 +282,9 @@ fn find_engine_exe(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         }
     }
 
-    Err("MipsyncEngine executable not found. Build the engine or set MIPSYNC_ENGINE.".into())
+    Err(
+        "MipsyncEngine executable not found. Build the engine or set MIPSYNC_ENGINE.".into(),
+    )
 }
 
 fn find_active_engine_exe(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -285,6 +322,27 @@ fn find_engine_for_project(app: &tauri::AppHandle, info: &ProjectInfo) -> Result
     find_active_engine_exe(app)
 }
 
+fn find_hub_updater_exe(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    if let Ok(exe) = std::env::current_exe() {
+        let dir = exe.parent().unwrap_or(Path::new("."));
+        for name in ["MipsyncHubUpdater.exe", "MipsyncHubUpdater"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    if let Ok(dir) = app.path().resource_dir() {
+        for name in ["MipsyncHubUpdater.exe", "MipsyncHubUpdater"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err("Hub updater executable not found (MipsyncHubUpdater.exe)".into())
+}
+
 #[tauri::command]
 fn list_projects() -> Result<Vec<ProjectEntry>, String> {
     let list = Registry::load()?;
@@ -299,11 +357,7 @@ fn get_defaults() -> HubDefaults {
 }
 
 #[tauri::command]
-fn create_project(
-    name: String,
-    parent_dir: String,
-    engine_version: String,
-) -> Result<ProjectEntry, String> {
+fn create_project(name: String, parent_dir: String, engine_version: String) -> Result<ProjectEntry, String> {
     let mut info = project::create(&parent_dir, &name, &engine_version)?;
     info.last_opened = now_unix();
     let mut list = Registry::load()?;
@@ -329,10 +383,7 @@ fn remove_project(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_project_engine_version(
-    path: String,
-    engine_version: String,
-) -> Result<ProjectEntry, String> {
+fn set_project_engine_version(path: String, engine_version: String) -> Result<ProjectEntry, String> {
     let mut info = project::load_from_dir(&path)?;
     info.engine_version = installer::canonical_editor_version(&engine_version)
         .ok_or_else(|| "invalid editor version".to_string())?;
@@ -505,7 +556,9 @@ fn get_bios_state() -> Result<BiosState, String> {
 #[tauri::command]
 fn set_openbios_path(path: Option<String>) -> Result<BiosState, String> {
     let mut s = settings::HubSettings::load();
-    let trimmed = path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+    let trimmed = path
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
     s.openbios_path = trimmed;
     s.save()?;
     get_bios_state()
@@ -524,6 +577,154 @@ fn launch_editor(app: tauri::AppHandle) -> Result<(), String> {
     }
     cmd.spawn()
         .map_err(|e| format!("Failed to start engine: {e}"))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HubUpdateInfo {
+    current_version: String,
+    latest_version: String,
+    asset_name: Option<String>,
+    download_url: Option<String>,
+    is_update_available: bool,
+}
+
+#[tauri::command]
+fn check_hub_update() -> Result<HubUpdateInfo, String> {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let current_version = format!("v{current}");
+    let m = manifest::fetch_latest()?;
+    let latest_version = m.hub.version.clone();
+
+    let settings = settings::HubSettings::load();
+    let installed_hub = settings.installed_hub_version.unwrap_or_default();
+
+    let mut is_update_available = semver_is_less(&current, &latest_version);
+    if is_update_available && !installed_hub.is_empty() {
+        if !semver_is_less(&installed_hub, &latest_version) {
+            is_update_available = false;
+        }
+    }
+
+    Ok(HubUpdateInfo {
+        current_version,
+        latest_version,
+        asset_name: Some(m.hub.asset_name),
+        download_url: Some(m.hub.download_url),
+        is_update_available,
+    })
+}
+
+#[tauri::command]
+fn update_hub(app: tauri::AppHandle) -> Result<(), String> {
+    let m = manifest::fetch_latest()?;
+
+    // 1. Auto-update editor and set active
+    let releases = m.editor.releases.clone().into_vec();
+    if let Some(latest_editor) = releases.first() {
+        let settings = settings::HubSettings::load();
+        let installed = installer::list_installed(&settings)?;
+        let already_installed = installed
+            .iter()
+            .any(|e| installer::versions_equal(&e.version, &latest_editor.version));
+        if !already_installed {
+            // Note: ignore error or let it fail if needed. Let's fail if download fails.
+            installer::install_from_url(&settings, &latest_editor.version, &latest_editor.download_url)?;
+        }
+
+        let mut s = settings::HubSettings::load();
+        s.active_version = installer::canonical_editor_version(&latest_editor.version);
+        let _ = s.save();
+    }
+
+    // 2. Mark hub version as updated in settings to prevent infinite update loop
+    {
+        let mut s = settings::HubSettings::load();
+        s.installed_hub_version = Some(m.hub.version.clone());
+        let _ = s.save();
+    }
+
+    let info = check_hub_update()?;
+    let url = info
+        .download_url
+        .ok_or_else(|| "no hub update asset in latest release".to_string())?;
+
+    // Download to temp
+    let tmp_dir = std::env::temp_dir().join("mipsync-hub-update");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+    let download_path = tmp_dir.join("hub_update.zip");
+
+    // reuse installer downloader
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("mipsync-hub")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut resp = client.get(url).send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("download failed: {}", resp.status()));
+    }
+    let mut out = std::fs::File::create(&download_path).map_err(|e| e.to_string())?;
+    std::io::copy(&mut resp, &mut out).map_err(|e| e.to_string())?;
+
+    // Extract and find new hub exe
+    let file = std::fs::File::open(&download_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    for i in 0..archive.len() {
+        let mut f = archive.by_index(i).map_err(|e| e.to_string())?;
+        let outpath = match f.enclosed_name() {
+            Some(p) => tmp_dir.join(p),
+            None => continue,
+        };
+        if f.name().ends_with('/') {
+            std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(parent) = outpath.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
+            std::io::copy(&mut f, &mut outfile).map_err(|e| e.to_string())?;
+        }
+    }
+
+    let new_hub = walkdir::WalkDir::new(&tmp_dir)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|e| {
+            e.file_type().is_file()
+                && e.file_name().to_string_lossy().eq_ignore_ascii_case("MipsyncHub.exe")
+        })
+        .map(|e| e.path().to_path_buf())
+        .ok_or_else(|| "MipsyncHub.exe not found in update zip".to_string())?;
+
+    let current_hub = std::env::current_exe().map_err(|e| e.to_string())?;
+    let updater = find_hub_updater_exe(&app)?;
+
+    // Run updater, then quit this app.
+    #[cfg(windows)]
+    {
+        // UAC prompt if needed (e.g. installed under Program Files).
+        let args = format!(
+            "\"{}\" \"{}\" 1",
+            new_hub.to_string_lossy(),
+            current_hub.to_string_lossy()
+        );
+        shell_execute_runas(&updater, &args)
+            .map_err(|e| format!("Failed to start updater: {e}"))?;
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new(&updater)
+            .arg(new_hub)
+            .arg(current_hub)
+            .arg("1")
+            .spawn()
+            .map_err(|e| format!("Failed to start updater: {e}"))?;
+    }
+
+    app.exit(0);
     Ok(())
 }
 
@@ -549,6 +750,8 @@ pub fn run() {
             install_ps1_toolchain,
             get_bios_state,
             set_openbios_path,
+            check_hub_update,
+            update_hub,
             open_ko_fi,
         ])
         .run(tauri::generate_context!())

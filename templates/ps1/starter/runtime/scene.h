@@ -20,6 +20,7 @@ typedef struct ps1_mesh_tri {
     int16_t  nx, ny, nz; /* 12.4 fixed (ONE=4096) */
     uint8_t  shade;      /* 0-255 baked light, mainly for terrain */
     uint8_t  color_r, color_g, color_b; /* baked vertex color for terrain paint */
+    uint8_t  texture_index; /* 0 = use entity material; 1+ = face material */
 } ps1_mesh_tri;
 
 typedef struct ps1_uv8 {
@@ -36,11 +37,27 @@ typedef struct ps1_mesh {
     const ps1_mesh_tri* tris;
     uint16_t            tri_count;
     int16_t             scale_q12; /* 12.12 scale from normalized PS1 verts to source mesh size */
+    int16_t             bounds_center_x; /* normalized local-space AABB center */
+    int16_t             bounds_center_y;
+    int16_t             bounds_center_z;
+    uint16_t            bounds_radius;   /* sphere enclosing the normalized local AABB */
     uint8_t             flags;
+    /* Bit N is set when a rigid triangle uses lighting direction bin N.
+     * Precomputing this at export avoids shading all 27 possible directions
+     * for every small character part on every frame. */
+    uint32_t            rigid_light_bin_mask;
 } ps1_mesh;
 
 #define PS1_MESH_FLAG_TERRAIN 1
 #define PS1_MESH_FLAG_SMOOTH  2
+
+typedef enum {
+    PS1_RENDER_PRESET_PROP = 0,
+    PS1_RENDER_PRESET_CORRIDOR = 1,
+    PS1_RENDER_PRESET_CHARACTER = 2,
+    PS1_RENDER_PRESET_VIEWMODEL = 3,
+    PS1_RENDER_PRESET_FLOOR = 4
+} ps1_render_preset;
 
 typedef struct ps1_entity {
     uint32_t    id;
@@ -59,20 +76,34 @@ typedef struct ps1_entity {
     int16_t     texture_offset_u_q8; /* Material offset, signed 8.8 fixed */
     int16_t     texture_offset_v_q8;
     uint8_t     mesh_enabled;
-    uint8_t     view_model;
+    uint8_t     render_preset;
     uint8_t     prerender_occluder;
     uint8_t     seam_fill;
+    uint8_t     mesh_subdivision_levels; /* 0=default, 1..4 authored render subdivision */
     uint16_t    vertex_anim_first_mesh_index;
     uint16_t    vertex_anim_frame_count;
     uint8_t     vertex_anim_fps;
     uint16_t    vertex_anim_next_mesh_index;
     uint8_t     vertex_anim_lerp_q8;
+    uint16_t    vertex_idle_first_mesh_index;
+    uint16_t    vertex_idle_frame_count;
+    uint8_t     vertex_idle_fps;
+    uint16_t    vertex_walk_first_mesh_index;
+    uint16_t    vertex_walk_frame_count;
+    uint8_t     vertex_walk_fps;
+    uint16_t    vertex_aim_first_mesh_index;
+    uint16_t    vertex_aim_frame_count;
+    uint8_t     vertex_aim_fps;
+    uint16_t    vertex_trigger_first_mesh_index;
+    uint16_t    vertex_trigger_frame_count;
+    uint8_t     vertex_trigger_fps;
     uint16_t    rigid_anim_first_frame;
     uint16_t    rigid_anim_frame_count;
     uint8_t     rigid_anim_fps;
     uint16_t    rigid_anim_current_frame;
     uint16_t    rigid_anim_next_frame;
     uint8_t     rigid_anim_lerp_q8;
+    uint16_t    rigid_anim_blend_target_frame_plus_one; /* runtime-only absolute target */
     uint16_t    rigid_idle_first_frame;
     uint16_t    rigid_idle_frame_count;
     uint8_t     rigid_idle_fps;
@@ -87,6 +118,8 @@ typedef struct ps1_entity {
     uint8_t     rigid_trigger_fps;
     uint16_t    animator_trigger_parameter_hash;
     uint16_t    animator_active_trigger_hash;
+    uint16_t    animator_trigger_exit_duration_q8; /* 8.8 seconds; 0 = full clip */
+    uint16_t    animator_trigger_transition_duration_q8; /* 8.8 seconds */
     int16_t     rigid_root_entity_index;
     fix16_t     animator_speed;
     fix16_t     animator_aim;
@@ -111,6 +144,7 @@ typedef struct ps1_entity {
     fix16_t     collider_capsule_height;
     uint8_t     collider_is_trigger;
     uint8_t     collider_convex;
+    uint16_t    collider_mesh_index;
     uint8_t     collider_camera_shot_trigger;
     int16_t     collider_camera_target_index;
     uint8_t     audio_clip_index;
@@ -119,6 +153,14 @@ typedef struct ps1_entity {
     uint8_t     audio_loop;
     uint8_t     audio_mute;
     uint8_t     audio_volume_q8;
+    uint8_t     camera_distance_cull_enabled;
+    fix16_t     camera_distance_cull_distance;
+    uint8_t     camera_distance_cull_meshes;
+    uint8_t     camera_distance_cull_skinned;
+    uint8_t     camera_frustum_cull_enabled;
+    fix16_t     camera_frustum_cull_margin;
+    uint8_t     camera_frustum_cull_meshes;
+    uint8_t     camera_frustum_cull_skinned;
 } ps1_entity;
 
 typedef struct ps1_rigid_anim_frame {
@@ -254,6 +296,8 @@ void ps1_scene_begin_frame(void);
 void ps1_scene_update_vertex_anims(fix16_t delta_time);
 void ps1_scene_set_animator_float(unsigned int root_index, const char* name, fix16_t value);
 void ps1_scene_set_animator_trigger(unsigned int root_index, const char* name);
+void ps1_scene_set_animator_trigger_held(unsigned int root_index, const char* name);
+void ps1_scene_release_animator_trigger(unsigned int root_index, const char* name);
 ps1_entity*       ps1_scene_mutable_entity(unsigned int index);
 const ps1_entity* ps1_scene_entity(unsigned int index);
 const ps1_entity* ps1_scene_source_entity(unsigned int index);

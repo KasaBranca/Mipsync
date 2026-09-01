@@ -1,4 +1,4 @@
-# App logo (Mipsync Engine)
+# App logo (MipsyncEngine / Hub)
 
 ## 1. PNG を置く
 
@@ -26,7 +26,7 @@ resources/icons/app_icon_source.png
 リポジトリ直下で:
 
 ```powershell
-cd C:\path\to\Mipsync
+cd d:\Nostalty
 npm install
 npm run icon
 ```
@@ -36,7 +36,7 @@ npm run icon
 ## 3. ビルド
 
 ```powershell
-cmake --build build --config Release
+cmake --build d:\Nostalty\build --config Release
 ```
 
 - **`app_icon.ico`** が無い状態で初めて CMake する場合は、先に `npm run icon` を実行してから `cmake ..` してください。

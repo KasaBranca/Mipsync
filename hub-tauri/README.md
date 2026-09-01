@@ -22,17 +22,17 @@ npm run tauri dev
 Set `MIPSYNC_ENGINE` if the engine is not next to the hub binary:
 
 ```powershell
-$env:MIPSYNC_ENGINE = "C:\path\to\Mipsync\build\src\MipsyncEngine.exe"
+$env:MIPSYNC_ENGINE = "D:\Nostalty\build\src\MipsyncEngine.exe"
 npm run tauri dev
 ```
 
-## Desktop build
+## Release build
 
 ```bash
 npm run tauri build
 ```
 
-Output (Windows): `src-tauri/target/release/MipsyncHub.exe` (name follows `productName` in `tauri.conf.json`). This source distribution does not include the self-replacing Hub updater or release-publishing automation.
+Output (Windows): `src-tauri/target/release/MipsyncHub.exe` (name follows `productName` in `tauri.conf.json`).
 
 Copy **`MipsyncHub.exe`** beside **`MipsyncEngine.exe`**. When you run the engine without `--project`, it launches the hub and exits.
 

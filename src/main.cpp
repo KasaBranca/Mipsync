@@ -2,13 +2,16 @@
 #include "core/Engine.h"
 #include "core/Log.h"
 #include "project/Project.h"
+#include "build/PlayerBuild.h"
 #include "ps1/Ps1Build.h"
 #include "assets/AssetManager.h"
 #include "physics/ColliderUtils.h"
 #include "renderer/Mesh.h"
 #include "mips/MipsRuntime.h"
 #include "mips/MipsTest.h"
+#include "scene/Scene.h"
 #include <array>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <map>
@@ -32,9 +35,12 @@ struct CliArgs {
     bool noSplash = false;
     bool playerMode = false;
     bool exportPs1Only = false;
+    bool buildPs1Only = false;
+    bool buildPcOnly = false;
     bool buildDiscOnly = false;
     std::string validateMipsPath;
     std::string testMipsRuntimePath;
+    bool testProModelerBevel = false;
     bool testMeshCollider = false;
 };
 
@@ -52,6 +58,16 @@ CliArgs ParseArgs(int argc, char** argv) {
             args.skipHub = true;
             if (i + 1 < argc && argv[i + 1][0] != '-')
                 args.projectPath = argv[++i];
+        } else if (a == "--build-ps1") {
+            args.buildPs1Only = true;
+            args.skipHub = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                args.projectPath = argv[++i];
+        } else if (a == "--build-pc") {
+            args.buildPcOnly = true;
+            args.skipHub = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                args.projectPath = argv[++i];
         } else if (a == "--build-disc") {
             args.buildDiscOnly = true;
             args.skipHub = true;
@@ -62,6 +78,9 @@ CliArgs ParseArgs(int argc, char** argv) {
             args.skipHub = true;
         } else if (a == "--test-mips-runtime" && i + 1 < argc) {
             args.testMipsRuntimePath = argv[++i];
+            args.skipHub = true;
+        } else if (a == "--test-promodeler-bevel") {
+            args.testProModelerBevel = true;
             args.skipHub = true;
         } else if (a == "--test-mesh-collider") {
             args.testMeshCollider = true;
@@ -149,6 +168,174 @@ bool TryLaunchMipsyncHub() {
 #endif
 }
 
+bool RunProModelerBevelRegression() {
+    using namespace MipsyncEngine;
+    Scene hierarchyScene;
+    Entity* hierarchyParent = hierarchyScene.CreateEntity("Parent");
+    Entity* hierarchyChild = hierarchyScene.CreateEntity("Child");
+    auto* parentTransform = hierarchyParent->GetComponent<TransformComponent>();
+    auto* childTransform = hierarchyChild->GetComponent<TransformComponent>();
+    parentTransform->position = { 7.0f, -2.0f, 3.0f };
+    parentTransform->rotation = { 12.0f, 37.0f, -5.0f };
+    parentTransform->scale = { 1.5f, 1.5f, 1.5f };
+    childTransform->position = { -4.0f, 6.0f, 2.0f };
+    childTransform->rotation = { -8.0f, 22.0f, 4.0f };
+    childTransform->scale = { 0.8f, 1.1f, 1.3f };
+    const glm::mat4 childWorldBeforeParenting = hierarchyScene.GetWorldMatrix(*hierarchyChild);
+    if (!hierarchyScene.SetParent(hierarchyChild, hierarchyParent, true)) {
+        std::cerr << "World-preserving SetParent returned false." << std::endl;
+        return false;
+    }
+    const glm::mat4 childWorldAfterParenting = hierarchyScene.GetWorldMatrix(*hierarchyChild);
+    for (int column = 0; column < 4; ++column) {
+        for (int row = 0; row < 4; ++row) {
+            if (std::abs(childWorldBeforeParenting[column][row] -
+                         childWorldAfterParenting[column][row]) > 1e-3f) {
+                std::cerr << "SetParent changed child world transform." << std::endl;
+                return false;
+            }
+        }
+    }
+
+    ProModelerComponent deletedFaceModel;
+    deletedFaceModel.ResetBox();
+    deletedFaceModel.faceMaterialPaths[1u] = "materials/front.nmat";
+    if (!deletedFaceModel.DeleteFaces({0u}) ||
+        deletedFaceModel.indices.size() / 3u != 10u ||
+        deletedFaceModel.triangleFaceIds.size() != 10u ||
+        deletedFaceModel.vertices.size() != 20u ||
+        deletedFaceModel.faceMaterialPaths.contains(1u) ||
+        std::find(deletedFaceModel.triangleFaceIds.begin(),
+                  deletedFaceModel.triangleFaceIds.end(), 1u) !=
+            deletedFaceModel.triangleFaceIds.end()) {
+        std::cerr << "DeleteFaces did not remove one complete box face." << std::endl;
+        return false;
+    }
+
+    ProModelerComponent model;
+    model.ResetBox();
+    std::vector<uint32_t> selectedVertices;
+    std::vector<std::pair<uint32_t, uint32_t>> selectedEdges;
+    if (!model.BevelEdge({1u, 2u}, 0.1f, selectedVertices, selectedEdges)) {
+        std::cerr << "BevelEdge returned false." << std::endl;
+        return false;
+    }
+    if (model.indices.size() / 3u != 16u ||
+        model.triangleFaceIds.size() != model.indices.size() / 3u ||
+        selectedVertices.size() != 2u || selectedEdges.size() != 1u) {
+        std::cerr << "Unexpected bevel counts: tris=" << model.indices.size() / 3u
+                  << " faceIds=" << model.triangleFaceIds.size()
+                  << " selectedVertices=" << selectedVertices.size()
+                  << " selectedEdges=" << selectedEdges.size() << std::endl;
+        return false;
+    }
+
+    using PositionKey = std::array<long long, 3>;
+    auto positionKey = [](const glm::vec3& p) -> PositionKey {
+        return {
+            std::llround(static_cast<double>(p.x) * 100000.0),
+            std::llround(static_cast<double>(p.y) * 100000.0),
+            std::llround(static_cast<double>(p.z) * 100000.0),
+        };
+    };
+    std::map<std::pair<PositionKey, PositionKey>, int> geometricEdges;
+    for (size_t ti = 0; ti + 2u < model.indices.size(); ti += 3u) {
+        const uint32_t tri[3] = {
+            model.indices[ti], model.indices[ti + 1u], model.indices[ti + 2u]
+        };
+        if (tri[0] >= model.vertices.size() || tri[1] >= model.vertices.size() ||
+            tri[2] >= model.vertices.size()) {
+            std::cerr << "Out-of-range bevel triangle at " << ti / 3u << std::endl;
+            return false;
+        }
+        const glm::vec3& a = model.vertices[tri[0]].position;
+        const glm::vec3& b = model.vertices[tri[1]].position;
+        const glm::vec3& c = model.vertices[tri[2]].position;
+        if (glm::length(glm::cross(b - a, c - a)) <= 1e-6f) {
+            std::cerr << "Degenerate bevel triangle at " << ti / 3u << std::endl;
+            return false;
+        }
+        for (int side = 0; side < 3; ++side) {
+            PositionKey first = positionKey(model.vertices[tri[side]].position);
+            PositionKey second = positionKey(model.vertices[tri[(side + 1) % 3]].position);
+            if (second < first)
+                std::swap(first, second);
+            ++geometricEdges[{first, second}];
+        }
+    }
+    for (const auto& [edge, uses] : geometricEdges) {
+        (void)edge;
+        if (uses != 2) {
+            std::cerr << "Non-manifold geometric edge use count: " << uses << std::endl;
+            return false;
+        }
+    }
+
+    const Mesh plane = Mesh::CreatePlane(2.0f, 1, true);
+    const Mesh subdivided = Mesh::CreateSubdivided(
+        plane, 1, 0.0f, glm::vec3(1.0f), true);
+    if (subdivided.GetIndexCount() / 3u != 8u ||
+        subdivided.GetVertexCount() != 9u) {
+        std::cerr << "Unexpected mesh subdivision counts: verts="
+                  << subdivided.GetVertexCount() << " tris="
+                  << subdivided.GetIndexCount() / 3u << std::endl;
+        return false;
+    }
+    const Mesh thresholdLimited = Mesh::CreateSubdivided(
+        plane, 4, 100.0f, glm::vec3(1.0f), true);
+    if (thresholdLimited.GetIndexCount() != plane.GetIndexCount()) {
+        std::cerr << "Mesh subdivision ignored max-edge early-out." << std::endl;
+        return false;
+    }
+
+    ProModelerComponent cylinder;
+    cylinder.sides = 12;
+    cylinder.size = { 2.0f, 3.0f, 1.0f };
+    cylinder.ResetCylinder();
+    if (cylinder.shape != ProModelerComponent::Shape::Cylinder ||
+        cylinder.vertices.size() != 120u || cylinder.indices.size() / 3u != 48u ||
+        cylinder.triangleFaceIds.size() != 48u || cylinder.nextFaceId != 15u) {
+        std::cerr << "Unexpected ProModeler cylinder topology: verts="
+                  << cylinder.vertices.size() << " tris=" << cylinder.indices.size() / 3u
+                  << " faceIds=" << cylinder.triangleFaceIds.size()
+                  << " nextFaceId=" << cylinder.nextFaceId << std::endl;
+        return false;
+    }
+    geometricEdges.clear();
+    for (size_t ti = 0; ti + 2u < cylinder.indices.size(); ti += 3u) {
+        const uint32_t tri[3] = {
+            cylinder.indices[ti], cylinder.indices[ti + 1u], cylinder.indices[ti + 2u]
+        };
+        if (tri[0] >= cylinder.vertices.size() || tri[1] >= cylinder.vertices.size() ||
+            tri[2] >= cylinder.vertices.size()) {
+            std::cerr << "Out-of-range cylinder triangle at " << ti / 3u << std::endl;
+            return false;
+        }
+        const glm::vec3& a = cylinder.vertices[tri[0]].position;
+        const glm::vec3& b = cylinder.vertices[tri[1]].position;
+        const glm::vec3& c = cylinder.vertices[tri[2]].position;
+        if (glm::length(glm::cross(b - a, c - a)) <= 1e-6f) {
+            std::cerr << "Degenerate cylinder triangle at " << ti / 3u << std::endl;
+            return false;
+        }
+        for (int side = 0; side < 3; ++side) {
+            PositionKey first = positionKey(cylinder.vertices[tri[side]].position);
+            PositionKey second = positionKey(cylinder.vertices[tri[(side + 1) % 3]].position);
+            if (second < first)
+                std::swap(first, second);
+            ++geometricEdges[{first, second}];
+        }
+    }
+    for (const auto& [edge, uses] : geometricEdges) {
+        (void)edge;
+        if (uses != 2) {
+            std::cerr << "Non-manifold cylinder edge use count: " << uses << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
 bool RunMeshColliderRegression() {
     using namespace MipsyncEngine;
     JPH::RegisterDefaultAllocator();
@@ -191,6 +378,39 @@ bool RunMeshColliderRegression() {
         return false;
     }
     return true;
+}
+
+void EmitBuildProgress(float fraction, const std::string& stage) {
+    const int percent = std::clamp(static_cast<int>(fraction * 100.0f), 0, 100);
+    std::cout << "MIPSYNC_PROGRESS\t" << percent << "\t" << stage << std::endl;
+}
+
+std::string EscapeBuildField(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char ch : value) {
+        if (ch == '\\') escaped += "\\\\";
+        else if (ch == '\n') escaped += "\\n";
+        else if (ch == '\r') continue;
+        else escaped += ch;
+    }
+    return escaped;
+}
+
+void EmitPs1BuildResult(const MipsyncEngine::Ps1::Ps1BuildResult& result) {
+    std::cout << result.message << std::endl;
+    std::cout << "MIPSYNC_RESULT_MESSAGE\t" << EscapeBuildField(result.message) << std::endl;
+    std::cout << "MIPSYNC_RESULT_OUTPUT\t" << result.outputDirectory << std::endl;
+    std::cout << "MIPSYNC_RESULT_PSX\t" << result.psxExePath << std::endl;
+    std::cout << "MIPSYNC_RESULT_CUE\t" << result.discCuePath << std::endl;
+    std::cout << "MIPSYNC_RESULT_DISC\t" << result.discFolderPath << std::endl;
+}
+
+void EmitPcBuildResult(const MipsyncEngine::PlayerBuildResult& result) {
+    std::cout << result.message << std::endl;
+    std::cout << "MIPSYNC_RESULT_MESSAGE\t" << EscapeBuildField(result.message) << std::endl;
+    std::cout << "MIPSYNC_RESULT_OUTPUT\t" << result.outputDirectory << std::endl;
+    std::cout << "MIPSYNC_RESULT_EXE\t" << result.executablePath << std::endl;
 }
 
 } // namespace
@@ -243,6 +463,15 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (args.testProModelerBevel) {
+            if (!RunProModelerBevelRegression()) {
+                std::cerr << "ProModeler bevel regression failed." << std::endl;
+                return 1;
+            }
+            std::cout << "ProModeler bevel regression OK." << std::endl;
+            return 0;
+        }
+
         if (args.testMeshCollider) {
             if (!RunMeshColliderRegression()) {
                 std::cerr << "Mesh collider regression failed." << std::endl;
@@ -278,6 +507,51 @@ int main(int argc, char** argv) {
             return result.success ? 0 : 1;
         }
 
+        if (args.buildPs1Only) {
+            if (args.projectPath.empty()) {
+                std::cerr << "Usage: MipsyncEngine --build-ps1 <projectDir>" << std::endl;
+                return 1;
+            }
+            MipsyncEngine::ProjectInfo info;
+            std::string err;
+            if (!MipsyncEngine::Project::LoadFromDir(args.projectPath, info, err)) {
+                std::cerr << "Project load failed: " << err << std::endl;
+                return 1;
+            }
+            const std::string engineRoot =
+                MipsyncEngine::PlayerBuild::GetRunningEngineDirectory();
+            MipsyncEngine::Ps1::Ps1BuildRequest req;
+            req.projectPath = args.projectPath;
+            req.settings = info.player;
+            req.engineRoot = engineRoot;
+            req.progress = EmitBuildProgress;
+            const auto result = MipsyncEngine::Ps1::Build(req);
+            EmitPs1BuildResult(result);
+            return result.success ? 0 : 1;
+        }
+
+        if (args.buildPcOnly) {
+            if (args.projectPath.empty()) {
+                std::cerr << "Usage: MipsyncEngine --build-pc <projectDir>" << std::endl;
+                return 1;
+            }
+            MipsyncEngine::ProjectInfo info;
+            std::string err;
+            if (!MipsyncEngine::Project::LoadFromDir(args.projectPath, info, err)) {
+                std::cerr << "Project load failed: " << err << std::endl;
+                return 1;
+            }
+            MipsyncEngine::PlayerBuildRequest req;
+            req.projectPath = args.projectPath;
+            req.settings = info.player;
+            req.engineDirectory = MipsyncEngine::PlayerBuild::GetRunningEngineDirectory();
+            req.outputParent = MipsyncEngine::PlayerBuild::DefaultOutputParent(args.projectPath);
+            req.progress = EmitBuildProgress;
+            const auto result = MipsyncEngine::PlayerBuild::BuildWindows(req);
+            EmitPcBuildResult(result);
+            return result.success ? 0 : 1;
+        }
+
         if (args.buildDiscOnly) {
             if (args.projectPath.empty()) {
                 std::cerr << "Usage: MipsyncEngine --build-disc <projectDir>" << std::endl;
@@ -299,8 +573,9 @@ int main(int argc, char** argv) {
             req.projectPath = args.projectPath;
             req.settings = info.player;
             req.engineRoot = engineRoot;
+            req.progress = EmitBuildProgress;
             const auto result = MipsyncEngine::Ps1::BuildDiscFolder(req);
-            std::cout << result.message << std::endl;
+            EmitPs1BuildResult(result);
             return result.success ? 0 : 1;
         }
 

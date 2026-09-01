@@ -15,10 +15,13 @@ namespace MipsyncEngine {
 
 // PS1 rendering parameters (adjustable from editor)
 struct PS1Settings {
-    float vertexJitter      = 160.0f;  // Snapping resolution (lower = more jitter)
-    bool  affineMapping     = true;    // Affine texture mapping
-    bool  colorDepthLimit   = true;    // 15-bit color (5-5-5)
-    bool  ditheringEnabled  = true;    // Ordered dithering
+    // Editor previews are intentionally clean. PS1 rasterization artifacts
+    // belong to the exported runtime, not the authoring views where they hide
+    // texture, topology and skinning problems.
+    float vertexJitter      = 0.0f;
+    bool  affineMapping     = false;
+    bool  colorDepthLimit   = false;
+    bool  ditheringEnabled  = false;
     bool  fogEnabled        = true;
     float fogStart          = 10.0f;
     float fogEnd            = 40.0f;

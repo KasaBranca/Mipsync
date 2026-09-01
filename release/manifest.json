@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-09-01T10:49:23.2258476+09:00",
+  "hub": {
+    "version": "v2026.9.1",
+    "assetName": "MipsyncHub_Windows_x64.zip",
+    "downloadUrl": "https://github.com/KasaBranca/Mipsync/releases/download/v2026.9.1/MipsyncHub_Windows_x64.zip",
+    "releaseNotesUrl": "https://github.com/KasaBranca/Mipsync/releases/tag/v2026.9.1"
+  },
+  "editor": {
+    "assetName": "MipsyncEngine_Windows_x64.zip",
+    "releases": [
+      {
+        "version": "v2026.9.1",
+        "title": "Mipsync Engine 2026.9.1",
+        "downloadUrl": "https://github.com/KasaBranca/Mipsync/releases/download/v2026.9.1/MipsyncEngine_Windows_x64.zip",
+        "publishedAt": "2026-09-01T10:49:23.2135783+09:00"
+      },
+      {
+        "version": "v2026.8.26",
+        "title": "Mipsync Engine 2026.8.26",
+        "downloadUrl": "https://github.com/KasaBranca/mipsync/releases/download/v2026.8.26/MipsyncEngine_Windows_x64.zip",
+        "publishedAt": "2026-08-26T14:11:47.5843939+09:00"
+      },
+      {
+        "version": "v2026.8.6",
+        "title": "Mipsync Engine 2026.8.6",
+        "downloadUrl": "https://github.com/KasaBranca/mipsync/releases/download/v2026.8.6/MipsyncEngine_Windows_x64.zip",
+        "publishedAt": "2026-08-07T09:54:04.8719422+09:00"
+      },
+      {
+        "version": "v2026.8.5",
+        "title": "Mipsync Engine 2026.8.5",
+        "downloadUrl": "https://github.com/LimeHato74/mipsync/releases/download/v2026.8.5/MipsyncEngine_Windows_x64.zip",
+        "publishedAt": "2026-08-05T21:59:59.5168274+09:00"
+      },
+      {
+        "version": "v2026.7.9",
+        "title": "Mipsync Engine 2026.7.9",
+        "downloadUrl": "https://github.com/LimeHato74/mipsync/releases/download/v2026.7.9/MipsyncEngine_Windows_x64.zip",
+        "publishedAt": "2026-07-10T23:52:50.6106093+09:00"
+      },
+      {
+        "version": "v2026.7.8",
+        "title": "Mipsync Engine 2026.7.8",
+        "downloadUrl": "https://github.com/LimeHato74/mipsync/releases/download/v2026.7.8/MipsyncEngine_Windows_x64.zip",
+        "publishedAt": "2026-07-10T07:29:44.5980245+09:00"
+      },
+      {
+        "version": "v2026.7.7",
+        "title": "Mipsync Engine 2026.7.7",
+        "downloadUrl": "https://github.com/LimeHato74/mipsync/releases/download/v2026.7.7/MipsyncEngine_Windows_x64.zip",
+        "publishedAt": "2026-07-03T17:01:37.1660876+09:00"
+      },
+      {
+        "version": "v2026.7.6",
+        "title": "Mipsync Engine 2026.7.6",
+        "downloadUrl": "https://github.com/LimeHato74/mipsync/releases/download/v2026.7.6/MipsyncEngine_Windows_x64.zip",
+        "publishedAt": "2026-07-03T08:37:26.5235168+09:00"
+      },
+      {
+        "version": "v2026.7.3",
+        "title": "Mipsync Engine 2026.7.3",
+        "downloadUrl": "https://github.com/LimeHato74/mipsync/releases/download/v2026.7.3/MipsyncEngine_Windows_x64.zip",
+        "publishedAt": "2026-07-02T13:00:00+09:00"
+      },
+      {
+        "version": "v2026.7.2",
+        "title": "Mipsync Engine 2026.7.2",
+        "downloadUrl": "https://github.com/LimeHato74/mipsync/releases/download/v2026.7.2/MipsyncEngine_Windows_x64.zip",
+        "publishedAt": "2026-07-02T11:53:39.7525599+09:00"
+      }
+    ]
+  }
+}

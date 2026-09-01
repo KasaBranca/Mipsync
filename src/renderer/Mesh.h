@@ -42,8 +42,9 @@ public:
     const std::vector<uint32_t>& GetIndices() const { return m_Indices; }
 
     // Primitive generators
-    static Mesh CreateCube(float size = 1.0f);
-    static Mesh CreatePlane(float size = 10.0f, int subdivisions = 1);
+    static Mesh CreateCube(float size = 1.0f, bool cpuOnly = false);
+    static Mesh CreatePlane(float size = 10.0f, int subdivisions = 1,
+                            bool cpuOnly = false);
     static Mesh CreateTerrain(float size = 32.0f, int subdivisions = 32,
                               float heightScale = 2.0f, float noiseScale = 0.18f,
                               int seed = 1337, bool flat = false,
@@ -54,6 +55,14 @@ public:
                                       bool cpuOnly = false);
     static Mesh CreateSphere(float radius = 0.5f, int sectors = 16, int stacks = 12);
     static Mesh CreateScreenQuad();
+
+    /// Uniformly subdivides every triangle into four, stopping early once the
+    /// longest edge (after worldScale) is at or below maxEdgeLength.  A value
+    /// <= 0 for maxEdgeLength applies exactly maxLevels iterations.
+    static Mesh CreateSubdivided(const Mesh& source, int maxLevels,
+                                 float maxEdgeLength = 0.0f,
+                                 const glm::vec3& worldScale = glm::vec3(1.0f),
+                                 bool cpuOnly = false);
 
     /// Load mesh from file (.obj, .fbx, .glb). Centers and scales to unit extent (matches CreateCube(1)).
     static Mesh LoadFromFile(const std::string& path);

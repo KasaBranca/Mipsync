@@ -92,6 +92,38 @@ std::string NormalizePrimitive(std::string primitive) {
     return primitive;
 }
 
+const char* MeshRendererPresetName(MeshRendererComponent::TypePreset preset) {
+    switch (preset) {
+    case MeshRendererComponent::TypePreset::Corridor: return "Corridor";
+    case MeshRendererComponent::TypePreset::Character: return "Character";
+    case MeshRendererComponent::TypePreset::Viewmodel: return "Viewmodel";
+    case MeshRendererComponent::TypePreset::Floor: return "Floor";
+    case MeshRendererComponent::TypePreset::Prop:
+    default: return "Prop";
+    }
+}
+
+MeshRendererComponent::TypePreset MeshRendererPresetFromJson(const json& mr) {
+    // Legacy scenes used a standalone checkbox. Preserve it during migration.
+    if (!mr.contains("typePreset"))
+        return mr.value("viewModel", false)
+            ? MeshRendererComponent::TypePreset::Viewmodel
+            : MeshRendererComponent::TypePreset::Prop;
+    if (mr["typePreset"].is_number_integer()) {
+        const int value = std::clamp(mr["typePreset"].get<int>(), 0, 4);
+        return static_cast<MeshRendererComponent::TypePreset>(value);
+    }
+    std::string value = mr.value("typePreset", std::string{"Prop"});
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (value == "corridor") return MeshRendererComponent::TypePreset::Corridor;
+    if (value == "character") return MeshRendererComponent::TypePreset::Character;
+    if (value == "viewmodel" || value == "view-model")
+        return MeshRendererComponent::TypePreset::Viewmodel;
+    if (value == "floor") return MeshRendererComponent::TypePreset::Floor;
+    return MeshRendererComponent::TypePreset::Prop;
+}
+
 bool IsCameraTriggerTag(const json& ent) {
     std::string tag;
     if (ent.contains("unityTag") && ent["unityTag"].is_string())
@@ -177,8 +209,43 @@ std::string InferPrimitiveFromEntityName(const std::string& entityName, const st
     return stored;
 }
 
+const char* ComponentOrderKey(const Component* component) {
+    if (dynamic_cast<const TagComponent*>(component)) return "tag";
+    if (dynamic_cast<const TransformComponent*>(component)) return "transform";
+    if (dynamic_cast<const MeshRendererComponent*>(component)) return "meshRenderer";
+    if (dynamic_cast<const MeshSubdividerComponent*>(component)) return "meshSubdivider";
+    if (dynamic_cast<const TerrainComponent*>(component)) return "terrain";
+    if (dynamic_cast<const ProModelerComponent*>(component)) return "proModeler";
+    if (dynamic_cast<const SkinnedMeshRendererComponent*>(component)) return "skinnedMeshRenderer";
+    if (dynamic_cast<const AnimatorComponent*>(component)) return "animator";
+    if (dynamic_cast<const BoneComponent*>(component)) return "bone";
+    if (dynamic_cast<const LightComponent*>(component)) return "light";
+    if (dynamic_cast<const PostProcessVolumeComponent*>(component)) return "postProcessVolume";
+    if (dynamic_cast<const AudioSourceComponent*>(component)) return "audioSource";
+    if (dynamic_cast<const CameraComponent*>(component)) return "camera";
+    if (dynamic_cast<const DistanceCullComponent*>(component)) return "distanceCull";
+    if (dynamic_cast<const FrustumCullComponent*>(component)) return "frustumCull";
+    if (dynamic_cast<const MipsScriptComponent*>(component)) return "mipsScript";
+    if (dynamic_cast<const ColliderComponent*>(component)) return "collider";
+    if (dynamic_cast<const RigidbodyComponent*>(component)) return "rigidbody";
+    if (dynamic_cast<const CanvasComponent*>(component)) return "canvas";
+    if (dynamic_cast<const RectTransformComponent*>(component)) return "rectTransform";
+    if (dynamic_cast<const UIImageComponent*>(component)) return "uiImage";
+    if (dynamic_cast<const UITextComponent*>(component)) return "uiText";
+    if (dynamic_cast<const UIButtonGroupComponent*>(component)) return "uiButtonGroup";
+    if (dynamic_cast<const UIButtonComponent*>(component)) return "uiButton";
+    if (dynamic_cast<const UIAudioSpectrumComponent*>(component)) return "uiAudioSpectrum";
+    return nullptr;
+}
+
 json EntityComponentsToJson(const Entity& entity) {
     json ent;
+
+    ent["componentOrder"] = json::array();
+    for (const Component* component : entity.GetComponentsInOrder()) {
+        if (const char* key = ComponentOrderKey(component))
+            ent["componentOrder"].push_back(key);
+    }
 
     if (!entity.IsActive()) ent["active"] = false;
     if (entity.IsStatic()) ent["static"] = true;
@@ -202,9 +269,8 @@ json EntityComponentsToJson(const Entity& entity) {
             mr["enabled"] = false;
         mr["primitive"] = mesh->meshPrimitive;
         mr["size"] = mesh->meshSize;
+        mr["typePreset"] = MeshRendererPresetName(mesh->typePreset);
         if (!mesh->materialPath.empty()) mr["material"] = mesh->materialPath;
-        if (mesh->viewModel)
-            mr["viewModel"] = true;
         if (mesh->editorOnly)
             mr["editorOnly"] = true;
         if (mesh->prerenderOccluder)
@@ -213,6 +279,16 @@ json EntityComponentsToJson(const Entity& entity) {
             mr["ps1SeamFill"] = true;
         if (!mesh->meshPath.empty()) mr["mesh"] = mesh->meshPath;
         ent["meshRenderer"] = mr;
+    }
+
+    if (const auto* subdivider =
+            const_cast<Entity&>(entity).GetComponent<MeshSubdividerComponent>()) {
+        ent["meshSubdivider"] = {
+            { "enabled", subdivider->enabled },
+            { "maxLevels", subdivider->maxLevels },
+            { "maxEdgeLength", subdivider->maxEdgeLength },
+            { "preview", subdivider->preview },
+        };
     }
 
     if (const auto* terrain = const_cast<Entity&>(entity).GetComponent<TerrainComponent>()) {
@@ -247,7 +323,9 @@ json EntityComponentsToJson(const Entity& entity) {
             { "shape", static_cast<int>(pb->shape) },
             { "size", Vec3ToJson(pb->size) },
             { "steps", pb->steps },
+            { "sides", pb->sides },
             { "extrudeAmount", pb->extrudeAmount },
+            { "bevelAmount", pb->bevelAmount },
         };
         if (!pb->enabled)
             pbJson["enabled"] = false;
@@ -348,6 +426,36 @@ json EntityComponentsToJson(const Entity& entity) {
         if (!camera->enabled)
             camJson["enabled"] = false;
         ent["camera"] = camJson;
+    }
+
+    if (const auto* cull = const_cast<Entity&>(entity).GetComponent<DistanceCullComponent>()) {
+        json cullJson = {
+            { "cullDistance", cull->cullDistance },
+            { "cullMeshRenderers", cull->cullMeshRenderers },
+            { "cullSkinnedMeshes", cull->cullSkinnedMeshes },
+            { "cullLights", cull->cullLights },
+        };
+        if (cull->targetEntityId != 0)
+            cullJson["target"] = cull->targetEntityId;
+        if (!cull->enabled)
+            cullJson["enabled"] = false;
+        if (cull->previewInEditor)
+            cullJson["previewInEditor"] = true;
+        ent["distanceCull"] = cullJson;
+    }
+
+    if (const auto* fcull = const_cast<Entity&>(entity).GetComponent<FrustumCullComponent>()) {
+        json fcullJson = {
+            { "margin", fcull->margin },
+            { "cullMeshRenderers", fcull->cullMeshRenderers },
+            { "cullSkinnedMeshes", fcull->cullSkinnedMeshes },
+            { "cullLights", fcull->cullLights },
+        };
+        if (!fcull->enabled)
+            fcullJson["enabled"] = false;
+        if (fcull->previewInEditor)
+            fcullJson["previewInEditor"] = true;
+        ent["frustumCull"] = fcullJson;
     }
 
     json scriptsJson = json::array();
@@ -614,7 +722,7 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         const std::string legacyTexturePath = ResolveAssetPathWithAssetsFallback(
             assets, mr.value("texture", std::string{}));
         meshComp.meshPath     = mr.value("mesh",     std::string{});
-        meshComp.viewModel    = mr.value("viewModel", false);
+        meshComp.typePreset   = MeshRendererPresetFromJson(mr);
         meshComp.editorOnly   = mr.value("editorOnly", false);
         meshComp.prerenderOccluder = mr.value("prerenderOccluder", false);
         meshComp.ps1SeamFill  = mr.value("ps1SeamFill", false);
@@ -661,6 +769,17 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         } else {
             meshComp.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
         }
+    }
+
+    if (ent.contains("meshSubdivider") && ent["meshSubdivider"].is_object()) {
+        const json& subdivisionJson = ent["meshSubdivider"];
+        auto& subdivider = entity.AddComponent<MeshSubdividerComponent>();
+        subdivider.enabled = subdivisionJson.value("enabled", true);
+        subdivider.maxLevels = std::clamp(
+            subdivisionJson.value("maxLevels", 1), 0, 4);
+        subdivider.maxEdgeLength = std::max(
+            0.0f, subdivisionJson.value("maxEdgeLength", 1.0f));
+        subdivider.preview = subdivisionJson.value("preview", true);
     }
 
     if (ent.contains("terrain")) {
@@ -714,11 +833,13 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         auto& pb = entity.AddComponent<ProModelerComponent>();
         pb.enabled = pj.value("enabled", true);
         pb.shape = static_cast<ProModelerComponent::Shape>(
-            std::clamp(pj.value("shape", static_cast<int>(pb.shape)), 0, 4));
+            std::clamp(pj.value("shape", static_cast<int>(pb.shape)), 0, 5));
         if (pj.contains("size"))
             Vec3FromJson(pj["size"], pb.size);
         pb.steps = std::clamp(pj.value("steps", pb.steps), 1, 32);
+        pb.sides = std::clamp(pj.value("sides", pb.sides), 3, 64);
         pb.extrudeAmount = pj.value("extrudeAmount", pb.extrudeAmount);
+        pb.bevelAmount = pj.value("bevelAmount", pb.bevelAmount);
 
         if (pj.contains("vertices") && pj["vertices"].is_array()) {
             pb.vertices.clear();
@@ -935,6 +1056,29 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
             cameraComp.camera.SyncFromTransform(transform->position, transform->rotation);
     }
 
+    if (ent.contains("distanceCull") && ent["distanceCull"].is_object()) {
+        const json& cj = ent["distanceCull"];
+        auto& cull = entity.AddComponent<DistanceCullComponent>();
+        cull.enabled           = cj.value("enabled", true);
+        cull.cullDistance      = cj.value("cullDistance", 30.0f);
+        cull.targetEntityId    = cj.value("target", 0u);
+        cull.cullMeshRenderers = cj.value("cullMeshRenderers", true);
+        cull.cullSkinnedMeshes = cj.value("cullSkinnedMeshes", true);
+        cull.cullLights        = cj.value("cullLights", true);
+        cull.previewInEditor   = cj.value("previewInEditor", false);
+    }
+
+    if (ent.contains("frustumCull") && ent["frustumCull"].is_object()) {
+        const json& fcj = ent["frustumCull"];
+        auto& fcull = entity.AddComponent<FrustumCullComponent>();
+        fcull.enabled           = fcj.value("enabled", true);
+        fcull.margin            = fcj.value("margin", 1.5f);
+        fcull.cullMeshRenderers = fcj.value("cullMeshRenderers", true);
+        fcull.cullSkinnedMeshes = fcj.value("cullSkinnedMeshes", true);
+        fcull.cullLights        = fcj.value("cullLights", true);
+        fcull.previewInEditor   = fcj.value("previewInEditor", false);
+    }
+
     auto loadMipsScript = [&](const json& scriptJson) {
         auto& script = entity.AddComponent<MipsScriptComponent>();
         script.enabled = scriptJson.value("enabled", true);
@@ -1122,6 +1266,28 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         spectrum.barGap = spectrumJson.value("barGap", spectrum.barGap);
         spectrum.sensitivity = spectrumJson.value("sensitivity", spectrum.sensitivity);
         spectrum.smoothing = spectrumJson.value("smoothing", spectrum.smoothing);
+    }
+
+    if (ent.contains("componentOrder") && ent["componentOrder"].is_array()) {
+        std::vector<Component*> remaining = entity.GetComponentsInOrder();
+        std::vector<Component*> ordered;
+        ordered.reserve(remaining.size());
+        for (const json& keyJson : ent["componentOrder"]) {
+            if (!keyJson.is_string())
+                continue;
+            const std::string key = keyJson.get<std::string>();
+            auto it = std::find_if(remaining.begin(), remaining.end(),
+                                   [&](Component* component) {
+                                       const char* componentKey = ComponentOrderKey(component);
+                                       return componentKey && key == componentKey;
+                                   });
+            if (it == remaining.end())
+                continue;
+            ordered.push_back(*it);
+            remaining.erase(it);
+        }
+        ordered.insert(ordered.end(), remaining.begin(), remaining.end());
+        entity.SetComponentOrder(ordered);
     }
 }
 

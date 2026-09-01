@@ -155,6 +155,7 @@ struct PhysicsWorld::Impl {
     JPH::BodyInterface* bodyInterface = nullptr;
     std::unordered_map<uint32_t, JPH::BodyID> entityToBody;
     std::unordered_map<uint32_t, JPH::Ref<JPH::CharacterVirtual>> entityToCharacter;
+    std::unordered_map<uint32_t, JPH::Vec3> characterDesiredVelocity;
 
     JPH::Vec3 gravity = JPH::Vec3(0.0f, -9.81f, 0.0f);
 
@@ -354,6 +355,7 @@ void PhysicsWorld::SetContactCallback(PhysicsContactCallback callback) {
 void PhysicsWorld::DestroyAllBodies() {
     // Destroy CharacterVirtuals first; their destructors remove the inner bodies they own.
     m_Impl->entityToCharacter.clear();
+    m_Impl->characterDesiredVelocity.clear();
     m_Impl->characterEntityIds.clear();
     m_Impl->activeEntityContactPairs.clear();
     m_Impl->subShapeContacts.clear();
@@ -586,7 +588,7 @@ void PhysicsWorld::SyncEntityFromScene(Scene& scene, Entity& entity) {
 // ─────────────────────────────────────────────────
 // Per-frame sync helpers
 // ─────────────────────────────────────────────────
-void PhysicsWorld::SyncKinematicAndStaticFromScene(Scene& scene) {
+void PhysicsWorld::SyncKinematicAndStaticFromScene(Scene& scene, float deltaTime) {
     if (!m_Impl->bodyInterface) return;
 
     for (const auto& entityPtr : scene.GetEntities()) {
@@ -605,10 +607,17 @@ void PhysicsWorld::SyncKinematicAndStaticFromScene(Scene& scene) {
         const ColliderUtils::ColliderWorldPose pose =
             ColliderUtils::ComputePhysicsWorldPose(scene, *entity, *collider, rb);
 
-        m_Impl->bodyInterface->SetPositionAndRotation(
-            it->second, ToJoltPos(pose.center), ToJoltQuat(pose.rotation),
-            motion == JPH::EMotionType::Kinematic ? JPH::EActivation::Activate
-                                                  : JPH::EActivation::DontActivate);
+        if (motion == JPH::EMotionType::Kinematic && deltaTime > 0.0f) {
+            // MoveKinematic derives linear/angular velocity from the target
+            // delta. CharacterVirtual uses that velocity to stay attached to
+            // moving ground instead of observing a teleported static surface.
+            m_Impl->bodyInterface->MoveKinematic(
+                it->second, ToJoltPos(pose.center), ToJoltQuat(pose.rotation), deltaTime);
+        } else {
+            m_Impl->bodyInterface->SetPositionAndRotation(
+                it->second, ToJoltPos(pose.center), ToJoltQuat(pose.rotation),
+                JPH::EActivation::DontActivate);
+        }
     }
 }
 
@@ -656,23 +665,45 @@ void PhysicsWorld::UpdateCharacters(Scene& scene, float deltaTime) {
     const auto layerFilter = m_Impl->physicsSystem->GetDefaultLayerFilter(Layers::kMoving);
 
     for (auto& [id, character] : m_Impl->entityToCharacter) {
-        // SetCharacterVelocity (called from Mips Update) wrote the velocity directly.
+        bool movingAwayFromGround = false;
+        // Refresh moving-ground velocity after kinematic targets were updated.
+        // Jolt expects player input to be added to this velocity while supported.
+        if (const auto desiredIt = m_Impl->characterDesiredVelocity.find(id);
+            desiredIt != m_Impl->characterDesiredVelocity.end()) {
+            character->UpdateGroundVelocity();
+            JPH::Vec3 velocity = desiredIt->second;
+            if (character->GetGroundState() == JPH::CharacterBase::EGroundState::OnGround) {
+                const JPH::Vec3 groundVelocity = character->GetGroundVelocity();
+                const JPH::Vec3 up = character->GetUp();
+                movingAwayFromGround =
+                    velocity.Dot(up) > groundVelocity.Dot(up) + 0.1f;
+                if (!movingAwayFromGround)
+                    velocity += groundVelocity;
+            }
+            character->SetLinearVelocity(velocity);
+        }
         Entity* entity = scene.FindEntity(id);
         const auto* rb = entity ? entity->GetComponent<RigidbodyComponent>() : nullptr;
         const JPH::Vec3 gravity = (!rb || rb->useGravity)
             ? m_Impl->gravity
             : JPH::Vec3::sZero();
         JPH::CharacterVirtual::ExtendedUpdateSettings settings;
-        // Do not magnetically snap controllers down to nearby floors. Gravity
-        // already keeps ordinary characters grounded, while fixed-camera
-        // controllers retain their authored vertical plane.
-        settings.mStickToFloorStepDown = JPH::Vec3::sZero();
+        // Keep an on-ground character projected onto its support surface.
+        // Disabling this made fast horizontal platforms alternate between
+        // OnGround and InAir, producing a visible one-frame carry / one-frame
+        // fall jitter. Never stick while the controller is jumping away.
+        settings.mStickToFloorStepDown =
+            character->GetGroundState() == JPH::CharacterBase::EGroundState::OnGround &&
+                    !movingAwayFromGround
+                ? -0.5f * character->GetUp()
+                : JPH::Vec3::sZero();
         character->ExtendedUpdate(deltaTime, gravity, settings,
                                   bpFilter, layerFilter,
                                   JPH::BodyFilter(), JPH::ShapeFilter(),
                                   *m_Impl->tempAllocator);
         (void)id;
     }
+    m_Impl->characterDesiredVelocity.clear();
 }
 
 void PhysicsWorld::SyncCharactersToScene(Scene& scene) {
@@ -685,7 +716,7 @@ void PhysicsWorld::SyncCharactersToScene(Scene& scene) {
 
 bool PhysicsWorld::SetCharacterVelocity(Entity& entity, const glm::vec3& velocity) {
     if (auto character = m_Impl->FindCharacter(entity.GetID())) {
-        character->SetLinearVelocity(ToJoltVec(velocity));
+        m_Impl->characterDesiredVelocity[entity.GetID()] = ToJoltVec(velocity);
         return true;
     }
     return false;
@@ -706,7 +737,7 @@ void PhysicsWorld::Simulate(Scene& scene, float deltaTime) {
 
     deltaTime = std::min(deltaTime, 1.0f / 20.0f);
 
-    SyncKinematicAndStaticFromScene(scene);
+    SyncKinematicAndStaticFromScene(scene, deltaTime);
 
     // 1) Move CharacterVirtuals (slides along surfaces, sticks to ground, walks stairs).
     UpdateCharacters(scene, deltaTime);

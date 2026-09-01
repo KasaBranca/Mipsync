@@ -4,6 +4,7 @@
 #include "../core/RuntimePaths.h"
 #include "../renderer/Texture.h"
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <unordered_map>
@@ -96,6 +97,17 @@ std::shared_ptr<Texture> GetWindowsSystemIcon(const std::wstring& extension) {
         unsigned char r = pixels[i * 4 + 2];
         pixels[i * 4 + 0] = r;
         pixels[i * 4 + 2] = b;
+    }
+
+    // Flip rows vertically so row 0 is at the bottom (matching STB flip for OpenGL / ImGui rendering)
+    const int rowBytes = width * 4;
+    std::vector<unsigned char> tempRow(rowBytes);
+    for (int y = 0; y < height / 2; ++y) {
+        unsigned char* rowTop = pixels.data() + y * rowBytes;
+        unsigned char* rowBottom = pixels.data() + (height - 1 - y) * rowBytes;
+        std::memcpy(tempRow.data(), rowTop, rowBytes);
+        std::memcpy(rowTop, rowBottom, rowBytes);
+        std::memcpy(rowBottom, tempRow.data(), rowBytes);
     }
 
     SelectObject(hdcMem, hbmOld);
@@ -396,6 +408,21 @@ void DrawShapePresetIcon(ImDrawList* drawList, ImVec2 min, ImVec2 max, int shape
         drawList->AddLine(p5, end, color, thick);
         drawList->AddLine(end, br, color, thick);
         drawList->AddLine(br, start, color, thick);
+    }
+    else if (shapeType == 4) { // Cylinder
+        const float rx = w * 0.28f;
+        const float ry = h * 0.12f;
+        const float topY = cy - h * 0.23f;
+        const float bottomY = cy + h * 0.23f;
+        drawList->AddEllipse(ImVec2(cx, topY), ImVec2(rx, ry), color,
+                             0.0f, 20, thick);
+        drawList->PathEllipticalArcTo(ImVec2(cx, bottomY), ImVec2(rx, ry),
+                                      0.0f, 0.0f, 3.14159265f, 12);
+        drawList->PathStroke(color, 0, thick);
+        drawList->AddLine(ImVec2(cx - rx, topY), ImVec2(cx - rx, bottomY),
+                          color, thick);
+        drawList->AddLine(ImVec2(cx + rx, topY), ImVec2(cx + rx, bottomY),
+                          color, thick);
     }
 }
 

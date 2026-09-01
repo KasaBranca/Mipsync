@@ -1,0 +1,6 @@
+interface:
+  display_name: "Mipsync CLI"
+  short_description: "Inspect and author live Mipsync projects"
+  default_prompt: "Use $mipsync-cli to inspect and safely modify my open Mipsync project."
+policy:
+  allow_implicit_invocation: true

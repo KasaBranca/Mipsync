@@ -1,0 +1,25 @@
+class Rotator : MipsBehaviour
+{
+    public float speed = 90.0;
+
+    void Awake()
+    {
+        Log.Info("Rotator awake");
+    }
+
+    void Start()
+    {
+        var self = GetComponent<Rotator>();
+        Log.Info("Rotator ready");
+    }
+
+    void Update()
+    {
+        transform.rotation.y = transform.rotation.y + speed * Time.deltaTime;
+    }
+
+    void OnDestroy()
+    {
+        Log.Info("Rotator destroyed");
+    }
+}

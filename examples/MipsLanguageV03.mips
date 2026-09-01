@@ -1,0 +1,41 @@
+enum Locomotion { Idle, Walk, Run }
+
+class MipsLanguageV03 : MipsBehaviour
+{
+    public float moveSpeed = 3.0;
+    public bool grounded { get; set; }
+    public int phase { get; set; }
+
+    void Start()
+    {
+        grounded = false;
+        phase = Idle;
+        Log.Info("Mips# v0.3 sample started");
+    }
+
+    void Update()
+    {
+        var anim = GetComponent<Animator>();
+        float h = 0.0;
+        if (Input.GetKey("W")) h = h + 1.0;
+        if (Input.GetKey("S")) h = h - 1.0;
+
+        anim.SetFloat("Speed", Mathf.Abs(h) * moveSpeed);
+        grounded = Physics.IsGrounded() != 0.0;
+
+        if (phase == Idle && Mathf.Abs(h) > 0.1)
+            phase = Walk;
+        if (phase == Walk && Mathf.Abs(h) < 0.05)
+            phase = Idle;
+    }
+
+    void OnCollisionEnter()
+    {
+        Log.Info("collision");
+    }
+
+    void OnTriggerEnter()
+    {
+        Log.Info("trigger");
+    }
+}

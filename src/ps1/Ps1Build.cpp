@@ -363,6 +363,11 @@ std::string DefaultOutputParent(const std::string& projectPath) {
 
 Ps1BuildResult Build(const Ps1BuildRequest& request) {
     Ps1BuildResult result;
+    const auto progress = [&](float fraction, const char* stage) {
+        if (request.progress)
+            request.progress(fraction, stage);
+    };
+    progress(0.02f, "Validating PS1 build settings");
     PlayerSettings settings = request.settings;
     settings.productName = SanitizeProductName(settings.productName);
 
@@ -390,6 +395,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
 
     std::string error;
     try {
+        progress(0.08f, "Preparing PS1 output folders");
         fs::create_directories(productRoot, ec);
         fs::create_directories(mipsyncExport, ec);
         fs::create_directories(projectCopy, ec);
@@ -420,12 +426,14 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
         fs::remove(outDir / "SYSTEM.CNF", rmEc);
         fs::create_directories(outDir, ec);
 
+        progress(0.15f, "Copying project assets");
         CopyProjectTree(projectRoot, projectCopy, error);
         if (!error.empty()) {
             result.message = error;
             return result;
         }
 
+        progress(0.24f, "Writing PS1 build manifest");
         BuildManifest manifest = BuildManifestIO::FromPlayerSettings(settings);
         const fs::path bootPath = mipsyncExport / "boot.json";
         if (!BuildManifestIO::SaveToFile(PathUtf8::ToString(bootPath), manifest, error)) {
@@ -459,6 +467,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
             return result;
         }
 
+        progress(0.31f, "Copying PS1 runtime sources");
         fs::create_directories(ps1Src / "generated", ec);
         CopyPs1StarterSources(templates / "starter", ps1Src, error);
         if (!error.empty()) {
@@ -472,6 +481,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
 
         // Export startup scene + scene-referenced Mipsync scripts into generated/
         // C tables consumed by the PS1 runtime (scene_data.c + scripts_data.c).
+        progress(0.40f, "Exporting scene, meshes and scripts");
         Mips::Ps1SceneExportResult sceneExport{};
         std::vector<std::string> exportDiagnostics;
         std::string exportError;
@@ -486,6 +496,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
             result.scriptCount = sceneExport.bindingCount;
             result.entityCount = sceneExport.entities.size();
         }
+        progress(0.66f, "Scene export complete");
         if (!exportDiagnostics.empty()) {
             for (const auto& d : exportDiagnostics)
                 MIPSYNC_WARN("Mipsync PS1 export: {}", d);
@@ -511,6 +522,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
             if (sdkRootStr.empty() && result.scriptCount > 0) {
                 log = "PSn00bSDK not found. Install it from the Hub (PS1 Toolchain), then rebuild.";
             } else {
+                progress(0.72f, "Compiling with PSn00bSDK");
                 const bool ran = RunPowerShellBuild(script, productRoot, engineDir, sdkRootStr, log);
                 const fs::path psx = outDir / "PSX.EXE";
                 const bool hasPsx = fs::is_regular_file(psx, ec);
@@ -543,6 +555,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
             fellBack = ApplyPrebuiltFallback(templates, outDir, result);
         }
 
+        progress(0.93f, "Finalizing PS1 build");
         result.success = !result.psxExePath.empty();
         result.outputDirectory = PathUtf8::ToString(productRoot);
         const std::string scriptSummary =
@@ -664,6 +677,8 @@ Ps1BuildResult BuildDiscFolder(const Ps1BuildRequest& request) {
     const fs::path discDir = productRoot / "disc";
     const fs::path ps1Src = productRoot / "ps1_src";
 
+    if (request.progress)
+        request.progress(0.95f, "Creating PS1 disc folder");
     std::error_code ec;
     // Clean and recreate the disc directory to make sure it's clean.
     fs::remove_all(discDir, ec);
@@ -737,6 +752,8 @@ Ps1BuildResult BuildDiscFolder(const Ps1BuildRequest& request) {
     }
 
     result.discFolderPath = PathUtf8::ToString(discDir);
+    if (request.progress)
+        request.progress(0.99f, "Finalizing disc folder");
     result.message = "PS2 Disc Folder generated successfully at:\n" + result.discFolderPath +
                      (hasLicense ? "\n(License file included)" : "\n(Warning: No license file included)");
     return result;

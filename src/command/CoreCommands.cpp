@@ -139,8 +139,13 @@ void RegisterLanguageSymbols(SymbolRegistry& symbols) {
     add("Mathf.Clamp", "method", "Clamps a number to an inclusive range.", "float Mathf.Clamp(float value, float min, float max)");
     add("Physics.Move", "method", "Moves the current character using desired velocity.", "void Physics.Move(float x, float y, float z)");
     add("Physics.IsGrounded", "method", "Returns whether the current character is grounded.", "bool Physics.IsGrounded()");
+    add("Physics.IsGroundedWithin", "method", "Returns whether walkable collision is within a downward distance.", "bool Physics.IsGroundedWithin(float distance)");
+    add("Physics.UseCharacterController", "method", "Configures the current entity for sliding character physics.", "void Physics.UseCharacterController()");
+    add("Physics.UseKinematicController", "method", "Configures the current entity for script-driven kinematic movement.", "void Physics.UseKinematicController()");
     add("Physics.Raycast", "method", "Returns the hit entity ID or zero.", "int Physics.Raycast(float ox, float oy, float oz, float dx, float dy, float dz, float maxDistance)");
     add("Animator.SetFloat", "method", "Sets an Animator float parameter.", "void Animator.SetFloat(string name, float value)");
+    add("Animator.SetTriggerHeld", "method", "Starts a trigger and holds its Exit Time pose until released.", "void Animator.SetTriggerHeld(string name)");
+    add("Animator.ReleaseTrigger", "method", "Releases a held Animator trigger into its authored transition.", "void Animator.ReleaseTrigger(string name)");
     add("AudioSource.Play", "method", "Starts playback on the entity AudioSource.", "void AudioSource.Play()");
     add("Log.Info", "method", "Writes values to the engine console.", "void Log.Info(...values)");
 }
@@ -337,14 +342,17 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
              Param("enabled", ValueType::Boolean, true, "New enabled state.")},
             "entity", ExecutionMode::Editor, {SideEffect::EditorMutation},
             {"mipsync component set-enabled Player MeshRenderer false"}, ForwardEditor},
-        {"mesh.set", "Configure an entity MeshRenderer.", "Sets primitive geometry, size, material and renderer flags.",
+        {"mesh.set", "Configure an entity MeshRenderer.", "Sets primitive geometry, size, material and the PS1 render type preset.",
             {Param("entity", ValueType::String, true, "Entity ID or exact name."),
              Param("primitive", ValueType::String, false, "cube, sphere or plane."),
              Param("size", ValueType::Number, false, "Primitive source mesh size."),
              Param("material", ValueType::Path, false, "Project-relative .nmat material, or none."),
              Param("enabled", ValueType::Boolean, false, "Renderer enabled state."),
              Param("editor-only", ValueType::Boolean, false, "Only draw in Scene View."),
-             Param("view-model", ValueType::Boolean, false, "First-person view-model flag.")},
+             Param("type-preset", ValueType::String, false,
+                   "prop, corridor, character, viewmodel or floor."),
+             Param("view-model", ValueType::Boolean, false,
+                   "Legacy alias: true selects viewmodel, false selects prop.")},
             "entity", ExecutionMode::Editor, {SideEffect::EditorMutation},
             {"mipsync mesh set Wall --material assets/materials/Wall.nmat"}, ForwardEditor},
         {"material.create", "Create or update a color material.", "Writes a project .nmat asset using the Editor material format and refreshes scene users.",

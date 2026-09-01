@@ -142,6 +142,22 @@ export async function launchEditor(): Promise<void> {
   return invoke("launch_editor");
 }
 
+export type HubUpdateInfo = {
+  currentVersion: string;
+  latestVersion: string;
+  assetName: string | null;
+  downloadUrl: string | null;
+  isUpdateAvailable: boolean;
+};
+
+export async function checkHubUpdate(): Promise<HubUpdateInfo> {
+  return invoke<HubUpdateInfo>("check_hub_update");
+}
+
+export async function updateHub(): Promise<void> {
+  return invoke("update_hub");
+}
+
 export async function openKoFi(): Promise<void> {
   return invoke("open_ko_fi");
 }

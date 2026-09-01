@@ -1,18 +1,11 @@
-# Build output and fetched dependencies
+# Build
 build/
-!src/build/
-!src/build/**
-build-debug/
 out/
 cmake-build-*/
-_deps/
-hub-tauri/node_modules/
-hub-tauri/dist/
-hub-tauri/src-tauri/target/
-hub-tauri/src-tauri/gen/
-*.tsbuildinfo
+!src/build/
+!src/build/**
 
-# IDE files
+# IDE
 .vs/
 .vscode/
 .idea/
@@ -21,19 +14,61 @@ hub-tauri/src-tauri/gen/
 *.sln
 *.vcxproj*
 
-# Local editor state
-imgui.ini
-editor_layout.ini
-.mipsync/
-
-# Generated binaries and logs
-*.exe
-*.dll
-*.pdb
-*.zip
-*.log
-*.log.err
-
-# OS files
+# OS
 Thumbs.db
 .DS_Store
+
+# Dependencies (fetched by CMake)
+_deps/
+
+# Third-party PS1 runtime (PCSX-Redux + OpenBIOS) fetched by
+# scripts/fetch_ps1_runtime.ps1. Binary artifacts are intentionally
+# kept out of source control.
+third_party/ps1_runtime/
+third_party/.cache/
+
+# Node (optional icon conversion: npm run icon)
+node_modules/
+hub-tauri/dist/
+hub-tauri/src-tauri/target/
+hub-tauri/src-tauri/gen/
+*.tsbuildinfo
+
+# Local editor / test
+imgui.ini
+editor_layout.ini
+_testproj/
+_test_*.txt
+
+# Local scratch / generated release payloads
+.tmp-*/
+test_player_crash/
+tmp_*.log
+/MipsyncEngine.exe
+release/engine-*/
+release/hub-*/
+release/*.zip
+release/*.log
+release/*.log.err
+release/_tmp_*/
+release/mipsync-repo-init/
+release/mipsync-v*/
+release/tmp-*/
+release/previous/
+
+# Local emulator, profiling, QA, and scratch workspaces
+/.sentry-native/
+/.tmp/
+/TinyBackrooms/
+/character-studio/
+/mipsync-launch-video/
+/u22_submission/
+/memcard*.mcd
+/pcsx.json
+/offscreen.frag
+/offscreen.lua
+/offscreen.vert
+/output.frag
+/output.lua
+/output.vert
+/hub-tauri/liquid-glass-qa.png

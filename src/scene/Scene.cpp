@@ -28,7 +28,7 @@ namespace MipsyncEngine {
 
 namespace {
 
-constexpr uint32_t kPs1PreviewMeshVersion = 16;
+constexpr uint32_t kPs1PreviewMeshVersion = 20;
 
 void EnsurePs1PreviewMesh(MeshRendererComponent& meshRenderer) {
     if (meshRenderer.meshPrimitive != "File" || !meshRenderer.mesh)
@@ -37,6 +37,37 @@ void EnsurePs1PreviewMesh(MeshRendererComponent& meshRenderer) {
         return;
     meshRenderer.ps1PreviewMesh = Mips::BuildPs1PreviewMesh(*meshRenderer.mesh, true);
     meshRenderer.ps1PreviewMeshVersion = kPs1PreviewMeshVersion;
+}
+
+const Mesh* ResolveSubdivisionPreview(Entity& entity, const Mesh* source,
+                                      const glm::mat4& worldMatrix) {
+    auto* subdivider = entity.GetComponent<MeshSubdividerComponent>();
+    if (!source || !subdivider || !subdivider->enabled || !subdivider->preview ||
+        subdivider->maxLevels <= 0)
+        return source;
+
+    const glm::vec3 worldScale(
+        glm::length(glm::vec3(worldMatrix[0])),
+        glm::length(glm::vec3(worldMatrix[1])),
+        glm::length(glm::vec3(worldMatrix[2])));
+    const bool scaleChanged =
+        glm::any(glm::greaterThan(glm::abs(subdivider->previewWorldScale - worldScale),
+                                  glm::vec3(1e-4f)));
+    if (!subdivider->previewMesh || subdivider->previewSource != source ||
+        subdivider->previewLevels != subdivider->maxLevels ||
+        std::abs(subdivider->previewMaxEdgeLength - subdivider->maxEdgeLength) > 1e-5f ||
+        scaleChanged) {
+        subdivider->previewMesh = std::make_shared<Mesh>(Mesh::CreateSubdivided(
+            *source, subdivider->maxLevels, subdivider->maxEdgeLength,
+            worldScale, false));
+        subdivider->previewSource = source;
+        subdivider->previewLevels = subdivider->maxLevels;
+        subdivider->previewMaxEdgeLength = subdivider->maxEdgeLength;
+        subdivider->previewWorldScale = worldScale;
+    }
+    return subdivider->previewMesh && subdivider->previewMesh->GetIndexCount() > 0
+        ? subdivider->previewMesh.get()
+        : source;
 }
 
 void EnsurePs1RigidPreview(SkinnedMeshRendererComponent& skinned) {
@@ -179,7 +210,7 @@ void DrawProModelerWithFaceMaterials(Renderer& renderer, ProModelerComponent& pr
         renderer.DrawMesh(mesh, worldMatrix, texture, color, tiling, offset,
                           static_cast<uint32_t>(first * 3u),
                           static_cast<uint32_t>((end - first) * 3u),
-                          projectionDepthClamp, true);
+                          projectionDepthClamp, false);
         first = end;
     }
 }
@@ -566,6 +597,82 @@ void ProModelerComponent::ResetStairs() {
     }
 }
 
+void ProModelerComponent::ResetCylinder() {
+    shape = Shape::Cylinder;
+    vertices.clear();
+    indices.clear();
+    faceMaterialPaths.clear();
+    triangleFaceIds.clear();
+    nextFaceId = 1;
+
+    const int segmentCount = std::clamp(sides, 3, 64);
+    sides = segmentCount;
+    const glm::vec3 clampedSize = glm::max(size, glm::vec3(0.001f));
+    const float radiusX = clampedSize.x * 0.5f;
+    const float radiusZ = clampedSize.z * 0.5f;
+    const float halfHeight = clampedSize.y * 0.5f;
+    constexpr float twoPi = 6.28318530717958647692f;
+
+    auto pointAt = [&](int segment, float y) {
+        const float angle = twoPi * static_cast<float>(segment) /
+                            static_cast<float>(segmentCount);
+        return glm::vec3(std::cos(angle) * radiusX, y,
+                         std::sin(angle) * radiusZ);
+    };
+    auto pushFaceTri = [&](const glm::vec3& a, const glm::vec3& b,
+                           const glm::vec3& c, const glm::vec2& uva,
+                           const glm::vec2& uvb, const glm::vec2& uvc,
+                           uint32_t faceId) {
+        PMPushTri(vertices, indices, a, b, c, uva, uvb, uvc);
+        triangleFaceIds.push_back(faceId);
+    };
+
+    // One editable quad per side with a continuous cylindrical UV seam.
+    for (int segment = 0; segment < segmentCount; ++segment) {
+        const int next = (segment + 1) % segmentCount;
+        const glm::vec3 bottomA = pointAt(segment, -halfHeight);
+        const glm::vec3 topA = pointAt(segment, halfHeight);
+        const glm::vec3 topB = pointAt(next, halfHeight);
+        const glm::vec3 bottomB = pointAt(next, -halfHeight);
+        const float u0 = static_cast<float>(segment) / static_cast<float>(segmentCount);
+        const float u1 = static_cast<float>(segment + 1) / static_cast<float>(segmentCount);
+        const uint32_t base = static_cast<uint32_t>(vertices.size());
+        glm::vec3 normal = glm::normalize(glm::cross(topA - bottomA, topB - bottomA));
+        if (!std::isfinite(normal.x) || !std::isfinite(normal.y) || !std::isfinite(normal.z))
+            normal = { 1.0f, 0.0f, 0.0f };
+        vertices.push_back({ bottomA, normal, { u0, 0.0f }, glm::vec4(1.0f) });
+        vertices.push_back({ topA, normal, { u0, 1.0f }, glm::vec4(1.0f) });
+        vertices.push_back({ topB, normal, { u1, 1.0f }, glm::vec4(1.0f) });
+        vertices.push_back({ bottomB, normal, { u1, 0.0f }, glm::vec4(1.0f) });
+        indices.insert(indices.end(), {
+            base + 0u, base + 1u, base + 2u,
+            base + 0u, base + 2u, base + 3u,
+        });
+        triangleFaceIds.push_back(nextFaceId);
+        triangleFaceIds.push_back(nextFaceId++);
+    }
+
+    const uint32_t topFaceId = nextFaceId++;
+    const uint32_t bottomFaceId = nextFaceId++;
+    const glm::vec3 topCenter{ 0.0f, halfHeight, 0.0f };
+    const glm::vec3 bottomCenter{ 0.0f, -halfHeight, 0.0f };
+    auto capUv = [&](const glm::vec3& point) {
+        return glm::vec2(point.x / clampedSize.x + 0.5f,
+                         point.z / clampedSize.z + 0.5f);
+    };
+    for (int segment = 0; segment < segmentCount; ++segment) {
+        const int next = (segment + 1) % segmentCount;
+        const glm::vec3 topA = pointAt(segment, halfHeight);
+        const glm::vec3 topB = pointAt(next, halfHeight);
+        const glm::vec3 bottomA = pointAt(segment, -halfHeight);
+        const glm::vec3 bottomB = pointAt(next, -halfHeight);
+        pushFaceTri(topCenter, topB, topA,
+                    { 0.5f, 0.5f }, capUv(topB), capUv(topA), topFaceId);
+        pushFaceTri(bottomCenter, bottomA, bottomB,
+                    { 0.5f, 0.5f }, capUv(bottomA), capUv(bottomB), bottomFaceId);
+    }
+}
+
 void ProModelerComponent::EnsureFaceTopology() {
     const size_t triangleCount = indices.size() / 3u;
     if (triangleFaceIds.size() == triangleCount) {
@@ -890,6 +997,417 @@ bool ProModelerComponent::ConnectOppositeEdges(
     return true;
 }
 
+bool ProModelerComponent::BevelEdge(
+    const std::pair<uint32_t, uint32_t>& edge, float amount,
+    std::vector<uint32_t>& outSelectedVertices,
+    std::vector<std::pair<uint32_t, uint32_t>>& outSelectedEdges) {
+    if (edge.first >= vertices.size() || edge.second >= vertices.size() ||
+        indices.size() < 3u || amount <= 0.0f)
+        return false;
+    EnsureFaceTopology();
+
+    const glm::vec3 edgeA = vertices[edge.first].position;
+    const glm::vec3 edgeB = vertices[edge.second].position;
+    const glm::vec3 edgeVector = edgeB - edgeA;
+    const float edgeLength = glm::length(edgeVector);
+    const float epsilon = std::max(0.0005f, glm::length(size) * 0.001f);
+    if (!std::isfinite(edgeLength) || edgeLength <= epsilon)
+        return false;
+    const glm::vec3 edgeDirection = edgeVector / edgeLength;
+    auto same = [&](const glm::vec3& a, const glm::vec3& b) {
+        return glm::length(a - b) <= epsilon;
+    };
+
+    struct AdjacentFace {
+        uint32_t id = 0;
+        glm::vec3 normal{0.0f};
+        glm::vec3 centroid{0.0f};
+        glm::vec3 inward{0.0f};
+        float available = 0.0f;
+        glm::vec3 otherAtA{0.0f};
+        glm::vec3 otherAtB{0.0f};
+        bool hasOtherAtA = false;
+        bool hasOtherAtB = false;
+        uint32_t insetA = UINT32_MAX;
+        uint32_t insetB = UINT32_MAX;
+    };
+    std::vector<AdjacentFace> adjacent;
+
+    auto faceContainsGeometricEdge = [&](uint32_t faceId,
+                                         const glm::vec3& edgeStart,
+                                         const glm::vec3& edgeEnd) {
+        for (size_t ti = 0; ti + 2u < indices.size(); ti += 3u) {
+            if (ti / 3u >= triangleFaceIds.size() ||
+                triangleFaceIds[ti / 3u] != faceId)
+                continue;
+            const uint32_t tri[3] = {indices[ti], indices[ti + 1u], indices[ti + 2u]};
+            for (int side = 0; side < 3; ++side) {
+                const glm::vec3& p = vertices[tri[side]].position;
+                const glm::vec3& q = vertices[tri[(side + 1) % 3]].position;
+                if ((same(p, edgeStart) && same(q, edgeEnd)) ||
+                    (same(p, edgeEnd) && same(q, edgeStart)))
+                    return true;
+            }
+        }
+        return false;
+    };
+
+    std::vector<uint32_t> uniqueFaceIds;
+    for (uint32_t faceId : triangleFaceIds) {
+        if (faceId == 0u ||
+            std::find(uniqueFaceIds.begin(), uniqueFaceIds.end(), faceId) != uniqueFaceIds.end())
+            continue;
+        uniqueFaceIds.push_back(faceId);
+        if (!faceContainsGeometricEdge(faceId, edgeA, edgeB))
+            continue;
+
+        AdjacentFace face;
+        face.id = faceId;
+        std::vector<glm::vec3> facePositions;
+        struct GeometricEdge {
+            glm::vec3 a{0.0f};
+            glm::vec3 b{0.0f};
+            int count = 0;
+        };
+        std::vector<GeometricEdge> faceEdges;
+        auto addFaceEdge = [&](const glm::vec3& a, const glm::vec3& b) {
+            for (GeometricEdge& existing : faceEdges) {
+                if ((same(existing.a, a) && same(existing.b, b)) ||
+                    (same(existing.a, b) && same(existing.b, a))) {
+                    ++existing.count;
+                    return;
+                }
+            }
+            faceEdges.push_back({a, b, 1});
+        };
+        for (size_t ti = 0; ti + 2u < indices.size(); ti += 3u) {
+            if (ti / 3u >= triangleFaceIds.size() ||
+                triangleFaceIds[ti / 3u] != faceId)
+                continue;
+            const uint32_t i0 = indices[ti];
+            const uint32_t i1 = indices[ti + 1u];
+            const uint32_t i2 = indices[ti + 2u];
+            addFaceEdge(vertices[i0].position, vertices[i1].position);
+            addFaceEdge(vertices[i1].position, vertices[i2].position);
+            addFaceEdge(vertices[i2].position, vertices[i0].position);
+            const glm::vec3 triNormal = glm::cross(
+                vertices[i1].position - vertices[i0].position,
+                vertices[i2].position - vertices[i0].position);
+            if (glm::length(triNormal) > epsilon)
+                face.normal += glm::normalize(triNormal);
+            for (uint32_t vi : {i0, i1, i2}) {
+                const glm::vec3& p = vertices[vi].position;
+                bool found = false;
+                for (const glm::vec3& existing : facePositions)
+                    found |= same(existing, p);
+                if (!found)
+                    facePositions.push_back(p);
+            }
+        }
+        if (facePositions.size() < 3u || glm::length(face.normal) <= epsilon)
+            return false;
+        face.normal = glm::normalize(face.normal);
+        for (const glm::vec3& p : facePositions)
+            face.centroid += p;
+        face.centroid /= static_cast<float>(facePositions.size());
+        for (const GeometricEdge& boundary : faceEdges) {
+            if (boundary.count != 1)
+                continue;
+            if (same(boundary.a, edgeA) && !same(boundary.b, edgeB)) {
+                face.otherAtA = boundary.b;
+                face.hasOtherAtA = true;
+            } else if (same(boundary.b, edgeA) && !same(boundary.a, edgeB)) {
+                face.otherAtA = boundary.a;
+                face.hasOtherAtA = true;
+            }
+            if (same(boundary.a, edgeB) && !same(boundary.b, edgeA)) {
+                face.otherAtB = boundary.b;
+                face.hasOtherAtB = true;
+            } else if (same(boundary.b, edgeB) && !same(boundary.a, edgeA)) {
+                face.otherAtB = boundary.a;
+                face.hasOtherAtB = true;
+            }
+        }
+        if (!face.hasOtherAtA || !face.hasOtherAtB)
+            return false;
+        const glm::vec3 edgeMidpoint = (edgeA + edgeB) * 0.5f;
+        glm::vec3 toInterior = face.centroid - edgeMidpoint;
+        toInterior -= edgeDirection * glm::dot(toInterior, edgeDirection);
+        if (glm::length(toInterior) <= epsilon)
+            return false;
+        face.inward = glm::normalize(toInterior);
+        for (const glm::vec3& p : facePositions)
+            face.available = std::max(face.available, glm::dot(p - edgeA, face.inward));
+        if (face.available <= epsilon)
+            return false;
+        adjacent.push_back(face);
+    }
+
+    // A one-face chamfer needs the two surfaces meeting at a manifold edge.
+    // Boundary and non-manifold edges are intentionally left unchanged.
+    if (adjacent.size() != 2u ||
+        std::abs(glm::dot(adjacent[0].normal, adjacent[1].normal)) > 0.999f)
+        return false;
+
+    const float inset = std::min({
+        amount,
+        edgeLength * 0.49f,
+        adjacent[0].available * 0.49f,
+        adjacent[1].available * 0.49f,
+    });
+    if (!std::isfinite(inset) || inset <= epsilon)
+        return false;
+
+    // Split the endpoint copies owned by each semantic face, then move them
+    // into that face. This preserves hard normals/UV seams and does not drag
+    // the third faces at either end of the selected edge.
+    for (AdjacentFace& face : adjacent) {
+        std::unordered_map<uint32_t, uint32_t> replacements;
+        for (size_t ti = 0; ti + 2u < indices.size(); ti += 3u) {
+            if (ti / 3u >= triangleFaceIds.size() ||
+                triangleFaceIds[ti / 3u] != face.id)
+                continue;
+            for (size_t corner = 0; corner < 3u; ++corner) {
+                uint32_t& vi = indices[ti + corner];
+                const bool atA = same(vertices[vi].position, edgeA);
+                const bool atB = same(vertices[vi].position, edgeB);
+                if (!atA && !atB)
+                    continue;
+                auto replacement = replacements.find(vi);
+                if (replacement == replacements.end()) {
+                    ProModelerVertex insetVertex = vertices[vi];
+                    insetVertex.position = (atA ? edgeA : edgeB) + face.inward * inset;
+                    const uint32_t newIndex = static_cast<uint32_t>(vertices.size());
+                    vertices.push_back(insetVertex);
+                    replacement = replacements.emplace(vi, newIndex).first;
+                }
+                vi = replacement->second;
+                if (atA && face.insetA == UINT32_MAX) face.insetA = vi;
+                if (atB && face.insetB == UINT32_MAX) face.insetB = vi;
+            }
+        }
+        if (face.insetA == UINT32_MAX || face.insetB == UINT32_MAX)
+            return false;
+    }
+
+    auto appendVertexAt = [&](const glm::vec3& position) {
+        ProModelerVertex vertex = vertices[edge.first];
+        vertex.position = position;
+        const uint32_t index = static_cast<uint32_t>(vertices.size());
+        vertices.push_back(vertex);
+        return index;
+    };
+
+    // The face at each end of the selected edge still owns the original
+    // corner. Replace that corner with the two inset points and retriangulate
+    // the polygon (a box quad becomes a pentagon). This cuts the corner out
+    // instead of layering extra coplanar triangles over the untouched face.
+    auto replaceEndFace = [&](const glm::vec3& corner,
+                              const glm::vec3& firstNeighbour,
+                              const glm::vec3& firstInset,
+                              const glm::vec3& secondNeighbour,
+                              const glm::vec3& secondInset) {
+        uint32_t endFaceId = 0u;
+        for (uint32_t faceId : uniqueFaceIds) {
+            if (faceId == adjacent[0].id || faceId == adjacent[1].id)
+                continue;
+            if (faceContainsGeometricEdge(faceId, corner, firstNeighbour) &&
+                faceContainsGeometricEdge(faceId, corner, secondNeighbour)) {
+                endFaceId = faceId;
+                break;
+            }
+        }
+        if (endFaceId == 0u)
+            return false;
+
+        std::vector<size_t> faceTriangles;
+        glm::vec3 faceNormal(0.0f);
+        struct BoundaryEdge {
+            glm::vec3 a{0.0f};
+            glm::vec3 b{0.0f};
+            int count = 0;
+        };
+        std::vector<BoundaryEdge> boundaryEdges;
+        auto addBoundaryEdge = [&](const glm::vec3& a, const glm::vec3& b) {
+            for (BoundaryEdge& existing : boundaryEdges) {
+                if ((same(existing.a, a) && same(existing.b, b)) ||
+                    (same(existing.a, b) && same(existing.b, a))) {
+                    ++existing.count;
+                    return;
+                }
+            }
+            boundaryEdges.push_back({a, b, 1});
+        };
+        for (size_t ti = 0; ti + 2u < indices.size(); ti += 3u) {
+            if (ti / 3u >= triangleFaceIds.size() ||
+                triangleFaceIds[ti / 3u] != endFaceId)
+                continue;
+            faceTriangles.push_back(ti);
+            const glm::vec3& a = vertices[indices[ti]].position;
+            const glm::vec3& b = vertices[indices[ti + 1u]].position;
+            const glm::vec3& c = vertices[indices[ti + 2u]].position;
+            addBoundaryEdge(a, b);
+            addBoundaryEdge(b, c);
+            addBoundaryEdge(c, a);
+            const glm::vec3 normal = glm::cross(b - a, c - a);
+            if (glm::length(normal) > epsilon)
+                faceNormal += glm::normalize(normal);
+        }
+        boundaryEdges.erase(
+            std::remove_if(boundaryEdges.begin(), boundaryEdges.end(),
+                           [](const BoundaryEdge& boundary) { return boundary.count != 1; }),
+            boundaryEdges.end());
+        if (faceTriangles.empty() || boundaryEdges.size() < 3u ||
+            glm::length(faceNormal) <= epsilon)
+            return false;
+        faceNormal = glm::normalize(faceNormal);
+
+        std::vector<glm::vec3> polygon = {boundaryEdges.front().a,
+                                          boundaryEdges.front().b};
+        std::vector<uint8_t> edgeUsed(boundaryEdges.size(), 0u);
+        edgeUsed[0] = 1u;
+        while (polygon.size() <= boundaryEdges.size()) {
+            const glm::vec3 current = polygon.back();
+            const glm::vec3 previous = polygon[polygon.size() - 2u];
+            bool advanced = false;
+            for (size_t i = 0; i < boundaryEdges.size(); ++i) {
+                if (edgeUsed[i])
+                    continue;
+                glm::vec3 next;
+                if (same(boundaryEdges[i].a, current))
+                    next = boundaryEdges[i].b;
+                else if (same(boundaryEdges[i].b, current))
+                    next = boundaryEdges[i].a;
+                else
+                    continue;
+                if (same(next, previous) && polygon.size() < boundaryEdges.size())
+                    continue;
+                edgeUsed[i] = 1u;
+                advanced = true;
+                if (!same(next, polygon.front()))
+                    polygon.push_back(next);
+                break;
+            }
+            if (!advanced || std::all_of(edgeUsed.begin(), edgeUsed.end(),
+                                         [](uint8_t used) { return used != 0u; }))
+                break;
+        }
+        if (polygon.size() != boundaryEdges.size())
+            return false;
+
+        glm::vec3 polygonNormal(0.0f);
+        for (size_t i = 0; i < polygon.size(); ++i)
+            polygonNormal += glm::cross(polygon[i], polygon[(i + 1u) % polygon.size()]);
+        if (glm::dot(polygonNormal, faceNormal) < 0.0f)
+            std::reverse(polygon.begin(), polygon.end());
+
+        size_t cornerIndex = SIZE_MAX;
+        for (size_t i = 0; i < polygon.size(); ++i) {
+            if (same(polygon[i], corner)) {
+                cornerIndex = i;
+                break;
+            }
+        }
+        if (cornerIndex == SIZE_MAX)
+            return false;
+        const glm::vec3& previous = polygon[(cornerIndex + polygon.size() - 1u) % polygon.size()];
+        const glm::vec3& next = polygon[(cornerIndex + 1u) % polygon.size()];
+        glm::vec3 insetAfterPrevious;
+        glm::vec3 insetBeforeNext;
+        if (same(previous, firstNeighbour) && same(next, secondNeighbour)) {
+            insetAfterPrevious = firstInset;
+            insetBeforeNext = secondInset;
+        } else if (same(previous, secondNeighbour) && same(next, firstNeighbour)) {
+            insetAfterPrevious = secondInset;
+            insetBeforeNext = firstInset;
+        } else {
+            return false;
+        }
+
+        std::vector<glm::vec3> beveledPolygon;
+        beveledPolygon.reserve(polygon.size() + 1u);
+        for (size_t i = 0; i < polygon.size(); ++i) {
+            if (i == cornerIndex) {
+                beveledPolygon.push_back(insetAfterPrevious);
+                beveledPolygon.push_back(insetBeforeNext);
+            } else {
+                beveledPolygon.push_back(polygon[i]);
+            }
+        }
+
+        for (auto it = faceTriangles.rbegin(); it != faceTriangles.rend(); ++it) {
+            const size_t faceIndex = *it / 3u;
+            indices.erase(indices.begin() + static_cast<ptrdiff_t>(*it),
+                          indices.begin() + static_cast<ptrdiff_t>(*it + 3u));
+            triangleFaceIds.erase(
+                triangleFaceIds.begin() + static_cast<ptrdiff_t>(faceIndex));
+        }
+
+        const uint32_t polygonBase = static_cast<uint32_t>(vertices.size());
+        for (const glm::vec3& position : beveledPolygon)
+            appendVertexAt(position);
+        for (uint32_t i = 1u; i + 1u < beveledPolygon.size(); ++i) {
+            uint32_t a = polygonBase;
+            uint32_t b = polygonBase + i;
+            uint32_t c = polygonBase + i + 1u;
+            if (glm::dot(glm::cross(vertices[b].position - vertices[a].position,
+                                    vertices[c].position - vertices[a].position),
+                         faceNormal) < 0.0f)
+                std::swap(b, c);
+            indices.insert(indices.end(), {a, b, c});
+            triangleFaceIds.push_back(endFaceId);
+        }
+        return true;
+    };
+
+    if (!replaceEndFace(edgeA,
+                        adjacent[0].otherAtA, vertices[adjacent[0].insetA].position,
+                        adjacent[1].otherAtA, vertices[adjacent[1].insetA].position) ||
+        !replaceEndFace(edgeB,
+                        adjacent[0].otherAtB, vertices[adjacent[0].insetB].position,
+                        adjacent[1].otherAtB, vertices[adjacent[1].insetB].position))
+        return false;
+
+    glm::vec3 quad[4] = {
+        vertices[adjacent[0].insetA].position,
+        vertices[adjacent[0].insetB].position,
+        vertices[adjacent[1].insetB].position,
+        vertices[adjacent[1].insetA].position,
+    };
+    const glm::vec3 shellNormal = adjacent[0].normal + adjacent[1].normal;
+    if (glm::dot(glm::cross(quad[1] - quad[0], quad[2] - quad[0]), shellNormal) < 0.0f) {
+        std::swap(quad[1], quad[3]);
+    }
+    const uint32_t bevelBase = static_cast<uint32_t>(vertices.size());
+    appendVertexAt(quad[0]);
+    appendVertexAt(quad[1]);
+    appendVertexAt(quad[2]);
+    appendVertexAt(quad[3]);
+    indices.insert(indices.end(), {
+        bevelBase + 0u, bevelBase + 1u, bevelBase + 2u,
+        bevelBase + 0u, bevelBase + 2u, bevelBase + 3u,
+    });
+    const uint32_t bevelFaceId = nextFaceId++;
+    triangleFaceIds.push_back(bevelFaceId);
+    triangleFaceIds.push_back(bevelFaceId);
+
+    const auto firstMaterial = faceMaterialPaths.find(adjacent[0].id);
+    const auto secondMaterial = faceMaterialPaths.find(adjacent[1].id);
+    const std::string inheritedMaterial = firstMaterial != faceMaterialPaths.end()
+        ? firstMaterial->second
+        : (secondMaterial != faceMaterialPaths.end() ? secondMaterial->second : std::string{});
+    if (!inheritedMaterial.empty()) {
+        faceMaterialPaths[bevelFaceId] = inheritedMaterial;
+    }
+
+    outSelectedVertices = {bevelBase, bevelBase + 1u};
+    outSelectedEdges = {{bevelBase, bevelBase + 1u}};
+    shape = Shape::Custom;
+    RecalculatePlanarUVs();
+    RecalculateNormals();
+    return true;
+}
+
 void ProModelerComponent::FlipFaces(const std::vector<size_t>& faceTriangles) {
     for (size_t triStart : faceTriangles) {
         if (triStart + 2 < indices.size())
@@ -897,6 +1415,67 @@ void ProModelerComponent::FlipFaces(const std::vector<size_t>& faceTriangles) {
     }
     shape = Shape::Custom;
     RecalculateNormals();
+}
+
+bool ProModelerComponent::DeleteFaces(const std::vector<size_t>& faceTriangles) {
+    if (faceTriangles.empty() || indices.empty())
+        return false;
+
+    EnsureFaceTopology();
+    std::unordered_set<uint32_t> deletedFaceIds;
+    for (size_t triangleStart : faceTriangles) {
+        const size_t triangleIndex = triangleStart / 3u;
+        if (triangleStart % 3u == 0u && triangleIndex < triangleFaceIds.size())
+            deletedFaceIds.insert(triangleFaceIds[triangleIndex]);
+    }
+    if (deletedFaceIds.empty())
+        return false;
+
+    std::vector<uint32_t> keptIndices;
+    std::vector<uint32_t> keptFaceIds;
+    keptIndices.reserve(indices.size());
+    keptFaceIds.reserve(triangleFaceIds.size());
+    for (size_t triangleIndex = 0; triangleIndex < triangleFaceIds.size(); ++triangleIndex) {
+        const size_t triangleStart = triangleIndex * 3u;
+        if (triangleStart + 2u >= indices.size())
+            break;
+        if (deletedFaceIds.contains(triangleFaceIds[triangleIndex]))
+            continue;
+        keptIndices.insert(keptIndices.end(), {
+            indices[triangleStart + 0u],
+            indices[triangleStart + 1u],
+            indices[triangleStart + 2u],
+        });
+        keptFaceIds.push_back(triangleFaceIds[triangleIndex]);
+    }
+
+    // Remove vertices no longer referenced by any surviving face. Leaving
+    // these behind makes Ctrl+A and the vertex gizmo select invisible points.
+    std::vector<uint32_t> remap(vertices.size(), UINT32_MAX);
+    std::vector<ProModelerVertex> keptVertices;
+    keptVertices.reserve(vertices.size());
+    for (uint32_t& index : keptIndices) {
+        if (index >= vertices.size())
+            continue;
+        if (remap[index] == UINT32_MAX) {
+            remap[index] = static_cast<uint32_t>(keptVertices.size());
+            keptVertices.push_back(vertices[index]);
+        }
+        index = remap[index];
+    }
+
+    indices = std::move(keptIndices);
+    triangleFaceIds = std::move(keptFaceIds);
+    vertices = std::move(keptVertices);
+    for (uint32_t faceId : deletedFaceIds)
+        faceMaterialPaths.erase(faceId);
+
+    shape = Shape::Custom;
+    if (!indices.empty()) {
+        RecalculatePlanarUVs();
+        RecalculateNormals();
+    }
+    return true;
 }
 
 void ProModelerComponent::RecalculatePlanarUVs() {
@@ -953,7 +1532,9 @@ void ProModelerComponent::RecalculateNormals() {
 }
 
 void ProModelerComponent::RebuildMesh(MeshRendererComponent& renderer) {
-    if (vertices.empty() || indices.empty())
+    // A Custom mesh is allowed to be empty after all of its faces are deleted.
+    // Preset components with missing data still recover to the default box.
+    if ((vertices.empty() || indices.empty()) && shape != Shape::Custom)
         ResetBox();
     EnsureFaceTopology();
     RecalculatePlanarUVs();
@@ -1076,11 +1657,65 @@ bool Scene::IsAncestor(uint32_t ancestorId, uint32_t descendantId) const {
     return false;
 }
 
-bool Scene::SetParent(Entity* child, Entity* parent) {
+namespace {
+
+float NearestSceneEulerDegrees(float value, float reference) {
+    while (value - reference > 180.0f) value -= 360.0f;
+    while (value - reference < -180.0f) value += 360.0f;
+    return value;
+}
+
+glm::vec3 ExtractSceneYXZEulerDegrees(const glm::mat4& transform,
+                                      const glm::vec3& referenceDegrees) {
+    glm::mat4 rotation(1.0f);
+    for (int column = 0; column < 3; ++column) {
+        glm::vec3 axis(transform[column]);
+        const float length = glm::length(axis);
+        if (length > 1e-6f) axis /= length;
+        rotation[column] = glm::vec4(axis, 0.0f);
+    }
+    const float yaw = std::atan2(rotation[2][0], rotation[2][2]);
+    const float pitchCos = std::sqrt(rotation[0][1] * rotation[0][1] +
+                                     rotation[1][1] * rotation[1][1]);
+    const float pitch = std::atan2(-rotation[2][1], pitchCos);
+    const float sinYaw = std::sin(yaw);
+    const float cosYaw = std::cos(yaw);
+    const float roll = std::atan2(
+        sinYaw * rotation[1][2] - cosYaw * rotation[1][0],
+        cosYaw * rotation[0][0] - sinYaw * rotation[0][2]);
+    glm::vec3 result = glm::degrees(glm::vec3(pitch, yaw, roll));
+    result.x = NearestSceneEulerDegrees(result.x, referenceDegrees.x);
+    result.y = NearestSceneEulerDegrees(result.y, referenceDegrees.y);
+    result.z = NearestSceneEulerDegrees(result.z, referenceDegrees.z);
+    return result;
+}
+
+void ApplyLocalTransformMatrix(Entity& entity, const glm::mat4& localMatrix) {
+    auto* transform = entity.GetComponent<TransformComponent>();
+    if (!transform) return;
+    glm::vec3 scale;
+    for (int column = 0; column < 3; ++column)
+        scale[column] = glm::length(glm::vec3(localMatrix[column]));
+    glm::mat4 rotationMatrix = localMatrix;
+    if (glm::determinant(glm::mat3(localMatrix)) < 0.0f) {
+        scale.x = -scale.x;
+        rotationMatrix[0] *= -1.0f;
+    }
+    transform->position = glm::vec3(localMatrix[3]);
+    transform->rotation = ExtractSceneYXZEulerDegrees(rotationMatrix, transform->rotation);
+    transform->scale = scale;
+}
+
+} // namespace
+
+bool Scene::SetParent(Entity* child, Entity* parent, bool worldPositionStays) {
     if (!child) return false;
     if (parent == child) return false;
     if (parent && IsAncestor(child->GetID(), parent->GetID()))
         return false;
+
+    const glm::mat4 oldWorld = worldPositionStays
+        ? GetWorldMatrix(*child) : glm::mat4(1.0f);
 
     DetachFromParent(child);
 
@@ -1088,10 +1723,15 @@ bool Scene::SetParent(Entity* child, Entity* parent) {
         parent->GetChildIDs().push_back(child->GetID());
         child->SetParentID(parent->GetID());
     }
+    if (worldPositionStays) {
+        const glm::mat4 parentWorld = parent ? GetWorldMatrix(*parent) : glm::mat4(1.0f);
+        ApplyLocalTransformMatrix(*child, glm::inverse(parentWorld) * oldWorld);
+    }
     return true;
 }
 
-bool Scene::ReorderEntity(Entity* child, Entity* parent, Entity* sibling, bool insertAfter) {
+bool Scene::ReorderEntity(Entity* child, Entity* parent, Entity* sibling, bool insertAfter,
+                          bool worldPositionStays) {
     if (!child)
         return false;
     if (parent == child)
@@ -1105,6 +1745,8 @@ bool Scene::ReorderEntity(Entity* child, Entity* parent, Entity* sibling, bool i
 
     const uint32_t oldParentId = child->GetParentID();
     const uint32_t newParentId = parent ? parent->GetID() : 0;
+    const glm::mat4 oldWorld = worldPositionStays
+        ? GetWorldMatrix(*child) : glm::mat4(1.0f);
 
     auto removeFrom = [&](std::vector<uint32_t>& list) {
         list.erase(std::remove(list.begin(), list.end(), child->GetID()), list.end());
@@ -1138,6 +1780,8 @@ bool Scene::ReorderEntity(Entity* child, Entity* parent, Entity* sibling, bool i
                 ++insertIt;
         }
         m_Entities.insert(insertIt, std::move(moved));
+        if (worldPositionStays)
+            ApplyLocalTransformMatrix(*child, oldWorld);
         return oldParentId != newParentId || sibling != nullptr;
     }
 
@@ -1152,6 +1796,10 @@ bool Scene::ReorderEntity(Entity* child, Entity* parent, Entity* sibling, bool i
             ++insertIt;
     }
     siblings.insert(insertIt, child->GetID());
+    if (worldPositionStays) {
+        const glm::mat4 parentWorld = GetWorldMatrix(*parent);
+        ApplyLocalTransformMatrix(*child, glm::inverse(parentWorld) * oldWorld);
+    }
     return true;
 }
 
@@ -1260,12 +1908,20 @@ Entity* Scene::DuplicateEntity(Entity& source) {
       dstMr.textureTiling = srcMr->textureTiling;
       dstMr.textureOffset = srcMr->textureOffset;
       dstMr.color = srcMr->color;
-      dstMr.viewModel = srcMr->viewModel;
+      dstMr.typePreset = srcMr->typePreset;
       dstMr.ps1SeamFill = srcMr->ps1SeamFill;
       dstMr.texture = srcMr->texture;
       dstMr.RebuildMesh();
         if (!dstMr.texturePath.empty())
         dstMr.texture = AssetManager::Get().GetTexture(dstMr.texturePath);
+    }
+
+    if (auto* srcSubdivider = src->GetComponent<MeshSubdividerComponent>()) {
+      auto& dstSubdivider = copy->AddComponent<MeshSubdividerComponent>();
+      dstSubdivider.enabled = srcSubdivider->enabled;
+      dstSubdivider.maxLevels = srcSubdivider->maxLevels;
+      dstSubdivider.maxEdgeLength = srcSubdivider->maxEdgeLength;
+      dstSubdivider.preview = srcSubdivider->preview;
     }
 
     if (auto* srcPb = src->GetComponent<ProModelerComponent>()) {
@@ -1274,7 +1930,9 @@ Entity* Scene::DuplicateEntity(Entity& source) {
       dstPb.shape = srcPb->shape;
       dstPb.size = srcPb->size;
       dstPb.steps = srcPb->steps;
+      dstPb.sides = srcPb->sides;
       dstPb.extrudeAmount = srcPb->extrudeAmount;
+      dstPb.bevelAmount = srcPb->bevelAmount;
       dstPb.vertices = srcPb->vertices;
       dstPb.indices = srcPb->indices;
       dstPb.triangleFaceIds = srcPb->triangleFaceIds;
@@ -1339,6 +1997,27 @@ Entity* Scene::DuplicateEntity(Entity& source) {
       dstCam.prerenderedBackgroundPath = srcCam->prerenderedBackgroundPath;
       dstCam.shotTriggerEntityId = srcCam->shotTriggerEntityId;
       dstCam.shotPriority = srcCam->shotPriority;
+    }
+
+    if (auto* srcCull = src->GetComponent<DistanceCullComponent>()) {
+      auto& dstCull = copy->AddComponent<DistanceCullComponent>();
+      dstCull.enabled = srcCull->enabled;
+      dstCull.cullDistance = srcCull->cullDistance;
+      dstCull.targetEntityId = srcCull->targetEntityId;
+      dstCull.cullMeshRenderers = srcCull->cullMeshRenderers;
+      dstCull.cullSkinnedMeshes = srcCull->cullSkinnedMeshes;
+      dstCull.cullLights = srcCull->cullLights;
+      dstCull.previewInEditor = srcCull->previewInEditor;
+    }
+
+    if (auto* srcFCull = src->GetComponent<FrustumCullComponent>()) {
+      auto& dstFCull = copy->AddComponent<FrustumCullComponent>();
+      dstFCull.enabled = srcFCull->enabled;
+      dstFCull.margin = srcFCull->margin;
+      dstFCull.cullMeshRenderers = srcFCull->cullMeshRenderers;
+      dstFCull.cullSkinnedMeshes = srcFCull->cullSkinnedMeshes;
+      dstFCull.cullLights = srcFCull->cullLights;
+      dstFCull.previewInEditor = srcFCull->previewInEditor;
     }
 
     for (auto* srcScript : src->GetComponents<MipsScriptComponent>()) {
@@ -1460,6 +2139,8 @@ Entity* Scene::DuplicateEntity(Entity& source) {
       dstSpectrum.smoothing = srcSpectrum->smoothing;
     }
 
+    copy->MatchComponentOrder(*src);
+
     for (uint32_t childId : src->GetChildIDs()) {
       if (Entity* child = FindEntity(childId))
         cloneRecursive(child, copy);
@@ -1512,26 +2193,9 @@ void Scene::NormalizePrimaryCameras() {
         return "Camera";
     };
 
-    auto isFpsCamera = [](Entity* entity) -> bool {
-      for (auto* script : entity->GetComponents<MipsScriptComponent>()) {
-            if (script->module && script->module->className == "FirstPersonController")
-                return true;
-            if (script->scriptPath.find("FirstPersonController") != std::string::npos)
-                return true;
-      }
-        return false;
-    };
-
     Entity* chosen = nullptr;
     if (primaries.size() > 1) {
-        for (Entity* entity : primaries) {
-            if (isFpsCamera(entity)) {
-                chosen = entity;
-                break;
-            }
-        }
-        if (!chosen)
-            chosen = primaries.front();
+        chosen = primaries.front();
 
         MIPSYNC_WARN("Multiple primary cameras; using '{}'", tagName(chosen));
         for (auto& entityPtr : m_Entities) {
@@ -1582,11 +2246,186 @@ glm::vec3 LightForwardFromWorldMatrix(const glm::mat4& world) {
     return glm::normalize(glm::vec3(world * glm::vec4(0.0f, 0.0f, -1.0f, 0.0f)));
 }
 
+struct ActiveDistanceCull {
+    glm::vec3 center{ 0.0f };
+    float distanceSq = 0.0f;
+    bool cullMeshRenderers = true;
+    bool cullSkinnedMeshes = true;
+    bool cullLights = true;
+};
+
+std::vector<ActiveDistanceCull> CollectActiveDistanceCullers(const Scene& scene, bool editorSceneView = false) {
+    std::vector<ActiveDistanceCull> cullers;
+    for (const auto& entity : scene.GetEntities()) {
+        if (!entity || !entity->IsActive()) continue;
+        auto* cullComp = entity->GetComponent<DistanceCullComponent>();
+        if (!cullComp || !cullComp->enabled || cullComp->cullDistance <= 0.0f)
+            continue;
+        // In editor scene view, only apply if previewInEditor is checked.
+        if (editorSceneView && !cullComp->previewInEditor)
+            continue;
+
+        glm::vec3 center(0.0f);
+        if (cullComp->targetEntityId != 0) {
+            if (const Entity* target = scene.FindEntity(cullComp->targetEntityId)) {
+                glm::mat4 wm = scene.GetWorldMatrix(*target);
+                center = glm::vec3(wm[3]);
+            } else {
+                glm::mat4 wm = scene.GetWorldMatrix(*entity);
+                center = glm::vec3(wm[3]);
+            }
+        } else {
+            glm::mat4 wm = scene.GetWorldMatrix(*entity);
+            center = glm::vec3(wm[3]);
+        }
+
+        ActiveDistanceCull c;
+        c.center = center;
+        c.distanceSq = cullComp->cullDistance * cullComp->cullDistance;
+        c.cullMeshRenderers = cullComp->cullMeshRenderers;
+        c.cullSkinnedMeshes = cullComp->cullSkinnedMeshes;
+        c.cullLights = cullComp->cullLights;
+        cullers.push_back(c);
+    }
+    return cullers;
+}
+
+inline float DistanceSq(const glm::vec3& a, const glm::vec3& b) {
+    const glm::vec3 diff = a - b;
+    return glm::dot(diff, diff);
+}
+
+struct WorldAabb {
+    glm::vec3 min{ 0.0f };
+    glm::vec3 max{ 0.0f };
+};
+
+WorldAabb TransformAabb(const glm::vec3& localMin, const glm::vec3& localMax,
+                        const glm::mat4& world) {
+    const glm::vec3 localCenter = (localMin + localMax) * 0.5f;
+    const glm::vec3 localHalf = glm::max((localMax - localMin) * 0.5f,
+                                         glm::vec3(0.0f));
+    const glm::vec3 worldCenter = glm::vec3(world * glm::vec4(localCenter, 1.0f));
+    const glm::mat3 linear(world);
+    // GLM matrices are column-major. Each world-space half extent is the
+    // corresponding row of |M| dotted with the local half extent.
+    const glm::vec3 half{
+        std::abs(linear[0][0]) * localHalf.x + std::abs(linear[1][0]) * localHalf.y +
+            std::abs(linear[2][0]) * localHalf.z,
+        std::abs(linear[0][1]) * localHalf.x + std::abs(linear[1][1]) * localHalf.y +
+            std::abs(linear[2][1]) * localHalf.z,
+        std::abs(linear[0][2]) * localHalf.x + std::abs(linear[1][2]) * localHalf.y +
+            std::abs(linear[2][2]) * localHalf.z,
+    };
+    return { worldCenter - half, worldCenter + half };
+}
+
+float DistanceSqToAabb(const glm::vec3& point, const WorldAabb& bounds) {
+    const glm::vec3 delta = glm::max(glm::max(bounds.min - point,
+                                               point - bounds.max),
+                                     glm::vec3(0.0f));
+    return glm::dot(delta, delta);
+}
+
+struct ActiveFrustumCull {
+    Camera camera;
+    float aspect = 4.0f / 3.0f;
+    float margin = 1.5f;
+    bool hasSpecificCamera = false;
+    bool cullMeshRenderers = true;
+    bool cullSkinnedMeshes = true;
+    bool cullLights = true;
+};
+
+std::vector<ActiveFrustumCull> CollectActiveFrustumCullers(const Scene& scene, bool editorSceneView = false) {
+    std::vector<ActiveFrustumCull> cullers;
+    for (const auto& entity : scene.GetEntities()) {
+        if (!entity || !entity->IsActive()) continue;
+        auto* fcull = entity->GetComponent<FrustumCullComponent>();
+        if (!fcull || !fcull->enabled)
+            continue;
+        // In editor scene view, only apply if previewInEditor is checked.
+        if (editorSceneView && !fcull->previewInEditor)
+            continue;
+
+        ActiveFrustumCull c;
+        c.margin = std::max(0.0f, fcull->margin);
+        c.cullMeshRenderers = fcull->cullMeshRenderers;
+        c.cullSkinnedMeshes = fcull->cullSkinnedMeshes;
+        c.cullLights = fcull->cullLights;
+
+        // In editor scene view, determine which scene camera to cull against.
+        // If attached directly to a Camera entity, use that entity's camera and transform.
+        // Otherwise, find the active scene camera entity.
+        Entity* camEntity = nullptr;
+        if (entity->GetComponent<CameraComponent>()) {
+            camEntity = entity.get();
+        } else {
+            for (const auto& other : scene.GetEntities()) {
+                if (other && other->IsActive() && other->GetComponent<CameraComponent>()) {
+                    camEntity = other.get();
+                    break;
+                }
+            }
+        }
+
+        if (camEntity) {
+            auto* camComp = camEntity->GetComponent<CameraComponent>();
+            auto* transformComp = camEntity->GetComponent<TransformComponent>();
+            if (camComp && transformComp) {
+                c.camera = camComp->camera;
+                c.camera.SyncFromTransform(transformComp->position, transformComp->rotation);
+                c.aspect = 4.0f / 3.0f;
+                c.hasSpecificCamera = true;
+            }
+        }
+
+        cullers.push_back(c);
+    }
+    return cullers;
+}
+
+bool AabbIntersectsFrustum(const WorldAabb& sourceBounds, const Camera& camera,
+                           float aspect, float margin) {
+    const glm::vec3 expansion(std::max(0.0f, margin));
+    const glm::vec3 boundsMin = sourceBounds.min - expansion;
+    const glm::vec3 boundsMax = sourceBounds.max + expansion;
+    const glm::mat4 projection = glm::perspective(
+        glm::radians(camera.fov), std::max(aspect, 0.01f),
+        std::max(camera.nearClip, 0.001f),
+        std::max(camera.farClip, camera.nearClip + 0.001f));
+    const glm::mat4 viewProjection = projection * camera.GetViewMatrix();
+
+    bool outsideLeft = true;
+    bool outsideRight = true;
+    bool outsideBottom = true;
+    bool outsideTop = true;
+    bool outsideNear = true;
+    bool outsideFar = true;
+    for (int corner = 0; corner < 8; ++corner) {
+        const glm::vec3 point{
+            (corner & 1) ? boundsMax.x : boundsMin.x,
+            (corner & 2) ? boundsMax.y : boundsMin.y,
+            (corner & 4) ? boundsMax.z : boundsMin.z,
+        };
+        const glm::vec4 clip = viewProjection * glm::vec4(point, 1.0f);
+        outsideLeft   &= clip.x < -clip.w;
+        outsideRight  &= clip.x >  clip.w;
+        outsideBottom &= clip.y < -clip.w;
+        outsideTop    &= clip.y >  clip.w;
+        outsideNear   &= clip.z < -clip.w;
+        outsideFar    &= clip.z >  clip.w;
+    }
+    return !(outsideLeft || outsideRight || outsideBottom || outsideTop ||
+             outsideNear || outsideFar);
+}
+
 } // namespace
 
-void Scene::UploadLightsToRenderer(Renderer& renderer) const {
+void Scene::UploadLightsToRenderer(Renderer& renderer, bool editorSceneView) const {
     SceneLightGpu lights[kMaxSceneLights];
     int count = 0;
+    const auto distanceCullers = CollectActiveDistanceCullers(*this, editorSceneView);
 
     for (const auto& entityPtr : m_Entities) {
         if (!entityPtr || count >= kMaxSceneLights)
@@ -1599,6 +2438,18 @@ void Scene::UploadLightsToRenderer(Renderer& renderer) const {
         const glm::mat4 world = GetWorldMatrix(*entityPtr);
         const glm::vec3 worldPos = glm::vec3(world[3]);
         const glm::vec3 forward = LightForwardFromWorldMatrix(world);
+
+        if (!distanceCullers.empty() && light->type != LightType::Directional) {
+            bool culled = false;
+            for (const auto& culler : distanceCullers) {
+                if (culler.cullLights && DistanceSq(worldPos, culler.center) > culler.distanceSq) {
+                    culled = true;
+                    break;
+                }
+            }
+            if (culled)
+                continue;
+        }
 
         SceneLightGpu gpu{};
         gpu.colorIntensity = glm::vec4(light->color, light->intensity);
@@ -1632,7 +2483,12 @@ void Scene::UploadLightsToRenderer(Renderer& renderer) const {
 void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* targetFBO,
                    uint32_t highlightEntityId, bool usePs1PreviewMeshes,
                    bool includeEditorOnlyMeshes, const Texture* backgroundTexture) {
-    UploadLightsToRenderer(renderer);
+    UploadLightsToRenderer(renderer, includeEditorOnlyMeshes);
+    const auto distanceCullers = CollectActiveDistanceCullers(*this, includeEditorOnlyMeshes);
+    const auto frustumCullers = CollectActiveFrustumCullers(*this, includeEditorOnlyMeshes);
+    const float renderAspect = (targetFBO && targetFBO->GetHeight() > 0)
+        ? ((float)targetFBO->GetWidth() / (float)targetFBO->GetHeight())
+        : (4.0f / 3.0f);
     // Pass 1: render all meshes normally (selected mesh included).
     renderer.BeginScene(camera, targetFBO, backgroundTexture);
 
@@ -1674,11 +2530,50 @@ void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* target
             continue;
 
         glm::mat4 worldMatrix = GetWorldMatrix(*entity);
-        // File meshes are imported at unit extent; mesh_size matches primitives and PS1 export.
+        // File meshes apply meshSize at draw time. Include it before deriving
+        // bounds so culling and rendering use the same final geometry.
         if (meshRenderer->meshPrimitive == "File" && meshRenderer->meshSize != 1.0f) {
             worldMatrix = worldMatrix * glm::scale(glm::mat4(1.0f),
                                                    glm::vec3(meshRenderer->meshSize));
         }
+        const WorldAabb worldBounds = TransformAabb(
+            meshRenderer->mesh->GetBoundsMin(), meshRenderer->mesh->GetBoundsMax(),
+            worldMatrix);
+
+        if (!distanceCullers.empty()) {
+            bool culled = false;
+            for (const auto& culler : distanceCullers) {
+                if (culler.cullMeshRenderers &&
+                    DistanceSqToAabb(culler.center, worldBounds) > culler.distanceSq) {
+                    culled = true;
+                    break;
+                }
+            }
+            if (culled)
+                continue;
+        }
+
+        if (!frustumCullers.empty()) {
+            bool culled = false;
+            for (const auto& fculler : frustumCullers) {
+                if (fculler.cullMeshRenderers) {
+                    const Camera& testCam = (includeEditorOnlyMeshes && fculler.hasSpecificCamera)
+                        ? fculler.camera
+                        : camera;
+                    const float testAspect = (includeEditorOnlyMeshes && fculler.hasSpecificCamera)
+                        ? fculler.aspect
+                        : renderAspect;
+                    if (!AabbIntersectsFrustum(worldBounds, testCam, testAspect,
+                                               fculler.margin)) {
+                        culled = true;
+                        break;
+                    }
+                }
+            }
+            if (culled)
+                continue;
+        }
+
         const Mesh* drawMesh = meshRenderer->mesh.get();
         float projectionDepthClamp = 0.0f;
         if (usePs1PreviewMeshes && meshRenderer->meshPrimitive == "File") {
@@ -1687,8 +2582,12 @@ void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* target
                 drawMesh = meshRenderer->ps1PreviewMesh.get();
             }
         }
+        const Mesh* preSubdivisionMesh = drawMesh;
+        drawMesh = ResolveSubdivisionPreview(*entity, drawMesh, worldMatrix);
+        const bool usesSubdivisionPreview = drawMesh != preSubdivisionMesh;
 
-        if (auto* proModeler = entity->GetComponent<ProModelerComponent>()) {
+        if (auto* proModeler = entity->GetComponent<ProModelerComponent>();
+            proModeler && !usesSubdivisionPreview) {
             DrawProModelerWithFaceMaterials(renderer, *proModeler, *meshRenderer, *drawMesh,
                                             worldMatrix, projectionDepthClamp);
         } else {
@@ -1777,6 +2676,43 @@ void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* target
         const glm::mat4 partGeo = partIndex >= 0
             ? skel->meshParts[static_cast<size_t>(partIndex)].geometryToWorld
             : skel->meshGeometryToWorld;
+        const WorldAabb worldBounds = TransformAabb(
+            skinned->mesh->GetBoundsMin(), skinned->mesh->GetBoundsMax(),
+            worldMatrix * partGeo);
+
+        if (!distanceCullers.empty()) {
+            bool culled = false;
+            for (const auto& culler : distanceCullers) {
+                if (culler.cullSkinnedMeshes &&
+                    DistanceSqToAabb(culler.center, worldBounds) > culler.distanceSq) {
+                    culled = true;
+                    break;
+                }
+            }
+            if (culled)
+                continue;
+        }
+
+        if (!frustumCullers.empty()) {
+            bool culled = false;
+            for (const auto& fculler : frustumCullers) {
+                if (fculler.cullSkinnedMeshes) {
+                    const Camera& testCam = (includeEditorOnlyMeshes && fculler.hasSpecificCamera)
+                        ? fculler.camera
+                        : camera;
+                    const float testAspect = (includeEditorOnlyMeshes && fculler.hasSpecificCamera)
+                        ? fculler.aspect
+                        : renderAspect;
+                    if (!AabbIntersectsFrustum(worldBounds, testCam, testAspect,
+                                               fculler.margin)) {
+                        culled = true;
+                        break;
+                    }
+                }
+            }
+            if (culled)
+                continue;
+        }
 
         const uint32_t rootId = FindSkeletalCharacterRootId(*entity, *this);
         AnimatorComponent* drawAnimator = entity->GetComponent<AnimatorComponent>();

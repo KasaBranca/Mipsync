@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+const OWNER_REPO: &str = "KasaBranca/Mipsync";
 const MANIFEST_LATEST_URL: &str =
-    "https://github.com/LimeHato74/mipsync/releases/latest/download/manifest.json";
+    "https://github.com/KasaBranca/Mipsync/releases/latest/download/manifest.json";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +85,10 @@ pub fn fetch_latest() -> Result<Manifest, String> {
         let head = s.chars().take(120).collect::<String>();
         format!("error decoding response body: {e}. head=`{head}`")
     })
+}
+
+pub fn repo() -> &'static str {
+    OWNER_REPO
 }
 
 fn strip_utf8_bom(bytes: &[u8]) -> &str {

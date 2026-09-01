@@ -351,6 +351,26 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
             ps1_physics_set_active_entity((unsigned int)vm_instance_entity_index(vm));
             push_number(vm, ps1_physics_is_grounded() ? FIX16_ONE : 0);
             return 1;
+        case HF_PHYSICS_IS_GROUNDED_WITHIN:
+            ps1_physics_set_active_entity((unsigned int)vm_instance_entity_index(vm));
+            push_number(vm, ps1_physics_is_grounded_within(
+                argc >= 1 ? (fix16_t)a[0].ival : 0) ? FIX16_ONE : 0);
+            return 1;
+        case HF_PHYSICS_USE_CHARACTER_CONTROLLER:
+        case HF_PHYSICS_USE_KINEMATIC_CONTROLLER:
+            /* PS1 collider/controller data is already fixed by scene export.
+             * Keep these lifecycle APIs source-compatible with desktop. */
+            push_nil(vm);
+            return 1;
+        case HF_PHYSICS_MOVE_KINEMATIC: {
+            fix16_t vx = argc >= 1 ? (fix16_t)a[0].ival : 0;
+            fix16_t vy = argc >= 2 ? (fix16_t)a[1].ival : 0;
+            fix16_t vz = argc >= 3 ? (fix16_t)a[2].ival : 0;
+            ps1_physics_set_active_entity((unsigned int)vm_instance_entity_index(vm));
+            ps1_physics_move_kinematic(vx, vy, vz, s_delta_q16_16);
+            push_nil(vm);
+            return 1;
+        }
         case HF_ENTITY_GETID:
             push_number(vm, argc >= 1 && a[0].tag == HOST_VAL_HOST
                 ? FIX16_FROM_INT((int32_t)a[0].ref.entity_idx) : 0);
@@ -385,6 +405,22 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
             if (name) {
                 ps1_scene_set_animator_trigger(
                     (unsigned int)vm_instance_entity_index(vm), name);
+            }
+            push_nil(vm);
+            return 1;
+        }
+        case HF_ANIMATOR_SETTRIGGER_HELD:
+        case HF_ANIMATOR_RELEASE_TRIGGER: {
+            const char* name = argc >= 1 && a[0].tag == HOST_VAL_STRING
+                ? vm_module_string(vm, a[0].str_idx)
+                : 0;
+            if (name) {
+                if (host_id == HF_ANIMATOR_SETTRIGGER_HELD)
+                    ps1_scene_set_animator_trigger_held(
+                        (unsigned int)vm_instance_entity_index(vm), name);
+                else
+                    ps1_scene_release_animator_trigger(
+                        (unsigned int)vm_instance_entity_index(vm), name);
             }
             push_nil(vm);
             return 1;
@@ -476,7 +512,7 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
         }
         case HF_CAMERA_FOLLOW: {
             /* Camera.Follow(cameraHandle, controllerYaw, distance, height,
-             *               lookHeight, sharpness). Entity-reference fields
+             *               lookHeight, sharpness[, pitchOffset]). Entity-reference fields
              * are exported as one-based scene indices so zero remains None. */
             const fix16_t radians_to_degrees = (fix16_t)3754936;
             const int camera_handle = argc >= 1 ?
@@ -490,10 +526,17 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
             fix16_t height;
             fix16_t look_height;
             fix16_t sharpness;
+            fix16_t pitch;
             fix16_t turn;
+            fix16_t pitch_turn;
             fix16_t sy;
             fix16_t cy;
+            fix16_t sp;
+            fix16_t cp;
+            fix16_t horizontal_distance;
             fix16_t desired[3];
+            fix16_t follow_position[3];
+            fix16_t look_pivot[3];
             fix16_t alpha;
             fix16_t direction[3];
             fix16_t horizontal;
@@ -514,23 +557,37 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
             height = argc >= 4 ? (fix16_t)a[3].ival : 0;
             look_height = argc >= 5 ? (fix16_t)a[4].ival : 0;
             sharpness = argc >= 6 ? (fix16_t)a[5].ival : 0;
+            pitch = argc >= 7 ? (fix16_t)a[6].ival : 0;
             if (distance < 0) distance = 0;
             if (sharpness < 0) sharpness = 0;
 
             turn = fix16_div(yaw, FIX16_FROM_INT(360));
+            pitch_turn = fix16_div(pitch, FIX16_FROM_INT(360));
             sy = fix16_sin(turn);
             cy = fix16_cos(turn);
-            desired[0] = fix16_add(target->position[0], fix16_mul(sy, distance));
-            desired[1] = fix16_add(target->position[1], height);
-            desired[2] = fix16_add(target->position[2], fix16_mul(cy, distance));
+            sp = fix16_sin(pitch_turn);
+            cp = fix16_cos(pitch_turn);
+            horizontal_distance = fix16_mul(cp, distance);
+            desired[0] = fix16_add(
+                target->position[0], fix16_mul(sy, horizontal_distance));
+            desired[1] = fix16_sub(
+                fix16_add(target->position[1], height), fix16_mul(sp, distance));
+            desired[2] = fix16_add(
+                target->position[2], fix16_mul(cy, horizontal_distance));
             alpha = sharpness <= 0
                 ? FIX16_ONE
                 : fix16_clamp(fix16_mul(sharpness, s_delta_q16_16), 0, FIX16_ONE);
             for (int axis = 0; axis < 3; ++axis) {
-                camera->position[axis] = fix16_add(
+                follow_position[axis] = fix16_add(
                     camera->position[axis],
                     fix16_mul(fix16_sub(desired[axis], camera->position[axis]), alpha));
             }
+            look_pivot[0] = target->position[0];
+            look_pivot[1] = fix16_add(target->position[1], look_height);
+            look_pivot[2] = target->position[2];
+            ps1_physics_camera_sweep(
+                (unsigned int)target_index, (unsigned int)camera_index,
+                look_pivot, follow_position, FIX16_ONE / 6, camera->position);
 
             direction[0] = fix16_sub(target->position[0], camera->position[0]);
             direction[1] = fix16_sub(

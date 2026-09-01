@@ -4,6 +4,8 @@
 #include "command/IpcTransport.h"
 #include "command/ResultRenderer.h"
 #include "command/SymbolRegistry.h"
+#include "bootstrap/AgentIntegration.h"
+#include "core/RuntimePaths.h"
 #include "project/Project.h"
 #include "EngineVersion.h"
 
@@ -70,6 +72,15 @@ int Print(const ParsedCommandLine& parsed, const CommandResult& result) {
     return result.success ? 0 : 1;
 }
 
+void EnsureProjectSkill(const std::string& projectPath,
+                        const fs::path& executableDirectory,
+                        bool jsonOutput) {
+    if (projectPath.empty()) return;
+    const auto setup = MipsyncEngine::EnsureAgentIntegration(projectPath, executableDirectory);
+    if (!setup.success && !jsonOutput)
+        std::cerr << "mipsync: warning: Agent Skill setup failed: " << setup.error << '\n';
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -103,8 +114,18 @@ int main(int argc, char** argv) {
         std::string error;
         const auto instance = SelectInstance(parsed, error);
         if (!instance) return Print(parsed, CommandResult::Fail("MIPSYNC_EDITOR_NOT_FOUND", error));
+        if (parsed.projectPath.empty()) {
+            parsed.projectPath = instance->projectPath;
+            parsed.request.projectPath = instance->projectPath;
+        }
+        fs::path editorDirectory = MipsyncEngine::GetExeDirectory();
+        if (!instance->executablePath.empty())
+            editorDirectory = fs::path(instance->executablePath).parent_path();
+        EnsureProjectSkill(instance->projectPath, editorDirectory, parsed.json);
         return Print(parsed, IpcClient::Execute(*instance, parsed.request, error));
     }
+
+    EnsureProjectSkill(parsed.projectPath, MipsyncEngine::GetExeDirectory(), parsed.json);
 
     CommandContext context;
     context.projectPath = parsed.projectPath;

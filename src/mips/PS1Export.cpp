@@ -103,7 +103,7 @@ const char* UnsupportedHostReason(HostFunc func) {
 
 bool IsUnsupportedLifecycle(const std::string& name) {
     static const std::unordered_set<std::string> unsupported = {
-        "LateUpdate", "OnDestroy", "OnCollisionEnter", "OnCollisionExit",
+        "OnDestroy", "OnCollisionEnter", "OnCollisionExit",
         "OnTriggerEnter", "OnTriggerExit"
     };
     return unsupported.find(name) != unsupported.end();
@@ -202,7 +202,7 @@ void ValidateMethodBytecode(const CompiledModule& module,
             if (!need(3)) break;
             const uint16_t id = readU16();
             ++pc; // argc
-            if (id > static_cast<uint16_t>(HostFunc::Camera_Follow)) {
+            if (id > static_cast<uint16_t>(HostFunc::Physics_MoveKinematic)) {
                 AddUniqueError(errors, where + ": unknown PS1 host function #" +
                                        std::to_string(id));
             } else if (const char* reason = UnsupportedHostReason(static_cast<HostFunc>(id))) {

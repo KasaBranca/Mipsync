@@ -1,0 +1,45 @@
+---
+description: Source repo vs distribution repo + release workflow
+alwaysApply: true
+---
+
+# Public repository and release workflow (IMPORTANT)
+
+This workspace (`Nostalty` / `MipsyncEngine`) is the authoritative development
+checkout. `KasaBranca/Mipsync` is the public source mirror and distribution
+repository, with an intentionally separate Git history. Publish a reviewed
+snapshot as a new commit on top of its existing `main` branch (never force-push
+or replace its history), then create the matching release tag and assets.
+
+## Release workflow (Windows)
+
+- Build engine: `d:\\Nostalty\\build\\src\\MipsyncEngine.exe`
+- Bundle required runtime + resources into a zip asset:
+  - `MipsyncEngine_Windows_x64.zip`
+  - Include the Editor, `mipsync.exe`, Skills, `resources/`, PS1 templates and
+    runtime, language tools, and MinGW runtime DLLs when applicable.
+
+- Build Hub (Tauri): `hub-tauri\\npm run tauri build`
+  - **Only rebuild the Hub if `hub-tauri/` source was changed.**
+  - Create `MipsyncHub_Windows_x64.zip` including:
+    - `MipsyncHub.exe`
+    - `MipsyncHubUpdater.exe` (used for self-update)
+
+- Publish to `KasaBranca/Mipsync` via `gh release create vX.Y.Z ...` with assets:
+  - Engine zip
+  - Hub zip (omit if Hub was not changed; reuse the previous release's zip URL in manifest)
+
+## manifest.json rules (IMPORTANT)
+
+The `manifest.json` uploaded with each release contains a `hub.version` field.
+
+- **`hub.version` MUST match the `version` field in `hub-tauri/src-tauri/Cargo.toml`.**
+- **Do NOT update `hub.version` unless the Hub itself was rebuilt with a new version.**
+- If only the engine changed, keep `hub.version` pointing to the previous Hub release (e.g. `"v2026.6.31"`), and set `hub.downloadUrl` to the previous release's zip URL.
+- Updating `hub.version` to the new release tag without rebuilding the Hub will cause the Hub to show a permanent "update available" notification that never clears.
+
+## Hub behavior contract
+
+- Hub lists **all GitHub Releases** from `KasaBranca/Mipsync` and installs editor zips.
+- Hub updates itself using `MipsyncHubUpdater.exe` (cannot overwrite a running exe).
+- `check_hub_update()` compares the embedded `CARGO_PKG_VERSION` against `manifest.hub.version`. They must match for the update badge to stay hidden.

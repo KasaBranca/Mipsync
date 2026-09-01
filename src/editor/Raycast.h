@@ -26,7 +26,8 @@ Entity* PickEntityAtPoint(
     float mouseX, float mouseY,
     float viewportMinX, float viewportMinY,
     float viewportWidth, float viewportHeight,
-    int uiLayoutWidth = 0, int uiLayoutHeight = 0);
+    int uiLayoutWidth = 0, int uiLayoutHeight = 0,
+    uint32_t selectionContextId = 0);
 
 /// Intersects a screen point with the horizontal plane y = planeY (for asset placement).
 glm::vec3 PickPointOnPlane(

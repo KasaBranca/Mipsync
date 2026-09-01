@@ -155,8 +155,7 @@ pub fn install(settings: &mut HubSettings) -> Result<ToolchainState, String> {
         .into_iter()
         .find(|r| !r.draft && !r.prerelease)
         .ok_or_else(|| "No stable PSn00bSDK release found".to_string())?;
-    let asset =
-        pick_windows_zip(&release).ok_or_else(|| "No Windows ZIP asset found".to_string())?;
+    let asset = pick_windows_zip(&release).ok_or_else(|| "No Windows ZIP asset found".to_string())?;
 
     let installs_root = settings.installs_root_dir();
     let toolchains_root = installs_root.join("toolchains").join("psn00bsdk");
@@ -174,8 +173,7 @@ pub fn install(settings: &mut HubSettings) -> Result<ToolchainState, String> {
     let _ = fs::remove_file(&tmp_zip);
 
     let sdk_root = find_sdk_root(&dest_dir).ok_or_else(|| {
-        "Installed archive did not contain expected PSn00bSDK layout (bin/, lib/libpsn00b/)"
-            .to_string()
+        "Installed archive did not contain expected PSn00bSDK layout (bin/, lib/libpsn00b/)".to_string()
     })?;
 
     settings.psn00bsdk_dir = Some(sdk_root.to_string_lossy().into_owned());

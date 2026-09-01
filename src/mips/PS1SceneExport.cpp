@@ -135,21 +135,85 @@ static bool IsCameraTriggerTag(const json& ent) {
 static uint8_t UvToPsxU(float u, int texSize) {
     if (texSize < 2)
         texSize = 2;
-    /* setUVWH uses 0..width (64 for 64x64); not width-1. */
-    const int uv = static_cast<int>(Fract01(u) * static_cast<float>(texSize) + 0.5f);
+    /* Custom mesh polygons use explicit UV vertices, so their last texel is
+     * width - 1. Using width samples the next packed VRAM cell at the edge and
+     * is especially visible on repeated ProModeler UVs. */
+    const int uv = static_cast<int>(
+        Fract01(u) * static_cast<float>(texSize - 1) + 0.5f);
     return static_cast<uint8_t>(std::min(uv, 255));
 }
 
 static uint8_t UvToPsxV(float v, int texSize) {
     if (texSize < 2)
         texSize = 2;
-    const int uv = static_cast<int>(Fract01(v) * static_cast<float>(texSize) + 0.5f);
+    const int uv = static_cast<int>(
+        Fract01(v) * static_cast<float>(texSize - 1) + 0.5f);
     return static_cast<uint8_t>(std::min(uv, 255));
 }
 
 static constexpr float kPs1UiLayoutWidth = 1024.0f;
 static constexpr float kPs1UiLayoutHeight = 768.0f;
 static constexpr int kPs1UiCjkGlyphSize = 16;
+static constexpr float kPs1BakedTextureRepeats = 8.0f;
+static constexpr const char* kPs1BakedTexturePrefix = "mipsynctile8://";
+
+static bool ProModelerUvCrossesRepeatCell(const Ps1SceneExportResult& data,
+                                         const std::string& meshPath,
+                                         const float tiling[2],
+                                         const float offset[2]) {
+    for (const Ps1ProModelerMeshData& mesh : data.proModelerMeshes) {
+        if (mesh.key != meshPath || mesh.uvs.size() < 2u)
+            continue;
+        float minU = std::numeric_limits<float>::max();
+        float minV = std::numeric_limits<float>::max();
+        float maxU = std::numeric_limits<float>::lowest();
+        float maxV = std::numeric_limits<float>::lowest();
+        for (size_t i = 0; i + 1u < mesh.uvs.size(); i += 2u) {
+            const float u = mesh.uvs[i] * tiling[0] + offset[0];
+            const float v = mesh.uvs[i + 1u] * tiling[1] + offset[1];
+            minU = std::min(minU, u);
+            minV = std::min(minV, v);
+            maxU = std::max(maxU, u);
+            maxV = std::max(maxV, v);
+        }
+        const int firstU = static_cast<int>(std::floor(minU));
+        const int firstV = static_cast<int>(std::floor(minV));
+        const int lastU = static_cast<int>(std::floor(maxU - 1e-5f));
+        const int lastV = static_cast<int>(std::floor(maxV - 1e-5f));
+        return firstU != lastU || firstV != lastV;
+    }
+    return false;
+}
+
+static bool IsBakedRepeatMesh(const Ps1SceneExportResult& data,
+                              const Ps1ExportedEntity& entity) {
+    const bool authoredRepeats =
+        std::abs(entity.textureTiling[0]) > 1.0001f ||
+        std::abs(entity.textureTiling[1]) > 1.0001f;
+    if (entity.meshKind == 2)
+        return authoredRepeats;
+    if (entity.meshKind != 4)
+        return false;
+    const bool supportsBakedRepeats =
+        entity.meshPath.rfind("promodelerdata://", 0) == 0 ||
+        entity.meshPath.rfind("probuilderdata://", 0) == 0 ||
+        entity.meshPath.rfind("primitivemesh://", 0) == 0;
+    /* ProModeler used to force every material through the eight-repeat atlas,
+     * even when its authored tiling was 1 or smaller. That reduced a normal
+     * 64x64 PS1 texture to a single 8x8 tile (notably doors and signs). Only
+     * transforms which actually repeat need the baked wrapping workaround. */
+    return supportsBakedRepeats &&
+           (authoredRepeats || ProModelerUvCrossesRepeatCell(
+               data, entity.meshPath, entity.textureTiling, entity.textureOffset));
+}
+
+static bool EntityUsesBakedRepeatTexture(const Ps1SceneExportResult& data,
+                                         const Ps1ExportedEntity& entity) {
+    if (entity.textureIndex == 0 || entity.textureIndex > data.texturePaths.size())
+        return false;
+    return data.texturePaths[entity.textureIndex - 1u].rfind(
+        kPs1BakedTexturePrefix, 0) == 0;
+}
 
 static bool DecodeUtf8Next(const std::string& text, size_t& index, uint32_t& outCodepoint) {
     if (index >= text.size())
@@ -334,8 +398,46 @@ void ResolveEntityAppearances(const std::string& projectRoot, const fs::path& sc
             texPath = e.texturePath;
         }
 
+        /* PS1 UVs are 8-bit and cannot express an arbitrary number of wraps
+         * inside one polygon. Materials which actually repeat use a texture
+         * with eight repeats pre-baked into it; non-repeating ProModeler
+         * materials retain the full texture cell and therefore full detail. */
+        if (!texPath.empty() && IsBakedRepeatMesh(data, e))
+            texPath = std::string(kPs1BakedTexturePrefix) + texPath;
+
         e.textureIndex = 0;
         e.textureIndex = RegisterTexturePath(data.texturePaths, texIndexByPath, texPath);
+    }
+
+    // ProModeler supports material overrides per logical face. Register those
+    // textures independently; local material slots are carried through mesh
+    // subdivision in vertex alpha and emitted per triangle below.
+    for (auto& mesh : data.proModelerMeshes) {
+        mesh.faceMaterialTextureIndices.clear();
+        mesh.faceMaterialTextureIndices.reserve(mesh.faceMaterialPaths.size());
+        const float identityTiling[2] = { 1.0f, 1.0f };
+        const float zeroOffset[2] = { 0.0f, 0.0f };
+        const bool meshUvsRepeat = ProModelerUvCrossesRepeatCell(
+            data, mesh.key, identityTiling, zeroOffset);
+        for (const std::string& materialPath : mesh.faceMaterialPaths) {
+            Material material;
+            std::string error;
+            std::string texturePath;
+            bool authoredRepeats = false;
+            if (Material::Load(AssetManager::Get().ToAbsolute(materialPath), material, error)) {
+                texturePath = material.texturePath;
+                authoredRepeats =
+                    std::abs(material.mainTextureTiling.x) > 1.0001f ||
+                    std::abs(material.mainTextureTiling.y) > 1.0001f;
+            } else {
+                MIPSYNC_WARN("PS1 ProModeler face material load failed '{}': {}",
+                             materialPath, error);
+            }
+            if (!texturePath.empty() && (authoredRepeats || meshUvsRepeat))
+                texturePath = std::string(kPs1BakedTexturePrefix) + texturePath;
+            mesh.faceMaterialTextureIndices.push_back(
+                RegisterTexturePath(data.texturePaths, texIndexByPath, texturePath));
+        }
     }
 
     for (auto& ui : data.uiElements) {
@@ -396,8 +498,11 @@ void ResolveEntityAppearances(const std::string& projectRoot, const fs::path& sc
 }
 
 bool FindMeshUvTransform(const Ps1SceneExportResult& data, const std::string& meshPath,
-                         float tiling[2], float offset[2], bool& outExportUvs) {
+                         float tiling[2], float offset[2], bool& outExportUvs,
+                         bool* outBakedRepeats = nullptr) {
     outExportUvs = false;
+    if (outBakedRepeats)
+        *outBakedRepeats = false;
     tiling[0] = 1.0f;
     tiling[1] = 1.0f;
     offset[0] = 0.0f;
@@ -405,16 +510,59 @@ bool FindMeshUvTransform(const Ps1SceneExportResult& data, const std::string& me
     for (const auto& e : data.entities) {
         if (e.meshKind != 4 || e.textureIndex == 0)
             continue;
-        if (e.meshPath != meshPath && !SameSkinnedAnimSequence(e.meshPath, meshPath))
+        if (e.meshPath != meshPath && !SameSkinnedAnimSequence(e.meshPath, meshPath) &&
+            !SameSkinnedAnimSequence(e.vertexIdleMeshPath, meshPath) &&
+            !SameSkinnedAnimSequence(e.vertexWalkMeshPath, meshPath) &&
+            !SameSkinnedAnimSequence(e.vertexAimMeshPath, meshPath) &&
+            !SameSkinnedAnimSequence(e.vertexTriggerMeshPath, meshPath))
             continue;
         tiling[0] = e.textureTiling[0];
         tiling[1] = e.textureTiling[1];
         offset[0] = e.textureOffset[0];
         offset[1] = e.textureOffset[1];
         outExportUvs = true;
+        if (outBakedRepeats)
+            *outBakedRepeats = EntityUsesBakedRepeatTexture(data, e);
         return true;
     }
+    for (const Ps1ProModelerMeshData& mesh : data.proModelerMeshes) {
+        if (mesh.key != meshPath)
+            continue;
+        if (std::any_of(mesh.faceMaterialTextureIndices.begin(),
+                        mesh.faceMaterialTextureIndices.end(),
+                        [](uint8_t textureIndex) { return textureIndex != 0; })) {
+            // Per-face material transforms were already baked into mesh UVs.
+            outExportUvs = true;
+            if (outBakedRepeats) {
+                *outBakedRepeats = std::any_of(
+                    mesh.faceMaterialTextureIndices.begin(),
+                    mesh.faceMaterialTextureIndices.end(),
+                    [&](uint8_t textureIndex) {
+                        return textureIndex > 0 && textureIndex <= data.texturePaths.size() &&
+                               data.texturePaths[textureIndex - 1u].rfind(
+                                   kPs1BakedTexturePrefix, 0) == 0;
+                    });
+            }
+            return true;
+        }
+        break;
+    }
     return false;
+}
+
+uint8_t ProModelerFaceTextureIndex(const Ps1SceneExportResult& data,
+                                   const std::string& meshPath,
+                                   uint8_t localMaterialSlot) {
+    if (localMaterialSlot == 0)
+        return 0;
+    for (const Ps1ProModelerMeshData& mesh : data.proModelerMeshes) {
+        if (mesh.key != meshPath)
+            continue;
+        const size_t slotIndex = static_cast<size_t>(localMaterialSlot - 1u);
+        return slotIndex < mesh.faceMaterialTextureIndices.size()
+            ? mesh.faceMaterialTextureIndices[slotIndex] : 0;
+    }
+    return 0;
 }
 
 static void EulerToForwardUnity(const float eulerDeg[3], float outForward[3]) {
@@ -581,6 +729,21 @@ static bool IsPrerenderOccluderEntity(const json& ent, const std::string& name) 
     return name.find(kMarker) != std::string::npos;
 }
 
+static uint8_t RenderPresetFromJson(const json& meshRenderer) {
+    if (!meshRenderer.contains("typePreset"))
+        return meshRenderer.value("viewModel", false) ? 3u : 0u;
+    if (meshRenderer["typePreset"].is_number_integer())
+        return static_cast<uint8_t>(std::clamp(meshRenderer["typePreset"].get<int>(), 0, 4));
+    std::string preset = meshRenderer.value("typePreset", std::string{"Prop"});
+    std::transform(preset.begin(), preset.end(), preset.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (preset == "corridor") return 1u;
+    if (preset == "character") return 2u;
+    if (preset == "viewmodel" || preset == "view-model") return 3u;
+    if (preset == "floor") return 4u;
+    return 0u;
+}
+
 static std::string RegisterProModelerMeshFromJson(const json& proModeler, Ps1SceneExportResult& result) {
     Ps1ProModelerMeshData data;
     data.key = "promodelerdata://" + std::to_string(result.proModelerMeshes.size());
@@ -606,6 +769,155 @@ static std::string RegisterProModelerMeshFromJson(const json& proModeler, Ps1Sce
                 data.indices.push_back(static_cast<uint32_t>(std::max<int64_t>(0, index.get<int64_t>())));
         }
     }
+    // ProModeler stores material assignments per logical face instead of on
+    // the MeshRenderer. Bake each face material colour into the vertex stream.
+    // Split vertices at colour boundaries so adjacent faces cannot overwrite
+    // each other's material.
+    std::unordered_map<uint32_t, uint32_t> faceColors;
+    std::unordered_map<uint32_t, uint8_t> faceMaterialSlots;
+    std::unordered_map<uint32_t, glm::vec2> faceTilings;
+    std::unordered_map<uint32_t, glm::vec2> faceOffsets;
+    std::unordered_map<std::string, uint8_t> materialSlots;
+    if (proModeler.contains("faceMaterials") && proModeler["faceMaterials"].is_array()) {
+        for (const json& assignment : proModeler["faceMaterials"]) {
+            if (!assignment.is_object())
+                continue;
+            const uint32_t faceId = assignment.value("faceId", 0u);
+            const std::string materialPath = assignment.value("material", std::string{});
+            if (faceId == 0u || materialPath.empty())
+                continue;
+            Material material;
+            std::string error;
+            if (Material::Load(AssetManager::Get().ToAbsolute(materialPath), material, error)) {
+                uint8_t materialSlot = 0;
+                const auto existingSlot = materialSlots.find(materialPath);
+                if (existingSlot != materialSlots.end()) {
+                    materialSlot = existingSlot->second;
+                } else if (data.faceMaterialPaths.size() < 254u) {
+                    materialSlot = static_cast<uint8_t>(data.faceMaterialPaths.size() + 1u);
+                    materialSlots.emplace(materialPath, materialSlot);
+                    data.faceMaterialPaths.push_back(materialPath);
+                }
+                faceColors[faceId] =
+                    (static_cast<uint32_t>(ToByte01(material.color.r)) << 24u) |
+                    (static_cast<uint32_t>(ToByte01(material.color.g)) << 16u) |
+                    (static_cast<uint32_t>(ToByte01(material.color.b)) << 8u);
+                faceMaterialSlots[faceId] = materialSlot;
+                faceTilings[faceId] = material.mainTextureTiling;
+                faceOffsets[faceId] = material.mainTextureOffset;
+            } else {
+                MIPSYNC_WARN("PS1 ProModeler face material load failed '{}': {}",
+                             materialPath, error);
+            }
+        }
+    }
+    if (!faceColors.empty() &&
+        proModeler.contains("faceIds") && proModeler["faceIds"].is_array()) {
+        const json& faceIds = proModeler["faceIds"];
+        Ps1ProModelerMeshData colored;
+        colored.key = data.key;
+        colored.positions.reserve(data.positions.size());
+        colored.normals.reserve(data.normals.size());
+        colored.uvs.reserve(data.uvs.size());
+        colored.colors.reserve(data.colors.size());
+        colored.indices.reserve(data.indices.size());
+        colored.faceMaterialPaths = data.faceMaterialPaths;
+        std::unordered_map<uint64_t, uint32_t> remap;
+        remap.reserve(data.indices.size());
+
+        auto appendVertex = [&](uint32_t sourceIndex, uint32_t faceColor,
+                                uint8_t materialSlot, const glm::vec2& tiling,
+                                const glm::vec2& offset) -> uint32_t {
+            const uint64_t key = (static_cast<uint64_t>(materialSlot) << 32u) | sourceIndex;
+            const auto found = remap.find(key);
+            if (found != remap.end())
+                return found->second;
+            if (sourceIndex * 3u + 2u >= data.positions.size())
+                return UINT32_MAX;
+            const uint32_t newIndex = static_cast<uint32_t>(colored.colors.size());
+            remap.emplace(key, newIndex);
+            colored.positions.insert(colored.positions.end(), {
+                data.positions[sourceIndex * 3u + 0u],
+                data.positions[sourceIndex * 3u + 1u],
+                data.positions[sourceIndex * 3u + 2u],
+            });
+            if (sourceIndex * 3u + 2u < data.normals.size()) {
+                colored.normals.insert(colored.normals.end(), {
+                    data.normals[sourceIndex * 3u + 0u],
+                    data.normals[sourceIndex * 3u + 1u],
+                    data.normals[sourceIndex * 3u + 2u],
+                });
+            } else {
+                colored.normals.insert(colored.normals.end(), { 0.0f, 1.0f, 0.0f });
+            }
+            if (sourceIndex * 2u + 1u < data.uvs.size()) {
+                colored.uvs.insert(colored.uvs.end(), {
+                    data.uvs[sourceIndex * 2u + 0u] * tiling.x + offset.x,
+                    data.uvs[sourceIndex * 2u + 1u] * tiling.y + offset.y,
+                });
+            } else {
+                colored.uvs.insert(colored.uvs.end(), { 0.0f, 0.0f });
+            }
+            const uint32_t sourceColor = sourceIndex < data.colors.size()
+                ? data.colors[sourceIndex] : 0xFFFFFFFFu;
+            auto multiplyChannel = [](uint32_t a, uint32_t b) {
+                return (a * b + 127u) / 255u;
+            };
+            colored.colors.push_back(
+                (multiplyChannel((sourceColor >> 24u) & 0xFFu, (faceColor >> 24u) & 0xFFu) << 24u) |
+                (multiplyChannel((sourceColor >> 16u) & 0xFFu, (faceColor >> 16u) & 0xFFu) << 16u) |
+                (multiplyChannel((sourceColor >> 8u) & 0xFFu, (faceColor >> 8u) & 0xFFu) << 8u) |
+                static_cast<uint32_t>(materialSlot));
+            return newIndex;
+        };
+
+        const size_t triangleCount = data.indices.size() / 3u;
+        for (size_t triangle = 0; triangle < triangleCount; ++triangle) {
+            uint32_t faceColor = 0xFFFFFFFFu;
+            uint8_t materialSlot = 0;
+            glm::vec2 tiling(1.0f);
+            glm::vec2 offset(0.0f);
+            if (triangle < faceIds.size() && faceIds[triangle].is_number_integer()) {
+                const uint32_t faceId = static_cast<uint32_t>(
+                    std::max<int64_t>(0, faceIds[triangle].get<int64_t>()));
+                const auto colorIt = faceColors.find(faceId);
+                if (colorIt != faceColors.end())
+                    faceColor = colorIt->second;
+                if (const auto slotIt = faceMaterialSlots.find(faceId);
+                    slotIt != faceMaterialSlots.end())
+                    materialSlot = slotIt->second;
+                if (const auto tilingIt = faceTilings.find(faceId);
+                    tilingIt != faceTilings.end())
+                    tiling = tilingIt->second;
+                if (const auto offsetIt = faceOffsets.find(faceId);
+                    offsetIt != faceOffsets.end())
+                    offset = offsetIt->second;
+            }
+            const uint32_t i0 = appendVertex(
+                data.indices[triangle * 3u + 0u], faceColor, materialSlot, tiling, offset);
+            const uint32_t i1 = appendVertex(
+                data.indices[triangle * 3u + 1u], faceColor, materialSlot, tiling, offset);
+            const uint32_t i2 = appendVertex(
+                data.indices[triangle * 3u + 2u], faceColor, materialSlot, tiling, offset);
+            if (i0 != UINT32_MAX && i1 != UINT32_MAX && i2 != UINT32_MAX)
+                colored.indices.insert(colored.indices.end(), { i0, i1, i2 });
+        }
+        data = std::move(colored);
+    }
+    /* Duplicating a ProModeler object preserves the exact authored streams.
+     * Reuse that immutable geometry instead of exporting another render and
+     * collision mesh for every transformed copy. */
+    for (const Ps1ProModelerMeshData& existing : result.proModelerMeshes) {
+        if (existing.positions == data.positions &&
+            existing.normals == data.normals &&
+            existing.uvs == data.uvs &&
+            existing.colors == data.colors &&
+            existing.indices == data.indices &&
+            existing.faceMaterialPaths == data.faceMaterialPaths)
+            return existing.key;
+    }
+    data.key = "promodelerdata://" +
+        std::to_string(result.proModelerMeshes.size());
     result.proModelerMeshes.push_back(std::move(data));
     return result.proModelerMeshes.back().key;
 }
@@ -667,6 +979,57 @@ static std::string RegisterPrimitiveSphereMesh(float size, Ps1SceneExportResult&
     }
     result.proModelerMeshes.push_back(std::move(data));
     return key;
+}
+
+static uint32_t StableVariantHash(const std::string& value) {
+    uint32_t hash = 2166136261u;
+    for (unsigned char byte : value) {
+        hash ^= byte;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static std::string RegisterSubdividablePrimitiveMesh(
+        const std::string& primitive, float size, const std::string& materialVariant,
+        Ps1SceneExportResult& result) {
+    char keyBuf[112];
+    std::snprintf(keyBuf, sizeof(keyBuf), "primitivemesh://%s/%.5f/%08x",
+                  primitive.c_str(), size, StableVariantHash(materialVariant));
+    const std::string key = keyBuf;
+    for (const Ps1ProModelerMeshData& existing : result.proModelerMeshes) {
+        if (existing.key == key)
+            return key;
+    }
+
+    const Mesh source = primitive == "Plane"
+        ? Mesh::CreatePlane(size, 1, true)
+        : Mesh::CreateCube(size, true);
+    Ps1ProModelerMeshData data;
+    data.key = key;
+    data.positions.reserve(source.GetVertexCount() * 3u);
+    data.normals.reserve(source.GetVertexCount() * 3u);
+    data.uvs.reserve(source.GetVertexCount() * 2u);
+    data.colors.reserve(source.GetVertexCount());
+    for (const Vertex& vertex : source.GetVertices()) {
+        data.positions.insert(data.positions.end(), {
+            vertex.position.x, vertex.position.y, vertex.position.z });
+        data.normals.insert(data.normals.end(), {
+            vertex.normal.x, vertex.normal.y, vertex.normal.z });
+        data.uvs.insert(data.uvs.end(), { vertex.uv.x, vertex.uv.y });
+        const auto channel = [](float value) -> uint32_t {
+            return static_cast<uint32_t>(std::clamp(
+                static_cast<int>(std::lround(value * 255.0f)), 0, 255));
+        };
+        data.colors.push_back(
+            (channel(vertex.color.r) << 24u) |
+            (channel(vertex.color.g) << 16u) |
+            (channel(vertex.color.b) << 8u) |
+            channel(vertex.color.a));
+    }
+    data.indices = source.GetIndices();
+    result.proModelerMeshes.push_back(std::move(data));
+    return result.proModelerMeshes.back().key;
 }
 
 static uint32_t ColorToPackedFromVec4(const glm::vec4& c) {
@@ -1003,8 +1366,21 @@ static void ReduceSkinnedTopologyForPs1(const std::vector<Vertex>& sampleVerts,
     compactIndices = std::move(reducedIndices);
 }
 
-static std::string RegisterSkinnedAnimMeshesFromJson(const json& skinned, Ps1SceneExportResult& result,
-                                                     uint16_t& outFrameCount, uint8_t& outFps) {
+struct Ps1AnimatorClipSelection {
+    std::shared_ptr<SkeletalModelAsset> clipModel;
+    int stackIndex = -1;
+    double duration = 0.0;
+    float speed = 1.0f;
+    float startOffset = 0.0f;
+    std::string stateName;
+    std::string clipName;
+    std::string clipModelPath;
+};
+
+static std::string RegisterSkinnedAnimMeshesFromJson(
+    const json& skinned, Ps1SceneExportResult& result,
+    uint16_t& outFrameCount, uint8_t& outFps,
+    const Ps1AnimatorClipSelection* selectedClip = nullptr) {
     outFrameCount = 0;
     outFps = 0;
 
@@ -1044,16 +1420,32 @@ static std::string RegisterSkinnedAnimMeshesFromJson(const json& skinned, Ps1Sce
             modelPath, model->sourceVertices.size(), model->sourceIndices.size() / 3);
     }
 
+    // Baked skinned vertices preserve the source surface exactly, but every
+    // sample consumes PS1 main RAM. The runtime interpolates between samples,
+    // so 10 samples/sec (at most 15 per clip) remains visually smooth while
+    // leaving room for the renderer, VM and stack in the console's 2 MiB.
     const int ps1Fps = ps1Mode == 2
-        ? std::clamp(skinned.value("ps1VertexAnimFps", 15), 1, 30)
+        ? std::clamp(skinned.value("ps1VertexAnimFps", 10), 1, 10)
         : 1;
     const int ps1MaxFrames = ps1Mode == 2
-        ? std::clamp(skinned.value("ps1VertexAnimMaxFrames", 30), 1, 120)
+        ? std::clamp(skinned.value("ps1VertexAnimMaxFrames", 15), 1, 15)
         : 1;
-    const int stackIndex = ps1Mode == 2 && !model->animationStackIndices.empty()
-        ? static_cast<int>(model->animationStackIndices[0])
+    const std::shared_ptr<SkeletalModelAsset> clipModel =
+        selectedClip && selectedClip->clipModel ? selectedClip->clipModel : model;
+    const int stackIndex = ps1Mode == 2
+        ? (selectedClip
+            ? selectedClip->stackIndex
+            : (!model->animationStackIndices.empty()
+                ? static_cast<int>(model->animationStackIndices[0]) : -1))
         : -1;
-    const double duration = stackIndex >= 0 ? model->GetClipDurationByStackIndex(stackIndex) : 0.0;
+    const double duration = stackIndex >= 0
+        ? (selectedClip ? selectedClip->duration
+                        : model->GetClipDurationByStackIndex(stackIndex))
+        : 0.0;
+    const float playbackSpeed = selectedClip ? selectedClip->speed : 1.0f;
+    const double playbackStart = selectedClip
+        ? static_cast<double>(selectedClip->startOffset) * duration
+        : 0.0;
     const int requestedFrames = duration > 0.0
         ? static_cast<int>(std::ceil(duration * static_cast<double>(ps1Fps)))
         : 1;
@@ -1098,8 +1490,8 @@ static std::string RegisterSkinnedAnimMeshesFromJson(const json& skinned, Ps1Sce
     std::vector<std::vector<uint32_t>> clusteredSourceVertices;
     {
         glm::mat4 sampleBones[kMaxBones];
-        if (stackIndex >= 0 && duration > 0.0)
-            model->EvaluateBoneMatricesByStackIndex(stackIndex, 0.0, sampleBones);
+        if (stackIndex >= 0 && duration > 0.0 && clipModel)
+            EvaluateRetargetedBoneMatrices(*model, *clipModel, stackIndex, 0.0, sampleBones);
         else
             model->EvaluateBoneMatrices({}, 0.0, sampleBones);
 
@@ -1142,8 +1534,11 @@ static std::string RegisterSkinnedAnimMeshesFromJson(const json& skinned, Ps1Sce
                 ? (duration * static_cast<double>(frame) / static_cast<double>(frameCount))
                 : (static_cast<double>(frame) / static_cast<double>(ps1Fps)))
             : 0.0;
-        if (stackIndex >= 0 && duration > 0.0)
-            model->EvaluateBoneMatricesByStackIndex(stackIndex, std::fmod(time, duration), bones);
+        if (stackIndex >= 0 && duration > 0.0 && clipModel)
+            EvaluateRetargetedBoneMatrices(
+                *model, *clipModel, stackIndex,
+                std::fmod(time * static_cast<double>(playbackSpeed) + playbackStart, duration),
+                bones);
         else
             model->EvaluateBoneMatrices({}, 0.0, bones);
 
@@ -1212,8 +1607,10 @@ static std::string RegisterSkinnedAnimMeshesFromJson(const json& skinned, Ps1Sce
         return {};
     outFrameCount = static_cast<uint16_t>(std::min<size_t>(generated, 65535));
     outFps = static_cast<uint8_t>(playbackFps);
-    MIPSYNC_INFO("PS1 vertex animation export: {} -> {} frames @ {}fps (low-budget PS1 mode)",
-                 modelPath, outFrameCount, static_cast<int>(outFps));
+    MIPSYNC_INFO("PS1 vertex animation export: {} -> {} frames @ {}fps{}{}",
+                 modelPath, outFrameCount, static_cast<int>(outFps),
+                 selectedClip && !selectedClip->stateName.empty() ? " from state " : "",
+                 selectedClip ? selectedClip->stateName : std::string{});
     return baseKey + "#0";
 }
 
@@ -1244,16 +1641,6 @@ static glm::mat4 DisplayBoneMatrixForPs1(const SkeletalModelAsset& model, int bo
 
 static int16_t ToMatrix12_4(float v) {
     return ClampI16(static_cast<int>(std::lround(v * 4096.0f)));
-}
-
-static glm::vec3 ExtractAxisScale(const glm::mat4& m) {
-    glm::vec3 scale(1.0f);
-    for (int col = 0; col < 3; ++col) {
-        const glm::vec3 axis(m[col]);
-        const float len = glm::length(axis);
-        scale[col] = (std::isfinite(len) && len > 1e-8f) ? len : 1.0f;
-    }
-    return scale;
 }
 
 static glm::mat3 ExtractOrthonormalBasis(const glm::mat4& m) {
@@ -1360,8 +1747,26 @@ static int CollapseShoulderToTorso(const SkeletalModelAsset& model, int boneInde
     return nearestParent >= 0 ? nearestParent : boneIndex;
 }
 
+// Toe helper joints are useful for smooth desktop skinning, but turning them
+// into independent rigid PS1 parts breaks an otherwise solid low-poly shoe
+// into small pieces. Keep the complete shoe attached to its Foot ancestor.
+static int CollapseToeToFoot(const SkeletalModelAsset& model, int boneIndex) {
+    if (!BoneNameContains(model, boneIndex, "toe"))
+        return boneIndex;
+
+    int current = GetParentBoneIndex(model, boneIndex);
+    int nearestParent = current;
+    while (current >= 0) {
+        if (BoneNameContains(model, current, "foot"))
+            return current;
+        current = GetParentBoneIndex(model, current);
+    }
+    return nearestParent >= 0 ? nearestParent : boneIndex;
+}
+
 static int CanonicalRigidBone(const SkeletalModelAsset& model, int boneIndex) {
     boneIndex = CollapseShoulderToTorso(model, boneIndex);
+    boneIndex = CollapseToeToFoot(model, boneIndex);
     if (!BoneNameContains(model, boneIndex, "spine"))
         return boneIndex;
 
@@ -1383,6 +1788,33 @@ static int CanonicalRigidBone(const SkeletalModelAsset& model, int boneIndex) {
             middleSpine = static_cast<int>(i);
     }
     return middleSpine >= 0 ? middleSpine : (firstSpine >= 0 ? firstSpine : boneIndex);
+}
+
+static int AccessoryHeadBone(const SkeletalModelAsset& model,
+                             const std::string& meshName) {
+    std::string lower = meshName;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (lower.find("hat") == std::string::npos &&
+        lower.find("helmet") == std::string::npos &&
+        lower.find("headwear") == std::string::npos &&
+        lower.find("headdress") == std::string::npos)
+        return -1;
+
+    int fallback = -1;
+    for (size_t i = 0; i < model.bones.size(); ++i) {
+        std::string boneName = model.bones[i].name;
+        std::transform(boneName.begin(), boneName.end(), boneName.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (boneName == "head" || boneName.ends_with(":head") ||
+            boneName.ends_with("_head"))
+            return static_cast<int>(i);
+        if (fallback < 0 && boneName.find("head") != std::string::npos &&
+            boneName.find("headtop") == std::string::npos)
+            fallback = static_cast<int>(i);
+    }
+    return fallback;
 }
 
 static int DominantCanonicalRigidBone(const SkeletalModelAsset& model,
@@ -1413,24 +1845,25 @@ struct RigidSplitGeometry {
     std::vector<glm::mat4> geometryToWorld;
     std::unordered_map<int, std::vector<uint32_t>> triangles;
     size_t mixedTriangleCount = 0;
-    size_t splitTriangleCount = 0;
 };
 
 static RigidSplitGeometry BuildRigidSplitGeometry(const SkeletalModelAsset& model,
                                                    uint32_t indexOffset,
                                                    uint32_t indexCount,
                                                    int maxBoneIndex,
-                                                   bool seamFill) {
+                                                   bool seamFill,
+                                                   int forcedBone = -1) {
     RigidSplitGeometry out;
     out.vertices = model.sourceVertices;
     out.geometryToWorld = model.vertexGeometryToWorld;
     if (out.geometryToWorld.size() < out.vertices.size())
         out.geometryToWorld.resize(out.vertices.size(), model.meshGeometryToWorld);
 
-    // Keep authored faces intact for the torso and other mostly rigid areas,
-    // but make a clean geometric cut at articulating limb joints. Whole-face
-    // assignment at an elbow creates a long triangular spike while walking;
-    // splitting every blended face everywhere is unnecessarily expensive.
+    // Keep every authored face intact. A previous implementation subdivided
+    // mixed arm faces into several triangles and assigned each fragment to a
+    // different rigid bone. Those artificial cuts cannot remain watertight
+    // once the bones move independently, so low-poly characters visibly tore
+    // into triangular shards on PS1 even though the source FBX was sound.
     auto dominantTriangleBone = [&](const uint32_t indices[3]) {
         float scores[kMaxBones] = { 0.0f };
         for (int corner = 0; corner < 3; ++corner) {
@@ -1457,48 +1890,6 @@ static RigidSplitGeometry BuildRigidSplitGeometry(const SkeletalModelAsset& mode
         return bestBone;
     };
 
-    auto isArmBone = [&](int bone) {
-        return BoneNameContains(model, bone, "arm") ||
-               BoneNameContains(model, bone, "hand");
-    };
-
-    auto appendInterpolated = [&](uint32_t a, uint32_t b, float t) {
-        const SkinnedVertex& va = out.vertices[a];
-        const SkinnedVertex& vb = out.vertices[b];
-        SkinnedVertex vertex{};
-        vertex.position = glm::mix(va.position, vb.position, t);
-        vertex.normal = glm::mix(va.normal, vb.normal, t);
-        if (glm::dot(vertex.normal, vertex.normal) > 1e-8f)
-            vertex.normal = glm::normalize(vertex.normal);
-        vertex.uv = glm::mix(va.uv, vb.uv, t);
-        vertex.color = glm::mix(va.color, vb.color, t);
-        vertex.boneIndices = va.boneIndices;
-        vertex.boneWeights = va.boneWeights;
-        const uint32_t index = static_cast<uint32_t>(out.vertices.size());
-        out.vertices.push_back(vertex);
-        out.geometryToWorld.push_back(out.geometryToWorld[a]);
-        return index;
-    };
-
-    auto appendCentroid = [&](uint32_t a, uint32_t b, uint32_t c) {
-        const SkinnedVertex& va = out.vertices[a];
-        const SkinnedVertex& vb = out.vertices[b];
-        const SkinnedVertex& vc = out.vertices[c];
-        SkinnedVertex vertex{};
-        vertex.position = (va.position + vb.position + vc.position) / 3.0f;
-        vertex.normal = va.normal + vb.normal + vc.normal;
-        if (glm::dot(vertex.normal, vertex.normal) > 1e-8f)
-            vertex.normal = glm::normalize(vertex.normal);
-        vertex.uv = (va.uv + vb.uv + vc.uv) / 3.0f;
-        vertex.color = (va.color + vb.color + vc.color) / 3.0f;
-        vertex.boneIndices = va.boneIndices;
-        vertex.boneWeights = va.boneWeights;
-        const uint32_t index = static_cast<uint32_t>(out.vertices.size());
-        out.vertices.push_back(vertex);
-        out.geometryToWorld.push_back(out.geometryToWorld[a]);
-        return index;
-    };
-
     for (uint32_t ii = 0; ii + 2 < indexCount; ii += 3) {
         const uint32_t original[3] = {
             model.sourceIndices[indexOffset + ii + 0],
@@ -1510,6 +1901,16 @@ static RigidSplitGeometry BuildRigidSplitGeometry(const SkeletalModelAsset& mode
             original[2] >= model.sourceVertices.size())
             continue;
 
+        // A hat/helmet is a rigid shell around the head. Splitting blended
+        // weights between Head and Spine makes part of that shell follow the
+        // torso and exposes the skull during animation. Keep every authored
+        // face intact and attach the whole accessory to Head on PS1.
+        if (forcedBone >= 0 && forcedBone <= maxBoneIndex) {
+            auto& dst = out.triangles[forcedBone];
+            dst.insert(dst.end(), { original[0], original[1], original[2] });
+            continue;
+        }
+
         const int bone[3] = {
             DominantCanonicalRigidBone(model, model.sourceVertices[original[0]], maxBoneIndex),
             DominantCanonicalRigidBone(model, model.sourceVertices[original[1]], maxBoneIndex),
@@ -1518,72 +1919,13 @@ static RigidSplitGeometry BuildRigidSplitGeometry(const SkeletalModelAsset& mode
         const bool mixed = bone[0] != bone[1] || bone[1] != bone[2];
         if (mixed)
             ++out.mixedTriangleCount;
-        const bool cleanArmCut = mixed &&
-            (isArmBone(bone[0]) || isArmBone(bone[1]) || isArmBone(bone[2]));
-        if (!cleanArmCut) {
-            const int groupBone = dominantTriangleBone(original);
-            auto& dst = out.triangles[groupBone];
-            dst.insert(dst.end(), { original[0], original[1], original[2] });
-            continue;
-        }
-
-        ++out.splitTriangleCount;
-        const glm::vec3 sourceNormal = glm::cross(
-            out.vertices[original[1]].position - out.vertices[original[0]].position,
-            out.vertices[original[2]].position - out.vertices[original[0]].position);
-        auto pushTriangle = [&](int group, uint32_t a, uint32_t b, uint32_t c) {
-            const glm::vec3 normal = glm::cross(
-                out.vertices[b].position - out.vertices[a].position,
-                out.vertices[c].position - out.vertices[a].position);
-            if (glm::dot(normal, sourceNormal) < 0.0f)
-                std::swap(b, c);
-            auto& dst = out.triangles[group];
-            dst.insert(dst.end(), { a, b, c });
-        };
-
-        if (bone[0] == bone[1] || bone[1] == bone[2] || bone[2] == bone[0]) {
-            int singleton = 0;
-            if (bone[0] == bone[1]) singleton = 2;
-            else if (bone[1] == bone[2]) singleton = 0;
-            else singleton = 1;
-            const int other0 = (singleton + 1) % 3;
-            const int other1 = (singleton + 2) % 3;
-            const uint32_t mid0 = appendInterpolated(
-                original[singleton], original[other0], 0.5f);
-            const uint32_t mid1 = appendInterpolated(
-                original[singleton], original[other1], 0.5f);
-            pushTriangle(bone[singleton], original[singleton], mid0, mid1);
-            pushTriangle(bone[other0], original[other0], original[other1], mid1);
-            pushTriangle(bone[other0], original[other0], mid1, mid0);
-            continue;
-        }
-
-        const uint32_t center = appendCentroid(original[0], original[1], original[2]);
-        for (int corner = 0; corner < 3; ++corner) {
-            const int next = (corner + 1) % 3;
-            const int previous = (corner + 2) % 3;
-            const uint32_t midNext = appendInterpolated(
-                original[corner], original[next], 0.5f);
-            const uint32_t midPrevious = appendInterpolated(
-                original[corner], original[previous], 0.5f);
-            pushTriangle(bone[corner], original[corner], midNext, center);
-            pushTriangle(bone[corner], original[corner], center, midPrevious);
-        }
+        const int groupBone = dominantTriangleBone(original);
+        auto& dst = out.triangles[groupBone];
+        dst.insert(dst.end(), { original[0], original[1], original[2] });
     }
     (void)seamFill;
     return out;
 }
-
-struct Ps1AnimatorClipSelection {
-    std::shared_ptr<SkeletalModelAsset> clipModel;
-    int stackIndex = -1;
-    double duration = 0.0;
-    float speed = 1.0f;
-    float startOffset = 0.0f;
-    std::string stateName;
-    std::string clipName;
-    std::string clipModelPath;
-};
 
 static const AnimatorStateDef* FindAnimatorStateForPs1(const AnimatorControllerAsset& controller,
                                                        const std::string& stateName) {
@@ -1720,12 +2062,14 @@ struct Ps1AnimatorClipSet {
     Ps1AnimatorClipSelection aim;
     Ps1AnimatorClipSelection trigger;
     uint16_t triggerParameterHash = 0;
+    uint16_t triggerExitDurationQ8 = 0;
+    uint16_t triggerTransitionDurationQ8 = 0;
 };
 
 static uint16_t AnimatorParameterHash(const std::string& name) {
     uint32_t hash = 2166136261u;
-    for (const unsigned char c : name) {
-        hash ^= static_cast<uint32_t>(c);
+    for (unsigned char c : name) {
+        hash ^= c;
         hash *= 16777619u;
     }
     hash ^= hash >> 16u;
@@ -1738,7 +2082,11 @@ static Ps1AnimatorClipSet ResolvePs1AnimatorClips(
     const std::shared_ptr<SkeletalModelAsset>& meshModel,
     const json* animator) {
     Ps1AnimatorClipSet clips;
-    clips.idle = ResolvePs1AnimatorClip(meshModelPath, meshModel, animator);
+    // The serialized Animator state is the editor's current preview state. It
+    // may legitimately be "Run" when the scene is saved, but that must not
+    // redefine the PS1 runtime's idle clip. Start with the mesh's own default
+    // clip, then resolve idle/walk/aim from the controller graph below.
+    clips.idle = ResolvePs1AnimatorClip(meshModelPath, meshModel, nullptr);
     if (!animator || !animator->value("enabled", true))
         return clips;
 
@@ -1751,9 +2099,12 @@ static Ps1AnimatorClipSet ResolvePs1AnimatorClips(
     if (!controller)
         return clips;
 
+    const AnimatorStateDef* idleState =
+        FindAnimatorStateForPs1(*controller, controller->defaultState);
     const AnimatorStateDef* walkState = nullptr;
     const AnimatorStateDef* aimState = nullptr;
     const AnimatorStateDef* triggerState = nullptr;
+    const AnimatorTransitionDef* triggerExitTransition = nullptr;
     std::string triggerParameter;
     for (const AnimatorTransitionDef& transition : controller->transitions) {
         for (const AnimatorTransitionCondition& condition : transition.conditions) {
@@ -1761,36 +2112,75 @@ static Ps1AnimatorClipSet ResolvePs1AnimatorClips(
                 condition.mode == AnimatorConditionMode::Greater ||
                 condition.mode == AnimatorConditionMode::IfTrue ||
                 (condition.mode == AnimatorConditionMode::Equals && condition.threshold > 0.5f);
-            if (!positiveCondition)
-                continue;
-            const auto parameterIt = std::find_if(
-                controller->parameters.begin(), controller->parameters.end(),
-                [&](const AnimatorParameterDef& parameter) {
-                    return parameter.name == condition.parameter;
-                });
-            if (!triggerState && parameterIt != controller->parameters.end() &&
-                parameterIt->type == AnimatorParamType::Trigger) {
-                triggerState = FindAnimatorStateForPs1(*controller, transition.toState);
-                triggerParameter = condition.parameter;
-                continue;
-            }
-            if (!walkState && (condition.parameter == "Speed" || condition.parameter == "Moving")) {
-                walkState = FindAnimatorStateForPs1(*controller, transition.toState);
-            } else if (!aimState && (condition.parameter == "Aim" ||
-                                     condition.parameter == "Aiming")) {
+            const bool negativeCondition =
+                condition.mode == AnimatorConditionMode::Less ||
+                condition.mode == AnimatorConditionMode::IfFalse ||
+                (condition.mode == AnimatorConditionMode::Equals && condition.threshold <= 0.5f);
+            if (condition.parameter == "Speed" || condition.parameter == "Moving") {
+                if (positiveCondition && !walkState)
+                    walkState = FindAnimatorStateForPs1(*controller, transition.toState);
+                else if (negativeCondition)
+                    idleState = FindAnimatorStateForPs1(*controller, transition.toState);
+            } else if (positiveCondition && !aimState &&
+                       (condition.parameter == "Aim" || condition.parameter == "Aiming")) {
                 aimState = FindAnimatorStateForPs1(*controller, transition.toState);
+            } else if (positiveCondition && !triggerState) {
+                const auto parameter = std::find_if(
+                    controller->parameters.begin(), controller->parameters.end(),
+                    [&](const AnimatorParameterDef& value) {
+                        return value.name == condition.parameter &&
+                               value.type == AnimatorParamType::Trigger;
+                    });
+                if (parameter != controller->parameters.end()) {
+                    triggerState = FindAnimatorStateForPs1(*controller, transition.toState);
+                    triggerParameter = condition.parameter;
+                }
             }
         }
     }
 
+    const Ps1AnimatorClipSelection resolvedIdle = ResolvePs1AnimatorStateClip(
+        meshModelPath, meshModel, animator, *controller, idleState);
+    if (resolvedIdle.stackIndex >= 0)
+        clips.idle = resolvedIdle;
     clips.walk = ResolvePs1AnimatorStateClip(
         meshModelPath, meshModel, animator, *controller, walkState);
     clips.aim = ResolvePs1AnimatorStateClip(
         meshModelPath, meshModel, animator, *controller, aimState);
     clips.trigger = ResolvePs1AnimatorStateClip(
         meshModelPath, meshModel, animator, *controller, triggerState);
-    if (!clips.trigger.stateName.empty() && !triggerParameter.empty())
+    if (triggerState) {
+        for (const AnimatorTransitionDef& transition : controller->transitions) {
+            if (transition.fromState == triggerState->name && transition.hasExitTime) {
+                triggerExitTransition = &transition;
+                break;
+            }
+        }
+    }
+    if (clips.trigger.stackIndex >= 0 && !triggerParameter.empty()) {
         clips.triggerParameterHash = AnimatorParameterHash(triggerParameter);
+        if (triggerExitTransition && clips.trigger.duration > 0.0 &&
+            clips.trigger.speed > 0.001f) {
+            /* Exit Time is elapsed normalized state time. Start Offset only
+             * selects the source pose at state entry; subtracting it here
+             * makes a state with Start Offset 0.29 / Exit Time 0.30 disappear
+             * in less than one PS1 frame. */
+            const double exitTime = static_cast<double>(triggerExitTransition->exitTime);
+            if (std::isfinite(exitTime) && exitTime <= 1.0) {
+                const double elapsedNormalized = std::max(0.0, exitTime);
+                const double seconds = elapsedNormalized * clips.trigger.duration /
+                                       static_cast<double>(clips.trigger.speed);
+                clips.triggerExitDurationQ8 = static_cast<uint16_t>(std::clamp(
+                    static_cast<int>(std::ceil(seconds * 256.0)), 1, 65535));
+            }
+            const double transitionSeconds =
+                static_cast<double>(triggerExitTransition->duration);
+            if (std::isfinite(transitionSeconds) && transitionSeconds > 0.0) {
+                clips.triggerTransitionDurationQ8 = static_cast<uint16_t>(std::clamp(
+                    static_cast<int>(std::ceil(transitionSeconds * 256.0)), 1, 65535));
+            }
+        }
+    }
     MIPSYNC_INFO("PS1 rigid animator clips: idle='{}', walk='{}', aim='{}', trigger='{}'",
                  clips.idle.stateName,
                  clips.walk.stateName,
@@ -1849,15 +2239,21 @@ static bool RegisterRigidBonePartsFromJson(const json& skinned, Ps1SceneExportRe
     if (maxBoneIndex < 0)
         return false;
 
+    const int accessoryBone = AccessoryHeadBone(*model, baseEntity.name);
     RigidSplitGeometry splitGeometry =
         BuildRigidSplitGeometry(*model, indexOffset, indexCount, maxBoneIndex,
-                                baseEntity.seamFill);
+                                baseEntity.seamFill, accessoryBone);
     std::unordered_map<int, std::vector<uint32_t>> initialTriangles =
         std::move(splitGeometry.triangles);
     MIPSYNC_INFO(
-        "PS1 rigid partition: {} mixed-weight triangles, {} clean arm cuts (Seam FX {})",
-        splitGeometry.mixedTriangleCount, splitGeometry.splitTriangleCount,
+        "PS1 rigid partition: {} mixed-weight triangles, authored topology preserved (Seam FX {})",
+        splitGeometry.mixedTriangleCount,
         baseEntity.seamFill ? "ON" : "OFF");
+    if (accessoryBone >= 0) {
+        MIPSYNC_INFO("PS1 rigid accessory: '{}' attached wholly to bone '{}'",
+                     baseEntity.name,
+                     model->bones[static_cast<size_t>(accessoryBone)].name);
+    }
 
     struct TempBoneCount {
         int bone = 0;
@@ -2043,7 +2439,9 @@ static bool RegisterRigidBonePartsFromJson(const json& skinned, Ps1SceneExportRe
             model->EvaluateBoneMatrices({}, 0.0, firstBones);
         const glm::mat4 firstBoneDisplay =
             DisplayBoneMatrixForPs1(*model, group.bone, geometryToWorld, firstBones);
-        const glm::vec3 axisScale = ExtractAxisScale(firstBoneDisplay);
+        const glm::mat3 firstBoneBasis = ExtractOrthonormalBasis(firstBoneDisplay);
+        const glm::mat3 displayToBoneBasis = glm::transpose(firstBoneBasis);
+        const glm::vec3 firstBoneOrigin = glm::vec3(firstBoneDisplay[3]);
 
         struct RigidLocalVertex {
             uint32_t sourceIndex = 0;
@@ -2068,13 +2466,15 @@ static bool RegisterRigidBonePartsFromJson(const json& skinned, Ps1SceneExportRe
             const uint32_t newIndex = static_cast<uint32_t>(mesh.positions.size() / 3);
             remap[oldIndex] = newIndex;
             mesh.indices.push_back(newIndex);
-            const glm::mat4 geometryToBone =
-                static_cast<size_t>(group.bone) < model->bones.size()
-                ? model->bones[static_cast<size_t>(group.bone)].bindGeometryToBone
-                : glm::mat4(1.0f);
+            // Fit the rigid part to the exact first exported animation pose,
+            // not to the FBX bind pose. This guarantees all authored faces
+            // meet in the same place at frame zero even when a blended vertex
+            // is assigned to only one PS1 bone.
+            const Vertex reference =
+                BakeSkinnedVertexForPs1(*model, oldIndex, firstBones);
             const glm::vec3 localPos =
-                glm::vec3(geometryToBone * glm::vec4(sv.position, 1.0f));
-            glm::vec3 localNormal = glm::mat3(glm::transpose(glm::inverse(geometryToBone))) * sv.normal;
+                displayToBoneBasis * (reference.position - firstBoneOrigin);
+            glm::vec3 localNormal = displayToBoneBasis * reference.normal;
             if (glm::dot(localNormal, localNormal) > 1e-8f)
                 localNormal = glm::normalize(localNormal);
             else
@@ -2104,8 +2504,7 @@ static bool RegisterRigidBonePartsFromJson(const json& skinned, Ps1SceneExportRe
         const float seamScale = baseEntity.seamFill ? 1.025f : 1.0f;
         for (size_t vi = 0; vi < localVertices.size(); ++vi) {
             const glm::vec3 p =
-                (localVertices[vi].position - localPivot) * axisScale *
-                model->displayScale * seamScale;
+                (localVertices[vi].position - localPivot) * seamScale;
             mesh.positions[vi * 3 + 0] = p.x;
             mesh.positions[vi * 3 + 1] = p.y;
             mesh.positions[vi * 3 + 2] = p.z;
@@ -2180,7 +2579,7 @@ static bool RegisterRigidBonePartsFromJson(const json& skinned, Ps1SceneExportRe
                 result.rigidAnimFrames.push_back(
                     RigidAnimFrameFromMatrix(
                         boneDisplay, rootPosition, rootRotation, rootScale,
-                        localPivot, axisScale, model->displayScale));
+                        localPivot, glm::vec3(1.0f), 1.0f));
             }
         };
 
@@ -2205,6 +2604,8 @@ static bool RegisterRigidBonePartsFromJson(const json& skinned, Ps1SceneExportRe
             part.rigidTriggerFrameCount,
             part.rigidTriggerFps);
         part.animatorTriggerParameterHash = clips.triggerParameterHash;
+        part.animatorTriggerExitDurationQ8 = clips.triggerExitDurationQ8;
+        part.animatorTriggerTransitionDurationQ8 = clips.triggerTransitionDurationQ8;
 
         if (part.rigidIdleFrameCount == 0) {
             part.rigidIdleFirstFrame =
@@ -2231,7 +2632,7 @@ static bool RegisterRigidBonePartsFromJson(const json& skinned, Ps1SceneExportRe
                 result.rigidAnimFrames.push_back(
                     RigidAnimFrameFromMatrix(
                         boneDisplay, rootPosition, rootRotation, rootScale,
-                        localPivot, axisScale, model->displayScale));
+                        localPivot, glm::vec3(1.0f), 1.0f));
             }
         }
         part.rigidAnimFirstFrame = part.rigidIdleFirstFrame;
@@ -2339,7 +2740,17 @@ static bool IsTerrainMeshKey(const std::string& key) {
 static bool IsProModelerMeshKey(const std::string& key) {
     return key.rfind("promodelerdata://", 0) == 0 ||
            key.rfind("probuilderdata://", 0) == 0 ||
-           key.rfind("primitivesphere://", 0) == 0;
+           key.rfind("primitivesphere://", 0) == 0 ||
+           key.rfind("primitivemesh://", 0) == 0;
+}
+
+static bool IsCollisionMeshKey(const std::string& key) {
+    static constexpr const char* suffix = "#collision";
+    return key.size() >= 10u && key.compare(key.size() - 10u, 10u, suffix) == 0;
+}
+
+static std::string CollisionMeshSourceKey(const std::string& key) {
+    return IsCollisionMeshKey(key) ? key.substr(0, key.size() - 10u) : key;
 }
 
 static bool IsSkinnedAnimMeshKey(const std::string& key) {
@@ -2393,7 +2804,12 @@ static void FindSkinnedAnimBudget(const Ps1SceneExportResult& data, const std::s
     outMaxTris = 320;
     outMaxVerts = 1000;
     for (const Ps1ExportedEntity& entity : data.entities) {
-        if (entity.meshKind != 4 || !SameSkinnedAnimSequence(entity.meshPath, meshPath))
+        if (entity.meshKind != 4 ||
+            (!SameSkinnedAnimSequence(entity.meshPath, meshPath) &&
+             !SameSkinnedAnimSequence(entity.vertexIdleMeshPath, meshPath) &&
+             !SameSkinnedAnimSequence(entity.vertexWalkMeshPath, meshPath) &&
+             !SameSkinnedAnimSequence(entity.vertexAimMeshPath, meshPath) &&
+             !SameSkinnedAnimSequence(entity.vertexTriggerMeshPath, meshPath)))
             continue;
         outMaxTris = std::clamp<size_t>(entity.vertexAnimTargetTris, 32, 2000);
         outMaxVerts = std::clamp<size_t>(entity.vertexAnimTargetVerts, 64, 2600);
@@ -2415,8 +2831,9 @@ static void FindRigidBoneBudget(const Ps1SceneExportResult& data, const std::str
 }
 
 static Mesh MeshFromProModelerKey(const std::string& key, const Ps1SceneExportResult& data) {
+    const std::string sourceKey = CollisionMeshSourceKey(key);
     for (const Ps1ProModelerMeshData& pb : data.proModelerMeshes) {
-        if (pb.key != key)
+        if (pb.key != sourceKey)
             continue;
         std::vector<Vertex> vertices;
         const size_t vertexCount = pb.positions.size() / 3;
@@ -2616,6 +3033,91 @@ struct Ps1LocalAnimator {
     bool has = false;
     json animator;
 };
+
+struct Ps1LocalActiveState {
+    uint32_t parent = 0;
+    bool selfActive = true;
+};
+
+static json FilterActivePs1Entities(
+    const json& entities,
+    std::unordered_set<uint32_t>& outInactiveSourceIds) {
+    std::unordered_map<uint32_t, Ps1LocalActiveState> states;
+    states.reserve(entities.size());
+    for (const json& ent : entities) {
+        if (!ent.is_object())
+            continue;
+        const uint32_t id = ent.value("id", 0u);
+        if (id == 0)
+            continue;
+        states[id] = {
+            ent.value("parent", 0u),
+            ent.value("active", true),
+        };
+    }
+
+    std::unordered_map<uint32_t, bool> resolved;
+    std::unordered_set<uint32_t> resolving;
+    std::function<bool(uint32_t)> isActive = [&](uint32_t id) -> bool {
+        if (const auto cached = resolved.find(id); cached != resolved.end())
+            return cached->second;
+        const auto stateIt = states.find(id);
+        if (stateIt == states.end())
+            return true;
+        if (!resolving.insert(id).second)
+            return false;
+        const Ps1LocalActiveState& state = stateIt->second;
+        const bool parentActive = state.parent == 0 || isActive(state.parent);
+        resolving.erase(id);
+        const bool active = state.selfActive && parentActive;
+        resolved[id] = active;
+        if (!active)
+            outInactiveSourceIds.insert(id);
+        return active;
+    };
+    for (const auto& [id, state] : states) {
+        (void)state;
+        isActive(id);
+    }
+
+    std::function<bool(const json&, bool, json&)> filterNested =
+        [&](const json& source, bool parentActive, json& output) -> bool {
+            if (!source.is_object())
+                return false;
+            const uint32_t id = source.value("id", 0u);
+            bool active = parentActive && source.value("active", true);
+            if (id != 0) {
+                const auto activeIt = resolved.find(id);
+                if (activeIt != resolved.end())
+                    active = activeIt->second;
+            }
+            if (!active) {
+                if (id != 0)
+                    outInactiveSourceIds.insert(id);
+                return false;
+            }
+
+            output = source;
+            if (source.contains("children") && source["children"].is_array()) {
+                json children = json::array();
+                for (const json& child : source["children"]) {
+                    json filteredChild;
+                    if (filterNested(child, true, filteredChild))
+                        children.push_back(std::move(filteredChild));
+                }
+                output["children"] = std::move(children);
+            }
+            return true;
+        };
+
+    json filtered = json::array();
+    for (const json& ent : entities) {
+        json activeEntity;
+        if (filterNested(ent, true, activeEntity))
+            filtered.push_back(std::move(activeEntity));
+    }
+    return filtered;
+}
 
 static Ps1ResolvedTransform ReadEntityLocalTransform(const json& ent) {
     Ps1ResolvedTransform transform;
@@ -2981,13 +3483,38 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
             ExtractColor(mr, e.color);
             e.materialPath = mr.value("material", std::string{});
             e.texturePath = mr.value("texture", std::string{});
-            e.viewModel = mr.value("viewModel", false);
+            e.renderPreset = RenderPresetFromJson(mr);
             e.seamFill = mr.value("ps1SeamFill", false);
+            if (ent.contains("meshSubdivider") && ent["meshSubdivider"].is_object()) {
+                e.meshSubdivisionExplicit = true;
+                const json& subdivision = ent["meshSubdivider"];
+                if (subdivision.value("enabled", true)) {
+                    e.meshSubdivisionLevels = static_cast<uint8_t>(std::clamp(
+                        subdivision.value("maxLevels", 1), 0, 4));
+                    e.meshSubdivisionMaxEdgeLength = std::max(
+                        0.0f, subdivision.value("maxEdgeLength", 1.0f));
+                }
+            }
+            // Preserve authored topology by default. Export subdivision is an
+            // opt-in operation: it runs only while an attached Mesh Subdivider
+            // component is enabled. Render presets, including Floor, must not
+            // silently multiply geometry behind the user's back.
             if (mr.contains("tiling"))
                 ReadVec2(mr["tiling"], e.textureTiling);
             if (mr.contains("offset"))
                 ReadVec2(mr["offset"], e.textureOffset);
-            if (e.meshKind == 3) {
+            if (e.meshSubdivisionLevels > 0 && (e.meshKind == 1 || e.meshKind == 2)) {
+                const std::string primitiveName = e.meshKind == 2 ? "Plane" : "Cube";
+                const std::string materialVariant =
+                    e.materialPath + "|" + e.texturePath + "|" +
+                    std::to_string(e.textureTiling[0]) + "," +
+                    std::to_string(e.textureTiling[1]) + "," +
+                    std::to_string(e.textureOffset[0]) + "," +
+                    std::to_string(e.textureOffset[1]);
+                e.meshKind = 4;
+                e.meshPath = RegisterSubdividablePrimitiveMesh(
+                    primitiveName, e.meshSize, materialVariant, result);
+            } else if (e.meshKind == 3) {
                 e.meshKind = 4;
                 e.meshPath = RegisterPrimitiveSphereMesh(e.meshSize, result);
             } else if (e.meshKind == 4 && mr.contains("mesh") && mr["mesh"].is_string())
@@ -2997,6 +3524,15 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
             else if (e.meshKind == 4 && (ent.contains("proModeler") || ent.contains("proBuilder"))) {
                 const std::string pmKey = ent.contains("proModeler") ? "proModeler" : "proBuilder";
                 e.meshPath = RegisterProModelerMeshFromJson(ent[pmKey], result);
+                // Face materials already carry their own colour. Do not tint
+                // them with the legacy renderer fallback grey.
+                if (!mr.contains("color") && e.materialPath.empty() &&
+                    ent[pmKey].contains("faceMaterials") && ent[pmKey]["faceMaterials"].is_array() &&
+                    !ent[pmKey]["faceMaterials"].empty()) {
+                    e.color[0] = 255;
+                    e.color[1] = 255;
+                    e.color[2] = 255;
+                }
             }
         }
     }
@@ -3022,14 +3558,65 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
             e.vertexAnimTargetVerts =
                 static_cast<uint16_t>(std::clamp(sm.value("ps1VertexAnimTargetVerts", 2000), 64, 5000));
 
-            const bool rigidOk = RegisterRigidBonePartsFromJson(
-                sm, result, nextId, e, worldPosition, worldRotation, worldScale,
-                controlRootEntityId, currentAnimator);
-            if (rigidOk) {
-                e.meshEnabled = false;
-                e.meshKind = 0;
+            bool vertexOk = false;
+            if (ps1ExportMode == 2) {
+                const std::string modelPath = sm.value("model", std::string{});
+                auto model = AssetManager::Get().GetSkeletalModel(modelPath);
+                if (model) {
+                    const Ps1AnimatorClipSet clips =
+                        ResolvePs1AnimatorClips(modelPath, model, currentAnimator);
+                    auto bakeClip = [&](const Ps1AnimatorClipSelection& clip,
+                                        std::string& pathOut,
+                                        uint16_t& countOut,
+                                        uint8_t& fpsOut) {
+                        if (clip.stackIndex < 0 || clip.duration <= 0.0 || !clip.clipModel)
+                            return;
+                        pathOut = RegisterSkinnedAnimMeshesFromJson(
+                            sm, result, countOut, fpsOut, &clip);
+                    };
+                    bakeClip(clips.idle, e.vertexIdleMeshPath,
+                             e.vertexIdleFrameCount, e.vertexIdleFps);
+                    bakeClip(clips.walk, e.vertexWalkMeshPath,
+                             e.vertexWalkFrameCount, e.vertexWalkFps);
+                    bakeClip(clips.aim, e.vertexAimMeshPath,
+                             e.vertexAimFrameCount, e.vertexAimFps);
+                    bakeClip(clips.trigger, e.vertexTriggerMeshPath,
+                             e.vertexTriggerFrameCount, e.vertexTriggerFps);
+                    e.animatorTriggerParameterHash = clips.triggerParameterHash;
+                    e.animatorTriggerExitDurationQ8 = clips.triggerExitDurationQ8;
+                    e.animatorTriggerTransitionDurationQ8 =
+                        clips.triggerTransitionDurationQ8;
+                }
             } else {
-                MIPSYNC_WARN("PS1 rigid bone export failed for '{}'; skipping mesh", e.name);
+                e.vertexIdleMeshPath = RegisterSkinnedAnimMeshesFromJson(
+                    sm, result, e.vertexIdleFrameCount, e.vertexIdleFps);
+            }
+
+            if (e.vertexIdleMeshPath.empty() &&
+                e.vertexWalkMeshPath.empty() && e.vertexAimMeshPath.empty() &&
+                e.vertexTriggerMeshPath.empty()) {
+                // Missing controllers/clips still get a correct one-frame bind
+                // pose instead of falling back to a visibly torn rigid split.
+                e.vertexIdleMeshPath = RegisterSkinnedAnimMeshesFromJson(
+                    sm, result, e.vertexIdleFrameCount, e.vertexIdleFps);
+            }
+            if (!e.vertexIdleMeshPath.empty()) {
+                e.meshPath = e.vertexIdleMeshPath;
+                e.vertexAnimFrameCount = e.vertexIdleFrameCount;
+                e.vertexAnimFps = e.vertexIdleFps;
+                e.rigidRootEntityId =
+                    controlRootEntityId != 0 ? controlRootEntityId : e.id;
+                vertexOk = true;
+            } else if (!e.vertexWalkMeshPath.empty()) {
+                e.meshPath = e.vertexWalkMeshPath;
+                e.vertexAnimFrameCount = e.vertexWalkFrameCount;
+                e.vertexAnimFps = e.vertexWalkFps;
+                e.rigidRootEntityId =
+                    controlRootEntityId != 0 ? controlRootEntityId : e.id;
+                vertexOk = true;
+            }
+            if (!vertexOk) {
+                MIPSYNC_WARN("PS1 vertex animation export failed for '{}'; skipping mesh", e.name);
                 e.meshEnabled = false;
                 e.meshKind = 0;
             }
@@ -3063,6 +3650,26 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
         e.cameraFov = cam.value("fov", 60.0f);
         e.cameraNear = cam.value("nearClip", 0.1f);
         e.cameraFar = cam.value("farClip", 100.0f);
+        if (ent.contains("distanceCull") && ent["distanceCull"].is_object()) {
+            const json& dc = ent["distanceCull"];
+            e.cameraDistanceCullEnabled = dc.value("enabled", true);
+            e.cameraDistanceCullDistance = std::max(
+                0.0f, dc.value("cullDistance", e.cameraFar));
+            e.cameraDistanceCullMeshes =
+                dc.value("cullMeshRenderers", true);
+            e.cameraDistanceCullSkinned =
+                dc.value("cullSkinnedMeshes", true);
+        }
+        if (ent.contains("frustumCull") && ent["frustumCull"].is_object()) {
+            const json& fc = ent["frustumCull"];
+            e.cameraFrustumCullEnabled = fc.value("enabled", true);
+            e.cameraFrustumCullMargin =
+                std::max(0.0f, fc.value("margin", 1.5f));
+            e.cameraFrustumCullMeshes =
+                fc.value("cullMeshRenderers", true);
+            e.cameraFrustumCullSkinned =
+                fc.value("cullSkinnedMeshes", true);
+        }
         e.prerenderedBackgroundPath = cam.value("prerenderedBackground", std::string{});
         if (cam.contains("shot") && cam["shot"].is_object()) {
             const json& shot = cam["shot"];
@@ -3838,6 +4445,20 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
         out << "static const ps1_entity k_ps1_entities[] = {\n";
         for (size_t i = 0; i < data.entities.size(); ++i) {
             const auto& e = data.entities[i];
+            float runtimeTilingU = e.textureTiling[0];
+            float runtimeTilingV = e.textureTiling[1];
+            float runtimeOffsetU = e.textureOffset[0];
+            float runtimeOffsetV = e.textureOffset[1];
+            /* Primitive Plane is generated at runtime rather than through
+             * mesh_data.c. When its texture contains eight pre-baked repeats,
+             * address that larger tile in baked-texture units so 100x remains
+             * 100 authored repeats without overflowing one PS1 polygon's UVs. */
+            if (e.meshKind == 2 && EntityUsesBakedRepeatTexture(data, e)) {
+                runtimeTilingU /= kPs1BakedTextureRepeats;
+                runtimeTilingV /= kPs1BakedTextureRepeats;
+                runtimeOffsetU /= kPs1BakedTextureRepeats;
+                runtimeOffsetV /= kPs1BakedTextureRepeats;
+            }
             out << "    { " << e.id << "u, "
                 << "\"" << e.name << "\", "
                 << e.parentEntityIndex << ", "
@@ -3857,22 +4478,35 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                 << static_cast<int>(e.color[1]) << ", "
                 << static_cast<int>(e.color[2]) << ", "
                 << static_cast<int>(e.textureIndex) << ", "
-                << ToQ8(e.textureTiling[0]) << ", "
-                << ToQ8(e.textureTiling[1]) << ", "
-                << ToQ8(e.textureOffset[0]) << ", "
-                << ToQ8(e.textureOffset[1]) << ", "
+                << ToQ8(runtimeTilingU) << ", "
+                << ToQ8(runtimeTilingV) << ", "
+                << ToQ8(runtimeOffsetU) << ", "
+                << ToQ8(runtimeOffsetV) << ", "
                 << (e.meshEnabled ? 1 : 0) << ", "
-                << (e.viewModel ? 1 : 0) << ", "
+                << static_cast<int>(e.renderPreset) << ", "
                 << (e.prerenderOccluder ? 1 : 0) << ", "
                 << (e.seamFill ? 1 : 0) << ", "
+                << static_cast<int>(e.meshSubdivisionLevels) << ", "
                 << e.vertexAnimFirstMeshIndex << "u, "
                 << e.vertexAnimFrameCount << "u, "
                 << static_cast<int>(e.vertexAnimFps) << ", "
                 << "0u, 0, "
+                << e.vertexIdleFirstMeshIndex << "u, "
+                << e.vertexIdleFrameCount << "u, "
+                << static_cast<int>(e.vertexIdleFps) << ", "
+                << e.vertexWalkFirstMeshIndex << "u, "
+                << e.vertexWalkFrameCount << "u, "
+                << static_cast<int>(e.vertexWalkFps) << ", "
+                << e.vertexAimFirstMeshIndex << "u, "
+                << e.vertexAimFrameCount << "u, "
+                << static_cast<int>(e.vertexAimFps) << ", "
+                << e.vertexTriggerFirstMeshIndex << "u, "
+                << e.vertexTriggerFrameCount << "u, "
+                << static_cast<int>(e.vertexTriggerFps) << ", "
                 << e.rigidAnimFirstFrame << "u, "
                 << e.rigidAnimFrameCount << "u, "
                 << static_cast<int>(e.rigidAnimFps) << ", "
-                << "0u, 0u, 0, "
+                << "0u, 0u, 0, 0u, "
                 << e.rigidIdleFirstFrame << "u, "
                 << e.rigidIdleFrameCount << "u, "
                 << static_cast<int>(e.rigidIdleFps) << ", "
@@ -3886,6 +4520,8 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                 << e.rigidTriggerFrameCount << "u, "
                 << static_cast<int>(e.rigidTriggerFps) << ", "
                 << e.animatorTriggerParameterHash << "u, 0u, "
+                << e.animatorTriggerExitDurationQ8 << "u, "
+                << e.animatorTriggerTransitionDurationQ8 << "u, "
                 << e.rigidRootEntityIndex << ", "
                 << "0, 0, "
                 << e.transformAnimFirstKey << "u, "
@@ -3913,6 +4549,7 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                 << ToFixed16(e.colliderCapsuleHeight) << ", "
                 << (e.colliderIsTrigger ? 1 : 0) << ", "
                 << (e.colliderConvex ? 1 : 0) << ", "
+                << e.colliderMeshIndex << "u, "
                 << (e.colliderCameraShotTrigger ? 1 : 0) << ", "
                 << e.colliderCameraTargetEntityIndex << ", "
                 << static_cast<int>(e.audioClipIndex) << ", "
@@ -3920,7 +4557,15 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                 << (e.audioPlayOnAwake ? 1 : 0) << ", "
                 << (e.audioLoop ? 1 : 0) << ", "
                 << (e.audioMute ? 1 : 0) << ", "
-                << std::clamp(static_cast<int>(std::lround(e.audioVolume * 255.0f)), 0, 255)
+                << std::clamp(static_cast<int>(std::lround(e.audioVolume * 255.0f)), 0, 255) << ", "
+                << (e.cameraDistanceCullEnabled ? 1 : 0) << ", "
+                << ToFixed16(e.cameraDistanceCullDistance) << ", "
+                << (e.cameraDistanceCullMeshes ? 1 : 0) << ", "
+                << (e.cameraDistanceCullSkinned ? 1 : 0) << ", "
+                << (e.cameraFrustumCullEnabled ? 1 : 0) << ", "
+                << ToFixed16(e.cameraFrustumCullMargin) << ", "
+                << (e.cameraFrustumCullMeshes ? 1 : 0) << ", "
+                << (e.cameraFrustumCullSkinned ? 1 : 0)
                 << " },\n";
         }
         out << "};\n\n";
@@ -4174,20 +4819,26 @@ static uint64_t PackQ(int xi, int yi, int zi) {
 
 struct PosUvWeldKey {
     uint64_t pos = 0;
-    uint32_t uv = 0;
-    bool operator==(const PosUvWeldKey& o) const { return pos == o.pos && uv == o.uv; }
+    uint64_t uv = 0;
+    uint32_t color = 0;
+    bool operator==(const PosUvWeldKey& o) const {
+        return pos == o.pos && uv == o.uv && color == o.color;
+    }
 };
 
 struct PosUvWeldKeyHash {
     size_t operator()(const PosUvWeldKey& k) const {
-        return std::hash<uint64_t>()(k.pos) ^ (std::hash<uint32_t>()(k.uv) << 1);
+        return std::hash<uint64_t>()(k.pos) ^
+               (std::hash<uint64_t>()(k.uv) << 1) ^
+               (std::hash<uint32_t>()(k.color) << 2);
     }
 };
 
 /// FBX import keeps 3 unique verts per triangle; weld before decimation/export.
 /// When `separateUvSeams` is true, only merge verts with the same position AND UV.
 static void WeldMeshVerts(std::vector<Vertex>& verts, std::vector<uint32_t>& indices,
-                          float eps = 1e-5f, bool separateUvSeams = true) {
+                          float eps = 1e-5f, bool separateUvSeams = true,
+                          bool separateColors = true) {
     if (verts.empty() || indices.empty() || !(eps > 0.0f))
         return;
 
@@ -4207,11 +4858,20 @@ static void WeldMeshVerts(std::vector<Vertex>& verts, std::vector<uint32_t>& ind
         const int zi = static_cast<int>(std::lround(v.position.z * inv));
         k.pos = PackQ(xi, yi, zi);
         if (separateUvSeams) {
-            const int ui = static_cast<int>(std::lround(Fract01(v.uv.x) * 4096.0f));
-            const int vi = static_cast<int>(std::lround(Fract01(v.uv.y) * 4096.0f));
-            k.uv = (static_cast<uint32_t>(ui & 0xFFFF) << 16) |
-                   static_cast<uint32_t>(vi & 0xFFFF);
+            /* Preserve the authored UV itself, not only its fractional part.
+             * ProModeler uses planar UVs in world-sized units; vertices at
+             * UV 0 and UV 1 address the same texel after wrapping but are on
+             * opposite sides of a repeat boundary. Welding them here turns
+             * checker faces into long stripes before repeat splitting. */
+            const int32_t ui = static_cast<int32_t>(
+                std::lround(static_cast<double>(v.uv.x) * 4096.0));
+            const int32_t vi = static_cast<int32_t>(
+                std::lround(static_cast<double>(v.uv.y) * 4096.0));
+            k.uv = (static_cast<uint64_t>(static_cast<uint32_t>(ui)) << 32u) |
+                   static_cast<uint32_t>(vi);
         }
+        if (separateColors)
+            k.color = ColorToPackedFromVec4(v.color);
         return k;
     };
 
@@ -4267,6 +4927,127 @@ struct SimplifiedMesh {
     std::vector<Vertex> verts;
     std::vector<uint32_t> indices; // tri list
 };
+
+/* Put compatible triangle pairs next to each other so the PS1 runtime can
+ * submit them as one native quad. Subdivision emits small triangles in scan
+ * order, where the matching neighbour is often several entries away; merely
+ * checking consecutive triangles therefore leaves much of the GPU/packet
+ * saving unused. This changes submission order only, never geometry. */
+static size_t ReorderTrianglesForPs1Quads(SimplifiedMesh& mesh) {
+    const size_t triangleCount = mesh.indices.size() / 3u;
+    if (triangleCount < 2u)
+        return 0;
+
+    auto triangleNormal = [&](size_t triangle) {
+        glm::vec3 normal;
+        const size_t base = triangle * 3u;
+        ComputeTriNormal(mesh.verts[mesh.indices[base + 0u]].position,
+                         mesh.verts[mesh.indices[base + 1u]].position,
+                         mesh.verts[mesh.indices[base + 2u]].position,
+                         normal);
+        return normal;
+    };
+    auto triangleColor = [&](size_t triangle) {
+        const size_t base = triangle * 3u;
+        return (mesh.verts[mesh.indices[base + 0u]].color +
+                mesh.verts[mesh.indices[base + 1u]].color +
+                mesh.verts[mesh.indices[base + 2u]].color) / 3.0f;
+    };
+    auto compatiblePair = [&](size_t aTriangle, size_t bTriangle,
+                              uint32_t outQuad[4]) {
+        const size_t aBase = aTriangle * 3u;
+        const size_t bBase = bTriangle * 3u;
+        const uint32_t a[3] = {
+            mesh.indices[aBase + 0u], mesh.indices[aBase + 1u],
+            mesh.indices[aBase + 2u]
+        };
+        const uint32_t b[3] = {
+            mesh.indices[bBase + 0u], mesh.indices[bBase + 1u],
+            mesh.indices[bBase + 2u]
+        };
+        const glm::vec3 an = triangleNormal(aTriangle);
+        const glm::vec3 bn = triangleNormal(bTriangle);
+        const glm::vec4 ac = triangleColor(aTriangle);
+        const glm::vec4 bc = triangleColor(bTriangle);
+        int ae;
+        int be;
+
+        if (float_to_norm12_4(an.x) != float_to_norm12_4(bn.x) ||
+            float_to_norm12_4(an.y) != float_to_norm12_4(bn.y) ||
+            float_to_norm12_4(an.z) != float_to_norm12_4(bn.z) ||
+            ToByte01(ac.r) != ToByte01(bc.r) ||
+            ToByte01(ac.g) != ToByte01(bc.g) ||
+            ToByte01(ac.b) != ToByte01(bc.b) ||
+            ToByte01(ac.a) != ToByte01(bc.a))
+            return false;
+
+        for (ae = 0; ae < 3; ++ae) {
+            const uint32_t edge0 = a[ae];
+            const uint32_t edge1 = a[(ae + 1) % 3];
+            for (be = 0; be < 3; ++be) {
+                uint32_t quad[4];
+                glm::vec2 uvError;
+                if (b[be] != edge1 || b[(be + 1) % 3] != edge0)
+                    continue;
+                quad[0] = a[(ae + 2) % 3];
+                quad[1] = edge0;
+                quad[2] = edge1;
+                quad[3] = b[(be + 2) % 3];
+                if (quad[0] == quad[3])
+                    continue;
+                uvError = mesh.verts[quad[0]].uv + mesh.verts[quad[3]].uv -
+                          mesh.verts[quad[1]].uv - mesh.verts[quad[2]].uv;
+                /* Runtime performs the final check after 8-bit UV
+                 * quantisation. This generous source-space gate only rejects
+                 * clearly non-rectangular UV pairs. */
+                if (std::abs(uvError.x) > 0.04f ||
+                    std::abs(uvError.y) > 0.04f)
+                    continue;
+                outQuad[0] = quad[0];
+                outQuad[1] = quad[1];
+                outQuad[2] = quad[2];
+                outQuad[3] = quad[3];
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::vector<uint8_t> used(triangleCount, 0u);
+    std::vector<uint32_t> reordered;
+    size_t pairCount = 0;
+    reordered.reserve(mesh.indices.size());
+    for (size_t ti = 0; ti < triangleCount; ++ti) {
+        size_t partner = triangleCount;
+        uint32_t pairQuad[4] = {};
+        if (used[ti])
+            continue;
+        for (size_t tj = ti + 1u; tj < triangleCount; ++tj) {
+            if (!used[tj] && compatiblePair(ti, tj, pairQuad)) {
+                partner = tj;
+                break;
+            }
+        }
+        used[ti] = 1u;
+        if (partner < triangleCount) {
+            /* Canonical cyclic winding lets runtime recover q0..q3 from the
+             * two faces without storing a 32 KiB quad-index side table. */
+            reordered.push_back(pairQuad[0]);
+            reordered.push_back(pairQuad[1]);
+            reordered.push_back(pairQuad[2]);
+            reordered.push_back(pairQuad[2]);
+            reordered.push_back(pairQuad[1]);
+            reordered.push_back(pairQuad[3]);
+            used[partner] = 1u;
+            ++pairCount;
+        } else {
+            for (int corner = 0; corner < 3; ++corner)
+                reordered.push_back(mesh.indices[ti * 3u + corner]);
+        }
+    }
+    mesh.indices = std::move(reordered);
+    return pairCount;
+}
 
 static Vertex InterpolateUvClipVertex(const Vertex& a, const Vertex& b, float t) {
     Vertex out{};
@@ -4356,13 +5137,14 @@ static bool SplitProModelerUvRepeats(SimplifiedMesh& mesh,
                 if (polygon.size() < 3u)
                     continue;
                 const size_t addedTriangles = polygon.size() - 2u;
-                if (tiled.indices.size() / 3u + addedTriangles > maxTriangles ||
-                    tiled.verts.size() + polygon.size() > maxVertices)
+                if (tiled.indices.size() / 3u + addedTriangles > maxTriangles)
                     return false;
                 const uint32_t base = static_cast<uint32_t>(tiled.verts.size());
                 for (Vertex& vertex : polygon) {
-                    vertex.uv.x = std::clamp(vertex.uv.x - static_cast<float>(cellU), 0.0f, 1.0f);
-                    vertex.uv.y = std::clamp(vertex.uv.y - static_cast<float>(cellV), 0.0f, 1.0f);
+                    vertex.uv.x -= static_cast<float>(cellU);
+                    vertex.uv.y -= static_cast<float>(cellV);
+                    vertex.uv.x = std::clamp(vertex.uv.x, 0.0f, 1.0f);
+                    vertex.uv.y = std::clamp(vertex.uv.y, 0.0f, 1.0f);
                     if (vertex.uv.x > 0.99999f) vertex.uv.x = 0.999999f;
                     if (vertex.uv.y > 0.99999f) vertex.uv.y = 0.999999f;
                     tiled.verts.push_back(vertex);
@@ -4376,6 +5158,14 @@ static bool SplitProModelerUvRepeats(SimplifiedMesh& mesh,
         }
     }
     if (tiled.indices.empty())
+        return false;
+    /* Clipping emits a private polygon vertex list per source triangle, so
+     * checking that temporary count rejects otherwise compact meshes and
+     * falls back to UV wrapping across 63->0. Weld first, preserving UV seams,
+     * then apply the actual exported-vertex budget. */
+    WeldMeshVerts(tiled.verts, tiled.indices, 1e-5f, true, true);
+    if (tiled.verts.size() > maxVertices ||
+        tiled.indices.size() / 3u > maxTriangles)
         return false;
     mesh = std::move(tiled);
     return true;
@@ -5092,6 +5882,42 @@ static bool FixTriangleWindingForPs1(std::vector<Vertex>& verts, std::vector<uin
     return globallyInverted;
 }
 
+/* Keep only genuinely suspect animated faces two-sided. This preserves the
+ * handful of triangles whose authored winding disagrees with their smoothed
+ * normals without doubling an entire character mesh. */
+static void DuplicateOpposedTriangles(std::vector<Vertex>& verts,
+                                      std::vector<uint32_t>& indices) {
+    const size_t originalSize = indices.size();
+    size_t duplicated = 0;
+    for (size_t ti = 0; ti + 2 < originalSize; ti += 3) {
+        const uint32_t i0 = indices[ti + 0];
+        const uint32_t i1 = indices[ti + 1];
+        const uint32_t i2 = indices[ti + 2];
+        if (i0 >= verts.size() || i1 >= verts.size() || i2 >= verts.size())
+            continue;
+        glm::vec3 face = glm::cross(
+            verts[i1].position - verts[i0].position,
+            verts[i2].position - verts[i0].position);
+        glm::vec3 smooth = verts[i0].normal + verts[i1].normal + verts[i2].normal;
+        const float faceLength = glm::length(face);
+        const float smoothLength = glm::length(smooth);
+        if (!(faceLength > 1e-10f) || !(smoothLength > 1e-6f))
+            continue;
+        face /= faceLength;
+        smooth /= smoothLength;
+        if (glm::dot(face, smooth) >= 0.0f)
+            continue;
+        indices.push_back(i0);
+        indices.push_back(i2);
+        indices.push_back(i1);
+        ++duplicated;
+    }
+    if (duplicated > 0) {
+        MIPSYNC_INFO("Selective animated backfaces: {} / {} triangles duplicated",
+                     duplicated, originalSize / 3);
+    }
+}
+
 
 static SimplifiedMesh SimplifyToBudget(const std::vector<Vertex>& inVerts,
                                       const std::vector<uint32_t>& inIndices,
@@ -5338,70 +6164,175 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
         data.meshPaths.clear();
         data.meshViewModelVariants.clear();
         data.meshOccluderVariants.clear();
+        data.meshSubdivisionLevels.clear();
+        data.meshSubdivisionMaxEdges.clear();
+        data.meshSubdivisionScales.clear();
+        data.meshSubdivisionExplicit.clear();
+
+        auto registerVertexSequence = [&](const Ps1ExportedEntity& e,
+                                          const std::string& path,
+                                          uint16_t requestedCount,
+                                          uint16_t& firstOut,
+                                          uint16_t& countOut) {
+            firstOut = 0;
+            countOut = 0;
+            if (path.empty() || requestedCount == 0 || !IsSkinnedAnimMeshKey(path))
+                return;
+            const size_t hash = path.find('#');
+            const std::string baseKey =
+                hash == std::string::npos ? path : path.substr(0, hash);
+            const bool viewModel = e.renderPreset == 3u;
+            const std::string roleKey = baseKey + (viewModel ? "\nvm" : "\nworld");
+            auto existing = vertexAnimIndex.find(roleKey);
+            if (existing != vertexAnimIndex.end()) {
+                firstOut = existing->second.first;
+                countOut = existing->second.second;
+                return;
+            }
+            firstOut = static_cast<uint16_t>(data.meshPaths.size() + 1u);
+            for (uint16_t frame = 0; frame < requestedCount; ++frame) {
+                data.meshPaths.push_back(baseKey + "#" + std::to_string(frame));
+                data.meshViewModelVariants.push_back(viewModel);
+                data.meshOccluderVariants.push_back(e.prerenderOccluder);
+                data.meshSubdivisionLevels.push_back(0);
+                data.meshSubdivisionMaxEdges.push_back(0.0f);
+                data.meshSubdivisionScales.emplace_back(1.0f);
+                data.meshSubdivisionExplicit.push_back(false);
+                ++countOut;
+            }
+            vertexAnimIndex[roleKey] = { firstOut, countOut };
+        };
 
         for (auto& e : data.entities) {
             if (e.meshKind != 4 || e.meshPath.empty()) continue;
-            if (e.vertexAnimFrameCount > 0 && IsSkinnedAnimMeshKey(e.meshPath)) {
-                const size_t hash = e.meshPath.find('#');
-                const std::string baseKey = hash == std::string::npos ? e.meshPath : e.meshPath.substr(0, hash);
-                const std::string roleKey = baseKey + (e.viewModel ? "\nvm" : "\nworld");
-                auto existing = vertexAnimIndex.find(roleKey);
-                if (existing != vertexAnimIndex.end()) {
-                    e.meshIndex = existing->second.first;
-                    e.vertexAnimFirstMeshIndex = existing->second.first;
-                    e.vertexAnimFrameCount = existing->second.second;
-                    continue;
+            if (!e.vertexIdleMeshPath.empty() || !e.vertexWalkMeshPath.empty() ||
+                !e.vertexAimMeshPath.empty() || !e.vertexTriggerMeshPath.empty()) {
+                registerVertexSequence(e, e.vertexIdleMeshPath, e.vertexIdleFrameCount,
+                                       e.vertexIdleFirstMeshIndex, e.vertexIdleFrameCount);
+                registerVertexSequence(e, e.vertexWalkMeshPath, e.vertexWalkFrameCount,
+                                       e.vertexWalkFirstMeshIndex, e.vertexWalkFrameCount);
+                registerVertexSequence(e, e.vertexAimMeshPath, e.vertexAimFrameCount,
+                                       e.vertexAimFirstMeshIndex, e.vertexAimFrameCount);
+                registerVertexSequence(e, e.vertexTriggerMeshPath, e.vertexTriggerFrameCount,
+                                       e.vertexTriggerFirstMeshIndex, e.vertexTriggerFrameCount);
+                if (e.vertexIdleFirstMeshIndex > 0) {
+                    e.meshIndex = e.vertexIdleFirstMeshIndex;
+                    e.vertexAnimFirstMeshIndex = e.vertexIdleFirstMeshIndex;
+                    e.vertexAnimFrameCount = e.vertexIdleFrameCount;
+                    e.vertexAnimFps = e.vertexIdleFps;
+                } else if (e.vertexWalkFirstMeshIndex > 0) {
+                    e.meshIndex = e.vertexWalkFirstMeshIndex;
+                    e.vertexAnimFirstMeshIndex = e.vertexWalkFirstMeshIndex;
+                    e.vertexAnimFrameCount = e.vertexWalkFrameCount;
+                    e.vertexAnimFps = e.vertexWalkFps;
                 }
-
-                const uint16_t firstIdx = static_cast<uint16_t>(data.meshPaths.size() + 1u);
-                uint16_t added = 0;
-                for (uint16_t frame = 0; frame < e.vertexAnimFrameCount; ++frame) {
-                    const std::string frameKey = baseKey + "#" + std::to_string(frame);
-                    data.meshPaths.push_back(frameKey);
-                    data.meshViewModelVariants.push_back(e.viewModel);
-                    data.meshOccluderVariants.push_back(e.prerenderOccluder);
-                    ++added;
-                }
-                e.meshIndex = firstIdx;
-                e.vertexAnimFirstMeshIndex = firstIdx;
-                e.vertexAnimFrameCount = added;
-                vertexAnimIndex[roleKey] = { firstIdx, added };
                 continue;
             }
-            const std::string key =
-                e.meshPath + (e.viewModel ? "\nvm" :
+            std::string key =
+                e.meshPath + (e.renderPreset == 3u ? "\nvm" :
                               (e.prerenderOccluder ? "\noccluder" : "\nworld"));
+            if (e.meshSubdivisionLevels > 0 || e.meshSubdivisionExplicit) {
+                key += "\nsub:" + std::to_string(e.meshSubdivisionLevels) + ":" +
+                       std::to_string(e.meshSubdivisionMaxEdgeLength) + ":" +
+                       std::to_string(e.scale[0]) + ":" +
+                       std::to_string(e.scale[1]) + ":" +
+                       std::to_string(e.scale[2]);
+            }
             auto it = meshIndex.find(key);
             if (it == meshIndex.end()) {
                 const uint16_t idx = static_cast<uint16_t>(data.meshPaths.size() + 1u);
                 data.meshPaths.push_back(e.meshPath);
-                data.meshViewModelVariants.push_back(e.viewModel);
+                data.meshViewModelVariants.push_back(e.renderPreset == 3u);
                 data.meshOccluderVariants.push_back(e.prerenderOccluder);
+                data.meshSubdivisionLevels.push_back(e.meshSubdivisionLevels);
+                data.meshSubdivisionMaxEdges.push_back(e.meshSubdivisionMaxEdgeLength);
+                data.meshSubdivisionScales.emplace_back(
+                    std::abs(e.scale[0]), std::abs(e.scale[1]), std::abs(e.scale[2]));
+                data.meshSubdivisionExplicit.push_back(e.meshSubdivisionExplicit);
                 meshIndex[key] = idx;
                 e.meshIndex = idx;
             } else {
                 e.meshIndex = it->second;
             }
+
+            if (e.colliderShape == 3 && !e.colliderConvex) {
+                const std::string collisionKey = e.meshPath + "\ncollision";
+                auto collisionIt = meshIndex.find(collisionKey);
+                if (collisionIt == meshIndex.end()) {
+                    const uint16_t idx = static_cast<uint16_t>(data.meshPaths.size() + 1u);
+                    data.meshPaths.push_back(e.meshPath + "#collision");
+                    data.meshViewModelVariants.push_back(false);
+                    data.meshOccluderVariants.push_back(false);
+                    data.meshSubdivisionLevels.push_back(0);
+                    data.meshSubdivisionMaxEdges.push_back(0.0f);
+                    data.meshSubdivisionScales.emplace_back(1.0f);
+                    data.meshSubdivisionExplicit.push_back(false);
+                    meshIndex[collisionKey] = idx;
+                    e.colliderMeshIndex = idx;
+                } else {
+                    e.colliderMeshIndex = collisionIt->second;
+                }
+            }
         }
 
         std::vector<int> meshScaleQ12(data.meshPaths.size(), 128);
+        std::vector<std::array<int16_t, 3>> meshBoundsCenters(
+            data.meshPaths.size(), std::array<int16_t, 3>{0, 0, 0});
+        // Runtime culling uses these authored-space bounds rather than the
+        // entity pivot, which may be far outside long or asymmetrical meshes.
+        std::vector<uint16_t> meshBoundsRadii(data.meshPaths.size(), 1024u);
+        std::vector<uint32_t> meshRigidLightBinMasks(data.meshPaths.size(), 0u);
+        std::vector<size_t> skinnedTopologyBase(data.meshPaths.size(), SIZE_MAX);
+        std::unordered_map<std::string, size_t> firstSkinnedMeshBySequence;
+        std::unordered_map<std::string, float> skinnedSequenceHalf;
+        for (const Ps1SkinnedAnimMeshData& anim : data.skinnedAnimMeshes) {
+            const size_t hash = anim.key.find('#');
+            const std::string base =
+                hash == std::string::npos ? anim.key : anim.key.substr(0, hash);
+            float& half = skinnedSequenceHalf[base];
+            for (float coordinate : anim.positions)
+                half = std::max(half, std::abs(coordinate));
+        }
+        for (size_t mi = 0; mi < data.meshPaths.size(); ++mi) {
+            const std::string& rel = data.meshPaths[mi];
+            if (!IsSkinnedAnimMeshKey(rel))
+                continue;
+            const size_t hash = rel.find('#');
+            const std::string base =
+                hash == std::string::npos ? rel : rel.substr(0, hash);
+            auto [it, inserted] = firstSkinnedMeshBySequence.emplace(base, mi);
+            skinnedTopologyBase[mi] = it->second;
+        }
 
         // Emit each mesh as a vertex array + tri list with face normals.
         for (size_t mi = 0; mi < data.meshPaths.size(); ++mi) {
             const std::string& rel = data.meshPaths[mi];
-            const bool isTerrainMesh = IsTerrainMeshKey(rel);
-            const bool isProModelerMesh = IsProModelerMeshKey(rel);
+            const bool isCollisionMesh = IsCollisionMeshKey(rel);
+            const std::string sourceRel = CollisionMeshSourceKey(rel);
+            const bool isTerrainMesh = IsTerrainMeshKey(sourceRel);
+            const bool isProModelerMesh = IsProModelerMeshKey(sourceRel);
+            const bool isAuthoredProModelerMesh =
+                sourceRel.rfind("promodelerdata://", 0) == 0 ||
+                sourceRel.rfind("probuilderdata://", 0) == 0;
             const bool isSkinnedAnimMesh = IsSkinnedAnimMeshKey(rel);
             const bool isRigidBoneMesh = IsRigidBoneMeshKey(rel);
+            const size_t animHash = isSkinnedAnimMesh ? rel.find('#') : std::string::npos;
+            const std::string animBaseKey = isSkinnedAnimMesh
+                ? (animHash == std::string::npos ? rel : rel.substr(0, animHash))
+                : std::string{};
+            const size_t topologyBase = isSkinnedAnimMesh
+                ? skinnedTopologyBase[mi] : mi;
+            const bool shareSkinnedTopology =
+                isSkinnedAnimMesh && topologyBase != SIZE_MAX && topologyBase != mi;
             const Mesh loadedMesh = isTerrainMesh
-                ? MeshFromTerrainKey(rel, data)
+                ? MeshFromTerrainKey(sourceRel, data)
                 : (isProModelerMesh
-                    ? MeshFromProModelerKey(rel, data)
+                    ? MeshFromProModelerKey(sourceRel, data)
                     : (isSkinnedAnimMesh
                         ? MeshFromSkinnedAnimKey(rel, data)
                         : (isRigidBoneMesh
                             ? MeshFromRigidBoneKey(rel, data)
-                            : Mesh::LoadFromFileCpu(AssetManager::Get().ToAbsolute(rel)))));
+                            : Mesh::LoadFromFileCpu(AssetManager::Get().ToAbsolute(sourceRel)))));
             if (loadedMesh.GetVertexCount() == 0) continue;
             const auto& verts = loadedMesh.GetVertices();
             const auto& indices = loadedMesh.GetIndices();
@@ -5413,16 +6344,48 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 AlignMeshBottom(workVerts);
             const size_t vertsBeforeWeld = workVerts.size();
             if (!isSkinnedAnimMesh && !isRigidBoneMesh)
-                WeldMeshVerts(workVerts, workIndices, 1e-5f, true);
+                WeldMeshVerts(workVerts, workIndices, 1e-5f,
+                              !isCollisionMesh, !isCollisionMesh);
             NormalizeNormals(workVerts);
+
+            uint8_t subdivisionLevels =
+                mi < data.meshSubdivisionLevels.size()
+                    ? data.meshSubdivisionLevels[mi] : 0;
+            float maxEdge = mi < data.meshSubdivisionMaxEdges.size()
+                ? data.meshSubdivisionMaxEdges[mi] : 0.0f;
+            /* Do not silently tessellate any mesh here. Mesh Subdivider is the
+             * sole opt-in source for these values. A late blanket fallback used
+             * to turn simple Prop walls into thousands of triangles and made
+             * entering a room vastly more expensive than authored topology. */
+            if (!isCollisionMesh && !isSkinnedAnimMesh && !isRigidBoneMesh &&
+                subdivisionLevels > 0) {
+                const glm::vec3 subdivisionScale =
+                    mi < data.meshSubdivisionScales.size()
+                        ? data.meshSubdivisionScales[mi] : glm::vec3(1.0f);
+                const size_t sourceTriangleCount = workIndices.size() / 3u;
+                const Mesh sourceMesh(workVerts, workIndices, false, true);
+                const Mesh subdivided = Mesh::CreateSubdivided(
+                    sourceMesh, subdivisionLevels, maxEdge,
+                    subdivisionScale, true);
+                workVerts = subdivided.GetVertices();
+                workIndices = subdivided.GetIndices();
+                NormalizeNormals(workVerts);
+                MIPSYNC_INFO(
+                    "PS1 Mesh Subdivider '{}': {} -> {} triangles (max {} levels, edge {:.3f})",
+                    rel, sourceTriangleCount, workIndices.size() / 3u,
+                    static_cast<int>(subdivisionLevels), maxEdge);
+            }
 
             const float sourceHalf = MeshBBoxHalfExtent(workVerts);
             if (sourceHalf < 1e-6f) {
                 MIPSYNC_WARN("PS1 mesh '{}' has zero extent; skipping", rel);
                 continue;
             }
+            const float sequenceHalf = isSkinnedAnimMesh
+                ? std::max(skinnedSequenceHalf[animBaseKey], sourceHalf)
+                : sourceHalf;
             meshScaleQ12[mi] = std::clamp(
-                static_cast<int>(std::lround((sourceHalf * kPs1UnitsPerWorld / kPs1TemplateHalf) * kPs1Q12One)),
+                static_cast<int>(std::lround((sequenceHalf * kPs1UnitsPerWorld / kPs1TemplateHalf) * kPs1Q12One)),
                 1,
                 32767);
 
@@ -5437,34 +6400,43 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 FindSkinnedAnimBudget(data, rel, skinnedAnimMaxTris, skinnedAnimMaxVerts);
             if (isRigidBoneMesh)
                 FindRigidBoneBudget(data, rel, skinnedAnimMaxTris, skinnedAnimMaxVerts);
-            const bool skinnedAnimDoubleSided = isSkinnedAnimMesh;
+            /* Animated character parts were previously duplicated wholesale
+             * for two-sided rendering. Runtime backface culling then threw
+             * one copy away, but still walked twice as many triangles every
+             * frame. Export the corrected authored winding once; deliberate
+             * two-sided world/view-model shells keep their existing path. */
+            const bool skinnedAnimDoubleSided = false;
             const bool rigidBoneDoubleSided = false;
             // Determine if the mesh requires double-sided rendering (e.g. thin shells).
             // View models are often authored as thin/partial meshes; force a
             // reversed copy so close first-person weapons do not lose faces.
             const bool needsDoubleSided =
-                !usedAsOccluder && !isTerrainMesh && !isSkinnedAnimMesh && !isRigidBoneMesh &&
-                (usedAsViewModel || IsOpenShellMesh(workVerts, workIndices));
+                !isCollisionMesh && !usedAsOccluder && !isTerrainMesh &&
+                !isSkinnedAnimMesh && !isRigidBoneMesh &&
+                (usedAsViewModel ||
+                 (!isAuthoredProModelerMesh && IsOpenShellMesh(workVerts, workIndices)));
 
             // Dynamic budgets per mesh type to keep PS1 performance usable.
             // View models stay denser than world meshes, but cannot consume an
             // entire PS1 frame by themselves; double-sided meshes are budgeted
             // after considering the reversed winding copy.
             const size_t meshMaxTris =
-                usedAsOccluder ? 192 :
+                isCollisionMesh ? 768 : (usedAsOccluder ? 192 :
                 (isRigidBoneMesh ? skinnedAnimMaxTris :
-                 (isTerrainMesh ? 1200 : (isSkinnedAnimMesh ? std::min<size_t>(skinnedAnimMaxTris * 2, 4000) : (usedAsViewModel ? 5000 : (highQualityProp ? 12000 : (needsDoubleSided ? 6500 : kMaxTris))))));
+                 (isTerrainMesh ? 1200 : (isSkinnedAnimMesh ? skinnedAnimMaxTris : (usedAsViewModel ? 5000 : (highQualityProp ? 12000 : (needsDoubleSided ? 6500 : kMaxTris)))))));
             const size_t meshMaxVerts =
-                usedAsOccluder ? 320 :
+                isCollisionMesh ? 1024 : (usedAsOccluder ? 320 :
                 (isRigidBoneMesh ? skinnedAnimMaxVerts :
-                 (isTerrainMesh ? 1300 : (isSkinnedAnimMesh ? skinnedAnimMaxVerts : (usedAsViewModel ? 5000 : (highQualityProp ? 8000 : (needsDoubleSided ? 6500 : kMaxVerts))))));
+                 (isTerrainMesh ? 1300 : (isSkinnedAnimMesh ? skinnedAnimMaxVerts : (usedAsViewModel ? 5000 : (highQualityProp ? 8000 : (needsDoubleSided ? 6500 : kMaxVerts)))))));
             const size_t simpMaxTris =
                 (skinnedAnimDoubleSided || rigidBoneDoubleSided) ? skinnedAnimMaxTris : (needsDoubleSided ? (meshMaxTris / 2) : meshMaxTris);
 
             float meshTiling[2] = { 1.0f, 1.0f };
             float meshOffset[2] = { 0.0f, 0.0f };
             bool exportUvs = false;
-            FindMeshUvTransform(data, rel, meshTiling, meshOffset, exportUvs);
+            bool bakedUvRepeats = false;
+            FindMeshUvTransform(
+                data, rel, meshTiling, meshOffset, exportUvs, &bakedUvRepeats);
             if (usedAsOccluder)
                 exportUvs = false;
 
@@ -5499,23 +6471,74 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 continue;
             }
 
-            if (exportUvs && rel.rfind("promodelerdata://", 0) == 0 &&
-                (std::abs(meshTiling[0] - 1.0f) > 1e-5f ||
-                 std::abs(meshTiling[1] - 1.0f) > 1e-5f ||
-                 std::abs(meshOffset[0]) > 1e-5f ||
-                 std::abs(meshOffset[1]) > 1e-5f)) {
+            /* A baked texture carries eight authored repeats in one PS1 UV
+             * cell, keeping broad ProModeler faces compact.  Ordinary
+             * full-resolution textures are only selected when their complete
+             * transformed UV range fits inside one repeat cell, so they need
+             * no geometry expansion here. */
+            if (exportUvs && bakedUvRepeats) {
                 const size_t sourceTriangles = simp.indices.size() / 3u;
-                if (SplitProModelerUvRepeats(
-                        simp, meshTiling, meshOffset, meshMaxTris, meshMaxVerts)) {
+                const size_t repeatTriangleBudget = meshMaxTris;
+                const size_t repeatVertexBudget = meshMaxVerts;
+                const SimplifiedMesh unsplit = simp;
+                const float repeatSpan = kPs1BakedTextureRepeats;
+                float packedOffset[2] = { meshOffset[0], meshOffset[1] };
+                /* ProModeler planar UVs are commonly centred around zero.
+                 * After packing eight identical repeats into one texture,
+                 * that needlessly places the mesh across the packed cell's
+                 * zero seam and forces extra polygons. An integer source-UV
+                 * shift is visually identical for a repeating texture; use it
+                 * to fit any range narrower than the atlas into one cell. */
+                for (int axis = 0; axis < 2; ++axis) {
+                    float minUv = std::numeric_limits<float>::max();
+                    float maxUv = std::numeric_limits<float>::lowest();
+                    for (const Vertex& vertex : simp.verts) {
+                        const float sourceUv = axis == 0 ? vertex.uv.x : vertex.uv.y;
+                        const float transformed =
+                            sourceUv * meshTiling[axis] + meshOffset[axis];
+                        minUv = std::min(minUv, transformed);
+                        maxUv = std::max(maxUv, transformed);
+                    }
+                    if (maxUv - minUv < repeatSpan - 1e-4f) {
+                        const float shift = std::ceil(-minUv + 1e-5f);
+                        if (minUv + shift >= -1e-4f &&
+                            maxUv + shift < repeatSpan - 1e-4f) {
+                            packedOffset[axis] += shift;
+                        }
+                    }
+                }
+                const float splitTiling[2] = {
+                    meshTiling[0] / repeatSpan,
+                    meshTiling[1] / repeatSpan
+                };
+                const float splitOffset[2] = {
+                    packedOffset[0] / repeatSpan,
+                    packedOffset[1] / repeatSpan
+                };
+                const bool repeatSplit = SplitProModelerUvRepeats(
+                    simp, splitTiling, splitOffset,
+                    repeatTriangleBudget, repeatVertexBudget);
+                if (repeatSplit) {
                     WeldMeshVerts(simp.verts, simp.indices, 1e-5f, true);
                     MIPSYNC_INFO(
-                        "PS1 ProModeler UV repeats: {} triangles -> {} tiled triangles",
-                        sourceTriangles, simp.indices.size() / 3u);
+                        "PS1 mesh UV repeats '{}': {} triangles -> {} tiled triangles (authored density, 8x baked texture)",
+                        rel, sourceTriangles, simp.indices.size() / 3u);
                     meshTiling[0] = meshTiling[1] = 1.0f;
                     meshOffset[0] = meshOffset[1] = 0.0f;
                 } else {
+                    simp = unsplit;
+                    for (Vertex& vertex : simp.verts) {
+                        vertex.uv.x =
+                            (vertex.uv.x * meshTiling[0] + meshOffset[0]) /
+                            repeatSpan;
+                        vertex.uv.y =
+                            (vertex.uv.y * meshTiling[1] + meshOffset[1]) /
+                            repeatSpan;
+                    }
+                    meshTiling[0] = meshTiling[1] = 1.0f;
+                    meshOffset[0] = meshOffset[1] = 0.0f;
                     MIPSYNC_WARN(
-                        "PS1 ProModeler UV repeat split exceeded mesh budget for '{}'; using wrapped UV fallback",
+                        "PS1 mesh UV repeat split exceeded mesh budget for '{}'; using wrapped UV fallback at authored density",
                         rel);
                 }
             }
@@ -5524,10 +6547,7 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
             FinalizeExportedMesh(simp);
             bool forceFlip = false;
             bool useForceFlip = false;
-            std::string animBaseKey;
             if (isSkinnedAnimMesh) {
-                const size_t hash = rel.find('#');
-                animBaseKey = hash == std::string::npos ? rel : rel.substr(0, hash);
                 auto it = skinnedAnimFlippedCache.find(animBaseKey);
                 if (it != skinnedAnimFlippedCache.end()) {
                     forceFlip = it->second;
@@ -5540,8 +6560,20 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
             if (isSkinnedAnimMesh && !useForceFlip) {
                 skinnedAnimFlippedCache[animBaseKey] = globallyInverted;
             }
+            if (isSkinnedAnimMesh && !shareSkinnedTopology)
+                DuplicateOpposedTriangles(simp.verts, simp.indices);
             if (needsDoubleSided || skinnedAnimDoubleSided || rigidBoneDoubleSided) {
                 DuplicateTrianglesDoubleSided(simp.indices);
+            }
+            if (isAuthoredProModelerMesh && !isCollisionMesh) {
+                const size_t quadPairCount = ReorderTrianglesForPs1Quads(simp);
+                if (quadPairCount > 0u) {
+                    MIPSYNC_INFO(
+                        "PS1 native quad order '{}': {} triangle pairs ({:.1f}% fewer GPU primitives)",
+                        rel, quadPairCount,
+                        100.0f * static_cast<float>(quadPairCount) /
+                            static_cast<float>(simp.indices.size() / 3u));
+                }
             }
             if (simp.verts.empty() || simp.indices.empty()) {
                 MIPSYNC_ERROR("PS1 mesh '{}' has no valid triangles after cull; skipped", rel);
@@ -5549,7 +6581,9 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
             }
 
             // Fit longest AABB axis to +/-64 PSX template (cube contract).
-            const float exportHalf = std::max(MeshBBoxHalfExtent(simp.verts), 1e-6f);
+            const float exportHalf = isSkinnedAnimMesh
+                ? std::max(sequenceHalf, 1e-6f)
+                : std::max(MeshBBoxHalfExtent(simp.verts), 1e-6f);
             const float toTemplate = kPs1TemplateHalf / exportHalf;
 
             const size_t vcount = std::min(simp.verts.size(), meshMaxVerts);
@@ -5558,6 +6592,23 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 MIPSYNC_ERROR("PS1 mesh '{}' has no triangles after decimation; skipped", rel);
                 continue;
             }
+
+            glm::vec3 templateMin = simp.verts[0].position * toTemplate;
+            glm::vec3 templateMax = templateMin;
+            for (size_t vi = 1; vi < vcount; ++vi) {
+                const glm::vec3 templatePosition = simp.verts[vi].position * toTemplate;
+                templateMin = glm::min(templateMin, templatePosition);
+                templateMax = glm::max(templateMax, templatePosition);
+            }
+            const glm::vec3 templateCenter = (templateMin + templateMax) * 0.5f;
+            const float templateRadius = glm::length((templateMax - templateMin) * 0.5f);
+            for (int axis = 0; axis < 3; ++axis) {
+                meshBoundsCenters[mi][static_cast<size_t>(axis)] =
+                    static_cast<int16_t>(ClampI16(static_cast<int>(std::lround(
+                        templateCenter[static_cast<size_t>(axis)]))));
+            }
+            meshBoundsRadii[mi] = static_cast<uint16_t>(std::clamp(
+                static_cast<int>(std::ceil(templateRadius)), 1, 32767));
 
             if (overBudget || workVerts.size() != vertsBeforeWeld) {
                 MIPSYNC_INFO("PS1 mesh '{}' export: {}v/{}t -> welded {}v/{}t -> {}v/{}t (budget {}v/{}t)",
@@ -5587,9 +6638,63 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                              rel, clamped, vcount, sourceHalf);
             }
 
-            if (isRigidBoneMesh) {
-                std::unordered_map<uint64_t, uint16_t> firstPositionIndex;
-                firstPositionIndex.reserve(vcount);
+            /* UV/material seams duplicate many vertices. Static/rigid meshes
+             * may share equal positions directly. For baked vertex animation,
+             * however, two vertices that overlap in the bind frame can carry
+             * different skin weights and separate later (notably hands and
+             * feet). Only share them when their quantised trajectory matches
+             * in every compatible animation frame. This also makes sharing
+             * safe while the runtime interpolates between animation meshes. */
+            if (isRigidBoneMesh ||
+                (isAuthoredProModelerMesh && !isCollisionMesh) ||
+                (isSkinnedAnimMesh && !shareSkinnedTopology)) {
+                struct TrajectoryFrame {
+                    const Ps1SkinnedAnimMeshData* mesh = nullptr;
+                    float toTemplate = 1.0f;
+                };
+                std::vector<TrajectoryFrame> trajectoryFrames;
+                bool canShareAnimatedPositions =
+                    isSkinnedAnimMesh && !overBudget &&
+                    simp.verts.size() == workVerts.size() &&
+                    vcount == simp.verts.size();
+                if (canShareAnimatedPositions) {
+                    for (const Ps1SkinnedAnimMeshData& frame : data.skinnedAnimMeshes) {
+                        if (frame.positions.size() != vcount * 3u)
+                            continue;
+                        const size_t frameHash = frame.key.find('#');
+                        const std::string frameBase = frameHash == std::string::npos
+                            ? frame.key : frame.key.substr(0, frameHash);
+                        const auto halfIt = skinnedSequenceHalf.find(frameBase);
+                        if (halfIt == skinnedSequenceHalf.end())
+                            continue;
+                        trajectoryFrames.push_back({
+                            &frame,
+                            kPs1TemplateHalf / std::max(halfIt->second, 1e-6f)
+                        });
+                    }
+                    canShareAnimatedPositions = !trajectoryFrames.empty();
+                }
+
+                auto sameAnimatedTrajectory = [&](uint16_t a, uint16_t b) {
+                    for (const TrajectoryFrame& trajectory : trajectoryFrames) {
+                        const std::vector<float>& positions = trajectory.mesh->positions;
+                        for (size_t axis = 0; axis < 3u; ++axis) {
+                            const int qa = ClampI16(static_cast<int>(std::round(
+                                positions[static_cast<size_t>(a) * 3u + axis] *
+                                trajectory.toTemplate)));
+                            const int qb = ClampI16(static_cast<int>(std::round(
+                                positions[static_cast<size_t>(b) * 3u + axis] *
+                                trajectory.toTemplate)));
+                            if (qa != qb)
+                                return false;
+                        }
+                    }
+                    return true;
+                };
+
+                std::unordered_map<uint64_t, std::vector<uint16_t>> positionCandidates;
+                positionCandidates.reserve(vcount);
+                size_t canonicalPositionCount = 0;
                 out << "static const uint16_t k_ps1_mesh_" << mi << "_position_refs[] = {\n";
                 for (size_t vi = 0; vi < vcount; ++vi) {
                     const glm::vec3& p = simp.verts[vi].position;
@@ -5600,13 +6705,32 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                         static_cast<uint64_t>(static_cast<uint16_t>(vx)) |
                         (static_cast<uint64_t>(static_cast<uint16_t>(vy)) << 16u) |
                         (static_cast<uint64_t>(static_cast<uint16_t>(vz)) << 32u);
-                    const auto [it, inserted] =
-                        firstPositionIndex.emplace(key, static_cast<uint16_t>(vi));
-                    out << "    " << it->second << "u,\n";
+                    uint16_t reference = static_cast<uint16_t>(vi);
+                    std::vector<uint16_t>& candidates = positionCandidates[key];
+                    if (!isSkinnedAnimMesh || canShareAnimatedPositions) {
+                        for (uint16_t candidate : candidates) {
+                            if (!isSkinnedAnimMesh ||
+                                sameAnimatedTrajectory(candidate, static_cast<uint16_t>(vi))) {
+                                reference = candidate;
+                                break;
+                            }
+                        }
+                    }
+                    if (reference == vi) {
+                        candidates.push_back(reference);
+                        ++canonicalPositionCount;
+                    }
+                    out << "    " << reference << "u,\n";
                 }
                 out << "};\n\n";
+                if (isSkinnedAnimMesh) {
+                    MIPSYNC_INFO(
+                        "PS1 animated position sharing '{}': {} / {} canonical trajectories across {} frames",
+                        rel, canonicalPositionCount, vcount, trajectoryFrames.size());
+                }
             }
 
+            if (!shareSkinnedTopology) {
             // Vertex normals (12.4 fixed; ONE=4096). Keep in mesh local space.
             out << "static const SVECTOR k_ps1_mesh_" << mi << "_norms[] = {\n";
             for (size_t vi = 0; vi < vcount; ++vi) {
@@ -5622,13 +6746,17 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
             out << "};\n\n";
 
             if (exportUvs) {
-                int texWidth = 128;
-                int texHeight = 128;
+                int texWidth = 64;
+                int texHeight = 64;
 
                 std::string texPath;
                 for (const auto& e : data.entities) {
                     if (e.meshKind == 4 && e.textureIndex > 0 &&
-                        (e.meshPath == rel || SameSkinnedAnimSequence(e.meshPath, rel))) {
+                        (e.meshPath == rel || SameSkinnedAnimSequence(e.meshPath, rel) ||
+                         SameSkinnedAnimSequence(e.vertexIdleMeshPath, rel) ||
+                         SameSkinnedAnimSequence(e.vertexWalkMeshPath, rel) ||
+                         SameSkinnedAnimSequence(e.vertexAimMeshPath, rel) ||
+                         SameSkinnedAnimSequence(e.vertexTriggerMeshPath, rel))) {
                         if (e.textureIndex <= data.texturePaths.size()) {
                             texPath = data.texturePaths[e.textureIndex - 1];
                         }
@@ -5637,12 +6765,17 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 }
 
                 if (!texPath.empty()) {
+                    if (texPath.rfind(kPs1BakedTexturePrefix, 0) == 0)
+                        texPath.erase(0, std::char_traits<char>::length(kPs1BakedTexturePrefix));
                     std::string absPath = AssetManager::Get().ToAbsolute(texPath);
                     int w = 0, h = 0, comp = 0;
                     if (stbi_info(absPath.c_str(), &w, &h, &comp)) {
-                        // Clamp to max size 128 (same as PS1TextureExport)
-                        if (w > 128 || h > 128) {
-                            float scale = 128.0f / static_cast<float>(std::max(w, h));
+                        // TIM rectangles are measured in 16-bit VRAM words and
+                        // getTPage selects X bases in 64-word increments. Keep
+                        // ordinary materials in one 64x64 packing cell so their
+                        // explicit UV range cannot reach a neighbouring cell.
+                        if (w > 64 || h > 64) {
+                            float scale = 64.0f / static_cast<float>(std::max(w, h));
                             w = std::max(1, static_cast<int>(std::lround(static_cast<float>(w) * scale)));
                             h = std::max(1, static_cast<int>(std::lround(static_cast<float>(h) * scale)));
                         }
@@ -5657,8 +6790,8 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                         if (texPtr) {
                             int w2 = texPtr->GetWidth();
                             int h2 = texPtr->GetHeight();
-                            if (w2 > 128 || h2 > 128) {
-                                float scale = 128.0f / static_cast<float>(std::max(w2, h2));
+                            if (w2 > 64 || h2 > 64) {
+                                float scale = 64.0f / static_cast<float>(std::max(w2, h2));
                                 w2 = std::max(1, static_cast<int>(std::lround(static_cast<float>(w2) * scale)));
                                 h2 = std::max(1, static_cast<int>(std::lround(static_cast<float>(h2) * scale)));
                             }
@@ -5709,9 +6842,15 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 const uint8_t shade =
                     isTerrainMesh ? TerrainTriShade(n, center, terrainMinY, terrainMaxY) :
                     (isRigidBoneMesh ? RigidLightDirectionBin(n) : 128);
-                const glm::vec4 triColor = isTerrainMesh
+                if (isRigidBoneMesh && shade < 27u)
+                    meshRigidLightBinMasks[mi] |= (1u << shade);
+                const glm::vec4 triColor = (isTerrainMesh || isProModelerMesh)
                     ? (simp.verts[i0].color + simp.verts[i1].color + simp.verts[i2].color) / 3.0f
                     : glm::vec4(1.0f);
+                const uint8_t faceTextureIndex = isProModelerMesh
+                    ? ProModelerFaceTextureIndex(
+                        data, sourceRel, ToByte01(triColor.a))
+                    : 0u;
                 // The cross product of the swapped vertices for reversed-winding copies
                 // naturally points inward, which is correct for interior lighting.
                 out << "    { " << i0 << "u, " << i1 << "u, " << i2 << "u, "
@@ -5721,20 +6860,31 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                     << static_cast<int>(shade) << ", "
                     << static_cast<int>(ToByte01(triColor.r)) << ", "
                     << static_cast<int>(ToByte01(triColor.g)) << ", "
-                    << static_cast<int>(ToByte01(triColor.b)) << " },\n";
+                    << static_cast<int>(ToByte01(triColor.b)) << ", "
+                    << static_cast<int>(faceTextureIndex) << " },\n";
             }
             out << "};\n\n";
+            }
         }
 
         out << "const ps1_mesh g_ps1_meshes[] = {\n";
         for (size_t mi = 0; mi < data.meshPaths.size(); ++mi) {
             const std::string& rel = data.meshPaths[mi];
+            const std::string sourceRel = CollisionMeshSourceKey(rel);
             float tiling[2] = { 1.0f, 1.0f };
             float offset[2] = { 0.0f, 0.0f };
             bool exportUvs = false;
             FindMeshUvTransform(data, rel, tiling, offset, exportUvs);
             const bool isTerrainMesh = IsTerrainMeshKey(rel);
             const bool isSmoothMesh = rel.rfind("primitivesphere://", 0) == 0;
+            const bool hasProModelerPositionRefs =
+                !IsCollisionMeshKey(rel) &&
+                (sourceRel.rfind("promodelerdata://", 0) == 0 ||
+                 sourceRel.rfind("probuilderdata://", 0) == 0);
+            const size_t topologyMi = IsSkinnedAnimMeshKey(rel) &&
+                                      mi < skinnedTopologyBase.size() &&
+                                      skinnedTopologyBase[mi] != SIZE_MAX
+                ? skinnedTopologyBase[mi] : mi;
             std::string meshFlags = "0";
             if (isTerrainMesh)
                 meshFlags = "PS1_MESH_FLAG_TERRAIN";
@@ -5742,16 +6892,27 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 meshFlags = meshFlags == "0" ? "PS1_MESH_FLAG_SMOOTH"
                                              : meshFlags + " | PS1_MESH_FLAG_SMOOTH";
             out << "    { k_ps1_mesh_" << mi << "_verts, "
-                << " k_ps1_mesh_" << mi << "_norms, "
+                << " k_ps1_mesh_" << topologyMi << "_norms, "
                 << " (uint16_t)(sizeof(k_ps1_mesh_" << mi << "_verts)/sizeof(k_ps1_mesh_" << mi << "_verts[0])), "
-                << (exportUvs ? ("k_ps1_mesh_" + std::to_string(mi) + "_uvs") : std::string("0"))
+                << (exportUvs ? ("k_ps1_mesh_" + std::to_string(topologyMi) + "_uvs") : std::string("0"))
                 << ", "
-                << (IsRigidBoneMeshKey(rel) ? ("k_ps1_mesh_" + std::to_string(mi) + "_position_refs") : std::string("0"))
+                << (IsRigidBoneMeshKey(rel)
+                        ? ("k_ps1_mesh_" + std::to_string(mi) + "_position_refs")
+                        : (hasProModelerPositionRefs
+                            ? ("k_ps1_mesh_" + std::to_string(mi) + "_position_refs")
+                            : (IsSkinnedAnimMeshKey(rel)
+                            ? ("k_ps1_mesh_" + std::to_string(topologyMi) + "_position_refs")
+                            : std::string("0"))))
                 << ", "
-                << " k_ps1_mesh_" << mi << "_tris, "
-                << " (uint16_t)(sizeof(k_ps1_mesh_" << mi << "_tris)/sizeof(k_ps1_mesh_" << mi << "_tris[0])), "
+                << " k_ps1_mesh_" << topologyMi << "_tris, "
+                << " (uint16_t)(sizeof(k_ps1_mesh_" << topologyMi << "_tris)/sizeof(k_ps1_mesh_" << topologyMi << "_tris[0])), "
                 << meshScaleQ12[mi] << ", "
-                << meshFlags << " },\n";
+                << meshBoundsCenters[mi][0] << ", "
+                << meshBoundsCenters[mi][1] << ", "
+                << meshBoundsCenters[mi][2] << ", "
+                << meshBoundsRadii[mi] << ", "
+                << meshFlags << ", "
+                << meshRigidLightBinMasks[mi] << "u },\n";
         }
         out << "};\n";
         out << "const unsigned int g_ps1_mesh_count = " << data.meshPaths.size() << "u;\n";
@@ -5791,6 +6952,32 @@ std::shared_ptr<MipsyncEngine::SkinnedMesh> BuildPs1RigidBonePreview(
     const int maxBoneIndex = static_cast<int>(std::min<size_t>(model.bones.size(), kMaxBones)) - 1;
     if (maxBoneIndex < 0)
         return nullptr;
+
+    // This mesh is already below the low-poly character budget. Its optimized
+    // topology is therefore the authored topology: do not manufacture rigid
+    // joint cuts in the editor preview. Keeping the original skin weights also
+    // prevents both detached chunks and the long single-bone triangle spikes
+    // that a per-face rigid preview would otherwise produce.
+    if ((indexCount / 3u) <= 1200u) {
+        std::vector<SkinnedVertex> previewVertices;
+        std::vector<uint32_t> previewIndices;
+        std::unordered_map<uint32_t, uint32_t> remap;
+        previewVertices.reserve(std::min<size_t>(model.sourceVertices.size(), indexCount));
+        previewIndices.reserve(indexCount);
+        remap.reserve(std::min<size_t>(model.sourceVertices.size(), indexCount));
+        for (uint32_t ii = 0; ii < indexCount; ++ii) {
+            const uint32_t sourceIndex = model.sourceIndices[indexOffset + ii];
+            if (sourceIndex >= model.sourceVertices.size())
+                continue;
+            auto [it, inserted] = remap.emplace(
+                sourceIndex, static_cast<uint32_t>(previewVertices.size()));
+            if (inserted)
+                previewVertices.push_back(model.sourceVertices[sourceIndex]);
+            previewIndices.push_back(it->second);
+        }
+        if (!previewVertices.empty() && previewIndices.size() >= 3)
+            return std::make_shared<MipsyncEngine::SkinnedMesh>(previewVertices, previewIndices);
+    }
 
     RigidSplitGeometry splitGeometry =
         BuildRigidSplitGeometry(model, indexOffset, indexCount, maxBoneIndex, seamFill);
@@ -6078,6 +7265,10 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
             return false;
         }
 
+        std::unordered_set<uint32_t> inactiveSourceEntityIds;
+        root["entities"] = FilterActivePs1Entities(
+            root["entities"], inactiveSourceEntityIds);
+
         std::unordered_map<uint32_t, Ps1ResolvedTransform> flatWorldTransforms;
         BuildFlatWorldTransforms(root["entities"], flatWorldTransforms);
         std::unordered_map<uint32_t, Ps1ResolvedAnimator> flatAnimatorContexts;
@@ -6249,6 +7440,11 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
                     const auto referencedIt = entityIndexBySourceId.find(
                         static_cast<uint32_t>(sourceId));
                     if (referencedIt == entityIndexBySourceId.end()) {
+                        if (inactiveSourceEntityIds.count(
+                                static_cast<uint32_t>(sourceId)) != 0) {
+                            script.fieldValuesQ16[fi] = 0;
+                            continue;
+                        }
                         outError = "PS1 script field '" + field.name +
                                    "' references a missing scene object";
                         return false;
@@ -6370,9 +7566,9 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
                            PathUtf8::ToString(runtimeLimitsH);
                 return false;
             }
-            // Preserve the public PS1 maxima for validation, but reserve VM
-            // storage only for this project's actual modules and bindings.
-            // A full 32-instance pool costs over 500 KiB of PS1 RAM.
+            // The VM still validates the public PS1 maxima, but only reserves
+            // storage for this project's actual modules and bindings. A full
+            // 32-instance pool costs over 500 KiB before the scene is loaded.
             limits << "#ifndef MIPSYNC_GENERATED_RUNTIME_LIMITS_H\n"
                       "#define MIPSYNC_GENERATED_RUNTIME_LIMITS_H\n\n"
                       "#define MIPSYNC_GENERATED_MODULE_CAP "

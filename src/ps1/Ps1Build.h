@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../project/Project.h"
+#include <functional>
 #include <string>
 
 namespace MipsyncEngine::Ps1 {
@@ -9,6 +10,8 @@ struct Ps1BuildRequest {
     std::string projectPath;
     PlayerSettings settings;
     std::string engineRoot; // directory containing MipsyncEngine.exe (for templates)
+    /// Optional build-stage callback. Fractions are monotonic in [0, 1].
+    std::function<void(float, const std::string&)> progress;
 };
 
 struct Ps1BuildResult {

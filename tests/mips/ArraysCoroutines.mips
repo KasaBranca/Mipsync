@@ -25,6 +25,12 @@ class ArraysCoroutines : MonoBehaviour {
         result = result + 10;
         yield return new WaitForSeconds(0.05);
         result = result + 100;
+        int loopCount = 0;
+        while (loopCount < 3) {
+            result = result + 1000;
+            loopCount = loopCount + 1;
+            yield return null;
+        }
         yield break;
     }
 

@@ -77,6 +77,110 @@ bool AabbOverlaps(const SimpleColliderAabb& a, const SimpleColliderAabb& b) {
            a.min.z < b.max.z && a.max.z > b.min.z;
 }
 
+bool IsEntityOrDescendantOf(const Scene& scene, const Entity& entity,
+                            const Entity& possibleAncestor);
+
+bool IsGroundedWithinDistance(const Scene& scene, Entity& entity, float distance) {
+    const auto* collider = entity.GetComponent<ColliderComponent>();
+    if (!collider || !collider->enabled || collider->isTrigger || distance < 0.0f)
+        return false;
+    const SimpleColliderAabb self = ComputeSimpleColliderAabb(scene, entity, *collider);
+    constexpr float kSkin = 0.01f;
+    for (const auto& otherPtr : scene.GetEntities()) {
+        Entity* other = otherPtr.get();
+        if (!other || other == &entity ||
+            IsEntityOrDescendantOf(scene, *other, entity) ||
+            IsEntityOrDescendantOf(scene, entity, *other))
+            continue;
+        const auto* otherCollider = other->GetComponent<ColliderComponent>();
+        if (!otherCollider || !otherCollider->enabled || otherCollider->isTrigger)
+            continue;
+        const SimpleColliderAabb bounds =
+            ComputeSimpleColliderAabb(scene, *other, *otherCollider);
+        if (self.min.x >= bounds.max.x || self.max.x <= bounds.min.x ||
+            self.min.z >= bounds.max.z || self.max.z <= bounds.min.z)
+            continue;
+        const float gap = self.min.y - bounds.max.y;
+        if (gap >= -kSkin && gap <= distance + kSkin)
+            return true;
+    }
+    return false;
+}
+
+bool IsEntityOrDescendantOf(const Scene& scene, const Entity& entity,
+                            const Entity& possibleAncestor) {
+    const Entity* cursor = &entity;
+    for (int depth = 0; cursor && depth < 128; ++depth) {
+        if (cursor == &possibleAncestor)
+            return true;
+        const uint32_t parentId = cursor->GetParentID();
+        cursor = parentId != 0 ? scene.FindEntity(parentId) : nullptr;
+    }
+    return false;
+}
+
+bool SegmentExpandedAabb(const glm::vec3& from, const glm::vec3& desired,
+                         const SimpleColliderAabb& bounds, float radius,
+                         float& outFraction) {
+    const glm::vec3 lower = bounds.min - glm::vec3(radius);
+    const glm::vec3 upper = bounds.max + glm::vec3(radius);
+    const glm::vec3 delta = desired - from;
+    float enter = 0.0f;
+    float leave = 1.0f;
+    bool startsInside = true;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        if (from[axis] < lower[axis] || from[axis] > upper[axis])
+            startsInside = false;
+        if (std::abs(delta[axis]) <= 1e-7f) {
+            if (from[axis] < lower[axis] || from[axis] > upper[axis])
+                return false;
+            continue;
+        }
+        float first = (lower[axis] - from[axis]) / delta[axis];
+        float second = (upper[axis] - from[axis]) / delta[axis];
+        if (first > second)
+            std::swap(first, second);
+        enter = std::max(enter, first);
+        leave = std::min(leave, second);
+        if (enter > leave)
+            return false;
+    }
+    if (startsInside || leave < 0.0f || enter > 1.0f)
+        return false;
+    outFraction = std::clamp(enter, 0.0f, 1.0f);
+    return true;
+}
+
+glm::vec3 ConstrainFollowCamera(Scene& scene, const Entity& target,
+                                const Entity& camera, const glm::vec3& pivot,
+                                const glm::vec3& candidate) {
+    constexpr float kCameraRadius = 1.0f / 6.0f;
+    constexpr float kCollisionSkin = 1.0f / 256.0f;
+    float nearest = 1.0f;
+    bool blocked = false;
+
+    for (const auto& entityPtr : scene.GetEntities()) {
+        Entity* other = entityPtr.get();
+        if (!other || other == &camera ||
+            IsEntityOrDescendantOf(scene, *other, target))
+            continue;
+        auto* collider = other->GetComponent<ColliderComponent>();
+        if (!collider || !collider->enabled || collider->isTrigger)
+            continue;
+        const SimpleColliderAabb bounds =
+            ComputeSimpleColliderAabb(scene, *other, *collider);
+        float fraction = 1.0f;
+        if (SegmentExpandedAabb(pivot, candidate, bounds,
+                                kCameraRadius + kCollisionSkin, fraction) &&
+            (!blocked || fraction < nearest)) {
+            nearest = fraction;
+            blocked = true;
+        }
+    }
+    return blocked ? glm::mix(pivot, candidate, nearest) : candidate;
+}
+
 void MoveEntityWithSimpleCollision(Scene& scene, Entity& entity,
                                    const glm::vec3& velocity, float deltaTime) {
     auto* movingCollider = entity.GetComponent<ColliderComponent>();
@@ -159,7 +263,7 @@ int MapKeyName(const std::string& name) {
         {"Q", GLFW_KEY_Q}, {"E", GLFW_KEY_E}, {"R", GLFW_KEY_R}, {"F", GLFW_KEY_F},
         {"G", GLFW_KEY_G}, {"H", GLFW_KEY_H}, {"I", GLFW_KEY_I}, {"J", GLFW_KEY_J},
         {"K", GLFW_KEY_K}, {"L", GLFW_KEY_L},
-        {"Space", GLFW_KEY_SPACE},
+        {"Space", GLFW_KEY_SPACE}, {"Jump", GLFW_KEY_SPACE},
         {"Run", GLFW_KEY_LEFT_SHIFT}, {"Aim", GLFW_KEY_RIGHT_SHIFT},
         {"StrafeLeft", GLFW_KEY_Q}, {"StrafeRight", GLFW_KEY_E},
         {"QuickTurn", GLFW_KEY_SPACE}, {"L1", GLFW_KEY_LEFT_SHIFT},
@@ -758,7 +862,7 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                     }
                 }
                 if (!message.empty())
-                    MIPSYNC_INFO("[Mips#] {}", message);
+                    MIPSYNC_CONSOLE_INFO("{}", message);
                 break;
             }
             case HostFunc::Time_DeltaTime:
@@ -945,7 +1049,7 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
             }
             case HostFunc::Camera_Follow: {
                 // Camera.Follow(cameraEntityId, controllerYaw, distance,
-                //               height, lookHeight, sharpness)
+                //               height, lookHeight, sharpness[, pitchOffset])
                 if (argc < 6 || !m_Scene || !m_Instance || !m_Instance->entity) {
                     pushNumber(0.0);
                     break;
@@ -968,19 +1072,26 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                 const float height = static_cast<float>(NumberValue(args[3]));
                 const float lookHeight = static_cast<float>(NumberValue(args[4]));
                 const float sharpness = std::max(0.0f, static_cast<float>(NumberValue(args[5])));
+                const float pitch = argc >= 7
+                    ? static_cast<float>(NumberValue(args[6])) : 0.0f;
                 const float yawRadians = glm::radians(yaw);
+                const float pitchRadians = glm::radians(pitch);
+                const float horizontalDistance = std::cos(pitchRadians) * distance;
 
                 const glm::vec3 targetPosition = targetTransform->position;
                 const glm::vec3 desiredPosition(
-                    targetPosition.x + std::sin(yawRadians) * distance,
-                    targetPosition.y + height,
-                    targetPosition.z + std::cos(yawRadians) * distance);
+                    targetPosition.x + std::sin(yawRadians) * horizontalDistance,
+                    targetPosition.y + height - std::sin(pitchRadians) * distance,
+                    targetPosition.z + std::cos(yawRadians) * horizontalDistance);
                 const float blend = sharpness <= 0.0f
                     ? 1.0f : std::clamp(sharpness * m_DeltaTime, 0.0f, 1.0f);
-                cameraTransform->position = glm::mix(
-                    cameraTransform->position, desiredPosition, blend);
-
                 const glm::vec3 lookTarget = targetPosition + glm::vec3(0.0f, lookHeight, 0.0f);
+                const glm::vec3 followPosition = glm::mix(
+                    cameraTransform->position, desiredPosition, blend);
+                cameraTransform->position = ConstrainFollowCamera(
+                    *m_Scene, *m_Instance->entity, *cameraEntity,
+                    lookTarget, followPosition);
+
                 const glm::vec3 direction = lookTarget - cameraTransform->position;
                 const float horizontal = std::sqrt(direction.x * direction.x +
                                                    direction.z * direction.z);
@@ -1001,6 +1112,54 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                 if (m_Instance && m_Instance->entity && m_PhysicsWorld)
                     grounded = m_PhysicsWorld->IsCharacterGrounded(*m_Instance->entity) ? 1.0 : 0.0;
                 pushNumber(grounded);
+                break;
+            }
+            case HostFunc::Physics_IsGroundedWithin: {
+                const float distance = argc >= 1
+                    ? std::max(0.0f, static_cast<float>(NumberValue(args[0]))) : 0.0f;
+                bool grounded = false;
+                if (m_Instance && m_Instance->entity) {
+                    if (m_PhysicsWorld && distance <= 0.01f)
+                        grounded = m_PhysicsWorld->IsCharacterGrounded(*m_Instance->entity);
+                    if (!grounded && m_Scene)
+                        grounded = IsGroundedWithinDistance(
+                            *m_Scene, *m_Instance->entity, distance);
+                }
+                pushNumber(grounded ? 1.0 : 0.0);
+                break;
+            }
+            case HostFunc::Physics_UseCharacterController: {
+                if (m_Instance && m_Instance->entity)
+                    ColliderUtils::EnsureFirstPersonPhysics(*m_Instance->entity);
+                pushNumber(0.0);
+                break;
+            }
+            case HostFunc::Physics_UseKinematicController: {
+                if (m_Instance && m_Instance->entity) {
+                    auto* rigidbody =
+                        m_Instance->entity->GetComponent<RigidbodyComponent>();
+                    if (!rigidbody)
+                        rigidbody = &m_Instance->entity->AddComponent<RigidbodyComponent>();
+                    rigidbody->characterController = false;
+                    rigidbody->bodyType = RigidbodyType::Kinematic;
+                    rigidbody->useGravity = false;
+                }
+                pushNumber(0.0);
+                break;
+            }
+            case HostFunc::Physics_MoveKinematic: {
+                if (m_Scene && m_Instance && m_Instance->entity && argc >= 3) {
+                    const glm::vec3 velocity{
+                        static_cast<float>(NumberValue(args[0])),
+                        static_cast<float>(NumberValue(args[1])),
+                        static_cast<float>(NumberValue(args[2])),
+                    };
+                    const glm::vec3 worldPosition =
+                        m_Scene->GetWorldPosition(*m_Instance->entity);
+                    m_Scene->SetWorldPosition(
+                        *m_Instance->entity, worldPosition + velocity * m_DeltaTime);
+                }
+                pushNumber(0.0);
                 break;
             }
             case HostFunc::Physics_Move: {
@@ -1065,14 +1224,20 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
             case HostFunc::Animator_SetFloat:
             case HostFunc::Animator_SetBool:
             case HostFunc::Animator_SetInt:
-            case HostFunc::Animator_SetTrigger: {
+            case HostFunc::Animator_SetTrigger:
+            case HostFunc::Animator_SetTriggerHeld:
+            case HostFunc::Animator_ReleaseTrigger: {
                 if (!m_Instance)
                     break;
                 Entity* entity = m_Instance->entity;
-                if (argc >= 3)
+                const bool triggerCall = func == HostFunc::Animator_SetTrigger ||
+                    func == HostFunc::Animator_SetTriggerHeld ||
+                    func == HostFunc::Animator_ReleaseTrigger;
+                const bool hasTarget = triggerCall ? argc >= 2 : argc >= 3;
+                if (hasTarget)
                     entity = EntityFromHost(args[0], entity);
-                const size_t nameIdx = (argc >= 3) ? 1 : 0;
-                const size_t valueIdx = (argc >= 3) ? 2 : 1;
+                const size_t nameIdx = hasTarget ? 1 : 0;
+                const size_t valueIdx = hasTarget ? 2 : 1;
                 if (!entity || nameIdx >= args.size() || args[nameIdx].tag != Value::Tag::String)
                     break;
                 auto* animator = entity->GetComponent<AnimatorComponent>();
@@ -1097,6 +1262,15 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                     break;
                 case HostFunc::Animator_SetTrigger:
                     animator->parameters.triggers[paramName] = true;
+                    animator->heldTriggers.erase(paramName);
+                    break;
+                case HostFunc::Animator_SetTriggerHeld:
+                    animator->parameters.triggers[paramName] = true;
+                    animator->heldTriggers.insert(paramName);
+                    break;
+                case HostFunc::Animator_ReleaseTrigger:
+                    animator->parameters.triggers[paramName] = false;
+                    animator->heldTriggers.erase(paramName);
                     break;
                 default:
                     break;
@@ -1235,8 +1409,9 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                         ? GameSave::Get().SaveToFile(filePath, err)
                         : GameSave::Get().LoadFromFile(filePath, err);
                     if (!ok)
-                        MIPSYNC_WARN("[Mips#] Save {} failed: {}", func == HostFunc::Save_Write ? "write" : "read",
-                                     err);
+                        MIPSYNC_CONSOLE_WARN("Save {} failed: {}",
+                                             func == HostFunc::Save_Write ? "write" : "read",
+                                             err);
                 }
                 pushNumber(ok ? 1.0 : 0.0);
                 break;

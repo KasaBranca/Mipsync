@@ -14,6 +14,7 @@ struct EditorInstanceInfo {
     std::string projectPath;
     std::string projectId;
     std::string engineVersion;
+    std::string executablePath;
     std::string endpoint;
     int protocolVersion = kProtocolVersion;
 

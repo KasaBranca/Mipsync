@@ -1,0 +1,24 @@
+// Example: scene transition, save/load, physics trigger (v0.4 APIs)
+class GameFlow : MipsBehaviour {
+
+    public string nextScene = "scenes/default.nscene";
+    public string saveFile = "slot1.json";
+
+    void OnTriggerEnter() {
+        var other = Physics.otherEntityId;
+        if (other == 0) return;
+        Log.Info("Trigger with entity", other);
+
+        Save.SetInt("lastTrigger", other);
+        Save.Write(saveFile);
+
+        Scene.Load(nextScene);
+    }
+
+    void Start() {
+        if (Save.Read(saveFile) != 0) {
+            var last = Save.GetInt("lastTrigger", 0);
+            Log.Info("Loaded save, lastTrigger=", last);
+        }
+    }
+}

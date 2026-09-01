@@ -2,6 +2,7 @@
 // Mipsync Engine — PC native standalone player packaging.
 
 #include "../project/Project.h"
+#include <functional>
 #include <string>
 
 namespace MipsyncEngine {
@@ -13,6 +14,8 @@ struct PlayerBuildRequest {
     std::string engineDirectory;
     /// Parent output folder; build writes `<outputParent>/<productName>/`.
     std::string outputParent;
+    /// Optional build-stage callback. Fractions are monotonic in [0, 1].
+    std::function<void(float, const std::string&)> progress;
 };
 
 struct PlayerBuildResult {

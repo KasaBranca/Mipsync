@@ -6,7 +6,10 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <algorithm>
+#include <typeinfo>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstdint>
 
 #include "../mips/PS1SceneExport.h"
@@ -107,6 +110,8 @@ struct AnimatorComponent : public Component {
     bool inTransition = false;
 
     AnimatorRuntimeValues parameters;
+    /// Trigger parameters explicitly held by Mips# until ReleaseTrigger.
+    std::unordered_set<std::string> heldTriggers;
     glm::mat4 boneMatrices[128]{};
 
     /// Global playback speed multiplier (default 1).
@@ -122,6 +127,14 @@ struct AnimatorComponent : public Component {
 };
 
 struct MeshRendererComponent : public Component {
+    enum class TypePreset : uint8_t {
+        Prop = 0,
+        Corridor = 1,
+        Character = 2,
+        Viewmodel = 3,
+        Floor = 4,
+    };
+
     std::shared_ptr<Mesh> mesh;
     std::shared_ptr<Mesh> ps1PreviewMesh;
     uint32_t ps1PreviewMeshVersion = 0;
@@ -141,8 +154,8 @@ struct MeshRendererComponent : public Component {
     /// Resolved UV scale/offset from the assigned material.
     glm::vec2 textureTiling = { 1.0f, 1.0f };
     glm::vec2 textureOffset = { 0.0f, 0.0f };
-    /// Draw as first-person view model in PS1 export/runtime.
-    bool viewModel = false;
+    /// Selects the PS1 runtime path used for caching, clipping and draw priority.
+    TypePreset typePreset = TypePreset::Prop;
     /// Visible only in editor Scene View; skipped by Game View, player, and PS1 export.
     bool editorOnly = false;
     /// Writes depth over a pre-rendered background without drawing color.
@@ -152,6 +165,26 @@ struct MeshRendererComponent : public Component {
     void RebuildMesh();
     void SetPrimitive(const std::string& primitive, float size);
     void SetMeshFile(const std::string& projectRelPath);
+};
+
+/// Adds render-only triangle density to control affine texture warping on PS1.
+/// Collider geometry is intentionally left untouched.
+struct MeshSubdividerComponent : public Component {
+    int maxLevels = 1;
+    float maxEdgeLength = 1.0f;
+    bool preview = true;
+
+    std::shared_ptr<Mesh> previewMesh;
+    const Mesh* previewSource = nullptr;
+    int previewLevels = -1;
+    float previewMaxEdgeLength = -1.0f;
+    glm::vec3 previewWorldScale{ 0.0f };
+
+    void InvalidatePreview() {
+        previewMesh.reset();
+        previewSource = nullptr;
+        previewLevels = -1;
+    }
 };
 
 struct TerrainComponent : public Component {
@@ -199,12 +232,15 @@ struct ProModelerComponent : public Component {
         Ramp,
         Stairs,
         Custom,
+        Cylinder,
     };
 
     Shape shape = Shape::Box;
     glm::vec3 size{ 1.0f, 1.0f, 1.0f };
     int steps = 4;
+    int sides = 16;
     float extrudeAmount = 0.25f;
+    float bevelAmount = 0.1f;
     std::vector<ProModelerVertex> vertices;
     std::vector<uint32_t> indices;
     // Rendering still uses triangles, but editing uses stable polygon face IDs.
@@ -220,6 +256,7 @@ struct ProModelerComponent : public Component {
     void ResetPlane();
     void ResetRamp();
     void ResetStairs();
+    void ResetCylinder();
     void RecalculatePlanarUVs();
     void RecalculateNormals();
     void EnsureFaceTopology();
@@ -228,6 +265,10 @@ struct ProModelerComponent : public Component {
     bool ConnectOppositeEdges(const std::pair<uint32_t, uint32_t>& first,
                               const std::pair<uint32_t, uint32_t>& second,
                               std::vector<uint32_t>& outSelectedVertices);
+    bool BevelEdge(const std::pair<uint32_t, uint32_t>& edge, float amount,
+                   std::vector<uint32_t>& outSelectedVertices,
+                   std::vector<std::pair<uint32_t, uint32_t>>& outSelectedEdges);
+    bool DeleteFaces(const std::vector<size_t>& faceTriangles);
     void FlipFaces(const std::vector<size_t>& faceTriangles);
     void RebuildMesh(MeshRendererComponent& renderer);
 };
@@ -239,6 +280,29 @@ struct CameraComponent : public Component {
     /// Optional trigger entity that selects this pre-rendered shot.
     uint32_t shotTriggerEntityId = 0;
     int shotPriority = 0;
+};
+
+/// Culls/hides distant meshes, characters, or lights beyond a specified radius.
+/// Can be attached to a Camera (or any entity), with an optional target entity (e.g. Player character).
+struct DistanceCullComponent : public Component {
+    float cullDistance = 30.0f;
+    /// Optional target entity ID used as the distance reference center (0 = this entity / camera).
+    uint32_t targetEntityId = 0;
+    bool cullMeshRenderers = true;
+    bool cullSkinnedMeshes = true;
+    bool cullLights = true;
+    /// When true, culling is also visible in the editor scene view (not just play/build).
+    bool previewInEditor = false;
+};
+
+/// Culls/hides meshes, characters, or lights that are outside the camera's view frustum.
+struct FrustumCullComponent : public Component {
+    float margin = 1.5f; ///< Safety margin in meters to prevent clipping at screen borders.
+    bool cullMeshRenderers = true;
+    bool cullSkinnedMeshes = true;
+    bool cullLights = true;
+    /// When true, culling is also visible in the editor scene view (not just play/build).
+    bool previewInEditor = false;
 };
 
 struct MipsScriptComponent : public Component {
@@ -526,6 +590,58 @@ public:
         return GetComponent<T>() != nullptr;
     }
 
+    std::vector<Component*> GetComponentsInOrder() {
+        std::vector<Component*> result;
+        result.reserve(m_Components.size());
+        for (auto& component : m_Components)
+            result.push_back(component.get());
+        return result;
+    }
+
+    std::vector<const Component*> GetComponentsInOrder() const {
+        std::vector<const Component*> result;
+        result.reserve(m_Components.size());
+        for (const auto& component : m_Components)
+            result.push_back(component.get());
+        return result;
+    }
+
+    void SetComponentOrder(const std::vector<Component*>& order) {
+        std::vector<std::unique_ptr<Component>> reordered;
+        reordered.reserve(m_Components.size());
+        for (Component* requested : order) {
+            auto it = std::find_if(m_Components.begin(), m_Components.end(),
+                                   [&](const std::unique_ptr<Component>& component) {
+                                       return component.get() == requested;
+                                   });
+            if (it == m_Components.end())
+                continue;
+            reordered.push_back(std::move(*it));
+            m_Components.erase(it);
+        }
+        for (auto& component : m_Components)
+            reordered.push_back(std::move(component));
+        m_Components = std::move(reordered);
+    }
+
+    void MatchComponentOrder(const Entity& source) {
+        std::vector<Component*> remaining = GetComponentsInOrder();
+        std::vector<Component*> ordered;
+        ordered.reserve(remaining.size());
+        for (const Component* sourceComponent : source.GetComponentsInOrder()) {
+            auto it = std::find_if(remaining.begin(), remaining.end(),
+                                   [&](Component* component) {
+                                       return typeid(*component) == typeid(*sourceComponent);
+                                   });
+            if (it == remaining.end())
+                continue;
+            ordered.push_back(*it);
+            remaining.erase(it);
+        }
+        ordered.insert(ordered.end(), remaining.begin(), remaining.end());
+        SetComponentOrder(ordered);
+    }
+
     template<typename T>
     void RemoveComponent() {
         for (auto it = m_Components.begin(); it != m_Components.end(); ++it) {
@@ -592,7 +708,7 @@ public:
     /// When false, animator clips are not advanced (edit mode); skinning uses bind pose.
     void SetAnimateCharacters(bool animate) { m_AnimateCharacters = animate; }
     bool GetAnimateCharacters() const { return m_AnimateCharacters; }
-    void UploadLightsToRenderer(Renderer& renderer) const;
+    void UploadLightsToRenderer(Renderer& renderer, bool editorSceneView = false) const;
 
     void Render(Renderer& renderer, const Camera& camera, Framebuffer* targetFBO = nullptr,
                 uint32_t highlightEntityId = 0, bool usePs1PreviewMeshes = false,
@@ -617,10 +733,12 @@ public:
     const Entity* FindEntity(uint32_t id) const;
 
     /// Reparents `child` under `parent` (or detaches when `parent == nullptr`).
-    /// Refuses cycles. Returns true on success.
-    bool SetParent(Entity* child, Entity* parent);
+    /// When worldPositionStays is true, converts the existing world transform
+    /// to the new parent's local space. Refuses cycles. Returns true on success.
+    bool SetParent(Entity* child, Entity* parent, bool worldPositionStays = false);
     /// Reparents and inserts before/after `sibling`. sibling == nullptr inserts at root/end.
-    bool ReorderEntity(Entity* child, Entity* parent, Entity* sibling, bool insertAfter);
+    bool ReorderEntity(Entity* child, Entity* parent, Entity* sibling, bool insertAfter,
+                       bool worldPositionStays = false);
 
     /// Local→World matrix for `entity`, walking up the parent chain.
     glm::mat4 GetWorldMatrix(const Entity& entity) const;

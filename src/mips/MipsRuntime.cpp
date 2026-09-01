@@ -3,7 +3,6 @@
 #include "../core/Log.h"
 #include "../assets/AssetManager.h"
 #include "../scene/Scene.h"
-#include "../physics/ColliderUtils.h"
 #include <filesystem>
 #include <vector>
 
@@ -129,24 +128,10 @@ void MipsRuntime::CollectInstances(Scene& scene) {
         if (!script->module) {
             script->module = CompileScriptFile(script->scriptPath, errors);
             for (const auto& e : errors)
-                MIPSYNC_WARN("[Mips#] {}", e);
+                MIPSYNC_CONSOLE_WARN("{}", e);
         }
         if (!script->module)
             continue;
-
-        if (script->module->className == "FirstPersonController" ||
-            script->module->className == "SilentHillController") {
-            ColliderUtils::EnsureFirstPersonPhysics(*entity);
-        } else if (script->module->className == "RadioController") {
-            // Migrate scenes that still carry the old CharacterVirtual flag.
-            // Radio movement is horizontal/kinematic; penetration recovery on
-            // a stale character controller changed Y as soon as Play began.
-            if (auto* rb = entity->GetComponent<RigidbodyComponent>()) {
-                rb->characterController = false;
-                rb->bodyType = RigidbodyType::Kinematic;
-                rb->useGravity = false;
-            }
-        }
 
         ScriptInstance instance;
         instance.module = script->module;
@@ -207,7 +192,7 @@ void MipsRuntime::ReloadChangedScripts(MipsyncEngine::Scene& scene) {
         std::vector<std::string> errors;
         auto newModule = CompileScriptFile(script->scriptPath, errors);
         for (const auto& e : errors)
-            MIPSYNC_WARN("[Mips#] {}", e);
+            MIPSYNC_CONSOLE_WARN("{}", e);
         if (!newModule)
             continue;
 
@@ -251,7 +236,7 @@ void MipsRuntime::InvokeLifecycleAll(const char* method, MipsyncEngine::Scene& s
             m_VM.RunMethod(instance, method, errors);
     }
     for (const auto& e : errors)
-        MIPSYNC_WARN("[Mips#] {}", e);
+        MIPSYNC_CONSOLE_WARN("{}", e);
 }
 
 void MipsRuntime::OnPlayStarted(Scene& scene) {
@@ -274,7 +259,7 @@ void MipsRuntime::OnPlayStarted(Scene& scene) {
         InvokeLifecycle(m_VM, instance, "Start", errors);
     }
     for (const auto& e : errors)
-        MIPSYNC_WARN("[Mips#] {}", e);
+        MIPSYNC_CONSOLE_WARN("{}", e);
 
     MIPSYNC_INFO("[Mips#] Play started ({} script instance(s))", m_Instances.size());
 }
@@ -286,7 +271,7 @@ void MipsRuntime::OnPlayStopped(Scene& scene) {
             InvokeLifecycle(m_VM, instance, "OnDestroy", errors);
         }
         for (const auto& e : errors)
-            MIPSYNC_WARN("[Mips#] {}", e);
+            MIPSYNC_CONSOLE_WARN("{}", e);
     }
 
     if (!m_EditSnapshot.Empty())
@@ -335,7 +320,7 @@ void MipsRuntime::DispatchPhysicsEvents(Scene& scene) {
     }
 
     for (const auto& e : errors)
-        MIPSYNC_WARN("[Mips#] {}", e);
+        MIPSYNC_CONSOLE_WARN("{}", e);
     m_PhysicsEvents.Clear();
 }
 
@@ -391,7 +376,7 @@ void MipsRuntime::Update(Scene& scene, float deltaTime) {
     for (auto& instance : m_Instances)
         m_VM.ResumeCoroutines(instance, deltaTime, coroutineErrors);
     for (const auto& error : coroutineErrors)
-        MIPSYNC_WARN("[Mips#] {}", error);
+        MIPSYNC_CONSOLE_WARN("{}", error);
 }
 
 void MipsRuntime::LateUpdate(Scene& scene, float deltaTime) {

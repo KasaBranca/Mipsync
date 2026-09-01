@@ -39,6 +39,7 @@ public:
 
 private:
     static GLFWwindow* s_Window;
+    static glm::vec2 s_CurrentMousePos;
     static glm::vec2 s_LastMousePos;
     static glm::vec2 s_MouseDelta;
     static float s_ScrollDelta;

@@ -1,0 +1,38 @@
+{
+  "defaultState": "Idle",
+  "parameters": [
+    { "name": "Speed", "type": "float", "default": 0.0 },
+    { "name": "Jump", "type": "trigger" }
+  ],
+  "states": [
+    { "name": "Idle", "clip": "mixamo.com|Idle", "speed": 1.0, "loop": true },
+    { "name": "Walk", "clip": "mixamo.com|Walking", "speed": 1.0, "loop": true },
+    { "name": "Run", "clip": "mixamo.com|Running", "speed": 1.2, "loop": true }
+  ],
+  "transitions": [
+    {
+      "from": "Idle",
+      "to": "Walk",
+      "duration": 0.15,
+      "conditions": [{ "param": "Speed", "mode": "greater", "threshold": 0.1 }]
+    },
+    {
+      "from": "Walk",
+      "to": "Idle",
+      "duration": 0.15,
+      "conditions": [{ "param": "Speed", "mode": "less", "threshold": 0.1 }]
+    },
+    {
+      "from": "Walk",
+      "to": "Run",
+      "duration": 0.1,
+      "conditions": [{ "param": "Speed", "mode": "greater", "threshold": 3.0 }]
+    },
+    {
+      "from": "Run",
+      "to": "Walk",
+      "duration": 0.15,
+      "conditions": [{ "param": "Speed", "mode": "less", "threshold": 3.0 }]
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+// Example: Mips# v0.2 — gameObject, strings, Physics.Raycast
+class RaycastProbe : MipsBehaviour
+{
+    public float maxDistance = 50.0;
+
+    void Update()
+    {
+        var pos = transform.position;
+        var fwd = Vector3.forward;
+        var yaw = transform.rotation.y * 0.01745329;
+        var sinY = Mathf.Sin(yaw);
+        var cosY = Mathf.Cos(yaw);
+        fwd.x = 0.0 - sinY;
+        fwd.z = 0.0 - cosY;
+
+        var hitId = Physics.Raycast(
+            pos.x, pos.y, pos.z,
+            fwd.x, fwd.y, fwd.z,
+            maxDistance);
+
+        if (hitId > 0.0)
+            Log.Info("Hit entity id=", hitId);
+    }
+}

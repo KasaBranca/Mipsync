@@ -8,7 +8,7 @@ static int16_t clamp_i16(int64_t value) {
     return (int16_t)value;
 }
 
-static int32_t round_q24_to_q12(int64_t value) {
+static int32_t round_q24_to_q12_i32(int32_t value) {
     if (value >= 0)
         return (int32_t)((value + (ONE / 2)) >> 12);
     return -(int32_t)(((-value) + (ONE / 2)) >> 12);
@@ -78,13 +78,19 @@ void mipsync_gte_init(void) {
 MATRIX* mipsync_gte_mul_matrix(const MATRIX* left, const MATRIX* right,
                                MATRIX* out) {
     MATRIX result;
-    int row, column, k;
+    int row, column;
     for (row = 0; row < 3; ++row) {
         for (column = 0; column < 3; ++column) {
-            int64_t sum = 0;
-            for (k = 0; k < 3; ++k)
-                sum += (int32_t)left->m[row][k] * right->m[k][column];
-            result.m[row][column] = clamp_i16(round_q24_to_q12(sum));
+            /* These matrices contain Q12 rotations and one already-scaled
+             * object matrix. Their three-term dot product fits int32 in the
+             * runtime's supported transform range. Avoiding int64 here is
+             * significant on the 32-bit R3000A and removes wide-arithmetic
+             * work from every rigid character part. */
+            const int32_t sum =
+                (int32_t)left->m[row][0] * (int32_t)right->m[0][column] +
+                (int32_t)left->m[row][1] * (int32_t)right->m[1][column] +
+                (int32_t)left->m[row][2] * (int32_t)right->m[2][column];
+            result.m[row][column] = clamp_i16(round_q24_to_q12_i32(sum));
         }
         result.t[row] = 0;
     }

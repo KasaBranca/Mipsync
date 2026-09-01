@@ -8,7 +8,9 @@
 #include "../audio/AudioSystem.h"
 #include "../scene/SceneIO.h"
 #include "../bootstrap/ProjectBootstrap.h"
+#include "../bootstrap/AgentIntegration.h"
 #include "../assets/AssetManager.h"
+#include "RuntimePaths.h"
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 #include <glm/gtc/matrix_transform.hpp>
@@ -64,6 +66,17 @@ Engine::Engine(const std::string& projectPath, EngineLaunchMode launchMode,
     Log::AddFileSink(PathUtf8::ToString(PathUtf8::FromString(m_ProjectPath) / "mipsync.log"));
 
     ProjectBootstrap::EnsureProjectDirectories(m_ProjectPath);
+
+    if (m_LaunchMode != EngineLaunchMode::Player) {
+        const AgentIntegrationResult agentIntegration = EnsureAgentIntegration(
+            PathUtf8::FromString(m_ProjectPath), GetExeDirectory());
+        if (!agentIntegration.success) {
+            MIPSYNC_WARN("Agent Skill setup failed: {}", agentIntegration.error);
+        } else if (agentIntegration.skillUpdated || agentIntegration.instructionsUpdated) {
+            MIPSYNC_INFO("Synchronized project Agent Skill: {}",
+                         PathUtf8::ToString(agentIntegration.skillPath));
+        }
+    }
 
     const bool builtinScriptsUpdated = EnsureBuiltinScripts();
     const bool demoContentUpdated = EnsureDemoContent();
@@ -154,11 +167,11 @@ bool Engine::EnsureBuiltinScripts() {
 
     // Bump this any time the embedded source below changes; existing files with
     // an older marker will be overwritten so users get fixes automatically.
-    static constexpr const char* kFpsScriptVersion = "// @mipsync-builtin v9";
-    static constexpr const char* kRadioScriptVersion = "// @mipsync-builtin-radio v22";
-    static constexpr const char* kSilentHillScriptVersion = "// @mipsync-builtin-silent-hill v3";
+    static constexpr const char* kFpsScriptVersion = "// @mipsync-builtin v10";
+    static constexpr const char* kRadioScriptVersion = "// @mipsync-builtin-radio v23";
+    static constexpr const char* kSilentHillScriptVersion = "// @mipsync-builtin-silent-hill v9";
 
-    static constexpr const char* kFpsScript = R"(// @mipsync-builtin v9
+    static constexpr const char* kFpsScript = R"(// @mipsync-builtin v10
 class FirstPersonController : MipsBehaviour
 {
     public float moveSpeed = 5.0;
@@ -171,6 +184,7 @@ class FirstPersonController : MipsBehaviour
 
     void Start()
     {
+        Physics.UseCharacterController();
         Input.SetCursorLocked(1);
     }
 
@@ -232,7 +246,7 @@ class FirstPersonController : MipsBehaviour
 }
 )";
 
-    static constexpr const char* kRadioScript = R"(// @mipsync-builtin-radio v22
+    static constexpr const char* kRadioScript = R"(// @mipsync-builtin-radio v23
 class RadioController : MipsBehaviour
 {
     public float moveSpeed = 3.0;
@@ -260,6 +274,11 @@ class RadioController : MipsBehaviour
     public int invertTurnDirection = 0;
     public float activeTurnTarget = 9999.0;
     public float activeTurnDirection = 0.0;
+
+    void Start()
+    {
+        Physics.UseKinematicController();
+    }
 
     void Update()
     {
@@ -474,12 +493,12 @@ class RadioController : MipsBehaviour
 }
 )";
 
-    static constexpr const char* kSilentHillScript = R"(// @mipsync-builtin-silent-hill v3
+    static constexpr const char* kSilentHillScript = R"(// @mipsync-builtin-silent-hill v9
 // Classic survival-horror tank controls for fixed or cinematic cameras.
 // PC: W/S move, A/D turn, Left Shift run, Q/E sidestep,
 //     Space jump, Right Shift aim.
 // PS1: D-pad/left stick move and turn, Square run, L1/R1 sidestep,
-//      L1+R1 jump, R2 aim.
+//      Cross (X) jump, R2 aim, right stick camera orbit.
 class SilentHillController : MipsBehaviour
 {
     public float walkSpeed = 1.8;
@@ -506,6 +525,17 @@ class SilentHillController : MipsBehaviour
     public float cameraHeight = 2.2;
     public float cameraLookHeight = 1.2;
     public float cameraFollowSharpness = 8.0;
+    public float cameraLookSensitivity = 2.5;
+    public float cameraReturnSharpness = 6.0;
+    public float cameraMinPitch = -35.0;
+    public float cameraMaxPitch = 55.0;
+    public float cameraYawOffset = 0.0;
+    public float cameraPitchOffset = 0.0;
+
+    void Start()
+    {
+        Physics.UseCharacterController();
+    }
 
     void Update()
     {
@@ -540,10 +570,11 @@ class SilentHillController : MipsBehaviour
             {
                 if (allowJump != 0)
                 {
-                    if (Input.GetKeyDown("QuickTurn"))
+                    if (Input.GetKeyDown("Jump"))
                     {
                         verticalVelocity = jumpSpeed;
-                        if (driveAnimator != 0) Animator.SetTrigger("Jump");
+                        grounded = 0;
+                        if (driveAnimator != 0) Animator.SetTriggerHeld("Jump");
                     }
                 }
                 if (verticalVelocity < 0.0) verticalVelocity = 0.0;
@@ -570,6 +601,26 @@ class SilentHillController : MipsBehaviour
         if (controllerYaw > 180.0) controllerYaw = controllerYaw - 360.0;
         if (controllerYaw < -180.0) controllerYaw = controllerYaw + 360.0;
         transform.rotation.y = controllerYaw + modelForwardYawOffset;
+
+        var cameraMoveInput = 0.0;
+        if (forwardInput != 0.0) cameraMoveInput = 1.0;
+        if (turnInput != 0.0) cameraMoveInput = 1.0;
+        if (strafeInput != 0.0) cameraMoveInput = 1.0;
+        if (cameraMoveInput != 0.0)
+        {
+            var cameraReturnBlend = cameraReturnSharpness * dt;
+            if (cameraReturnBlend > 1.0) cameraReturnBlend = 1.0;
+            cameraYawOffset = Mathf.Lerp(cameraYawOffset, 0.0, cameraReturnBlend);
+            cameraPitchOffset = Mathf.Lerp(cameraPitchOffset, 0.0, cameraReturnBlend);
+        }
+        else
+        {
+            cameraYawOffset = cameraYawOffset + Input.mouseDeltaX * cameraLookSensitivity;
+            cameraPitchOffset = cameraPitchOffset + Input.mouseDeltaY * cameraLookSensitivity;
+            cameraPitchOffset = Mathf.Clamp(cameraPitchOffset, cameraMinPitch, cameraMaxPitch);
+            if (cameraYawOffset > 180.0) cameraYawOffset = cameraYawOffset - 360.0;
+            if (cameraYawOffset < -180.0) cameraYawOffset = cameraYawOffset + 360.0;
+        }
 
         var yawRadians = controllerYaw * 0.0174532925;
         var sinYaw = Mathf.Sin(yawRadians);
@@ -600,10 +651,20 @@ class SilentHillController : MipsBehaviour
         Physics.Move(velocityX, verticalVelocity, velocityZ);
         if (lockY != 0) transform.position.y = fixedY;
 
-        if (followCameraEnabled != 0)
+        if (driveAnimator != 0)
         {
-            Camera.Follow(followCamera, controllerYaw, cameraDistance,
-                          cameraHeight, cameraLookHeight, cameraFollowSharpness);
+            if (grounded != 0)
+            {
+                Animator.ReleaseTrigger("Jump");
+            }
+            else if (verticalVelocity < 0.0)
+            {
+                var landingProbeDistance =
+                    Mathf.Abs(verticalVelocity) * 0.1667 + 0.05;
+                landingProbeDistance = Mathf.Clamp(landingProbeDistance, 0.0, 3.0);
+                if (Physics.IsGroundedWithin(landingProbeDistance))
+                    Animator.ReleaseTrigger("Jump");
+            }
         }
 
         if (driveAnimator != 0)
@@ -616,9 +677,21 @@ class SilentHillController : MipsBehaviour
             Animator.SetBool("Running", running != 0);
             Animator.SetBool("Backward", forwardInput < 0.0);
             Animator.SetBool("Aiming", aiming != 0);
+            Animator.SetBool("Grounded", grounded != 0);
             Animator.SetFloat("Move", forwardInput);
             Animator.SetFloat("Turn", turnInput);
             Animator.SetFloat("Strafe", strafeInput);
+        }
+    }
+
+    void LateUpdate()
+    {
+        if (followCameraEnabled != 0)
+        {
+            var controllerYaw = transform.rotation.y - modelForwardYawOffset;
+            Camera.Follow(followCamera, controllerYaw + cameraYawOffset, cameraDistance,
+                          cameraHeight, cameraLookHeight, cameraFollowSharpness,
+                          cameraPitchOffset);
         }
     }
 }
@@ -930,9 +1003,12 @@ void Engine::Update() {
         // Scripts run before AnimationSystem so Animator.Set* applies same frame.
         m_MipsRuntime->Update(*m_Scene, dt);
         m_Scene->Update(dt);
-        m_MipsRuntime->LateUpdate(*m_Scene, dt);
         m_PhysicsWorld->Simulate(*m_Scene, dt);
         m_MipsRuntime->DispatchPhysicsEvents(*m_Scene);
+        // Camera and other follow behaviours must observe transforms written
+        // back by the current physics step, especially characters riding
+        // kinematic platforms.
+        m_MipsRuntime->LateUpdate(*m_Scene, dt);
     } else if (!playPaused) {
         m_Scene->Update(dt);
     }

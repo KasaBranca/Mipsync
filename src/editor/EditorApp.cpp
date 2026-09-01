@@ -7,7 +7,6 @@
 #endif
 #include "AssetBrowserPanel.h"
 #include "EditorAnimatorControllerInspector.h"
-#include "EditorAnimatorDebug.h"
 #include "EditorTheme.h"
 #include "EditorIcons.h"
 #include "EditorAssetIcons.h"
@@ -51,6 +50,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <sstream>
 #include <imgui.h>
@@ -71,6 +71,229 @@ namespace MipsyncEngine {
 namespace {
 
 EditorApp* s_EditorForWindowClose = nullptr;
+
+struct InspectorComponentCard {
+    ImVec2 min{};
+    float maxX = 0.0f;
+    float headerMaxY = 0.0f;
+    bool open = false;
+};
+
+std::vector<InspectorComponentCard> s_InspectorComponentCards;
+
+struct InspectorMultiEditState {
+    Component* primary = nullptr;
+    size_t primarySize = 0;
+    std::vector<Component*> peers;
+};
+
+InspectorMultiEditState s_InspectorMultiEdit;
+
+size_t InspectorComponentSize(const Component& component) {
+#define MIPSYNC_COMPONENT_SIZE(Type) \
+    if (dynamic_cast<const Type*>(&component)) return sizeof(Type)
+    MIPSYNC_COMPONENT_SIZE(TagComponent);
+    MIPSYNC_COMPONENT_SIZE(TransformComponent);
+    MIPSYNC_COMPONENT_SIZE(SkinnedMeshRendererComponent);
+    MIPSYNC_COMPONENT_SIZE(BoneComponent);
+    MIPSYNC_COMPONENT_SIZE(AnimatorComponent);
+    MIPSYNC_COMPONENT_SIZE(MeshRendererComponent);
+    MIPSYNC_COMPONENT_SIZE(MeshSubdividerComponent);
+    MIPSYNC_COMPONENT_SIZE(TerrainComponent);
+    MIPSYNC_COMPONENT_SIZE(ProModelerComponent);
+    MIPSYNC_COMPONENT_SIZE(CameraComponent);
+    MIPSYNC_COMPONENT_SIZE(DistanceCullComponent);
+    MIPSYNC_COMPONENT_SIZE(FrustumCullComponent);
+    MIPSYNC_COMPONENT_SIZE(MipsScriptComponent);
+    MIPSYNC_COMPONENT_SIZE(ColliderComponent);
+    MIPSYNC_COMPONENT_SIZE(RigidbodyComponent);
+    MIPSYNC_COMPONENT_SIZE(LightComponent);
+    MIPSYNC_COMPONENT_SIZE(PostProcessVolumeComponent);
+    MIPSYNC_COMPONENT_SIZE(AudioSourceComponent);
+    MIPSYNC_COMPONENT_SIZE(CanvasComponent);
+    MIPSYNC_COMPONENT_SIZE(RectTransformComponent);
+    MIPSYNC_COMPONENT_SIZE(UIImageComponent);
+    MIPSYNC_COMPONENT_SIZE(UITextComponent);
+    MIPSYNC_COMPONENT_SIZE(UIButtonGroupComponent);
+    MIPSYNC_COMPONENT_SIZE(UIButtonComponent);
+    MIPSYNC_COMPONENT_SIZE(UIAudioSpectrumComponent);
+#undef MIPSYNC_COMPONENT_SIZE
+    return sizeof(Component);
+}
+
+Component* FindMatchingInspectorComponent(Entity& entity, const Component& source,
+                                          size_t occurrence) {
+    size_t current = 0;
+    for (Component* component : entity.GetComponentsInOrder()) {
+        if (typeid(*component) != typeid(source))
+            continue;
+        if (current++ == occurrence)
+            return component;
+    }
+    return nullptr;
+}
+
+size_t InspectorComponentOccurrence(const Entity& entity, const Component& source) {
+    size_t occurrence = 0;
+    for (const Component* component : entity.GetComponentsInOrder()) {
+        if (component == &source)
+            break;
+        if (typeid(*component) == typeid(source))
+            ++occurrence;
+    }
+    return occurrence;
+}
+
+void BeginInspectorMultiEdit(Component& primary, std::vector<Component*> peers) {
+    s_InspectorMultiEdit.primary = &primary;
+    s_InspectorMultiEdit.primarySize = InspectorComponentSize(primary);
+    s_InspectorMultiEdit.peers = std::move(peers);
+}
+
+void EndInspectorMultiEdit() {
+    s_InspectorMultiEdit = {};
+}
+
+template <typename T>
+bool InspectorValuesMixed(const T* primary, size_t count = 1) {
+    if (!s_InspectorMultiEdit.primary || s_InspectorMultiEdit.peers.empty())
+        return false;
+    const auto base = reinterpret_cast<uintptr_t>(s_InspectorMultiEdit.primary);
+    const auto address = reinterpret_cast<uintptr_t>(primary);
+    const size_t bytes = sizeof(T) * count;
+    if (address < base || address - base > s_InspectorMultiEdit.primarySize ||
+        bytes > s_InspectorMultiEdit.primarySize - (address - base))
+        return false;
+    const size_t offset = address - base;
+    for (const Component* peer : s_InspectorMultiEdit.peers) {
+        const auto* peerValue = reinterpret_cast<const T*>(
+            reinterpret_cast<const unsigned char*>(peer) + offset);
+        if (std::memcmp(primary, peerValue, bytes) != 0)
+            return true;
+    }
+    return false;
+}
+
+template <typename T>
+void PropagateInspectorValues(const T* primary, size_t count = 1) {
+    if (!s_InspectorMultiEdit.primary || s_InspectorMultiEdit.peers.empty())
+        return;
+    const auto base = reinterpret_cast<uintptr_t>(s_InspectorMultiEdit.primary);
+    const auto address = reinterpret_cast<uintptr_t>(primary);
+    const size_t bytes = sizeof(T) * count;
+    if (address < base || address - base > s_InspectorMultiEdit.primarySize ||
+        bytes > s_InspectorMultiEdit.primarySize - (address - base))
+        return;
+    const size_t offset = address - base;
+    for (Component* peer : s_InspectorMultiEdit.peers) {
+        auto* peerValue = reinterpret_cast<T*>(reinterpret_cast<unsigned char*>(peer) + offset);
+        std::memcpy(peerValue, primary, bytes);
+    }
+}
+
+bool InspectorStringMixed(const std::string* primary) {
+    if (!s_InspectorMultiEdit.primary || s_InspectorMultiEdit.peers.empty())
+        return false;
+    const auto base = reinterpret_cast<uintptr_t>(s_InspectorMultiEdit.primary);
+    const auto address = reinterpret_cast<uintptr_t>(primary);
+    if (address < base || address - base > s_InspectorMultiEdit.primarySize ||
+        sizeof(std::string) > s_InspectorMultiEdit.primarySize - (address - base))
+        return false;
+    const size_t offset = address - base;
+    for (const Component* peer : s_InspectorMultiEdit.peers) {
+        const auto* peerValue = reinterpret_cast<const std::string*>(
+            reinterpret_cast<const unsigned char*>(peer) + offset);
+        if (*peerValue != *primary)
+            return true;
+    }
+    return false;
+}
+
+void PropagateInspectorString(const std::string* primary) {
+    if (!s_InspectorMultiEdit.primary || s_InspectorMultiEdit.peers.empty())
+        return;
+    const auto base = reinterpret_cast<uintptr_t>(s_InspectorMultiEdit.primary);
+    const auto address = reinterpret_cast<uintptr_t>(primary);
+    if (address < base || address - base > s_InspectorMultiEdit.primarySize ||
+        sizeof(std::string) > s_InspectorMultiEdit.primarySize - (address - base))
+        return;
+    const size_t offset = address - base;
+    for (Component* peer : s_InspectorMultiEdit.peers) {
+        auto* peerValue = reinterpret_cast<std::string*>(
+            reinterpret_cast<unsigned char*>(peer) + offset);
+        *peerValue = *primary;
+    }
+}
+
+void RemoveCurrentInspectorComponents(Entity& primaryEntity, Component* primaryComponent) {
+    const std::vector<Component*> peers = s_InspectorMultiEdit.peers;
+    EndInspectorMultiEdit();
+    for (Component* peer : peers) {
+        if (peer && peer->entity)
+            peer->entity->RemoveComponent(peer);
+    }
+    primaryEntity.RemoveComponent(primaryComponent);
+}
+
+void DrawStraightDockTabOverlines() {
+    ImGuiContext& context = *ImGui::GetCurrentContext();
+    const ImGuiStyle& style = context.Style;
+    const float thickness = 2.0f;
+    const ImU32 color = ImGui::GetColorU32(EditorTheme::Accent);
+
+    for (ImGuiWindow* window : context.Windows) {
+        ImGuiDockNode* node = window ? window->DockNode : nullptr;
+        if (!node || node->VisibleWindow != window || !node->TabBar || !node->HostWindow)
+            continue;
+
+        ImGuiTabBar* tabBar = node->TabBar;
+        ImGuiTabItem* tab = ImGui::TabBarFindTabByID(tabBar, tabBar->SelectedTabId);
+        if (!tab)
+            continue;
+
+        const float x1 = tabBar->BarRect.Min.x + tab->Offset;
+        const float x2 = x1 + tab->Width;
+        const float y1 = tabBar->BarRect.Min.y;
+        const float y2 = y1 + thickness;
+        const float radius = std::min({std::max(0.0f, style.TabRounding),
+                                       (x2 - x1) * 0.5f,
+                                       tabBar->BarRect.GetHeight()});
+        ImDrawList* drawList = node->HostWindow->DrawList;
+        drawList->PushClipRect(ImVec2(x1, tabBar->BarRect.Min.y),
+                               ImVec2(x2, tabBar->BarRect.Max.y), true);
+
+        // This is the geometric intersection of a full-width straight strip
+        // and the tab's rounded top edge: the ImGui equivalent of a child bar
+        // clipped by a rounded parent with CSS overflow:hidden. A fixed inset
+        // leaves the line visibly cut short and makes it look painted on top.
+        if (radius <= 0.0f) {
+            drawList->AddRectFilled(ImVec2(x1, y1), ImVec2(x2, y2), color);
+        } else {
+            constexpr int curveSteps = 4;
+            ImVec2 points[curveSteps * 2 + 4];
+            int pointCount = 0;
+            points[pointCount++] = ImVec2(x1 + radius, y1);
+            for (int step = 1; step <= curveSteps; ++step) {
+                const float y = y1 + thickness * (static_cast<float>(step) / curveSteps);
+                const float dy = std::min(radius, y - y1);
+                const float inset = radius - std::sqrt(std::max(
+                    0.0f, radius * radius - (radius - dy) * (radius - dy)));
+                points[pointCount++] = ImVec2(x1 + inset, y);
+            }
+            points[pointCount++] = ImVec2(x2 - (points[pointCount - 1].x - x1), y2);
+            for (int step = curveSteps - 1; step >= 1; --step) {
+                const float y = y1 + thickness * (static_cast<float>(step) / curveSteps);
+                const float dy = std::min(radius, y - y1);
+                const float inset = radius - std::sqrt(std::max(
+                    0.0f, radius * radius - (radius - dy) * (radius - dy)));
+                points[pointCount++] = ImVec2(x2 - inset, y);
+            }
+            points[pointCount++] = ImVec2(x2 - radius, y1);
+            drawList->AddConvexPolyFilled(points, pointCount, color);
+        }
+        drawList->PopClipRect();
+    }
+}
 
 bool IsUIButtonCallableMethod(const Mips::CompiledMethod& method) {
     if (!method.isPublic || method.parameterCount != 0 || method.returnType != "void")
@@ -149,6 +372,16 @@ void AddDefaultCollider(Entity& entity, const std::string& primitive, float mesh
     }
 }
 
+void AddProModelerMeshCollider(Entity& entity, const MeshRendererComponent& renderer) {
+    if (entity.HasComponent<ColliderComponent>())
+        return;
+    auto& collider = entity.AddComponent<ColliderComponent>();
+    collider.shape = ColliderShape::Mesh;
+    collider.convex = false;
+    if (renderer.mesh)
+        ColliderUtils::FitColliderToMesh(collider, *renderer.mesh);
+}
+
 Entity* FindButtonGroupAncestor(Scene& scene, Entity* entity) {
     Entity* walk = entity;
     while (walk) {
@@ -199,9 +432,17 @@ void DrawInspectorDivider() {
 }
 
 bool DrawComponentEnabledToggle(bool& enabled) {
+    const bool mixed = InspectorValuesMixed(&enabled);
+    if (mixed)
+        ImGui::PushItemFlag(ImGuiItemFlags_MixedValue, true);
     const bool pressed = EditorTheme::Checkbox("##enabled", &enabled);
+    if (mixed)
+        ImGui::PopItemFlag();
+    if (pressed)
+        PropagateInspectorValues(&enabled);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(enabled ? "Disable component" : "Enable component");
+        ImGui::SetTooltip(mixed ? "Mixed component state" :
+                          (enabled ? "Disable component" : "Enable component"));
     return pressed;
 }
 
@@ -526,20 +767,115 @@ Entity* SelectAdjacentShotCamera(Scene& scene, const glm::vec3& triggerCenter,
 
 /// Inspector header: enable checkbox, foldout, right-click remove.
 bool BeginInspectableComponent(const char* title, Component& comp, bool& removeRequested,
-                               EditorApp* editorForUndo) {
+                               EditorApp* editorForUndo,
+                               const std::function<void()>& drawComponentMenu = {}) {
     ImGui::PushID(&comp);
+
+    // Godot-style inspector section: one coherent StyleBox row contains the
+    // foldout, enabled state and context action. Keep the existing positions
+    // and height, but remove the visually disconnected collection of widgets.
+    const ImVec2 rawCursor = ImGui::GetCursorScreenPos();
+    ImGuiWindow* inspectorWindow = ImGui::GetCurrentWindow();
+    // CursorScreenPos can sit outside InnerClipRect after returning from the
+    // auto-sized component child. That made the nominal 5 px inset get
+    // clipped down to 1 px. Anchor cards to the window's actual visible work
+    // rectangle instead of trusting the inherited cursor X coordinate.
+    const float visibleMinX = std::max(inspectorWindow->WorkRect.Min.x,
+                                       inspectorWindow->InnerClipRect.Min.x + 1.0f);
+    const float visibleMaxX = std::min(inspectorWindow->WorkRect.Max.x,
+                                       inspectorWindow->InnerClipRect.Max.x - 1.0f);
+    const ImVec2 rowMin(visibleMinX, rawCursor.y);
+    const float rowHeight = ImGui::GetFrameHeight();
+    const ImVec2 rowMax(std::max(rowMin.x + 1.0f, visibleMaxX),
+                        rowMin.y + rowHeight);
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(rowMin, rowMax,
+                            ImGui::GetColorU32(EditorTheme::SurfaceContainerHigh),
+                            EditorTheme::ShapeCornerSmall);
+
+    constexpr float checkboxSidePadding = 5.0f;
+    ImGui::SetCursorScreenPos(ImVec2(rowMin.x + checkboxSidePadding, rowMin.y));
     DrawComponentEnabledToggle(comp.enabled);
-    ImGui::SameLine();
-    const bool open = ImGui::CollapsingHeader(title, ImGuiTreeNodeFlags_DefaultOpen);
+    const float checkboxMaxX = ImGui::GetItemRectMax().x;
+
+    constexpr float menuSide = 14.0f;
+    const ImVec2 menuMin(rowMax.x - checkboxSidePadding - menuSide,
+                         rowMin.y + (rowHeight - menuSide) * 0.5f);
+    const ImVec2 menuSize(menuSide, menuSide);
+
+    // Do not use CollapsingHeader here. It owns undocumented arrow padding,
+    // which made visually equal checkbox margins impossible. A fixed hit rect
+    // and a manually drawn arrow make the 5 px measurements exact.
+    const ImVec2 headerHitMin(checkboxMaxX + checkboxSidePadding, rowMin.y);
+    const ImVec2 headerHitMax(std::max(headerHitMin.x + 1.0f, menuMin.x - 2.0f),
+                              rowMax.y);
+    ImGuiStorage* headerStorage = ImGui::GetStateStorage();
+    const ImGuiID headerId = ImGui::GetID("##component_header");
+    bool open = headerStorage->GetBool(headerId, true);
+    ImGui::SetCursorScreenPos(headerHitMin);
+    if (ImGui::InvisibleButton("##component_header",
+                               ImVec2(headerHitMax.x - headerHitMin.x,
+                                      headerHitMax.y - headerHitMin.y))) {
+        open = !open;
+        headerStorage->SetBool(headerId, open);
+    }
+    const bool headerHovered = ImGui::IsItemHovered();
+    const bool headerHeld = ImGui::IsItemActive();
     const bool headerContext = ImGui::BeginPopupContextItem("##component_context");
-    ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 42.0f);
-    ImGui::TextDisabled("?");
-    if (ImGui::IsItemHovered())
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
         ImGui::SetTooltip("%s component", title);
-    ImGui::SameLine(0.0f, 8.0f);
-    if (ImGui::SmallButton("..."))
+
+    if (headerHovered || headerHeld) {
+        drawList->AddRectFilled(headerHitMin, headerHitMax,
+                                ImGui::GetColorU32(headerHeld ? EditorTheme::BtnDarkShadow
+                                                             : EditorTheme::SurfaceHover));
+    }
+
+    const float arrowLeft = checkboxMaxX + checkboxSidePadding;
+    const ImVec2 arrowCenter(arrowLeft + 4.0f, rowMin.y + rowHeight * 0.5f);
+    const ImU32 headerTextColor = ImGui::GetColorU32(EditorTheme::TextPrimary);
+    if (open) {
+        drawList->AddTriangleFilled(ImVec2(arrowCenter.x - 4.0f, arrowCenter.y - 2.0f),
+                                    ImVec2(arrowCenter.x + 4.0f, arrowCenter.y - 2.0f),
+                                    ImVec2(arrowCenter.x, arrowCenter.y + 3.0f),
+                                    headerTextColor);
+    } else {
+        drawList->AddTriangleFilled(ImVec2(arrowCenter.x - 2.0f, arrowCenter.y - 4.0f),
+                                    ImVec2(arrowCenter.x - 2.0f, arrowCenter.y + 4.0f),
+                                    ImVec2(arrowCenter.x + 3.0f, arrowCenter.y),
+                                    headerTextColor);
+    }
+    const ImVec2 titleSize = ImGui::CalcTextSize(title);
+    const ImVec2 titlePos(arrowLeft + 12.0f,
+                          rowMin.y + std::floor((rowHeight - titleSize.y) * 0.5f));
+    drawList->PushClipRect(titlePos, ImVec2(menuMin.x - 3.0f, rowMax.y), true);
+    drawList->AddText(titlePos, headerTextColor, title);
+    drawList->PopClipRect();
+
+    ImGui::SetCursorScreenPos(menuMin);
+    if (ImGui::InvisibleButton("##component_menu_button", menuSize))
         ImGui::OpenPopup("##component_menu");
+    const bool menuHovered = ImGui::IsItemHovered();
+    const bool menuHeld = ImGui::IsItemActive();
+    if (menuHovered || menuHeld) {
+        drawList->AddRectFilled(menuMin,
+                                ImVec2(menuMin.x + menuSize.x, menuMin.y + menuSize.y),
+                                ImGui::GetColorU32(menuHeld ? EditorTheme::BtnDarkShadow
+                                                           : EditorTheme::SurfaceHover),
+                                EditorTheme::ShapeCornerSmall);
+    }
+    const ImVec2 menuCenter(menuMin.x + menuSize.x * 0.5f,
+                            menuMin.y + menuSize.y * 0.5f);
+    const ImU32 dotColor = ImGui::GetColorU32(EditorTheme::TextSecondary);
+    for (int dot = -1; dot <= 1; ++dot)
+        drawList->AddCircleFilled(ImVec2(menuCenter.x + dot * 3.2f, menuCenter.y),
+                                  1.0f, dotColor, 8);
+
     if (headerContext || ImGui::BeginPopup("##component_menu")) {
+        if (drawComponentMenu) {
+            drawComponentMenu();
+            ImGui::Separator();
+        }
         if (ImGui::MenuItem("Remove Component")) {
             if (editorForUndo)
                 editorForUndo->RecordUndoSnapshot();
@@ -547,14 +883,61 @@ bool BeginInspectableComponent(const char* title, Component& comp, bool& removeR
         }
         ImGui::EndPopup();
     }
+    const ImVec2 afterHeaderCursor(rowMin.x,
+                                   rowMax.y + ImGui::GetStyle().ItemSpacing.y);
+    ImGui::SetCursorScreenPos(open ? ImVec2(rowMin.x, rowMax.y)
+                                   : afterHeaderCursor);
+    s_InspectorComponentCards.push_back(
+        InspectorComponentCard{rowMin, rowMax.x, rowMax.y, open});
     if (!comp.enabled)
         ImGui::BeginDisabled();
+    if (open) {
+        // Constrain every inspector field to the same inset as the header
+        // controls. Negative-width text/combo fields now resolve against this
+        // child work rect instead of extending to the parent window edge.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f, 8.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, EditorTheme::PanelFace);
+        ImGui::BeginChild("##component_body",
+                          ImVec2(rowMax.x - rowMin.x, 0.0f),
+                          ImGuiChildFlags_AutoResizeY |
+                              ImGuiChildFlags_AlwaysUseWindowPadding,
+                          ImGuiWindowFlags_NoScrollbar |
+                              ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar(2);
+        const ImGuiStyle& style = ImGui::GetStyle();
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                            ImVec2(style.ItemSpacing.x, 4.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                            ImVec2(style.FramePadding.x, 2.0f));
+    }
     return open;
 }
 
-void EndInspectableComponent(const Component& comp) {
+void EndInspectableComponent(const Component& comp, bool open) {
+    ImVec2 bodyMax{};
+    if (open) {
+        // AutoResizeY does not reserve trailing WindowPadding in every ImGui
+        // content pattern (notably after SameLine). Materialize it explicitly.
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+        ImGui::PopStyleVar(2);
+        ImGui::EndChild();
+        bodyMax = ImGui::GetItemRectMax();
+    }
     if (!comp.enabled)
         ImGui::EndDisabled();
+
+    if (!s_InspectorComponentCards.empty()) {
+        const InspectorComponentCard card = s_InspectorComponentCards.back();
+        s_InspectorComponentCards.pop_back();
+        const float maxY = open ? std::max(card.headerMaxY, bodyMax.y)
+                                : card.headerMaxY;
+        ImGui::GetWindowDrawList()->AddRect(
+            card.min, ImVec2(card.maxX, maxY),
+            ImGui::GetColorU32(EditorTheme::BorderLight),
+            EditorTheme::ShapeCornerSmall, 0, 1.0f);
+    }
     ImGui::PopID();
     DrawInspectorDivider();
 }
@@ -853,7 +1236,6 @@ void EditorApp::Init() {
     m_FallbackGameCamera.SetPosition({ 0.0f, 2.0f, 6.0f });
     m_FallbackGameCamera.LookAt({ 0.0f, 0.0f, 0.0f });
 
-    m_SceneViewPsxBaseline = m_Engine->GetRenderer().GetPS1Settings();
     if (!m_Engine->IsPlayerMode() && std::filesystem::exists(PathUtf8::FromString(m_SceneFilePath))) {
         LoadScene(false);
     }
@@ -921,62 +1303,656 @@ void AddUniqueEdge(std::vector<std::pair<uint32_t, uint32_t>>& edges,
         edges.push_back(edge);
 }
 
+template <typename DrawControl>
+bool DrawInspectorPropertyRow(const char* label, DrawControl&& drawControl) {
+    ImGui::PushID(label);
+    const float available = ImGui::GetContentRegionAvail().x;
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    const float labelWidth = std::clamp(std::floor(available * 0.36f), 78.0f, 122.0f);
+    const ImVec2 labelMin = ImGui::GetCursorScreenPos();
+    const float rowHeight = ImGui::GetFrameHeight();
+    ImGui::Dummy(ImVec2(std::max(1.0f, labelWidth - spacing), rowHeight));
+    ImGui::RenderTextClipped(labelMin,
+                             ImVec2(labelMin.x + labelWidth - spacing, labelMin.y + rowHeight),
+                             label, nullptr, nullptr, ImVec2(0.0f, 0.5f));
+    ImGui::SameLine(0.0f, spacing);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    const bool changed = drawControl();
+    ImGui::PopID();
+    return changed;
+}
+
+bool InspectorCheckbox(const char* label, bool* value, bool forceMixed = false) {
+    return DrawInspectorPropertyRow(label, [&] {
+        const bool mixed = forceMixed || InspectorValuesMixed(value);
+        if (mixed)
+            ImGui::PushItemFlag(ImGuiItemFlags_MixedValue, true);
+        const bool changed = EditorTheme::Checkbox("##value", value);
+        if (mixed)
+            ImGui::PopItemFlag();
+        if (changed)
+            PropagateInspectorValues(value);
+        return changed;
+    });
+}
+
+bool InspectorDragFloat(const char* label, float* value, float speed = 1.0f,
+                        float min = 0.0f, float max = 0.0f,
+                        const char* format = "%.3f", bool forceMixed = false) {
+    return DrawInspectorPropertyRow(label, [&] {
+        const bool mixed = forceMixed || InspectorValuesMixed(value);
+        const bool changed = ImGui::DragFloat("##value", value, speed, min, max,
+                                              mixed ? "-" : format);
+        if (changed)
+            PropagateInspectorValues(value);
+        return changed;
+    });
+}
+
+bool InspectorDragInt(const char* label, int* value, float speed = 1.0f,
+                      int min = 0, int max = 0, bool forceMixed = false) {
+    return DrawInspectorPropertyRow(label, [&] {
+        const bool mixed = forceMixed || InspectorValuesMixed(value);
+        const bool changed = ImGui::DragInt("##value", value, speed, min, max,
+                                            mixed ? "-" : "%d");
+        if (changed)
+            PropagateInspectorValues(value);
+        return changed;
+    });
+}
+
+bool InspectorSliderFloat(const char* label, float* value, float min, float max,
+                          const char* format = "%.3f") {
+    return DrawInspectorPropertyRow(label, [&] {
+        const bool mixed = InspectorValuesMixed(value);
+        const bool changed = ImGui::SliderFloat("##value", value, min, max,
+                                                mixed ? "-" : format);
+        if (changed)
+            PropagateInspectorValues(value);
+        return changed;
+    });
+}
+
+bool InspectorSliderInt(const char* label, int* value, int min, int max) {
+    return DrawInspectorPropertyRow(label, [&] {
+        const bool mixed = InspectorValuesMixed(value);
+        const bool changed = ImGui::SliderInt("##value", value, min, max,
+                                              mixed ? "-" : "%d");
+        if (changed)
+            PropagateInspectorValues(value);
+        return changed;
+    });
+}
+
+bool InspectorInputInt(const char* label, int* value) {
+    return DrawInspectorPropertyRow(label, [&] {
+        const bool mixed = InspectorValuesMixed(value);
+        if (mixed) {
+            int working = *value;
+            const bool changed = ImGui::DragInt("##value", &working, 1.0f, 0, 0, "-");
+            if (changed) {
+                *value = working;
+                PropagateInspectorValues(value);
+            }
+            return changed;
+        }
+        const bool changed = ImGui::InputInt("##value", value);
+        if (changed)
+            PropagateInspectorValues(value);
+        return changed;
+    });
+}
+
+bool InspectorInputText(const char* label, char* value, size_t size) {
+    return DrawInspectorPropertyRow(label, [&] {
+        return ImGui::InputText("##value", value, size);
+    });
+}
+
+bool InspectorCombo(const char* label, int* value, const char* const items[], int count,
+                    bool forceMixed = false) {
+    return DrawInspectorPropertyRow(label, [&] {
+        const bool mixed = forceMixed || InspectorValuesMixed(value);
+        const char* preview = mixed ? "-" :
+            ((*value >= 0 && *value < count) ? items[*value] : "");
+        bool changed = false;
+        if (ImGui::BeginCombo("##value", preview)) {
+            for (int index = 0; index < count; ++index) {
+                const bool selected = !mixed && *value == index;
+                if (ImGui::Selectable(items[index], selected)) {
+                    *value = index;
+                    PropagateInspectorValues(value);
+                    changed = true;
+                }
+                if (selected)
+                    ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        return changed;
+    });
+}
+
+void DrawColorEyedropperGlyph(ImDrawList* drawList, const ImVec2& center, ImU32 color) {
+    const ImVec2 tip(center.x - 3.5f, center.y + 3.5f);
+    const ImVec2 neck(center.x + 2.5f, center.y - 2.5f);
+    drawList->AddLine(tip, neck, color, 1.25f);
+    drawList->AddLine(ImVec2(tip.x - 1.0f, tip.y + 1.0f),
+                      ImVec2(tip.x + 1.2f, tip.y - 1.2f), color, 1.25f);
+    drawList->AddRect(ImVec2(center.x + 1.0f, center.y - 4.0f),
+                      ImVec2(center.x + 4.0f, center.y - 1.0f), color,
+                      0.7f, 0, 1.1f);
+}
+
+bool UnityColorField(const char* id, float* value, int components) {
+    const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+    const float height = ImGui::GetFrameHeight();
+    const ImVec4 color(value[0], value[1], value[2], components == 4 ? value[3] : 1.0f);
+    ImGuiColorEditFlags previewFlags =
+        ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop;
+    if (components == 4)
+        previewFlags |= ImGuiColorEditFlags_AlphaPreview;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 1.0f);
+    const bool openPicker = ImGui::ColorButton(id, color, previewFlags,
+                                               ImVec2(width, height));
+    ImGui::PopStyleVar();
+
+    const ImVec2 fieldMin = ImGui::GetItemRectMin();
+    const ImVec2 fieldMax = ImGui::GetItemRectMax();
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const float toolWidth = std::min(17.0f, width);
+    const ImVec2 toolMin(fieldMax.x - toolWidth, fieldMin.y);
+    drawList->AddRectFilled(toolMin, fieldMax,
+                            ImGui::GetColorU32(UiTokens::Rgba(0x2C2C2C, 0xC8)),
+                            1.0f, ImDrawFlags_RoundCornersRight);
+    drawList->AddLine(toolMin, ImVec2(toolMin.x, fieldMax.y),
+                      ImGui::GetColorU32(EditorTheme::BorderDark), 1.0f);
+    DrawColorEyedropperGlyph(
+        drawList,
+        ImVec2(toolMin.x + toolWidth * 0.5f, (fieldMin.y + fieldMax.y) * 0.5f),
+        ImGui::GetColorU32(EditorTheme::TextSecondary));
+    drawList->AddRect(fieldMin, fieldMax, ImGui::GetColorU32(EditorTheme::BorderLight),
+                      1.0f, 0, 1.0f);
+
+    if (openPicker)
+        ImGui::OpenPopup("##unity_color_picker");
+
+    bool changed = false;
+    if (ImGui::BeginPopup("##unity_color_picker")) {
+        float edited[4] = { value[0], value[1], value[2],
+                            components == 4 ? value[3] : 1.0f };
+        ImGuiColorEditFlags pickerFlags =
+            ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_DisplayRGB |
+            ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_DisplayHex;
+        if (components == 4)
+            pickerFlags |= ImGuiColorEditFlags_AlphaBar;
+        if (ImGui::ColorPicker4("##picker", edited, pickerFlags)) {
+            value[0] = edited[0];
+            value[1] = edited[1];
+            value[2] = edited[2];
+            if (components == 4)
+                value[3] = edited[3];
+            changed = true;
+        }
+        ImGui::EndPopup();
+    }
+    return changed;
+}
+
+bool InspectorColorEdit3(const char* label, float* value) {
+    return DrawInspectorPropertyRow(label, [&] {
+        const bool changed = UnityColorField("##value", value, 3);
+        if (changed)
+            PropagateInspectorValues(value, 3);
+        return changed;
+    });
+}
+
+bool InspectorColorEdit4(const char* label, float* value) {
+    return DrawInspectorPropertyRow(label, [&] {
+        const bool changed = UnityColorField("##value", value, 4);
+        if (changed)
+            PropagateInspectorValues(value, 4);
+        return changed;
+    });
+}
+
+bool InspectorDragFloatN(const char* label, float* values, int components,
+                         float speed = 1.0f, float min = 0.0f, float max = 0.0f,
+                         const char* format = "%.3f",
+                         const bool* forceMixedAxes = nullptr) {
+    return DrawInspectorPropertyRow(label, [&] {
+        static constexpr const char* axes[] = { "X", "Y", "Z", "W" };
+        const float spacing = ImGui::GetStyle().ItemSpacing.x;
+        constexpr float axisFieldGap = 2.0f;
+        const float axisWidth = ImGui::CalcTextSize("W").x + 2.0f;
+        const float available = ImGui::GetContentRegionAvail().x;
+        const float fieldWidth = std::max(24.0f,
+            (available - components * (axisWidth + axisFieldGap) -
+             (components - 1) * spacing) /
+                components);
+        bool changed = false;
+        for (int axis = 0; axis < components; ++axis) {
+            if (axis > 0)
+                ImGui::SameLine(0.0f, spacing);
+            const ImVec2 axisMin = ImGui::GetCursorScreenPos();
+            const float frameHeight = ImGui::GetFrameHeight();
+            const ImVec2 axisTextSize = ImGui::CalcTextSize(axes[axis]);
+            ImGui::Dummy(ImVec2(axisWidth, frameHeight));
+            ImGui::GetWindowDrawList()->AddText(
+                ImVec2(axisMin.x + std::floor((axisWidth - axisTextSize.x) * 0.5f),
+                       axisMin.y + std::floor((frameHeight - axisTextSize.y) * 0.5f)),
+                ImGui::GetColorU32(EditorTheme::TextMuted), axes[axis]);
+            ImGui::SameLine(0.0f, axisFieldGap);
+            ImGui::PushID(axis);
+            ImGui::SetNextItemWidth(fieldWidth);
+            const bool mixed = (forceMixedAxes && forceMixedAxes[axis]) ||
+                               InspectorValuesMixed(&values[axis]);
+            const bool axisChanged = ImGui::DragFloat("##axis", &values[axis], speed, min, max,
+                                                      mixed ? "-" : format);
+            if (axisChanged)
+                PropagateInspectorValues(&values[axis]);
+            changed |= axisChanged;
+            ImGui::PopID();
+        }
+        return changed;
+    });
+}
+
+bool InspectorDragFloat2(const char* label, float* values, float speed = 1.0f,
+                         float min = 0.0f, float max = 0.0f,
+                         const char* format = "%.3f",
+                         const bool* forceMixedAxes = nullptr) {
+    return InspectorDragFloatN(label, values, 2, speed, min, max, format,
+                               forceMixedAxes);
+}
+
+bool InspectorDragFloat3(const char* label, float* values, float speed = 1.0f,
+                         float min = 0.0f, float max = 0.0f,
+                         const char* format = "%.3f",
+                         const bool* forceMixedAxes = nullptr) {
+    return InspectorDragFloatN(label, values, 3, speed, min, max, format,
+                               forceMixedAxes);
+}
+
+std::shared_ptr<Texture> GetInspectorObjectReferenceIcon() {
+    static std::shared_ptr<Texture> icon;
+    static bool attempted = false;
+    if (attempted)
+        return icon;
+    attempted = true;
+
+    const std::filesystem::path path =
+        GetBundledResourcesDirectory() / "icons" / "project" / "object_reference.png";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec))
+        return nullptr;
+
+    TextureParams params;
+    params.nearestFilter = false;
+    params.maxSize = 0;
+    icon = std::make_shared<Texture>(PathUtf8::ToString(path), params);
+    if (icon->GetID() == 0)
+        icon.reset();
+    return icon;
+}
+
+bool DrawInspectorObjectReferenceButton(const char* display, float width = -1.0f) {
+    const bool pressed = ImGui::Button("##object_reference", ImVec2(width, 0.0f));
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    ImGui::RenderTextClipped(ImVec2(min.x + 5.0f, min.y),
+                             ImVec2(max.x - 20.0f, max.y),
+                             display, nullptr, nullptr, ImVec2(0.0f, 0.5f));
+
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImVec2 center(std::floor(max.x - 10.0f) + 0.5f,
+                        std::floor((min.y + max.y) * 0.5f) + 0.5f);
+    const ImU32 color = ImGui::GetColorU32(EditorTheme::TextSecondary);
+    if (const auto icon = GetInspectorObjectReferenceIcon(); icon && icon->GetID() != 0) {
+        constexpr float iconSize = 10.0f;
+        const ImVec2 iconMin(std::floor(center.x - iconSize * 0.5f),
+                             std::floor(center.y - iconSize * 0.5f));
+        const ImVec2 iconMax(iconMin.x + iconSize, iconMin.y + iconSize);
+        // The supplied PNG is 258x324 with the actual 237x237 mark at
+        // x=10..246, y=64..300. Keep the original file intact and crop only
+        // through UVs. Texture loads vertically flipped for OpenGL, hence V is
+        // reversed here.
+        constexpr ImVec2 uvTopLeft(10.0f / 258.0f, 1.0f - 64.0f / 324.0f);
+        constexpr ImVec2 uvBottomRight(247.0f / 258.0f, 1.0f - 301.0f / 324.0f);
+        drawList->AddImage(static_cast<ImTextureID>(static_cast<intptr_t>(icon->GetID())),
+                           iconMin, iconMax, uvTopLeft, uvBottomRight, color);
+    } else {
+        // Keep a functional fallback for incomplete development deployments.
+        drawList->AddCircle(center, 4.0f, color, 12, 1.0f);
+        drawList->AddLine(ImVec2(center.x - 3.0f, center.y),
+                          ImVec2(center.x + 3.0f, center.y), color, 1.0f);
+        drawList->AddLine(ImVec2(center.x, center.y - 3.0f),
+                          ImVec2(center.x, center.y + 3.0f), color, 1.0f);
+    }
+    return pressed;
+}
+
+struct InspectorAssetPickerState {
+    AssetKind kind = AssetKind::Other;
+    std::string root;
+    std::string selected;
+    std::vector<AssetEntry> entries;
+    char search[128]{};
+};
+
+InspectorAssetPickerState s_InspectorAssetPicker;
+char s_InspectorObjectSearch[128]{};
+uint32_t s_InspectorObjectCandidate = 0;
+
+const char* InspectorAssetKindLabel(AssetKind kind) {
+    switch (kind) {
+    case AssetKind::Scene: return "Scene";
+    case AssetKind::Script: return "Mips#";
+    case AssetKind::Texture: return "Texture";
+    case AssetKind::Material: return "Material";
+    case AssetKind::AnimatorController: return "Controller";
+    case AssetKind::Prefab: return "Prefab";
+    case AssetKind::Model: return "Model";
+    case AssetKind::AnimationClip: return "Clip";
+    case AssetKind::Audio: return "Audio";
+    default: return "Asset";
+    }
+}
+
+void RefreshInspectorAssetPicker(AssetKind kind, const std::string& selected) {
+    namespace fs = std::filesystem;
+    InspectorAssetPickerState& state = s_InspectorAssetPicker;
+    state.kind = kind;
+    state.root = AssetManager::Get().GetProjectRoot();
+    state.selected = selected;
+    state.entries.clear();
+    state.search[0] = '\0';
+
+    fs::path scanRoot = PathUtf8::FromString(state.root);
+    scanRoot /= kind == AssetKind::Scene ? "scenes" : "assets";
+    std::error_code ec;
+    if (!fs::exists(scanRoot, ec))
+        scanRoot = PathUtf8::FromString(state.root);
+
+    fs::recursive_directory_iterator it(
+        scanRoot, fs::directory_options::skip_permission_denied, ec);
+    const fs::recursive_directory_iterator end;
+    for (; !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec))
+            continue;
+        const std::string absolute = PathUtf8::ToString(it->path());
+        const std::string relative = AssetManager::Get().ToProjectRelative(absolute);
+        if (AssetBrowserPanel::ClassifyAssetByPath(relative) != kind)
+            continue;
+        AssetEntry entry;
+        entry.name = PathUtf8::ToString(it->path().filename());
+        entry.projectRelPath = relative;
+        entry.absolutePath = absolute;
+        entry.kind = kind;
+        state.entries.push_back(std::move(entry));
+    }
+    std::sort(state.entries.begin(), state.entries.end(),
+              [](const AssetEntry& a, const AssetEntry& b) {
+                  return a.name < b.name;
+              });
+}
+
+std::shared_ptr<Texture> GetInspectorAssetThumbnail(EditorApp* editor,
+                                                    const AssetEntry& entry) {
+    if (!editor || !editor->GetEngine())
+        return nullptr;
+    switch (entry.kind) {
+    case AssetKind::Texture:
+        return AssetManager::Get().GetTexture(entry.projectRelPath);
+    case AssetKind::Model:
+        return AssetThumbnail::Get().GetMeshThumbnail(
+            entry.projectRelPath, editor->GetEngine()->GetRenderer());
+    case AssetKind::Material:
+        return AssetThumbnail::Get().GetMaterialThumbnail(
+            entry.projectRelPath, editor->GetEngine()->GetRenderer());
+    case AssetKind::Audio:
+        return AssetThumbnail::Get().GetAudioThumbnail(entry.projectRelPath);
+    case AssetKind::Prefab:
+        return AssetThumbnail::Get().GetPrefabThumbnail(
+            entry.projectRelPath, editor->GetEngine()->GetRenderer());
+    default:
+        return nullptr;
+    }
+}
+
+void DrawInspectorThumbnailImage(ImDrawList* drawList, const Texture& texture,
+                                 const ImVec2& min, const ImVec2& max) {
+    // Use the same aspect-fit and OpenGL UV orientation as the Project window.
+    DrawTexturedImageAspectFit(drawList, texture, min, max);
+}
+
+void DrawInspectorAssetKindIcon(ImDrawList* drawList, const AssetEntry& entry,
+                                const ImVec2& min, const ImVec2& max) {
+    ImVec2 iconMin = min;
+    ImVec2 iconMax = max;
+    const bool compact =
+        entry.kind == AssetKind::AnimationClip ||
+        entry.kind == AssetKind::AnimatorController ||
+        entry.kind == AssetKind::Scene ||
+        entry.kind == AssetKind::Script;
+    if (compact) {
+        constexpr float kIconScale = 0.65f;
+        const float width = max.x - min.x;
+        const float height = max.y - min.y;
+        const float insetX = width * (1.0f - kIconScale) * 0.5f;
+        const float insetY = height * (1.0f - kIconScale) * 0.5f;
+        iconMin = ImVec2(min.x + insetX, min.y + insetY);
+        iconMax = ImVec2(max.x - insetX, max.y - insetY);
+    }
+
+    if (TryDrawProjectAssetIcon(drawList, entry.kind, iconMin, iconMax,
+                                entry.projectRelPath))
+        return;
+    if (entry.kind == AssetKind::Script) {
+        DrawScriptIcon(drawList, iconMin, iconMax);
+        return;
+    }
+    const char* label = InspectorAssetKindLabel(entry.kind);
+    ImGui::RenderTextClipped(min, max, label, nullptr, nullptr, ImVec2(0.5f, 0.5f));
+}
+
+bool DrawInspectorAssetPickerPopup(EditorApp* editor, std::string& selectedPath) {
+    bool changed = false;
+    const ImVec2 pickerSize(510.0f, 410.0f);
+    ImGui::SetNextWindowSize(pickerSize, ImGuiCond_Always);
+    ImGui::SetNextWindowSizeConstraints(pickerSize, pickerSize);
+    if (!ImGui::BeginPopup("##asset_picker", ImGuiWindowFlags_NoResize))
+        return false;
+
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##search", "Search assets...",
+                             s_InspectorAssetPicker.search,
+                             sizeof(s_InspectorAssetPicker.search));
+    ImGui::Separator();
+
+    std::string search = s_InspectorAssetPicker.search;
+    std::transform(search.begin(), search.end(), search.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    ImGui::BeginChild("##asset_grid", ImVec2(0.0f, 0.0f), false);
+    constexpr float cellWidth = 92.0f;
+    constexpr float cellHeight = 92.0f;
+    constexpr float thumbSize = 64.0f;
+    const int columns = std::max(1, static_cast<int>(
+        ImGui::GetContentRegionAvail().x / (cellWidth + ImGui::GetStyle().ItemSpacing.x)));
+    int column = 0;
+    for (const AssetEntry& entry : s_InspectorAssetPicker.entries) {
+        std::string lower = entry.name;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (!search.empty() && lower.find(search) == std::string::npos)
+            continue;
+
+        ImGui::PushID(entry.projectRelPath.c_str());
+        const ImVec2 cellMin = ImGui::GetCursorScreenPos();
+        const bool selected = s_InspectorAssetPicker.selected == entry.projectRelPath;
+        const bool activated = ImGui::Selectable(
+            "##asset", selected, ImGuiSelectableFlags_AllowDoubleClick,
+            ImVec2(cellWidth, cellHeight));
+        if (activated)
+            s_InspectorAssetPicker.selected = entry.projectRelPath;
+        if (activated && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            selectedPath = entry.projectRelPath;
+            changed = true;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        const ImVec2 thumbMin(cellMin.x + (cellWidth - thumbSize) * 0.5f,
+                              cellMin.y + 3.0f);
+        const ImVec2 thumbMax(thumbMin.x + thumbSize, thumbMin.y + thumbSize);
+        drawList->AddRectFilled(thumbMin, thumbMax,
+                                ImGui::GetColorU32(EditorTheme::SurfaceContainerHigh), 2.0f);
+        if (auto texture = GetInspectorAssetThumbnail(editor, entry);
+            texture && texture->GetID() != 0) {
+            DrawInspectorThumbnailImage(drawList, *texture, thumbMin, thumbMax);
+        } else if (entry.kind != AssetKind::Prefab) {
+            // Project intentionally leaves model-less prefab tiles empty; all
+            // other fallbacks use its exact bundled icon and compact scale.
+            DrawInspectorAssetKindIcon(drawList, entry, thumbMin, thumbMax);
+        }
+        ImGui::RenderTextClipped(ImVec2(cellMin.x + 2.0f, thumbMax.y + 3.0f),
+                                 ImVec2(cellMin.x + cellWidth - 2.0f,
+                                        cellMin.y + cellHeight),
+                                 entry.name.c_str(), nullptr, nullptr,
+                                 ImVec2(0.5f, 0.0f));
+        ImGui::PopID();
+        ++column;
+        if (column < columns)
+            ImGui::SameLine();
+        else
+            column = 0;
+    }
+    ImGui::EndChild();
+    ImGui::EndPopup();
+    return changed;
+}
+
+bool DrawInspectorSceneObjectPickerPopup(Scene& scene, const std::string& expectedType,
+                                         uint32_t& selectedId) {
+    bool changed = false;
+    const ImVec2 pickerSize(390.0f, 410.0f);
+    ImGui::SetNextWindowSize(pickerSize, ImGuiCond_Always);
+    ImGui::SetNextWindowSizeConstraints(pickerSize, pickerSize);
+    if (!ImGui::BeginPopup("##scene_object_picker", ImGuiWindowFlags_NoResize))
+        return false;
+
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##search", "Search scene objects...",
+                             s_InspectorObjectSearch, sizeof(s_InspectorObjectSearch));
+    ImGui::SeparatorText("Scene");
+    std::string search = s_InspectorObjectSearch;
+    std::transform(search.begin(), search.end(), search.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    ImGui::BeginChild("##object_list", ImVec2(0.0f, -34.0f), true);
+    auto drawObject = [&](uint32_t id, const std::string& name) {
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (!search.empty() && lower.find(search) == std::string::npos)
+            return;
+        ImGui::PushID(static_cast<int>(id));
+        const bool activated = ImGui::Selectable(
+            name.c_str(), s_InspectorObjectCandidate == id,
+            ImGuiSelectableFlags_AllowDoubleClick);
+        if (activated)
+            s_InspectorObjectCandidate = id;
+        if (activated && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            selectedId = id;
+            changed = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopID();
+    };
+
+    drawObject(0, "None");
+    for (const auto& entityPtr : scene.GetEntities()) {
+        Entity* entity = entityPtr.get();
+        if (!entity)
+            continue;
+        if (expectedType == "Camera" && !entity->HasComponent<CameraComponent>())
+            continue;
+        std::string name = "Entity #" + std::to_string(entity->GetID());
+        if (const auto* tag = entity->GetComponent<TagComponent>())
+            name = tag->tag;
+        drawObject(entity->GetID(), name);
+    }
+    ImGui::EndChild();
+    if (Entity* candidate = scene.FindEntity(s_InspectorObjectCandidate)) {
+        const auto* tag = candidate->GetComponent<TagComponent>();
+        ImGui::TextUnformatted(tag ? tag->tag.c_str() : "Scene Object");
+    } else {
+        ImGui::TextUnformatted("None");
+    }
+    ImGui::EndPopup();
+    return changed;
+}
+
 bool DrawAssetReferenceField(EditorApp* editor, const char* label, AssetKind expectedKind,
                              std::string& path, const char* emptyText) {
     bool changed = false;
-    ImGui::PushID(label);
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
-    ImGui::SameLine(112.0f);
-
-    const float clearWidth = ImGui::GetFrameHeight();
-    const float fieldWidth = std::max(70.0f, ImGui::GetContentRegionAvail().x - clearWidth - 4.0f);
-    std::string display = emptyText;
-    if (!path.empty()) {
+    const bool mixed = InspectorStringMixed(&path);
+    std::string display = mixed ? "-" : emptyText;
+    if (!mixed && !path.empty()) {
         display = PathUtf8::ToString(PathUtf8::FromString(path).filename());
         if (display.empty()) display = path;
     }
 
-    ImGui::PushStyleColor(ImGuiCol_Button, EditorTheme::InputBg);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, EditorTheme::BtnFaceLight);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, EditorTheme::BtnFace);
-    ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.04f, 0.5f));
-    if (ImGui::Button(display.c_str(), ImVec2(fieldWidth, 0.0f)) && !path.empty()) {
-        if (editor && editor->GetAssetBrowser()) {
-            editor->GetAssetBrowser()->RevealAndSelectAsset(path);
-            editor->FocusDockedWindow("Project");
-        }
-    }
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor(3);
+    DrawInspectorPropertyRow(label, [&] {
+        const float clearWidth = ImGui::GetFrameHeight();
+        const float fieldWidth = std::max(
+            48.0f, ImGui::GetContentRegionAvail().x - clearWidth - 4.0f);
+        ImGui::PushStyleColor(ImGuiCol_Button, EditorTheme::InputBg);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, EditorTheme::BtnFaceLight);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, EditorTheme::BtnFace);
+        const bool openPicker =
+            DrawInspectorObjectReferenceButton(display.c_str(), fieldWidth);
+        ImGui::PopStyleColor(3);
 
-    if (ImGui::BeginDragDropTarget()) {
-        const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetMove);
-        if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetScript);
-        if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetAnimatorController);
-        if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetModel);
-        if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetTexture);
-        if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetMaterial);
-        if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetAudio);
-        if (payload) {
-            const auto paths = PathsFromDragPayload(payload);
-            if (paths.size() == 1 &&
-                AssetBrowserPanel::ClassifyAssetByPath(paths.front()) == expectedKind) {
-                path = paths.front();
-                changed = true;
+        if (ImGui::BeginDragDropTarget()) {
+            const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetMove);
+            if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetScript);
+            if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetAnimatorController);
+            if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetModel);
+            if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetTexture);
+            if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetMaterial);
+            if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetAudio);
+            if (payload) {
+                const auto paths = PathsFromDragPayload(payload);
+                if (paths.size() == 1 &&
+                    AssetBrowserPanel::ClassifyAssetByPath(paths.front()) == expectedKind) {
+                    path = paths.front();
+                    changed = true;
+                }
             }
+            ImGui::EndDragDropTarget();
         }
-        ImGui::EndDragDropTarget();
-    }
 
-    ImGui::SameLine(0.0f, 4.0f);
-    ImGui::BeginDisabled(path.empty());
-    if (ImGui::Button("x", ImVec2(clearWidth, 0.0f))) {
-        path.clear();
-        changed = true;
-    }
-    ImGui::EndDisabled();
-    ImGui::PopID();
+        ImGui::SameLine(0.0f, 4.0f);
+        ImGui::BeginDisabled(path.empty() && !mixed);
+        if (ImGui::Button("x", ImVec2(clearWidth, 0.0f))) {
+            path.clear();
+            changed = true;
+        }
+        ImGui::EndDisabled();
+
+        if (openPicker && editor) {
+            RefreshInspectorAssetPicker(expectedKind, mixed ? std::string{} : path);
+            ImGui::OpenPopup("##asset_picker");
+        }
+        if (DrawInspectorAssetPickerPopup(editor, path))
+            changed = true;
+        return false;
+    });
+    if (changed)
+        PropagateInspectorString(&path);
     return changed;
 }
 
@@ -1036,8 +2012,10 @@ void EditorApp::BeginFrame() {
 
 void EditorApp::EndFrame() {
     ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2((float)m_Engine->GetWindow().GetWidth(), (float)m_Engine->GetWindow().GetHeight());
-
+    // ImGui_ImplGlfw_NewFrame has already populated DisplaySize in window
+    // coordinates and DisplayFramebufferScale in physical pixels.  Window::
+    // GetWidth/GetHeight are framebuffer dimensions; overwriting DisplaySize
+    // with them breaks the projection on scaled displays and blurs all chrome.
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
@@ -1127,6 +2105,8 @@ void EditorApp::OnImGuiRender() {
 
     EnsureAnimatorControllerDocked();
 
+    DrawStraightDockTabOverlines();
+
     ImGui::End();
 }
 
@@ -1175,27 +2155,25 @@ void EditorApp::SetupDockspace() {
 
         if (ImGui::BeginMenu("Build")) {
             if (ImGui::MenuItem("Build Settings...", "Ctrl+Shift+B")) OpenBuildSettings();
-            if (ImGui::MenuItem("Build PS1")) {
+            const bool canBuild = m_BuildSettings && !m_BuildSettings->IsBuildInProgress();
+            if (ImGui::MenuItem("Build PS1", nullptr, false, canBuild)) {
                 std::string msg;
                 const bool ok = m_BuildSettings->RunBuild(msg);
-                TriggerBuildToast(msg.empty() ? std::string{ok ? "Build complete." : "Build failed."}
-                                              : msg,
-                                  ok);
+                if (!ok)
+                    TriggerBuildToast(msg.empty() ? "Could not start build." : msg, false);
             }
-            if (ImGui::MenuItem("Build PS1 && Run in Emulator")) {
+            if (ImGui::MenuItem("Build PS1 && Run in Emulator", nullptr, false, canBuild)) {
                 std::string msg;
                 const bool ok = m_BuildSettings->RunBuildAndRun(msg);
-                TriggerBuildToast(msg.empty() ? std::string{ok ? "Launched emulator." : "Build/Run failed."}
-                                              : msg,
-                                  ok);
+                if (!ok)
+                    TriggerBuildToast(msg.empty() ? "Could not start build." : msg, false);
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Build PC Native")) {
+            if (ImGui::MenuItem("Build PC Native", nullptr, false, canBuild)) {
                 std::string msg;
                 const bool ok = m_BuildSettings->RunPcNativeBuild(msg);
-                TriggerBuildToast(msg.empty() ? std::string{ok ? "PC native build complete." : "PC native build failed."}
-                                              : msg,
-                                  ok);
+                if (!ok)
+                    TriggerBuildToast(msg.empty() ? "Could not start build." : msg, false);
             }
             ImGui::EndMenu();
         }
@@ -1580,18 +2558,6 @@ void EditorApp::RegisterSettingsHandler() {
         if (std::sscanf(line, "TreeExpanded=%511[^\r\n]", treePath) == 1)
             app->m_PendingAssetBrowserTreeExpanded.push_back(treePath);
 
-        int psxJit = 1, psxAff = 1, psx15b = 1, psxDith = 1, psxMesh = 1;
-        if (std::sscanf(line, "SceneViewPsxJit=%d", &psxJit) == 1)
-            app->m_SceneViewPsx.vertexJitter = (psxJit != 0);
-        if (std::sscanf(line, "SceneViewPsxAff=%d", &psxAff) == 1)
-            app->m_SceneViewPsx.affineMapping = (psxAff != 0);
-        if (std::sscanf(line, "SceneViewPsx15b=%d", &psx15b) == 1)
-            app->m_SceneViewPsx.colorDepthLimit = (psx15b != 0);
-        if (std::sscanf(line, "SceneViewPsxDith=%d", &psxDith) == 1)
-            app->m_SceneViewPsx.dithering = (psxDith != 0);
-        if (std::sscanf(line, "SceneViewPsxMesh=%d", &psxMesh) == 1)
-            app->m_SceneViewPsx.meshPreview = (psxMesh != 0);
-
         float px = 0, py = 0, pz = 0, dist = 0, yaw = 0, pitch = 0;
         if (std::sscanf(line, "SceneCamPivot=%f,%f,%f", &px, &py, &pz) == 3) {
             app->m_PendingSceneCamPivotPos = { px, py, pz };
@@ -1622,11 +2588,6 @@ void EditorApp::RegisterSettingsHandler() {
         }
 
         const glm::vec3 pivot = app->m_SceneCamera.GetPivot();
-        buf->appendf("SceneViewPsxJit=%d\n", app->m_SceneViewPsx.vertexJitter ? 1 : 0);
-        buf->appendf("SceneViewPsxAff=%d\n", app->m_SceneViewPsx.affineMapping ? 1 : 0);
-        buf->appendf("SceneViewPsx15b=%d\n", app->m_SceneViewPsx.colorDepthLimit ? 1 : 0);
-        buf->appendf("SceneViewPsxDith=%d\n", app->m_SceneViewPsx.dithering ? 1 : 0);
-        buf->appendf("SceneViewPsxMesh=%d\n", app->m_SceneViewPsx.meshPreview ? 1 : 0);
         buf->appendf("SceneCamPivot=%.6f,%.6f,%.6f\n", pivot.x, pivot.y, pivot.z);
         buf->appendf("SceneCamDistance=%.6f\n", app->m_SceneCamera.GetDistance());
         buf->appendf("SceneCamYaw=%.6f\n", app->m_SceneCamera.GetOrbitYaw());
@@ -1957,39 +2918,128 @@ void EditorApp::HandleEditorShortcuts() {
     if (m_IsPlaying)
         return;
 
+    ImGuiIO& io = ImGui::GetIO();
     const bool ctrl = Input::IsKeyPressed(GLFW_KEY_LEFT_CONTROL) ||
                       Input::IsKeyPressed(GLFW_KEY_RIGHT_CONTROL);
-    if (!ctrl || ImGui::GetIO().WantTextInput)
+    if (io.WantTextInput)
         return;
-
-    if (ImGui::IsKeyPressed(ImGuiKey_S, false))
-        SaveScene();
-    if (ImGui::IsKeyPressed(ImGuiKey_O, false))
-        LoadScene();
 
     const bool shift = Input::IsKeyPressed(GLFW_KEY_LEFT_SHIFT) ||
                        Input::IsKeyPressed(GLFW_KEY_RIGHT_SHIFT);
-    if (shift && ImGui::IsKeyPressed(ImGuiKey_B, false))
-        OpenBuildSettings();
-    if (shift && ImGui::IsKeyPressed(ImGuiKey_P, false) && m_BuildSettings) {
-        std::string msg;
-        const bool ok = m_BuildSettings->RunBuild(msg);
-        TriggerBuildToast(
-            msg.empty() ? std::string{ok ? "Build complete." : "Build failed."} : msg, ok);
+    if (ctrl) {
+        if (ImGui::IsKeyPressed(ImGuiKey_S, false))
+            SaveScene();
+        if (ImGui::IsKeyPressed(ImGuiKey_O, false))
+            LoadScene();
+
+        if (shift && ImGui::IsKeyPressed(ImGuiKey_B, false))
+            OpenBuildSettings();
+        if (shift && ImGui::IsKeyPressed(ImGuiKey_P, false) && m_BuildSettings) {
+            std::string msg;
+            const bool ok = m_BuildSettings->RunBuild(msg);
+            if (!ok)
+                TriggerBuildToast(msg.empty() ? "Could not start build." : msg, false);
+        }
+
+        std::string err;
+        if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+            if (m_UndoStack.Undo(m_Engine->GetScene(), err))
+                AfterSceneRestoredFromHistory();
+            else if (!err.empty())
+                MIPSYNC_WARN("Undo failed: {}", err);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) {
+            if (m_UndoStack.Redo(m_Engine->GetScene(), err))
+                AfterSceneRestoredFromHistory();
+            else if (!err.empty())
+                MIPSYNC_WARN("Redo failed: {}", err);
+        }
     }
 
-    std::string err;
-    if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
-        if (m_UndoStack.Undo(m_Engine->GetScene(), err))
-            AfterSceneRestoredFromHistory();
-        else if (!err.empty())
-            MIPSYNC_WARN("Undo failed: {}", err);
+    // Entity editing shortcuts belong to the selection, not to the panel that
+    // happened to create it. Scene View and Hierarchy now feed the same IDs
+    // into this one path, so no second click is required to make the
+    // Hierarchy window own keyboard focus.
+    Scene& scene = m_Engine->GetScene();
+    const bool hasEntitySelection =
+        m_SelectedEntityID != 0 || !m_SelectedEntityIDs.empty();
+    if (ctrl && hasEntitySelection && ImGui::IsKeyPressed(ImGuiKey_C, false))
+        m_HierarchyClipboardEntityIDs = GetSelectedHierarchyRootIDs(m_SelectedEntityID);
+
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_V, false) &&
+        !m_HierarchyClipboardEntityIDs.empty()) {
+        std::vector<uint32_t> pastedIds;
+        RecordUndoSnapshot();
+        for (uint32_t sourceId : m_HierarchyClipboardEntityIDs) {
+            Entity* source = scene.FindEntity(sourceId);
+            if (!source)
+                continue;
+            Entity* duplicate = scene.DuplicateEntity(*source);
+            if (!duplicate)
+                continue;
+            scene.SetParent(duplicate, scene.FindEntity(source->GetParentID()));
+            pastedIds.push_back(duplicate->GetID());
+        }
+        if (!pastedIds.empty()) {
+            m_SelectedEntityIDs.clear();
+            m_SelectedEntityIDs.insert(pastedIds.begin(), pastedIds.end());
+            m_SelectedEntityID = pastedIds.back();
+            m_HierarchySelectionAnchor = m_SelectedEntityID;
+            m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
+            m_SceneDirty = true;
+        }
     }
-    if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) {
-        if (m_UndoStack.Redo(m_Engine->GetScene(), err))
-            AfterSceneRestoredFromHistory();
-        else if (!err.empty())
-            MIPSYNC_WARN("Redo failed: {}", err);
+
+    if (!hasEntitySelection)
+        return;
+
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
+        const auto sourceIds = GetSelectedHierarchyRootIDs(m_SelectedEntityID);
+        std::vector<uint32_t> duplicateIds;
+        RecordUndoSnapshot();
+        for (uint32_t sourceId : sourceIds) {
+            if (Entity* source = scene.FindEntity(sourceId)) {
+                if (Entity* duplicate = scene.DuplicateEntity(*source))
+                    duplicateIds.push_back(duplicate->GetID());
+            }
+        }
+        if (!duplicateIds.empty()) {
+            m_SelectedEntityIDs.clear();
+            m_SelectedEntityIDs.insert(duplicateIds.begin(), duplicateIds.end());
+            m_SelectedEntityID = duplicateIds.back();
+            m_HierarchySelectionAnchor = m_SelectedEntityID;
+            m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
+            m_SceneDirty = true;
+        }
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
+        if (m_ProModelerEditMode == 3 &&
+            !m_ProModelerSelectedFaceTriangles.empty() &&
+            DeleteSelectedProModelerFaces()) {
+            return;
+        }
+        const auto deleteIds = GetSelectedHierarchyRootIDs(m_SelectedEntityID);
+        RecordUndoSnapshot();
+        for (uint32_t id : deleteIds) {
+            if (Entity* target = scene.FindEntity(id))
+                scene.DestroyEntity(target);
+        }
+        ClearEntitySelection();
+        ClearProModelerSelection();
+        m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
+        m_SceneDirty = true;
+        return;
+    }
+
+    if (!ctrl) {
+        if (ImGui::IsKeyPressed(ImGuiKey_W, false)) m_GizmoOperation = ImGuizmo::TRANSLATE;
+        if (ImGui::IsKeyPressed(ImGuiKey_E, false)) m_GizmoOperation = ImGuizmo::ROTATE;
+        if (ImGui::IsKeyPressed(ImGuiKey_R, false)) m_GizmoOperation = ImGuizmo::SCALE;
+        if (ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+            if (Entity* selected = GetSelectedEntity())
+                FrameEntityInSceneView(*selected);
+        }
     }
 }
 
@@ -2086,6 +3136,8 @@ static std::filesystem::path EditorSettingsPath() {
     return GetEngineSettingsDirectory() / "editor_settings.json";
 }
 
+static constexpr int kFontSizeDefaultVersion = 1;
+
 void EditorApp::LoadEditorSettings() {
     using json = nlohmann::json;
     std::ifstream f(EditorSettingsPath());
@@ -2097,6 +3149,13 @@ void EditorApp::LoadEditorSettings() {
         json j = json::parse(f);
         m_FontSize = j.value("fontSize", EditorTheme::GetDefaultFontSizeForDisplay());
         m_FontSize = std::clamp(m_FontSize, 8.0f, 32.0f);
+        // 12px was the old untouched default. Move only that legacy value to
+        // the new 13px baseline once; explicit larger/smaller choices survive.
+        const int defaultVersion = j.value("fontSizeDefaultVersion", 0);
+        if (defaultVersion < kFontSizeDefaultVersion && m_FontSize == 12.0f) {
+            m_FontSize = 13.0f;
+            SaveEditorSettings();
+        }
     } catch (...) {
         m_FontSize = EditorTheme::GetDefaultFontSizeForDisplay();
     }
@@ -2106,6 +3165,7 @@ void EditorApp::SaveEditorSettings() {
     using json = nlohmann::json;
     json j;
     j["fontSize"] = m_FontSize;
+    j["fontSizeDefaultVersion"] = kFontSizeDefaultVersion;
     std::ofstream f(EditorSettingsPath());
     if (f.is_open())
         f << j.dump(2);
@@ -2318,8 +3378,26 @@ void EditorApp::RenderSceneToFramebuffer(Framebuffer& fbo, const Camera& camera,
     PS1Settings& psx = m_Engine->GetRenderer().GetPS1Settings();
     const PS1Settings savedPsx = psx;
     ApplyPostProcessVolumeSettings(psx);
+    // The editor is an authoring and inspection surface, not a PS1 rasterizer
+    // emulator. Keep both Scene View and Game View perspective-correct and
+    // full-color so texture seams, topology and skinning defects stay visible.
+    psx.vertexJitter = 0.0f;
+    psx.affineMapping = false;
+    psx.colorDepthLimit = false;
+    psx.ditheringEnabled = false;
 
-    const bool usePs1PreviewMeshes = sceneView3D ? m_SceneViewPsx.meshPreview : true;
+    if (sceneView3D) {
+        // Avoid the short PS1 fog range swallowing the editor scene while the
+        // orbit camera is pulled back. Game View keeps the authored fog.
+        const float sceneFar = m_SceneCamera.GetCamera().farClip;
+        if (psx.fogEnabled && sceneFar > psx.fogEnd)
+            psx.fogEnd = sceneFar * 0.9f;
+    }
+
+    // Scene View and Game View must expose identical export-time topology.
+    // Keeping this unconditional also ignores legacy SceneViewPsxMesh=0
+    // layout entries that could silently restore the high-poly source mesh.
+    constexpr bool usePs1PreviewMeshes = true;
     const Texture* prerenderBackground =
         sceneView3D ? nullptr : ResolvePrerenderedBackgroundTexture(activeCameraEntityId);
     scene.Render(m_Engine->GetRenderer(), camera, &fbo, highlightEntityId,
@@ -2452,15 +3530,42 @@ bool EditorApp::IsEntitySelected(uint32_t entityId) const {
                              m_SelectedEntityIDs.count(entityId) != 0);
 }
 
+glm::vec3 EditorApp::GetSceneViewSpawnPosition() const {
+    const Camera& camera = m_SceneCamera.GetCamera();
+    // Follow the Scene View zoom level while keeping a newly created unit
+    // object large enough to see and far enough not to intersect the camera.
+    const float distance = std::clamp(m_SceneCamera.GetDistance(), 2.0f, 10.0f);
+    return camera.GetPosition() + camera.GetForward() * distance;
+}
+
+void EditorApp::PlaceNewSceneEntity(Entity& entity, Entity* parentForNew) {
+    Scene& scene = m_Engine->GetScene();
+    if (parentForNew)
+        scene.SetParent(&entity, parentForNew);
+    // Set after parenting: TransformComponent stores a local position.
+    scene.SetWorldPosition(entity, GetSceneViewSpawnPosition());
+}
+
 void EditorApp::SelectSingleEntity(uint32_t entityId) {
     m_SelectedEntityID = entityId;
     m_SelectedEntityIDs.clear();
     if (entityId != 0)
         m_SelectedEntityIDs.insert(entityId);
     m_HierarchySelectionAnchor = entityId;
+    QueueHierarchyReveal(entityId);
     if (m_AssetBrowser)
         m_AssetBrowser->ClearAssetSelection();
     SyncAnimatorWindowToSelectedEntity();
+}
+
+void EditorApp::QueueHierarchyReveal(uint32_t entityId) {
+    Scene& scene = m_Engine->GetScene();
+    Entity* current = scene.FindEntity(entityId);
+    while (current && current->GetParentID() != 0) {
+        const uint32_t parentId = current->GetParentID();
+        m_PendingHierarchyExpansionIDs.insert(parentId);
+        current = scene.FindEntity(parentId);
+    }
 }
 
 void EditorApp::CommandRevealEntity(uint32_t entityId, bool frameInSceneView) {
@@ -2548,6 +3653,7 @@ void EditorApp::HandleHierarchySelection(uint32_t entityId) {
     } else {
         SelectSingleEntity(entityId);
     }
+    QueueHierarchyReveal(m_SelectedEntityID);
     if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
     SyncAnimatorWindowToSelectedEntity();
 }
@@ -2581,6 +3687,55 @@ std::vector<uint32_t> EditorApp::GetSelectedHierarchyRootIDs(uint32_t fallbackId
         return ia < ib;
     });
     return roots;
+}
+
+void EditorApp::CreateEmptyParentForSelection() {
+    Scene& scene = m_Engine->GetScene();
+    const std::vector<uint32_t> roots =
+        GetSelectedHierarchyRootIDs(m_SelectedEntityID);
+    if (roots.empty())
+        return;
+
+    std::vector<Entity*> children;
+    children.reserve(roots.size());
+    glm::vec3 worldCenter(0.0f);
+    for (uint32_t id : roots) {
+        Entity* child = scene.FindEntity(id);
+        if (!child)
+            continue;
+        children.push_back(child);
+        worldCenter += scene.GetWorldPosition(*child);
+    }
+    if (children.empty())
+        return;
+    worldCenter /= static_cast<float>(children.size());
+
+    uint32_t commonParentId = children.front()->GetParentID();
+    for (Entity* child : children) {
+        if (child->GetParentID() != commonParentId) {
+            commonParentId = 0;
+            break;
+        }
+    }
+    Entity* commonParent = scene.FindEntity(commonParentId);
+    Entity* firstChild = children.front();
+
+    RecordUndoSnapshot();
+    Entity* emptyParent = scene.CreateEntity("Empty Parent");
+    if (commonParent)
+        scene.SetParent(emptyParent, commonParent);
+    scene.SetWorldPosition(*emptyParent, worldCenter);
+
+    // Keep the group where the first selected root used to appear instead of
+    // appending it at the bottom of the hierarchy.
+    scene.ReorderEntity(emptyParent, commonParent, firstChild, false, true);
+
+    for (Entity* child : children)
+        scene.SetParent(child, emptyParent, true);
+
+    SelectSingleEntity(emptyParent->GetID());
+    m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
+    m_SceneDirty = true;
 }
 
 namespace {
@@ -2678,23 +3833,6 @@ void EditorApp::HandleSceneViewControls(bool viewportHovered) {
     if (scroll != 0.0f)
         m_SceneCamera.ProcessZoom(scroll);
 
-    // Hotkeys for gizmo mode (Unity-style, not while flying in edit mode)
-    const bool blockGizmoHotkeys =
-        Input::IsMouseButtonPressed(GLFW_MOUSE_BUTTON_RIGHT) && !m_IsPlaying;
-    if (m_SceneViewFocused && !ImGui::GetIO().WantTextInput && !blockGizmoHotkeys) {
-        if (Input::IsKeyPressed(GLFW_KEY_W)) m_GizmoOperation = ImGuizmo::TRANSLATE;
-        if (Input::IsKeyPressed(GLFW_KEY_E)) m_GizmoOperation = ImGuizmo::ROTATE;
-        if (Input::IsKeyPressed(GLFW_KEY_R)) m_GizmoOperation = ImGuizmo::SCALE;
-
-        if (Input::IsKeyPressed(GLFW_KEY_F)) {
-            if (Entity* selected = GetSelectedEntity()) {
-                if (auto* transform = selected->GetComponent<TransformComponent>())
-                    m_SceneCamera.FocusOn(transform->position, m_SceneCamera.GetDistance());
-            } else {
-                m_SceneCamera.FocusOn({ 0.0f, 0.0f, 0.0f });
-            }
-        }
-    }
 }
 
 bool EditorApp::DrawProModelerSubobjectGizmo(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& camera) {
@@ -2723,7 +3861,16 @@ bool EditorApp::DrawProModelerSubobjectGizmo(const ImVec2& imageMin, const ImVec
     Scene& scene = m_Engine->GetScene();
     const glm::mat4 entityWorld = scene.GetWorldMatrix(*selected);
     const glm::vec3 worldCenter = glm::vec3(entityWorld * glm::vec4(localCenter, 1.0f));
-    const glm::mat4 centerMatrix = glm::translate(glm::mat4(1.0f), worldCenter);
+    glm::mat4 centerMatrix = entityWorld;
+    for (int column = 0; column < 3; ++column) {
+        glm::vec3 axis(centerMatrix[column]);
+        const float axisLength = glm::length(axis);
+        centerMatrix[column] = glm::vec4(
+            axisLength > 1e-6f ? axis / axisLength
+                               : glm::vec3(column == 0, column == 1, column == 2),
+            0.0f);
+    }
+    centerMatrix[3] = glm::vec4(worldCenter, 1.0f);
 
     static glm::mat4 activeSubGizmoMatrix(1.0f);
     static uint32_t activeSubGizmoEntity = 0;
@@ -2740,10 +3887,11 @@ bool EditorApp::DrawProModelerSubobjectGizmo(const ImVec2& imageMin, const ImVec
         glm::value_ptr(view),
         glm::value_ptr(proj),
         m_GizmoOperation,
-        m_GizmoOperation == ImGuizmo::SCALE ? ImGuizmo::LOCAL : ImGuizmo::WORLD,
+        m_GizmoMode,
         matrix);
     const bool gizmoUsing = ImGuizmo::IsUsing();
     const bool gizmoStarted = gizmoUsing && !wasSubGizmoUsing && !gizmoUsingBefore;
+    const bool gizmoEnded = !gizmoUsing && wasSubGizmoUsing;
     if (gizmoStarted) {
         activeSubGizmoMatrix = inputGizmoMatrix;
         activeSubGizmoEntity = selected->GetID();
@@ -2815,6 +3963,12 @@ bool EditorApp::DrawProModelerSubobjectGizmo(const ImVec2& imageMin, const ImVec
             m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
             m_SceneDirty = true;
         }
+    }
+
+    if (gizmoEnded && RecenterProModelerPivot(*selected, *pb)) {
+        pb->RebuildMesh(*meshRenderer);
+        m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
+        m_SceneDirty = true;
     }
 
     wasSubGizmoUsing = gizmoUsing;
@@ -2904,6 +4058,71 @@ void EditorApp::ClearProModelerSelection() {
     m_ProModelerSelectedFaceTriangles.clear();
     m_ProModelerSelectionIsExtrudedCap = false;
     m_ProModelerSelectionEntityID = 0;
+}
+
+bool EditorApp::RecenterProModelerPivot(Entity& entity,
+                                        ProModelerComponent& proModeler) {
+    if (proModeler.vertices.empty())
+        return false;
+    auto* transform = entity.GetComponent<TransformComponent>();
+    if (!transform)
+        return false;
+
+    glm::vec3 boundsMin = proModeler.vertices.front().position;
+    glm::vec3 boundsMax = boundsMin;
+    for (const ProModelerVertex& vertex : proModeler.vertices) {
+        boundsMin = glm::min(boundsMin, vertex.position);
+        boundsMax = glm::max(boundsMax, vertex.position);
+    }
+    const glm::vec3 localCenter = (boundsMin + boundsMax) * 0.5f;
+    const float epsilon = std::max(1e-5f, glm::length(boundsMax - boundsMin) * 1e-6f);
+    if (glm::length(localCenter) <= epsilon)
+        return false;
+
+    // Move the Transform to the geometric center, then offset all local data
+    // by the inverse amount. The rendered geometry remains exactly where it
+    // was while the entity origin becomes useful again.
+    const glm::mat4 localLinear =
+        TransformComponent::RotationMatrixFromEuler(transform->rotation) *
+        glm::scale(glm::mat4(1.0f), transform->scale);
+    transform->position += glm::vec3(localLinear * glm::vec4(localCenter, 0.0f));
+    for (ProModelerVertex& vertex : proModeler.vertices)
+        vertex.position -= localCenter;
+
+    if (auto* collider = entity.GetComponent<ColliderComponent>())
+        collider->center -= localCenter;
+
+    // Re-centering a parent's pivot must not drag its existing children away
+    // from the geometry they were attached to.
+    Scene& scene = m_Engine->GetScene();
+    for (const auto& childPtr : scene.GetEntities()) {
+        if (!childPtr || childPtr->GetParentID() != entity.GetID())
+            continue;
+        if (auto* childTransform = childPtr->GetComponent<TransformComponent>())
+            childTransform->position -= localCenter;
+    }
+    return true;
+}
+
+bool EditorApp::DeleteSelectedProModelerFaces() {
+    Entity* selected = GetSelectedEntity();
+    if (!selected || selected->GetID() != m_ProModelerSelectionEntityID)
+        return false;
+    auto* proModeler = selected->GetComponent<ProModelerComponent>();
+    auto* meshRenderer = selected->GetComponent<MeshRendererComponent>();
+    if (!proModeler || !meshRenderer || m_ProModelerSelectedFaceTriangles.empty())
+        return false;
+
+    RecordUndoSnapshot();
+    if (!proModeler->DeleteFaces(m_ProModelerSelectedFaceTriangles))
+        return false;
+
+    RecenterProModelerPivot(*selected, *proModeler);
+    proModeler->RebuildMesh(*meshRenderer);
+    ClearProModelerSelection();
+    m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+    m_SceneDirty = true;
+    return true;
 }
 
 bool EditorApp::HandleProModelerSubobjectPick(const ImVec2& imageMin, const ImVec2& imageSize, bool viewportHovered) {
@@ -3161,6 +4380,16 @@ void EditorApp::DrawProModelerWindow() {
         return;
     }
 
+    // Repair existing off-center ProModeler pivots as soon as the object is
+    // selected in object mode. Sub-object edits recenter when committed.
+    if (m_ProModelerSelectedVertices.empty() &&
+        RecenterProModelerPivot(*selectedEntity, *proModelerComp)) {
+        if (auto* meshRenderer = selectedEntity->GetComponent<MeshRendererComponent>())
+            proModelerComp->RebuildMesh(*meshRenderer);
+        m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+        m_SceneDirty = true;
+    }
+
     ImGui::SetNextWindowSize(ImVec2(360.0f, 0.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(24.0f, 118.0f), ImGuiCond_FirstUseEver);
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_AlwaysAutoResize |
@@ -3229,14 +4458,15 @@ void EditorApp::DrawProModelerWindow() {
     }
 
     ImGui::SeparatorText("Shape Preset");
-    const char* shapeNames[] = { "Box", "Plane", "Ramp", "Stairs", "Custom" };
+    const char* shapeNames[] = { "Box", "Plane", "Ramp", "Stairs", "Custom", "Cylinder" };
     int shape = static_cast<int>(proModelerComp->shape);
     if (ImGui::Combo("Preset##combo", &shape, shapeNames, IM_ARRAYSIZE(shapeNames))) {
         RecordUndoSnapshot();
-        proModelerComp->shape = static_cast<ProModelerComponent::Shape>(std::clamp(shape, 0, 4));
+        proModelerComp->shape = static_cast<ProModelerComponent::Shape>(std::clamp(shape, 0, 5));
         if      (proModelerComp->shape == ProModelerComponent::Shape::Plane)  proModelerComp->ResetPlane();
         else if (proModelerComp->shape == ProModelerComponent::Shape::Ramp)   proModelerComp->ResetRamp();
         else if (proModelerComp->shape == ProModelerComponent::Shape::Stairs) proModelerComp->ResetStairs();
+        else if (proModelerComp->shape == ProModelerComponent::Shape::Cylinder) proModelerComp->ResetCylinder();
         else if (proModelerComp->shape == ProModelerComponent::Shape::Box)    proModelerComp->ResetBox();
         rebuild = true;
     }
@@ -3248,19 +4478,34 @@ void EditorApp::DrawProModelerWindow() {
         if (ImGui::SliderInt("Steps", &proModelerComp->steps, 1, 32)) changed = true;
         if (ImGui::IsItemActivated()) RecordUndoSnapshot();
     }
+    if (proModelerComp->shape == ProModelerComponent::Shape::Cylinder) {
+        if (ImGui::SliderInt("Sides", &proModelerComp->sides, 3, 64)) changed = true;
+        if (ImGui::IsItemActivated()) RecordUndoSnapshot();
+    }
 
     // Shape preset icon buttons
-    const char* shapeTooltips[] = { "Box", "Plane", "Ramp", "Stairs" };
-    for (int i = 0; i < 4; ++i) {
+    const char* shapeTooltips[] = { "Box", "Plane", "Ramp", "Stairs", "Cylinder" };
+    const ProModelerComponent::Shape shapeButtons[] = {
+        ProModelerComponent::Shape::Box,
+        ProModelerComponent::Shape::Plane,
+        ProModelerComponent::Shape::Ramp,
+        ProModelerComponent::Shape::Stairs,
+        ProModelerComponent::Shape::Cylinder,
+    };
+    int activeShapeButton = -1;
+    for (int i = 0; i < IM_ARRAYSIZE(shapeButtons); ++i)
+        if (proModelerComp->shape == shapeButtons[i]) activeShapeButton = i;
+    for (int i = 0; i < IM_ARRAYSIZE(shapeButtons); ++i) {
         if (i > 0) ImGui::SameLine();
         char id[32]; std::snprintf(id, sizeof(id), "##shape_%d", i);
-        if (drawIconButton(id, i, static_cast<int>(proModelerComp->shape), 1, shapeTooltips[i])) {
+        if (drawIconButton(id, i, activeShapeButton, 1, shapeTooltips[i])) {
             RecordUndoSnapshot();
-            proModelerComp->shape = static_cast<ProModelerComponent::Shape>(i);
+            proModelerComp->shape = shapeButtons[i];
             if      (i == 0) proModelerComp->ResetBox();
             else if (i == 1) proModelerComp->ResetPlane();
             else if (i == 2) proModelerComp->ResetRamp();
             else if (i == 3) proModelerComp->ResetStairs();
+            else if (i == 4) proModelerComp->ResetCylinder();
             rebuild = true;
         }
     }
@@ -3303,6 +4548,11 @@ void EditorApp::DrawProModelerWindow() {
         proModelerComp->FlipFaces(m_ProModelerSelectedFaceTriangles);
         rebuild = true;
     }
+    if (ImGui::Button("Delete Selected Faces", ImVec2(-1.0f, 0.0f))) {
+        DeleteSelectedProModelerFaces();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Delete selected polygon faces (Delete)");
     ImGui::EndDisabled();
 
     const char* extrudeTooltips[] = { "Extrude Up (+Y)", "Extrude Right (+X)", "Extrude Forward (+Z)" };
@@ -3319,7 +4569,26 @@ void EditorApp::DrawProModelerWindow() {
     }
 
     ImGui::SeparatorText("Edge Tools");
-    ImGui::TextDisabled("Select two opposite edges with Ctrl/Shift-click.");
+    ImGui::DragFloat("Bevel Amount", &proModelerComp->bevelAmount,
+                     0.01f, 0.001f, 64.0f, "%.3f");
+    ImGui::TextDisabled("Select one edge for a simple one-segment bevel.");
+    ImGui::BeginDisabled(m_ProModelerSelectedEdges.size() != 1);
+    if (ImGui::Button("Bevel Selected Edge", ImVec2(-1.0f, 0.0f))) {
+        RecordUndoSnapshot();
+        std::vector<std::pair<uint32_t, uint32_t>> beveledEdges;
+        if (proModelerComp->BevelEdge(m_ProModelerSelectedEdges.front(),
+                                      proModelerComp->bevelAmount,
+                                      m_ProModelerSelectedVertices,
+                                      beveledEdges)) {
+            m_ProModelerSelectedEdges = std::move(beveledEdges);
+            m_ProModelerSelectedFaceTriangles.clear();
+            m_ProModelerSelectionIsExtrudedCap = false;
+            rebuild = true;
+        }
+    }
+    ImGui::EndDisabled();
+
+    ImGui::TextDisabled("Select two opposite edges with Ctrl/Shift-click for a loop.");
     ImGui::BeginDisabled(m_ProModelerSelectedEdges.size() < 2);
     if (ImGui::Button("Connect Edges / Add Loop", ImVec2(-1.0f, 0.0f))) {
         RecordUndoSnapshot();
@@ -3344,6 +4613,7 @@ void EditorApp::DrawProModelerWindow() {
         if      (proModelerComp->shape == ProModelerComponent::Shape::Plane)  proModelerComp->ResetPlane();
         else if (proModelerComp->shape == ProModelerComponent::Shape::Ramp)   proModelerComp->ResetRamp();
         else if (proModelerComp->shape == ProModelerComponent::Shape::Stairs) proModelerComp->ResetStairs();
+        else if (proModelerComp->shape == ProModelerComponent::Shape::Cylinder) proModelerComp->ResetCylinder();
         else                                                                   proModelerComp->ResetBox();
         rebuild = true;
     }
@@ -3353,6 +4623,7 @@ void EditorApp::DrawProModelerWindow() {
         if (!mr)
             mr = &selectedEntity->AddComponent<MeshRendererComponent>();
         proModelerComp->steps = std::clamp(proModelerComp->steps, 1, 32);
+        RecenterProModelerPivot(*selectedEntity, *proModelerComp);
         proModelerComp->RebuildMesh(*mr);
         if (!mr->texture)
             mr->texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
@@ -3368,9 +4639,19 @@ void EditorApp::DrawProModelerWindow() {
 
 void EditorApp::DrawSceneViewPanel() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{ 0, 0 });
-    ImGui::Begin("Scene View");
+    if (!ImGui::Begin("Scene View")) {
+        // A docked tab that is not selected still receives Begin/End calls.
+        // Match Godot CanvasItem visibility culling and avoid rendering its
+        // framebuffer, gizmos and picking pass until it becomes visible.
+        m_SceneViewHovered = false;
+        m_SceneViewFocused = false;
+        ImGui::End();
+        ImGui::PopStyleVar();
+        return;
+    }
 
-    m_SceneViewFocused = ImGui::IsWindowFocused();
+    m_SceneViewFocused =
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 
     DrawGizmoToolbar();
 
@@ -3380,13 +4661,9 @@ void EditorApp::DrawSceneViewPanel() {
         m_SceneCamera.SetViewportAspect(m_LastSceneViewAspect);
         m_Engine->GetRenderer().SetRenderMode(m_SceneRenderMode);
 
-        PS1Settings& psx = m_Engine->GetRenderer().GetPS1Settings();
-        const PS1Settings savedPsx = psx;
-        ApplySceneViewPsxOverrides(psx);
         RenderSceneToFramebuffer(m_SceneViewFBO, m_SceneCamera.GetCamera(), viewportPanelSize,
                                  m_SelectedEntityID, 0, true, m_GameViewSettings.renderWidth,
                                  m_GameViewSettings.renderHeight);
-        psx = savedPsx;
 
         uint32_t textureID = m_SceneViewFBO.GetColorAttachment();
 
@@ -3406,6 +4683,7 @@ void EditorApp::DrawSceneViewPanel() {
 
         DrawGizmoControls(imageMin, imageSize, m_SceneCamera.GetCamera());
         DrawColliderGizmos(imageMin, imageSize, m_SceneCamera.GetCamera());
+        DrawMeshSubdivisionPreview(imageMin, imageSize, m_SceneCamera.GetCamera());
         DrawLightGizmos(imageMin, imageSize, m_SceneCamera.GetCamera());
         DrawCameraFrustumGizmo(imageMin, imageSize, m_SceneCamera.GetCamera());
         DrawProModelerOverlay(imageMin, imageSize, m_SceneCamera.GetCamera());
@@ -3425,6 +4703,14 @@ void EditorApp::DrawSceneViewPanel() {
             !proModelerConsumed &&
             !Input::IsKeyPressed(GLFW_KEY_LEFT_ALT) && !Input::IsKeyPressed(GLFW_KEY_RIGHT_ALT)) {
 
+            // The framebuffer image is drawn directly and is not an ImGui
+            // item, so clicking it did not reliably transfer keyboard focus
+            // away from the Hierarchy dock. Make the Scene View authoritative
+            // immediately so W/E/R, F, Delete and Ctrl+D work on the entity
+            // selected by this same click.
+            ImGui::FocusWindow(ImGui::GetCurrentWindow());
+            m_SceneViewFocused = true;
+
             bool gizmoBlocks = m_SelectedEntityID != 0 && (ImGuizmo::IsOver() || ImGuizmo::IsUsing());
 
             if (!gizmoBlocks) {
@@ -3435,10 +4721,20 @@ void EditorApp::DrawSceneViewPanel() {
                     imageMin.x, imageMin.y,
                     imageSize.x, imageSize.y,
                     m_GameViewSettings.renderWidth,
-                    m_GameViewSettings.renderHeight);
-                if ((picked ? picked->GetID() : 0) != m_SelectedEntityID)
+                    m_GameViewSettings.renderHeight,
+                    m_SelectedEntityID);
+                const uint32_t pickedId = picked ? picked->GetID() : 0;
+                const bool ctrlSelect = io.KeyCtrl;
+                if (pickedId != m_SelectedEntityID)
                     ClearProModelerSelection();
-                SelectSingleEntity(picked ? picked->GetID() : 0);
+                if (ctrlSelect && pickedId != 0) {
+                    /* Scene View uses the same selection model as Hierarchy:
+                     * Ctrl-click adds/removes an entity and makes newly added
+                     * entities the active member of the selection. */
+                    HandleHierarchySelection(pickedId);
+                } else if (!ctrlSelect) {
+                    SelectSingleEntity(pickedId);
+                }
             }
         }
 
@@ -3470,49 +4766,8 @@ void EditorApp::DrawSceneViewPanel() {
 }
 
 void EditorApp::DrawGameViewToolbar() {
-    Scene& scene = m_Engine->GetScene();
-    const int presetCount = GetGameViewResolutionPresetCount();
-    const int customIndex = presetCount - 1;
-
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4, 3));
-    ImGui::SetNextItemWidth(180.0f);
-    if (ImGui::BeginCombo("##GameViewResolution", GetGameViewResolutionPresetLabel(m_GameViewSettings.resolutionPreset))) {
-        for (int i = 0; i < presetCount; ++i) {
-            const bool selected = m_GameViewSettings.resolutionPreset == i;
-            if (ImGui::Selectable(GetGameViewResolutionPresetLabel(i), selected)) {
-                ApplyGameViewResolutionPreset(m_GameViewSettings, i);
-                SyncSceneCanvasesToGameView(scene, m_GameViewSettings);
-            }
-        }
-        ImGui::EndCombo();
-    }
-
-    ImGui::SameLine();
-    if (m_GameViewSettings.resolutionPreset == customIndex) {
-        int w = m_GameViewSettings.renderWidth;
-        int h = m_GameViewSettings.renderHeight;
-        ImGui::SetNextItemWidth(72.0f);
-        if (ImGui::InputInt("W##GameView", &w, 0, 0)) {
-            m_GameViewSettings.renderWidth = std::max(w, 1);
-            SyncSceneCanvasesToGameView(scene, m_GameViewSettings);
-        }
-        ImGui::SameLine();
-        ImGui::TextUnformatted("x");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(72.0f);
-        if (ImGui::InputInt("H##GameView", &h, 0, 0)) {
-            m_GameViewSettings.renderHeight = std::max(h, 1);
-            SyncSceneCanvasesToGameView(scene, m_GameViewSettings);
-        }
-    } else {
-        ImGui::Text("%d x %d", m_GameViewSettings.renderWidth, m_GameViewSettings.renderHeight);
-    }
-
-    ImGui::SameLine();
-    if (EditorTheme::Checkbox("Sync Canvas Resolution", &m_GameViewSettings.syncCanvasReferenceResolution)) {
-        SyncSceneCanvasesToGameView(scene, m_GameViewSettings);
-    }
-    ImGui::PopStyleVar();
+    // Keep the visual toolbar row while the PS1 Game View remains fixed to 4:3.
+    ImGui::Dummy(ImVec2(0.0f, ImGui::GetFrameHeight()));
 }
 
 void EditorApp::DrawPlayerModeUI() {
@@ -3587,7 +4842,13 @@ void EditorApp::DrawPlayerModeUI() {
 
 void EditorApp::DrawGameViewPanel() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{ 4, 4 });
-    ImGui::Begin("Game View");
+    if (!ImGui::Begin("Game View")) {
+        m_GameViewHovered = false;
+        m_Engine->GetUIRenderer().SetPointerState(false, 0.0f, 0.0f, false, false, false);
+        ImGui::End();
+        ImGui::PopStyleVar();
+        return;
+    }
 
     DrawGameViewToolbar();
 
@@ -3595,8 +4856,7 @@ void EditorApp::DrawGameViewPanel() {
     ImVec2 viewportPanelSize = ImGui::GetContentRegionAvail();
     if (viewportPanelSize.x > 0.0f && viewportPanelSize.y > 0.0f) {
         Scene& scene = m_Engine->GetScene();
-        if (m_GameViewSettings.syncCanvasReferenceResolution)
-            SyncSceneCanvasesToGameView(scene, m_GameViewSettings);
+        SyncSceneCanvasesToGameView(scene, m_GameViewSettings);
 
         Entity* cameraEntity = ResolveActiveShotCameraEntity(m_IsPlaying || m_Engine->IsPlayerMode());
         Camera activeCamera = m_FallbackGameCamera;
@@ -3680,10 +4940,17 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
     Scene& scene = m_Engine->GetScene();
 
     auto selectNew = [&](Entity* e) {
-        if (parentForNew) scene.SetParent(e, parentForNew);
-        m_SelectedEntityID = e->GetID();
-        if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+        if (!e)
+            return;
+        PlaceNewSceneEntity(*e, parentForNew);
+        SelectSingleEntity(e->GetID());
     };
+
+    if (!GetSelectedHierarchyRootIDs(m_SelectedEntityID).empty()) {
+        if (ImGui::MenuItem("Create Empty Parent"))
+            CreateEmptyParentForSelection();
+        ImGui::Separator();
+    }
 
     if (ImGui::MenuItem("Create Empty Entity")) {
         RecordUndoSnapshot();
@@ -3738,13 +5005,16 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
                 if (shape == ProModelerComponent::Shape::Plane) pb.ResetPlane();
                 else if (shape == ProModelerComponent::Shape::Ramp) pb.ResetRamp();
                 else if (shape == ProModelerComponent::Shape::Stairs) pb.ResetStairs();
+                else if (shape == ProModelerComponent::Shape::Cylinder) pb.ResetCylinder();
                 else pb.ResetBox();
                 pb.RebuildMesh(mr);
+                AddProModelerMeshCollider(*entity, mr);
                 mr.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
                 selectNew(entity);
             };
             if (ImGui::MenuItem("Cube")) createProModeler("ProModeler Cube", ProModelerComponent::Shape::Box);
             if (ImGui::MenuItem("Plane")) createProModeler("ProModeler Plane", ProModelerComponent::Shape::Plane);
+            if (ImGui::MenuItem("Cylinder")) createProModeler("ProModeler Cylinder", ProModelerComponent::Shape::Cylinder);
             if (ImGui::MenuItem("Ramp")) createProModeler("ProModeler Ramp", ProModelerComponent::Shape::Ramp);
             if (ImGui::MenuItem("Stairs")) createProModeler("ProModeler Stairs", ProModelerComponent::Shape::Stairs);
             ImGui::EndMenu();
@@ -3755,8 +5025,7 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
     if (ImGui::MenuItem("Camera")) {
         RecordUndoSnapshot();
         if (Entity* cam = CreateCamera(parentForNew)) {
-            m_SelectedEntityID = cam->GetID();
-            if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+            SelectSingleEntity(cam->GetID());
         }
     }
 
@@ -3768,7 +5037,7 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
     }
 
     if (ImGui::BeginMenu("Light")) {
-        const glm::vec3 defaultPos{ 0.0f, 3.0f, 0.0f };
+        const glm::vec3 defaultPos = GetSceneViewSpawnPosition();
         if (ImGui::MenuItem("Point Light")) {
             RecordUndoSnapshot();
             if (Entity* light = CreatePointLight(parentForNew, defaultPos))
@@ -3805,8 +5074,7 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
         if (ImGui::MenuItem("Canvas")) {
             RecordUndoSnapshot();
             if (Entity* canvas = CreateUICanvas(parentForNew)) {
-                m_SelectedEntityID = canvas->GetID();
-                if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+                SelectSingleEntity(canvas->GetID());
             }
         }
 
@@ -3825,15 +5093,13 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
         if (ImGui::MenuItem("Image", nullptr, false, canvasParent != nullptr)) {
             RecordUndoSnapshot();
             if (Entity* img = CreateUIImage(canvasParent)) {
-                m_SelectedEntityID = img->GetID();
-                if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+                SelectSingleEntity(img->GetID());
             }
         }
         if (ImGui::MenuItem("Text", nullptr, false, canvasParent != nullptr)) {
             RecordUndoSnapshot();
             if (Entity* txt = CreateUIText(canvasParent)) {
-                m_SelectedEntityID = txt->GetID();
-                if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+                SelectSingleEntity(txt->GetID());
             }
         }
         if (ImGui::MenuItem("Button Group")) {
@@ -3842,22 +5108,19 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
             if (!parent)
                 parent = CreateUICanvas(parentForNew);
             if (Entity* group = CreateUIButtonGroup(parent)) {
-                m_SelectedEntityID = group->GetID();
-                if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+                SelectSingleEntity(group->GetID());
             }
         }
         if (ImGui::MenuItem("Button")) {
             RecordUndoSnapshot();
             if (Entity* button = CreateUIButton(parentForNew)) {
-                m_SelectedEntityID = button->GetID();
-                if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+                SelectSingleEntity(button->GetID());
             }
         }
         if (ImGui::MenuItem("Audio Spectrum", nullptr, false, canvasParent != nullptr)) {
             RecordUndoSnapshot();
             if (Entity* spectrum = CreateUIAudioSpectrum(canvasParent)) {
-                m_SelectedEntityID = spectrum->GetID();
-                if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+                SelectSingleEntity(spectrum->GetID());
             }
         }
         ImGui::EndMenu();
@@ -3866,8 +5129,7 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
     if (ImGui::MenuItem("First Person Controller")) {
         RecordUndoSnapshot();
         if (Entity* fps = CreateFirstPersonController(parentForNew)) {
-            m_SelectedEntityID = fps->GetID();
-            if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+            SelectSingleEntity(fps->GetID());
         }
     }
 }
@@ -3925,16 +5187,17 @@ Entity* EditorApp::CreateCamera(Entity* parentForNew) {
         }
     }
     cameraComp.primary = !hasPrimary;
-    cameraComp.camera.SetPosition({ 0.0f, 2.0f, 6.0f });
-    cameraComp.camera.LookAt({ 0.0f, 0.0f, 0.0f });
+    const Camera& sceneCamera = m_SceneCamera.GetCamera();
+    const glm::vec3 spawnPosition = GetSceneViewSpawnPosition();
+    cameraComp.camera.SetPosition(spawnPosition);
+    cameraComp.camera.LookAt(spawnPosition + sceneCamera.GetForward());
     if (auto* tr = cam->GetComponent<TransformComponent>())
         cameraComp.camera.SyncTransformFromCamera(*tr);
 
     if (cameraComp.primary)
         scene.SetPrimaryCamera(*cam);
 
-    if (parentForNew)
-        scene.SetParent(cam, parentForNew);
+    PlaceNewSceneEntity(*cam, parentForNew);
 
     m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
     return cam;
@@ -4124,67 +5387,18 @@ void EditorApp::DrawUIButtonGroupCursorSlot(UIButtonGroupComponent& group) {
 }
 
 void EditorApp::DrawUITextureSlot(UIImageComponent& image) {
-    auto assignTexture = [&](const std::string& projectRelPath) {
-        if (projectRelPath.empty() ||
-            AssetBrowserPanel::ClassifyAssetByPath(projectRelPath) != AssetKind::Texture)
-            return;
+    if (DrawAssetReferenceField(this, "Texture", AssetKind::Texture,
+                                image.texturePath, "None (Texture)")) {
         RecordUndoSnapshot();
-        image.texturePath = projectRelPath;
-        image.texture = AssetManager::Get().GetTexture(image.texturePath);
-        image.preserveAspect = true;
-        FitRectTransformToTextureAspect(image.entity, image.texture.get());
+        image.texture = image.texturePath.empty()
+            ? nullptr
+            : AssetManager::Get().GetTexture(image.texturePath);
+        if (image.texture) {
+            image.preserveAspect = true;
+            FitRectTransformToTextureAspect(image.entity, image.texture.get());
+        }
         m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
         m_SceneDirty = true;
-    };
-
-    ImGui::Text("Texture:");
-    ImGui::SameLine();
-    const ImVec2 slotSize(220.0f, 32.0f);
-    const std::string label = image.texturePath.empty() ? "<drop texture here>" : image.texturePath;
-
-    ImGui::PushStyleColor(ImGuiCol_Button, EditorTheme::InputBg);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, EditorTheme::BtnFace);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, EditorTheme::BtnFaceLight);
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          image.texturePath.empty() ? EditorTheme::TextMuted : EditorTheme::TextPrimary);
-    ImGui::Button(label.c_str(), slotSize);
-    ImGui::PopStyleColor(4);
-
-    if (ImGui::BeginDragDropTarget()) {
-        const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetMove);
-        if (!payload)
-            payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetTexture);
-        if (payload) {
-            const std::vector<std::string> paths = PathsFromDragPayload(payload);
-            if (paths.size() == 1)
-                assignTexture(paths[0]);
-        }
-        ImGui::EndDragDropTarget();
-    }
-
-    if (!image.texture && !image.texturePath.empty())
-        image.texture = AssetManager::Get().GetTexture(image.texturePath);
-    if (image.texture) {
-        const float preview = 72.0f;
-        ImGui::Image((ImTextureID)(intptr_t)image.texture->GetID(), ImVec2(preview, preview));
-        ImGui::SameLine();
-        ImGui::BeginGroup();
-        ImGui::TextDisabled("%dx%d", image.texture->GetWidth(), image.texture->GetHeight());
-        ImGui::TextWrapped("%s", image.texturePath.c_str());
-        ImGui::EndGroup();
-    }
-
-    if (m_AssetBrowser && m_AssetBrowser->GetSelectedAssetCount() == 1 &&
-        m_AssetBrowser->GetSelectedAssetKind() == AssetKind::Texture) {
-        if (ImGui::Button("Assign Selected Texture", ImVec2(-1, 0)))
-            assignTexture(m_AssetBrowser->GetSelectedAssetPath());
-    }
-
-    if (ImGui::Button("Clear Texture", ImVec2(-1, 0))) {
-        RecordUndoSnapshot();
-        image.texturePath.clear();
-        image.texture.reset();
-        m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
     }
 }
 
@@ -4208,10 +5422,7 @@ Entity* EditorApp::CreateFirstPersonController(Entity* parentForNew) {
     Scene& scene = m_Engine->GetScene();
 
     Entity* fps = scene.CreateEntity("First Person Controller");
-    if (auto* tr = fps->GetComponent<TransformComponent>())
-        // Eye-height pivot. Capsule extends 1.7m below the pivot, so y=0.2 puts the
-        // feet flush with the default floor at y=-1.5 (top surface).
-        tr->position = { 0.0f, 0.2f, 0.0f };
+    PlaceNewSceneEntity(*fps, parentForNew);
 
     fps->AddComponent<CameraComponent>();
     scene.SetPrimaryCamera(*fps);
@@ -4219,8 +5430,6 @@ Entity* EditorApp::CreateFirstPersonController(Entity* parentForNew) {
     auto& script = fps->AddComponent<MipsScriptComponent>();
     script.scriptPath = "assets/scripts/FirstPersonController.mips";
     ColliderUtils::EnsureFirstPersonPhysics(*fps);
-
-    if (parentForNew) scene.SetParent(fps, parentForNew);
 
     m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
     return fps;
@@ -4234,13 +5443,40 @@ void EditorApp::DrawHierarchyEntityNode(Entity& entity) {
 
     const bool hasChildren = !entity.GetChildIDs().empty();
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
-    if (!hasChildren) flags |= ImGuiTreeNodeFlags_Leaf;
+    if (!hasChildren) {
+        flags |= ImGuiTreeNodeFlags_Leaf;
+        // Match the Project tree: a leaf has no branch to communicate, so do
+        // not draw ImGui's short terminal connector in the otherwise empty
+        // foldout gutter.
+        flags |= ImGuiTreeNodeFlags_DrawLinesNone;
+    }
     if (IsEntitySelected(entity.GetID())) flags |= ImGuiTreeNodeFlags_Selected;
+
+    if (hasChildren && m_PendingHierarchyExpansionIDs.count(entity.GetID()) != 0)
+        ImGui::SetNextItemOpen(true, ImGuiCond_Always);
 
     bool opened = ImGui::TreeNodeEx((void*)(uint64_t)entity.GetID(), flags, "%s", name.c_str());
 
-    if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen())
-        m_PendingHierarchyClickEntityID = entity.GetID();
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen()) {
+        const ImGuiIO& io = ImGui::GetIO();
+        const uint32_t clickedId = entity.GetID();
+        if (!IsEntitySelected(clickedId) || io.KeyCtrl || io.KeyShift) {
+            /* Make a newly clicked row authoritative on mouse-down.  Waiting
+             * for release left the row visually selected while gizmos and
+             * other consumers still used the previous primary selection. */
+            m_PendingHierarchyClickEntityID = 0;
+            HandleHierarchySelection(clickedId);
+        } else {
+            /* Preserve an existing multi-selection while a drag may start,
+             * but immediately make this blue row the primary/active entity. */
+            m_SelectedEntityID = clickedId;
+            m_SelectedEntityIDs.insert(clickedId);
+            if (m_AssetBrowser)
+                m_AssetBrowser->ClearAssetSelection();
+            SyncAnimatorWindowToSelectedEntity();
+            m_PendingHierarchyClickEntityID = clickedId;
+        }
+    }
 
     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
         m_PendingHierarchyClickEntityID = 0;
@@ -4322,7 +5558,7 @@ void EditorApp::DrawHierarchyEntityNode(Entity& entity) {
             if (dup) {
                 Entity* parent = scene.FindEntity(entity.GetParentID());
                 scene.SetParent(dup, parent);
-                m_SelectedEntityID = dup->GetID();
+                SelectSingleEntity(dup->GetID());
                 m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
             }
         }
@@ -4398,6 +5634,7 @@ void EditorApp::DrawHierarchyPanel() {
         if (entityPtr->GetParentID() == 0)
             DrawHierarchyEntityNode(*entityPtr);
     }
+    m_PendingHierarchyExpansionIDs.clear();
 
     // Empty area: left-click deselect, right-click create menu, drag here to unparent.
     {
@@ -4437,48 +5674,6 @@ void EditorApp::DrawHierarchyPanel() {
 
     AcceptPrefabDrop();
 
-    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-        !ImGui::GetIO().WantTextInput) {
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C) &&
-            (!m_SelectedEntityIDs.empty() || m_SelectedEntityID != 0)) {
-            m_HierarchyClipboardEntityIDs = GetSelectedHierarchyRootIDs(m_SelectedEntityID);
-        }
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V) &&
-            !m_HierarchyClipboardEntityIDs.empty()) {
-            std::vector<uint32_t> pastedIds;
-            bool recordedUndo = false;
-            for (uint32_t sourceId : m_HierarchyClipboardEntityIDs) {
-                Entity* source = scene.FindEntity(sourceId);
-                if (!source)
-                    continue;
-                if (!recordedUndo) {
-                    RecordUndoSnapshot();
-                    recordedUndo = true;
-                }
-                Entity* dup = scene.DuplicateEntity(*source);
-                if (!dup)
-                    continue;
-                Entity* parent = scene.FindEntity(source->GetParentID());
-                scene.SetParent(dup, parent);
-                pastedIds.push_back(dup->GetID());
-            }
-            if (!pastedIds.empty()) {
-                m_SelectedEntityIDs.clear();
-                for (uint32_t id : pastedIds)
-                    m_SelectedEntityIDs.insert(id);
-                m_SelectedEntityID = pastedIds.back();
-                m_HierarchySelectionAnchor = m_SelectedEntityID;
-                m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
-                m_SceneDirty = true;
-            }
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete) &&
-            (!m_SelectedEntityIDs.empty() || m_SelectedEntityID != 0)) {
-            RecordUndoSnapshot();
-            m_PendingHierarchyDeleteIDs = GetSelectedHierarchyRootIDs(m_SelectedEntityID);
-        }
-    }
-
     if (!m_PendingReparentChildren.empty()) {
         Entity* parent = scene.FindEntity(m_PendingReparentParent);
         Entity* sibling = scene.FindEntity(m_PendingReparentSibling);
@@ -4490,7 +5685,7 @@ void EditorApp::DrawHierarchyPanel() {
                     Entity* child = scene.FindEntity(cid);
                     if (!child)
                         continue;
-                    if (scene.ReorderEntity(child, parent, anchor, true)) {
+                    if (scene.ReorderEntity(child, parent, anchor, true, true)) {
                         reparented = true;
                         anchor = child;
                     }
@@ -4499,14 +5694,14 @@ void EditorApp::DrawHierarchyPanel() {
                 for (uint32_t cid : m_PendingReparentChildren) {
                     Entity* child = scene.FindEntity(cid);
                     if (child)
-                        reparented = scene.ReorderEntity(child, parent, sibling, false) || reparented;
+                        reparented = scene.ReorderEntity(child, parent, sibling, false, true) || reparented;
                 }
             }
         } else {
             for (uint32_t cid : m_PendingReparentChildren) {
                 Entity* child = scene.FindEntity(cid);
                 if (child)
-                    reparented = scene.SetParent(child, parent) || reparented;
+                    reparented = scene.SetParent(child, parent, true) || reparented;
             }
         }
         if (reparented) {
@@ -4553,10 +5748,11 @@ std::vector<std::string> EditorApp::CollectProjectScripts() const {
     namespace fs = std::filesystem;
     std::error_code ec;
     const fs::path rootPath = PathUtf8::FromString(root);
-    if (!fs::is_directory(rootPath, ec))
+    const fs::path scriptsPath = rootPath / "assets" / "scripts";
+    if (!fs::is_directory(scriptsPath, ec))
         return out;
 
-    for (auto it = fs::recursive_directory_iterator(rootPath, fs::directory_options::skip_permission_denied, ec);
+    for (auto it = fs::recursive_directory_iterator(scriptsPath, fs::directory_options::skip_permission_denied, ec);
          it != fs::recursive_directory_iterator(); it.increment(ec)) {
         if (ec) { ec.clear(); continue; }
         if (!it->is_regular_file(ec)) continue;
@@ -4574,9 +5770,43 @@ std::vector<std::string> EditorApp::CollectProjectScripts() const {
     return out;
 }
 
-void EditorApp::DrawAddComponentScriptMenu(Entity& entity) {
+void EditorApp::DrawAddComponentScriptMenu(const std::vector<Entity*>& entities) {
     if (!ImGui::BeginMenu("Scripts"))
         return;
+
+    static char newScriptName[128] = "NewScript";
+    constexpr float createScriptControlWidth = 220.0f;
+    ImGui::TextDisabled("Create and Add");
+    ImGui::SetNextItemWidth(createScriptControlWidth);
+    const bool createOnEnter = ImGui::InputTextWithHint(
+        "##new_component_script", "Script name", newScriptName,
+        sizeof(newScriptName), ImGuiInputTextFlags_EnterReturnsTrue);
+    const bool createClicked = ImGui::Button(
+        "Create New", ImVec2(createScriptControlWidth, 0.0f));
+    if (createOnEnter || createClicked) {
+        std::string scriptPath;
+        std::string error;
+        if (m_AssetBrowser &&
+            m_AssetBrowser->CreateScriptAsset(newScriptName, scriptPath, error)) {
+            RecordUndoSnapshot();
+            for (Entity* entity : entities) {
+                auto& script = entity->AddComponent<MipsScriptComponent>();
+                script.scriptPath = scriptPath;
+                script.module.reset();
+                script.fieldValues.clear();
+            }
+            m_AssetBrowser->RevealAndSelectAsset(scriptPath);
+            m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+            m_SceneDirty = true;
+            std::strncpy(newScriptName, "NewScript", sizeof(newScriptName) - 1);
+            newScriptName[sizeof(newScriptName) - 1] = '\0';
+            ImGui::CloseCurrentPopup();
+        } else {
+            MIPSYNC_WARN("Create New Mips# script failed: {}", error);
+        }
+    }
+
+    ImGui::SeparatorText("Existing Scripts");
 
     const auto scripts = CollectProjectScripts();
     if (scripts.empty()) {
@@ -4585,10 +5815,14 @@ void EditorApp::DrawAddComponentScriptMenu(Entity& entity) {
         for (const std::string& path : scripts) {
             if (ImGui::MenuItem(path.c_str())) {
                 RecordUndoSnapshot();
-                auto& script = entity.AddComponent<MipsScriptComponent>();
-                script.scriptPath = path;
-                script.module.reset();
-                script.fieldValues.clear();
+                for (Entity* entity : entities) {
+                    auto& script = entity->AddComponent<MipsScriptComponent>();
+                    script.scriptPath = path;
+                    script.module.reset();
+                    script.fieldValues.clear();
+                }
+                m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+                m_SceneDirty = true;
                 ImGui::CloseCurrentPopup();
             }
         }
@@ -4596,8 +5830,12 @@ void EditorApp::DrawAddComponentScriptMenu(Entity& entity) {
     ImGui::Separator();
     if (ImGui::MenuItem("Empty (set path manually)")) {
         RecordUndoSnapshot();
-        auto& script = entity.AddComponent<MipsScriptComponent>();
-        script.scriptPath.clear();
+        for (Entity* entity : entities) {
+            auto& script = entity->AddComponent<MipsScriptComponent>();
+            script.scriptPath.clear();
+        }
+        m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+        m_SceneDirty = true;
         ImGui::CloseCurrentPopup();
     }
     ImGui::EndMenu();
@@ -4690,6 +5928,36 @@ void EditorApp::DrawMipsScriptIdeActions(const std::string& projectRelPath) {
     ImGui::PopID();
 }
 
+void EditorApp::DrawMipsScriptIdeMenuItems(const std::string& projectRelPath) {
+    const bool hasScript = !projectRelPath.empty();
+    if (!hasScript)
+        ImGui::BeginDisabled();
+
+    if (ImGui::MenuItem("Open in IDE")) {
+        if (!MipsEditorIntegration::OpenScriptInIde(projectRelPath)) {
+            EDITOR_WARN("[Mips# IDE] Failed to open script in IDE: {}", projectRelPath);
+            TriggerBuildToast("Could not open script in IDE", false);
+        }
+    }
+    if (ImGui::MenuItem("Validate")) {
+        const auto result = MipsEditorIntegration::ValidateScript(projectRelPath);
+        MipsEditorIntegration::LogValidationResult(projectRelPath, result);
+        if (result.success) {
+            const std::string cls = result.module ? result.module->className : std::string{"Mips#"};
+            TriggerBuildToast("Mips# OK: " + cls, true);
+        } else {
+            TriggerBuildToast("Mips# compile errors; see Console", false);
+            if (!result.diagnostics.empty() && result.diagnostics.front().hasLocation) {
+                const auto& first = result.diagnostics.front();
+                MipsEditorIntegration::OpenScriptInIde(projectRelPath, first.line, first.column);
+            }
+        }
+    }
+
+    if (!hasScript)
+        ImGui::EndDisabled();
+}
+
 void EditorApp::DrawMipsScriptAssetInspector(const std::string& projectRelPath) {
     ImGui::TextColored(EditorTheme::TextSecondary, "Mips# Script Asset");
     ImGui::TextWrapped("%s", projectRelPath.c_str());
@@ -4764,6 +6032,15 @@ void EditorApp::DrawInspectorPanel() {
         Entity* selectedEntity = GetSelectedEntity();
 
         if (selectedEntity) {
+            std::vector<Entity*> inspectorEntities;
+            inspectorEntities.push_back(selectedEntity);
+            for (uint32_t entityId : m_SelectedEntityIDs) {
+                Entity* entity = m_Engine->GetScene().FindEntity(entityId);
+                if (entity && entity != selectedEntity)
+                    inspectorEntities.push_back(entity);
+            }
+            const bool multiSelection = inspectorEntities.size() > 1;
+
             ImGui::BeginChild("##unity_object_header", ImVec2(-1.0f, 82.0f),
                               ImGuiChildFlags_Borders);
             const ImVec2 iconMin = ImGui::GetCursorScreenPos();
@@ -4773,23 +6050,59 @@ void EditorApp::DrawInspectorPanel() {
                                   ImGui::GetColorU32(EditorTheme::TextSecondary));
             ImGui::SameLine();
             bool active = selectedEntity->IsActive();
+            const bool activeMixed = std::any_of(
+                inspectorEntities.begin() + 1, inspectorEntities.end(),
+                [&](const Entity* entity) { return entity->IsActive() != active; });
             ImGui::PushID("object_active");
+            if (activeMixed)
+                ImGui::PushItemFlag(ImGuiItemFlags_MixedValue, true);
             const bool activeChanged = DrawComponentEnabledToggle(active);
+            if (activeMixed)
+                ImGui::PopItemFlag();
             ImGui::PopID();
-            if (activeChanged)
-                selectedEntity->SetActive(active);
+            if (activeChanged) {
+                RecordUndoSnapshot();
+                for (Entity* target : inspectorEntities)
+                    target->SetActive(active);
+                m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+                m_SceneDirty = true;
+            }
             ImGui::SameLine();
             if (auto* tag = selectedEntity->GetComponent<TagComponent>()) {
                 char nameBuffer[256]{};
-                strncpy(nameBuffer, tag->tag.c_str(), sizeof(nameBuffer) - 1);
+                const bool nameMixed = std::any_of(
+                    inspectorEntities.begin() + 1, inspectorEntities.end(),
+                    [&](Entity* entity) {
+                        auto* other = entity->GetComponent<TagComponent>();
+                        return !other || other->tag != tag->tag;
+                    });
+                strncpy(nameBuffer, nameMixed ? "-" : tag->tag.c_str(), sizeof(nameBuffer) - 1);
                 ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - 92.0f));
-                if (ImGui::InputText("##object_name", nameBuffer, sizeof(nameBuffer)))
-                    tag->tag = nameBuffer;
+                if (ImGui::InputText("##object_name", nameBuffer, sizeof(nameBuffer),
+                                     nameMixed ? ImGuiInputTextFlags_AutoSelectAll : 0)) {
+                    RecordUndoSnapshot();
+                    for (Entity* target : inspectorEntities) {
+                        if (auto* targetTag = target->GetComponent<TagComponent>())
+                            targetTag->tag = nameBuffer;
+                    }
+                    m_SceneDirty = true;
+                }
             }
             ImGui::SameLine();
             bool isStatic = selectedEntity->IsStatic();
-            if (EditorTheme::Checkbox("Static", &isStatic))
-                selectedEntity->SetStatic(isStatic);
+            const bool staticMixed = std::any_of(
+                inspectorEntities.begin() + 1, inspectorEntities.end(),
+                [&](const Entity* entity) { return entity->IsStatic() != isStatic; });
+            if (staticMixed)
+                ImGui::PushItemFlag(ImGuiItemFlags_MixedValue, true);
+            if (EditorTheme::Checkbox("Static", &isStatic)) {
+                RecordUndoSnapshot();
+                for (Entity* target : inspectorEntities)
+                    target->SetStatic(isStatic);
+                m_SceneDirty = true;
+            }
+            if (staticMixed)
+                ImGui::PopItemFlag();
 
             ImGui::SetCursorPosY(47.0f);
             ImGui::TextDisabled("Tag"); ImGui::SameLine(42.0f);
@@ -4798,21 +6111,49 @@ void EditorApp::DrawInspectorPanel() {
             int tagIndex = 0;
             for (int i = 0; i < IM_ARRAYSIZE(tags); ++i)
                 if (selectedEntity->GetEditorTag() == tags[i]) tagIndex = i;
-            if (ImGui::Combo("##object_tag", &tagIndex, tags, IM_ARRAYSIZE(tags)))
-                selectedEntity->SetEditorTag(tags[tagIndex]);
+            const bool editorTagMixed = std::any_of(
+                inspectorEntities.begin() + 1, inspectorEntities.end(),
+                [&](const Entity* entity) {
+                    return entity->GetEditorTag() != selectedEntity->GetEditorTag();
+                });
+            if (ImGui::BeginCombo("##object_tag", editorTagMixed ? "-" : tags[tagIndex])) {
+                for (int index = 0; index < IM_ARRAYSIZE(tags); ++index) {
+                    if (ImGui::Selectable(tags[index], !editorTagMixed && tagIndex == index)) {
+                        RecordUndoSnapshot();
+                        for (Entity* target : inspectorEntities)
+                            target->SetEditorTag(tags[index]);
+                        m_SceneDirty = true;
+                    }
+                }
+                ImGui::EndCombo();
+            }
             ImGui::SameLine(); ImGui::TextDisabled("Layer"); ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
             const char* layers[] = { "Default", "TransparentFX", "Ignore Raycast", "UI" };
             int layerIndex = 0;
             for (int i = 0; i < IM_ARRAYSIZE(layers); ++i)
                 if (selectedEntity->GetEditorLayer() == layers[i]) layerIndex = i;
-            if (ImGui::Combo("##object_layer", &layerIndex, layers, IM_ARRAYSIZE(layers)))
-                selectedEntity->SetEditorLayer(layers[layerIndex]);
+            const bool editorLayerMixed = std::any_of(
+                inspectorEntities.begin() + 1, inspectorEntities.end(),
+                [&](const Entity* entity) {
+                    return entity->GetEditorLayer() != selectedEntity->GetEditorLayer();
+                });
+            if (ImGui::BeginCombo("##object_layer", editorLayerMixed ? "-" : layers[layerIndex])) {
+                for (int index = 0; index < IM_ARRAYSIZE(layers); ++index) {
+                    if (ImGui::Selectable(layers[index], !editorLayerMixed && layerIndex == index)) {
+                        RecordUndoSnapshot();
+                        for (Entity* target : inspectorEntities)
+                            target->SetEditorLayer(layers[index]);
+                        m_SceneDirty = true;
+                    }
+                }
+                ImGui::EndCombo();
+            }
             ImGui::EndChild();
             ImGui::Spacing();
 
             // 隨渉隨渉 Prefab header 隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉
-            if (selectedEntity->IsPrefabInstance()) {
+            if (!multiSelection && selectedEntity->IsPrefabInstance()) {
                 const std::string& srcPath = selectedEntity->GetPrefabSourcePath();
                 ImGui::PushStyleColor(ImGuiCol_ChildBg, EditorTheme::AccentMuted);
                 ImGui::BeginChild("##prefab_header", ImVec2(-1, 0), ImGuiChildFlags_AutoResizeY);
@@ -4840,7 +6181,7 @@ void EditorApp::DrawInspectorPanel() {
                     Entity* fresh = SceneIO::RevertEntityFromPrefab(
                         m_Engine->GetScene(), *selectedEntity, err);
                     if (fresh)
-                        m_SelectedEntityID = fresh->GetID();
+                        SelectSingleEntity(fresh->GetID());
                     else
                         MIPSYNC_WARN("Revert Prefab failed: {}", err);
                 }
@@ -4850,111 +6191,249 @@ void EditorApp::DrawInspectorPanel() {
             }
             // 隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉隨渉
 
-            auto* transformComp = selectedEntity->GetComponent<TransformComponent>();
+            bool removeComponent = false;
+            for (Component* orderedComponent : selectedEntity->GetComponentsInOrder()) {
+            const size_t occurrence = InspectorComponentOccurrence(*selectedEntity, *orderedComponent);
+            std::vector<Component*> peerComponents;
+            peerComponents.reserve(inspectorEntities.size() - 1);
+            bool componentIsCommon = true;
+            for (size_t entityIndex = 1; entityIndex < inspectorEntities.size(); ++entityIndex) {
+                Component* peer = FindMatchingInspectorComponent(
+                    *inspectorEntities[entityIndex], *orderedComponent, occurrence);
+                if (!peer) {
+                    componentIsCommon = false;
+                    break;
+                }
+                peerComponents.push_back(peer);
+            }
+            if (!componentIsCommon)
+                continue;
+            BeginInspectorMultiEdit(*orderedComponent, std::move(peerComponents));
+
+            auto* transformComp = dynamic_cast<TransformComponent*>(orderedComponent);
             if (transformComp && !selectedEntity->GetComponent<RectTransformComponent>()) {
                 if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
-                    if (ImGui::DragFloat3("Position", glm::value_ptr(transformComp->position), 0.1f) ||
-                        ImGui::DragFloat3("Rotation", glm::value_ptr(transformComp->rotation), 0.1f) ||
-                        ImGui::DragFloat3("Scale", glm::value_ptr(transformComp->scale), 0.1f)) {
-                        SyncSelectedCameraFromTransform(selectedEntity);
+                    if (InspectorDragFloat3("Position", glm::value_ptr(transformComp->position), 0.1f) ||
+                        InspectorDragFloat3("Rotation", glm::value_ptr(transformComp->rotation), 0.1f) ||
+                        InspectorDragFloat3("Scale", glm::value_ptr(transformComp->scale), 0.1f)) {
+                        for (Entity* target : inspectorEntities) {
+                            SyncSelectedCameraFromTransform(target);
+                            SyncPhysicsAfterTransformEdit(target);
+                        }
                         m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
-                        SyncPhysicsAfterTransformEdit(selectedEntity);
+                        m_SceneDirty = true;
                     }
                 }
                 DrawInspectorDivider();
+                DrawInspectorDivider();
             }
 
-            bool removeComponent = false;
-
-            auto* cameraComp = selectedEntity->GetComponent<CameraComponent>();
+            auto* cameraComp = dynamic_cast<CameraComponent*>(orderedComponent);
             if (cameraComp) {
-                const bool open = BeginInspectableComponent("Camera", *cameraComp, removeComponent, this);
+                const bool open = BeginInspectableComponent(
+                    "Camera", *cameraComp, removeComponent, this, [&] {
+                        if (ImGui::MenuItem("Clear Prerendered Background", nullptr, false,
+                                            !cameraComp->prerenderedBackgroundPath.empty())) {
+                            cameraComp->prerenderedBackgroundPath.clear();
+                            m_PrerenderedBackgroundTextures.clear();
+                            m_SceneDirty = true;
+                        }
+                    });
                 if (!removeComponent && open) {
                     bool cameraChanged = false;
-                    if (EditorTheme::Checkbox("Primary", &cameraComp->primary)) {
+                    if (InspectorCheckbox("Primary", &cameraComp->primary)) {
                         if (cameraComp->primary)
                             m_Engine->GetScene().SetPrimaryCamera(*selectedEntity);
                         cameraChanged = true;
                     }
-                    cameraChanged |= ImGui::DragFloat("Field of View", &cameraComp->camera.fov, 0.5f, 15.0f, 120.0f);
-                    cameraChanged |= ImGui::DragFloat("Near Clip", &cameraComp->camera.nearClip, 0.01f, 0.01f, 10.0f);
-                    cameraChanged |= ImGui::DragFloat("Far Clip", &cameraComp->camera.farClip, 0.5f, 1.0f, 500.0f);
+                    cameraChanged |= InspectorDragFloat("Field of View", &cameraComp->camera.fov, 0.5f, 15.0f, 120.0f);
+                    cameraChanged |= InspectorDragFloat("Near Clip", &cameraComp->camera.nearClip, 0.01f, 0.01f, 10.0f);
+                    cameraChanged |= InspectorDragFloat("Far Clip (Draw Dist)", &cameraComp->camera.farClip, 0.5f, 1.0f, 500.0f);
+
+                    ImGui::Spacing();
+                    ImGui::TextDisabled("Far Clip Presets:");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("20m (PS1 Low)")) { cameraComp->camera.farClip = 20.0f; cameraChanged = true; }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("35m (PS1 Mid)")) { cameraComp->camera.farClip = 35.0f; cameraChanged = true; }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("60m (PS1 High)")) { cameraComp->camera.farClip = 60.0f; cameraChanged = true; }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("100m")) { cameraComp->camera.farClip = 100.0f; cameraChanged = true; }
+
                     char bgBuffer[512]{};
                     strncpy(bgBuffer, cameraComp->prerenderedBackgroundPath.c_str(), sizeof(bgBuffer) - 1);
-                    if (ImGui::InputText("Prerender BG", bgBuffer, sizeof(bgBuffer))) {
-                        cameraComp->prerenderedBackgroundPath = bgBuffer;
+                    if (InspectorInputText("Prerender BG", bgBuffer, sizeof(bgBuffer))) {
                         m_PrerenderedBackgroundTextures.clear();
                         m_SceneDirty = true;
                     }
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("Clear##prerender_bg")) {
-                        cameraComp->prerenderedBackgroundPath.clear();
-                        m_PrerenderedBackgroundTextures.clear();
-                        m_SceneDirty = true;
-                    }
-                    if (ImGui::InputInt("Shot Priority", &cameraComp->shotPriority))
+                    if (InspectorInputInt("Shot Priority", &cameraComp->shotPriority))
                         m_SceneDirty = true;
                     if (cameraChanged)
                         SyncSelectedCameraFromTransform(selectedEntity);
                 }
-                EndInspectableComponent(*cameraComp);
+                EndInspectableComponent(*cameraComp, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<CameraComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, cameraComp);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* lightComp = selectedEntity->GetComponent<LightComponent>();
+            auto* distanceCullComp = dynamic_cast<DistanceCullComponent*>(orderedComponent);
+            if (distanceCullComp) {
+                const bool open = BeginInspectableComponent("Distance Cull", *distanceCullComp, removeComponent, this);
+                if (!removeComponent && open) {
+                    bool changed = false;
+                    changed |= InspectorCheckbox("Enabled", &distanceCullComp->enabled);
+                    changed |= InspectorDragFloat("Cull Distance", &distanceCullComp->cullDistance, 0.5f, 1.0f, 200.0f);
+
+                    ImGui::Spacing();
+                    ImGui::TextDisabled("Distance Presets:");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("15m (Close)")) { distanceCullComp->cullDistance = 15.0f; changed = true; }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("30m (Normal)")) { distanceCullComp->cullDistance = 30.0f; changed = true; }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("50m (Far)")) { distanceCullComp->cullDistance = 50.0f; changed = true; }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("80m (Max)")) { distanceCullComp->cullDistance = 80.0f; changed = true; }
+
+                    ImGui::Spacing();
+                    std::string targetLabel = "Self (This Entity / Camera)";
+                    if (distanceCullComp->targetEntityId != 0) {
+                        if (Entity* target = m_Engine->GetScene().FindEntity(distanceCullComp->targetEntityId)) {
+                            if (auto* tag = target->GetComponent<TagComponent>())
+                                targetLabel = tag->tag;
+                            else
+                                targetLabel = "Entity #" + std::to_string(distanceCullComp->targetEntityId);
+                        } else {
+                            targetLabel = "Missing (ID: " + std::to_string(distanceCullComp->targetEntityId) + ")";
+                        }
+                    }
+                    if (ImGui::BeginCombo("Target Center", targetLabel.c_str())) {
+                        if (ImGui::Selectable("Self (This Entity / Camera)", distanceCullComp->targetEntityId == 0)) {
+                            distanceCullComp->targetEntityId = 0;
+                            changed = true;
+                        }
+                        for (auto& entityPtr : m_Engine->GetScene().GetEntities()) {
+                            if (!entityPtr || entityPtr.get() == selectedEntity)
+                                continue;
+                            std::string name = "Entity #" + std::to_string(entityPtr->GetID());
+                            if (auto* tag = entityPtr->GetComponent<TagComponent>())
+                                name = tag->tag;
+                            const bool isPicked = (distanceCullComp->targetEntityId == entityPtr->GetID());
+                            if (ImGui::Selectable(name.c_str(), isPicked)) {
+                                distanceCullComp->targetEntityId = entityPtr->GetID();
+                                changed = true;
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+
+                    changed |= InspectorCheckbox("Cull Static Meshes", &distanceCullComp->cullMeshRenderers);
+                    changed |= InspectorCheckbox("Cull Skinned Meshes", &distanceCullComp->cullSkinnedMeshes);
+                    changed |= InspectorCheckbox("Cull Lights", &distanceCullComp->cullLights);
+                    changed |= InspectorCheckbox("Preview in Scene View", &distanceCullComp->previewInEditor);
+
+                    if (changed)
+                        m_SceneDirty = true;
+                }
+                EndInspectableComponent(*distanceCullComp, open);
+                if (removeComponent) {
+                    RemoveCurrentInspectorComponents(*selectedEntity, distanceCullComp);
+                    ImGui::End();
+                    return;
+                }
+            }
+
+            auto* frustumCullComp = dynamic_cast<FrustumCullComponent*>(orderedComponent);
+            if (frustumCullComp) {
+                const bool open = BeginInspectableComponent("Frustum Cull", *frustumCullComp, removeComponent, this);
+                if (!removeComponent && open) {
+                    bool changed = false;
+                    changed |= InspectorCheckbox("Enabled", &frustumCullComp->enabled);
+                    changed |= InspectorDragFloat("Margin", &frustumCullComp->margin, 0.1f, 0.0f, 10.0f);
+
+                    ImGui::Spacing();
+                    ImGui::TextDisabled("Margin Presets:");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("0.5m (Tight)")) { frustumCullComp->margin = 0.5f; changed = true; }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("1.5m (Standard)")) { frustumCullComp->margin = 1.5f; changed = true; }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("3.0m (Safe)")) { frustumCullComp->margin = 3.0f; changed = true; }
+
+                    ImGui::Spacing();
+                    changed |= InspectorCheckbox("Cull Static Meshes", &frustumCullComp->cullMeshRenderers);
+                    changed |= InspectorCheckbox("Cull Skinned Meshes", &frustumCullComp->cullSkinnedMeshes);
+                    changed |= InspectorCheckbox("Cull Lights", &frustumCullComp->cullLights);
+                    changed |= InspectorCheckbox("Preview in Scene View", &frustumCullComp->previewInEditor);
+
+                    if (changed)
+                        m_SceneDirty = true;
+                }
+                EndInspectableComponent(*frustumCullComp, open);
+                if (removeComponent) {
+                    RemoveCurrentInspectorComponents(*selectedEntity, frustumCullComp);
+                    ImGui::End();
+                    return;
+                }
+            }
+
+            auto* lightComp = dynamic_cast<LightComponent*>(orderedComponent);
             if (lightComp) {
                 removeComponent = false;
                 const bool open = BeginInspectableComponent("Light", *lightComp, removeComponent, this);
                 if (!removeComponent && open) {
                     const char* typeNames[] = { "Directional", "Point", "Spot" };
                     int typeIdx = static_cast<int>(lightComp->type);
-                    if (ImGui::Combo("Type", &typeIdx, typeNames, IM_ARRAYSIZE(typeNames)))
+                    if (InspectorCombo("Type", &typeIdx, typeNames, IM_ARRAYSIZE(typeNames),
+                                       InspectorValuesMixed(&lightComp->type))) {
                         lightComp->type = static_cast<LightType>(typeIdx);
-                    if (ImGui::ColorEdit3("Color", glm::value_ptr(lightComp->color)))
+                        PropagateInspectorValues(&lightComp->type);
+                    }
+                    if (InspectorColorEdit3("Color", glm::value_ptr(lightComp->color)))
                         { /* live */ }
-                    if (ImGui::DragFloat("Intensity", &lightComp->intensity, 0.05f, 0.0f, 10.0f))
+                    if (InspectorDragFloat("Intensity", &lightComp->intensity, 0.05f, 0.0f, 10.0f))
                         { /* live */ }
                     if (lightComp->type != LightType::Directional) {
-                        if (ImGui::DragFloat("Range", &lightComp->range, 0.1f, 0.1f, 200.0f))
+                        if (InspectorDragFloat("Range", &lightComp->range, 0.1f, 0.1f, 200.0f))
                             { /* live */ }
                     }
                     if (lightComp->type == LightType::Spot) {
-                        if (ImGui::DragFloat("Spot Angle", &lightComp->spotAngle, 0.5f, 1.0f, 89.0f))
+                        if (InspectorDragFloat("Spot Angle", &lightComp->spotAngle, 0.5f, 1.0f, 89.0f))
                             lightComp->spotInnerAngle = std::min(lightComp->spotInnerAngle, lightComp->spotAngle);
-                        if (ImGui::DragFloat("Inner Angle", &lightComp->spotInnerAngle, 0.5f, 1.0f,
+                        if (InspectorDragFloat("Inner Angle", &lightComp->spotInnerAngle, 0.5f, 1.0f,
                                               lightComp->spotAngle))
                             lightComp->spotInnerAngle = std::min(lightComp->spotInnerAngle, lightComp->spotAngle);
                     }
                     ImGui::TextColored(EditorTheme::TextMuted,
                         "Rotation aims the light (local -Z forward).");
                 }
-                EndInspectableComponent(*lightComp);
+                EndInspectableComponent(*lightComp, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<LightComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, lightComp);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* postProcess = selectedEntity->GetComponent<PostProcessVolumeComponent>();
+            auto* postProcess = dynamic_cast<PostProcessVolumeComponent*>(orderedComponent);
             if (postProcess) {
                 removeComponent = false;
                 const bool open = BeginInspectableComponent("Post Process Volume", *postProcess,
                                                             removeComponent, this);
                 if (!removeComponent && open) {
-                    if (EditorTheme::Checkbox("Is Global", &postProcess->isGlobal))
+                    if (InspectorCheckbox("Is Global", &postProcess->isGlobal))
                         RecordUndoSnapshot();
-                    if (ImGui::DragInt("Priority", &postProcess->priority, 1.0f, -100, 100))
+                    if (InspectorDragInt("Priority", &postProcess->priority, 1.0f, -100, 100))
                         RecordUndoSnapshot();
                     ImGui::TextColored(EditorTheme::TextMuted,
                         "Highest enabled priority volume drives the scene post-process.");
 
                     if (ImGui::CollapsingHeader("HDRI Skybox", ImGuiTreeNodeFlags_DefaultOpen)) {
-                        if (EditorTheme::Checkbox("Enable Skybox", &postProcess->skyboxEnabled))
+                        if (InspectorCheckbox("Enable Skybox", &postProcess->skyboxEnabled))
                             RecordUndoSnapshot();
                         ImGui::BeginDisabled(!postProcess->skyboxEnabled);
                         if (DrawAssetReferenceField(this, "HDRI Texture", AssetKind::Texture,
@@ -4964,25 +6443,25 @@ void EditorApp::DrawInspectorPanel() {
                                 ? nullptr
                                 : AssetManager::Get().GetSkyboxTexture(postProcess->skyboxTexturePath);
                         }
-                        if (ImGui::DragFloat("Rotation Y", &postProcess->skyboxRotationDegrees,
+                        if (InspectorDragFloat("Rotation Y", &postProcess->skyboxRotationDegrees,
                                              0.5f, -360.0f, 360.0f, "%.1f deg"))
                             RecordUndoSnapshot();
-                        if (ImGui::SliderFloat("Skybox Exposure", &postProcess->skyboxExposure, -4.0f, 4.0f))
+                        if (InspectorSliderFloat("Skybox Exposure", &postProcess->skyboxExposure, -4.0f, 4.0f))
                             RecordUndoSnapshot();
-                        if (ImGui::ColorEdit3("Skybox Tint", glm::value_ptr(postProcess->skyboxTint)))
+                        if (InspectorColorEdit3("Skybox Tint", glm::value_ptr(postProcess->skyboxTint)))
                             RecordUndoSnapshot();
                         ImGui::EndDisabled();
                     }
 
                     if (ImGui::CollapsingHeader("Fog", ImGuiTreeNodeFlags_DefaultOpen)) {
-                        if (EditorTheme::Checkbox("Enable Fog", &postProcess->fogEnabled))
+                        if (InspectorCheckbox("Enable Fog", &postProcess->fogEnabled))
                             RecordUndoSnapshot();
                         ImGui::BeginDisabled(!postProcess->fogEnabled);
-                        if (ImGui::ColorEdit3("Fog Color", glm::value_ptr(postProcess->fogColor)))
+                        if (InspectorColorEdit3("Fog Color", glm::value_ptr(postProcess->fogColor)))
                             RecordUndoSnapshot();
-                        if (ImGui::DragFloat("Fog Start", &postProcess->fogStart, 0.1f, 0.0f, 10000.0f))
+                        if (InspectorDragFloat("Fog Start", &postProcess->fogStart, 0.1f, 0.0f, 10000.0f))
                             RecordUndoSnapshot();
-                        if (ImGui::DragFloat("Fog End", &postProcess->fogEnd, 0.1f, 0.1f, 10000.0f)) {
+                        if (InspectorDragFloat("Fog End", &postProcess->fogEnd, 0.1f, 0.1f, 10000.0f)) {
                             postProcess->fogEnd = std::max(postProcess->fogEnd, postProcess->fogStart + 0.1f);
                             RecordUndoSnapshot();
                         }
@@ -4990,48 +6469,80 @@ void EditorApp::DrawInspectorPanel() {
                     }
 
                     if (ImGui::CollapsingHeader("Color Grading", ImGuiTreeNodeFlags_DefaultOpen)) {
-                        if (EditorTheme::Checkbox("Enable Color Grading", &postProcess->colorGradingEnabled))
+                        if (InspectorCheckbox("Enable Color Grading", &postProcess->colorGradingEnabled))
                             RecordUndoSnapshot();
                         ImGui::BeginDisabled(!postProcess->colorGradingEnabled);
-                        if (ImGui::SliderFloat("Exposure", &postProcess->exposure, -4.0f, 4.0f))
+                        if (InspectorSliderFloat("Exposure", &postProcess->exposure, -4.0f, 4.0f))
                             RecordUndoSnapshot();
-                        if (ImGui::SliderFloat("Contrast", &postProcess->contrast, 0.0f, 3.0f))
+                        if (InspectorSliderFloat("Contrast", &postProcess->contrast, 0.0f, 3.0f))
                             RecordUndoSnapshot();
-                        if (ImGui::SliderFloat("Saturation", &postProcess->saturation, 0.0f, 3.0f))
+                        if (InspectorSliderFloat("Saturation", &postProcess->saturation, 0.0f, 3.0f))
                             RecordUndoSnapshot();
-                        if (ImGui::ColorEdit3("Color Filter", glm::value_ptr(postProcess->colorFilter)))
+                        if (InspectorColorEdit3("Color Filter", glm::value_ptr(postProcess->colorFilter)))
                             RecordUndoSnapshot();
                         ImGui::EndDisabled();
                     }
 
                     if (ImGui::CollapsingHeader("Vignette", ImGuiTreeNodeFlags_DefaultOpen)) {
-                        if (EditorTheme::Checkbox("Enable Vignette", &postProcess->vignetteEnabled))
+                        if (InspectorCheckbox("Enable Vignette", &postProcess->vignetteEnabled))
                             RecordUndoSnapshot();
                         ImGui::BeginDisabled(!postProcess->vignetteEnabled);
-                        if (ImGui::ColorEdit3("Vignette Color", glm::value_ptr(postProcess->vignetteColor)))
+                        if (InspectorColorEdit3("Vignette Color", glm::value_ptr(postProcess->vignetteColor)))
                             RecordUndoSnapshot();
-                        if (ImGui::SliderFloat("Intensity", &postProcess->vignetteIntensity, 0.0f, 1.0f))
+                        if (InspectorSliderFloat("Intensity", &postProcess->vignetteIntensity, 0.0f, 1.0f))
                             RecordUndoSnapshot();
-                        if (ImGui::SliderFloat("Smoothness", &postProcess->vignetteSmoothness, 0.01f, 2.0f))
+                        if (InspectorSliderFloat("Smoothness", &postProcess->vignetteSmoothness, 0.01f, 2.0f))
                             RecordUndoSnapshot();
                         ImGui::EndDisabled();
                     }
                 }
-                EndInspectableComponent(*postProcess);
+                EndInspectableComponent(*postProcess, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<PostProcessVolumeComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, postProcess);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* skinnedComp = selectedEntity->GetComponent<SkinnedMeshRendererComponent>();
+            auto* skinnedComp = dynamic_cast<SkinnedMeshRendererComponent*>(orderedComponent);
             if (skinnedComp) {
                 removeComponent = false;
-                const bool open =
-                    BeginInspectableComponent("Skinned Mesh Renderer", *skinnedComp, removeComponent, this);
+                const bool open = BeginInspectableComponent(
+                    "Skinned Mesh Renderer", *skinnedComp, removeComponent, this, [&] {
+                        const bool hasModel = !skinnedComp->modelPath.empty();
+                        if (ImGui::MenuItem("Reload Model", nullptr, false, hasModel)) {
+                            RecordUndoSnapshot();
+                            skinnedComp->SetModelFile(skinnedComp->modelPath);
+                            ApplySkeletalModelFitScale(*selectedEntity, skinnedComp->modelPath);
+                            if (auto* anim = selectedEntity->GetComponent<AnimatorComponent>()) {
+                                if (anim->modelPath.empty())
+                                    anim->modelPath = skinnedComp->modelPath;
+                                anim->ReloadAssets();
+                            }
+                        }
+                        if (ImGui::MenuItem("Fit Scale", nullptr, false, hasModel)) {
+                            RecordUndoSnapshot();
+                            ApplySkeletalModelFitScale(*selectedEntity, skinnedComp->modelPath);
+                        }
+                        if (ImGui::MenuItem("Save Material", nullptr, false,
+                                            !skinnedComp->materialPath.empty())) {
+                            Material mat;
+                            mat.color = skinnedComp->color;
+                            mat.texturePath = skinnedComp->texturePath;
+                            mat.mainTextureTiling = skinnedComp->textureTiling;
+                            mat.mainTextureOffset = skinnedComp->textureOffset;
+                            std::string err;
+                            if (Material::Save(AssetManager::Get().ToAbsolute(
+                                                   skinnedComp->materialPath), mat, err)) {
+                                AssetThumbnail::Get().DropMaterialThumbnail(
+                                    skinnedComp->materialPath);
+                            } else {
+                                MIPSYNC_WARN("Material save failed: {}", err);
+                            }
+                        }
+                    });
                 if (!removeComponent && open) {
-                    ImGui::ColorEdit4("Color", glm::value_ptr(skinnedComp->color));
+                    InspectorColorEdit4("Color", glm::value_ptr(skinnedComp->color));
                     if (DrawAssetReferenceField(this, "Model", AssetKind::Model,
                                                 skinnedComp->modelPath, "None (Model)")) {
                         RecordUndoSnapshot();
@@ -5045,41 +6556,8 @@ void EditorApp::DrawInspectorPanel() {
                     if (!skinnedComp->modelPath.empty()) {
                         const uint32_t indexCount =
                             skinnedComp->mesh ? skinnedComp->mesh->GetIndexCount() : 0;
-                        ImGui::Text("GPU indices: %u", indexCount);
-                        if (skinnedComp->meshPartIndex >= 0)
-                            ImGui::Text("Mesh part index: %d", skinnedComp->meshPartIndex);
-                        if (auto skel = AssetManager::Get().GetSkeletalModel(skinnedComp->modelPath)) {
-                            if (skinnedComp->meshPartIndex >= 0 &&
-                                static_cast<size_t>(skinnedComp->meshPartIndex) <
-                                    skel->meshParts.size()) {
-                                ImGui::Text("Part: %s",
-                                            skel->meshParts[static_cast<size_t>(
-                                                skinnedComp->meshPartIndex)]
-                                                .name.c_str());
-                            }
-                            ImGui::Text("Bones: %zu  Clips: %zu  Materials: %zu", skel->bones.size(),
-                                        skel->animationNames.size(), skel->materials.size());
-                            const glm::vec3 ext = skel->boundsMax - skel->boundsMin;
-                            ImGui::Text("Bounds size: %.2f x %.2f x %.2f", ext.x, ext.y, ext.z);
-                            ImGui::Text("Fit scale: %.4f (baked in mesh, Transform=1)", skel->vertexBakeScale);
-                        }
                         if (indexCount == 0)
                             ImGui::TextColored(EditorTheme::Error, "Skinned mesh has 0 indices");
-                        if (ImGui::SmallButton("Reload Model")) {
-                            RecordUndoSnapshot();
-                            skinnedComp->SetModelFile(skinnedComp->modelPath);
-                            ApplySkeletalModelFitScale(*selectedEntity, skinnedComp->modelPath);
-                            if (auto* anim = selectedEntity->GetComponent<AnimatorComponent>()) {
-                                if (anim->modelPath.empty())
-                                    anim->modelPath = skinnedComp->modelPath;
-                                anim->ReloadAssets();
-                            }
-                        }
-                        ImGui::SameLine();
-                        if (ImGui::SmallButton("Fit Scale")) {
-                            RecordUndoSnapshot();
-                            ApplySkeletalModelFitScale(*selectedEntity, skinnedComp->modelPath);
-                        }
                         if (auto* tr = selectedEntity->GetComponent<TransformComponent>()) {
                             const float s = tr->scale.x;
                             if (std::abs(s - 1.0f) > 0.02f)
@@ -5093,10 +6571,12 @@ void EditorApp::DrawInspectorPanel() {
                     const char* ps1Modes[] = { "Off", "Static Pose", "Rigid Bones" };
                     int ps1Mode = static_cast<int>(skinnedComp->ps1ExportMode);
                     if (ps1Mode > 2) ps1Mode = 2; // clamp legacy
-                    if (ImGui::Combo("PS1 Mode", &ps1Mode, ps1Modes, IM_ARRAYSIZE(ps1Modes))) {
+                    if (InspectorCombo("PS1 Mode", &ps1Mode, ps1Modes, IM_ARRAYSIZE(ps1Modes),
+                                       InspectorValuesMixed(&skinnedComp->ps1ExportMode))) {
                         RecordUndoSnapshot();
                         skinnedComp->ps1ExportMode =
                             static_cast<SkinnedMeshRendererComponent::Ps1ExportMode>(std::clamp(ps1Mode, 0, 2));
+                        PropagateInspectorValues(&skinnedComp->ps1ExportMode);
                         m_SceneDirty = true;
                     }
                     if (skinnedComp->ps1ExportMode == SkinnedMeshRendererComponent::Ps1ExportMode::Off) {
@@ -5106,9 +6586,9 @@ void EditorApp::DrawInspectorPanel() {
                         ImGui::TextColored(EditorTheme::PsAccent,
                                            "PS1 uses rigid bone parts by default; no runtime skinning.");
                         bool ps1AnimChanged = false;
-                        ps1AnimChanged |= ImGui::DragInt("PS1 Anim FPS", &skinnedComp->ps1VertexAnimFps,
+                        ps1AnimChanged |= InspectorDragInt("PS1 Anim FPS", &skinnedComp->ps1VertexAnimFps,
                                                          1.0f, 1, 30);
-                        ps1AnimChanged |= ImGui::DragInt("PS1 Max Frames", &skinnedComp->ps1VertexAnimMaxFrames,
+                        ps1AnimChanged |= InspectorDragInt("PS1 Max Frames", &skinnedComp->ps1VertexAnimMaxFrames,
                                                          1.0f, 1, 120);
                         if (ps1AnimChanged) {
                             skinnedComp->ps1VertexAnimFps =
@@ -5121,15 +6601,15 @@ void EditorApp::DrawInspectorPanel() {
                     }
 
                 }
-                EndInspectableComponent(*skinnedComp);
+                EndInspectableComponent(*skinnedComp, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<SkinnedMeshRendererComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, skinnedComp);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* audioSource = selectedEntity->GetComponent<AudioSourceComponent>();
+            auto* audioSource = dynamic_cast<AudioSourceComponent*>(orderedComponent);
             if (audioSource) {
                 removeComponent = false;
                 const bool open = BeginInspectableComponent("Audio Source", *audioSource,
@@ -5138,37 +6618,50 @@ void EditorApp::DrawInspectorPanel() {
                     if (DrawAssetReferenceField(this, "Audio Clip", AssetKind::Audio,
                                                 audioSource->clipPath, "None (Audio Clip)"))
                         RecordUndoSnapshot();
-                    if (EditorTheme::Checkbox("Play On Awake", &audioSource->playOnAwake))
+                    if (InspectorCheckbox("Play On Awake", &audioSource->playOnAwake))
                         RecordUndoSnapshot();
-                    if (EditorTheme::Checkbox("Loop", &audioSource->loop))
+                    if (InspectorCheckbox("Loop", &audioSource->loop))
                         RecordUndoSnapshot();
-                    if (EditorTheme::Checkbox("Mute", &audioSource->mute))
+                    if (InspectorCheckbox("Mute", &audioSource->mute))
                         RecordUndoSnapshot();
-                    if (ImGui::SliderFloat("Volume", &audioSource->volume, 0.0f, 1.0f))
+                    if (InspectorSliderFloat("Volume", &audioSource->volume, 0.0f, 1.0f))
                         RecordUndoSnapshot();
                 }
-                EndInspectableComponent(*audioSource);
+                EndInspectableComponent(*audioSource, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<AudioSourceComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, audioSource);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* animatorComp = selectedEntity->GetComponent<AnimatorComponent>();
+            auto* animatorComp = dynamic_cast<AnimatorComponent*>(orderedComponent);
             if (animatorComp) {
                 removeComponent = false;
-                const bool open = BeginInspectableComponent("Animator", *animatorComp, removeComponent, this);
+                auto* animatorSkinnedComp =
+                    selectedEntity->GetComponent<SkinnedMeshRendererComponent>();
+                const bool open = BeginInspectableComponent(
+                    "Animator", *animatorComp, removeComponent, this, [&] {
+                        if (ImGui::MenuItem("Reload Assets"))
+                            animatorComp->ReloadAssets();
+
+                        std::string modelForController = animatorComp->modelPath;
+                        if (modelForController.empty() && animatorSkinnedComp)
+                            modelForController = animatorSkinnedComp->modelPath;
+                        if (ImGui::MenuItem("Create from Model Clips", nullptr, false,
+                                            !modelForController.empty())) {
+                            CreateAndAssignControllerFromModel(
+                                this, *animatorComp, modelForController, animatorSkinnedComp);
+                        }
+                        if (ImGui::MenuItem("Open Controller Window", nullptr, false,
+                                            !animatorComp->controllerPath.empty())) {
+                            OpenAnimatorControllerWindow(animatorComp->controllerPath);
+                        }
+                    });
                 if (!removeComponent && open) {
-                    if (ImGui::Button("Reload Assets", ImVec2(-1, 0)))
-                        animatorComp->ReloadAssets();
-
-                    if (EditorTheme::Checkbox("Debug: Bind Pose Only", &animatorComp->debugBindPoseOnly))
+                    if (InspectorDragFloat("Playback Speed", &animatorComp->speed, 0.01f, 0.0f, 10.0f))
                         RecordUndoSnapshot();
-
-                    if (ImGui::DragFloat("Playback Speed", &animatorComp->speed, 0.01f, 0.0f, 10.0f))
-                        RecordUndoSnapshot();
-                    if (ImGui::DragFloat("Animation FPS", &animatorComp->animationFps, 0.5f, 1.0f,
+                    if (InspectorDragFloat("Animation FPS", &animatorComp->animationFps, 0.5f, 1.0f,
                                          120.0f))
                         RecordUndoSnapshot();
 
@@ -5180,32 +6673,6 @@ void EditorApp::DrawInspectorPanel() {
                             OpenAnimatorControllerWindow(animatorComp->controllerPath);
                     }
 
-                    std::string modelForController = animatorComp->modelPath;
-                    if (modelForController.empty()) {
-                        if (auto* skinned = selectedEntity->GetComponent<SkinnedMeshRendererComponent>())
-                            modelForController = skinned->modelPath;
-                    }
-                    if (!modelForController.empty() &&
-                        EditorTheme::AeroButton("Create from Model Clips", ImVec2(-1.0f, EditorTheme::ButtonHeight),
-                                                 AeroButtonKind::Secondary)) {
-                        CreateAndAssignControllerFromModel(this, *animatorComp, modelForController,
-                                                         skinnedComp);
-                    }
-
-                    if (!animatorComp->controllerPath.empty() &&
-                        EditorTheme::AeroButton("Open Controller Window",
-                                                ImVec2(-1.0f, EditorTheme::ButtonHeight),
-                                                AeroButtonKind::Primary)) {
-                        OpenAnimatorControllerWindow(animatorComp->controllerPath);
-                    }
-
-                    ImGui::Text("State: %s", animatorComp->currentState.empty()
-                                                   ? "<none>"
-                                                   : animatorComp->currentState.c_str());
-                    if (animatorComp->inTransition)
-                        ImGui::Text("Transition -> %s (%.2f)", animatorComp->nextState.c_str(),
-                                    animatorComp->transitionTime);
-
                     if (animatorComp->controller && !animatorComp->controller->parameters.empty()) {
                         ImGui::Separator();
                         ImGui::TextColored(EditorTheme::TextSecondary,
@@ -5215,46 +6682,58 @@ void EditorApp::DrawInspectorPanel() {
                                 float v = animatorComp->parameters.floats.count(p.name)
                                     ? animatorComp->parameters.floats[p.name]
                                     : p.defaultFloat;
-                                if (ImGui::DragFloat(p.name.c_str(), &v, 0.01f, -100.0f, 100.0f))
+                                if (InspectorDragFloat(p.name.c_str(), &v, 0.01f, -100.0f, 100.0f))
                                     animatorComp->parameters.floats[p.name] = v;
                             } else if (p.type == AnimatorParamType::Bool) {
                                 bool v = animatorComp->parameters.bools.count(p.name)
                                     ? animatorComp->parameters.bools[p.name]
                                     : p.defaultBool;
-                                if (EditorTheme::Checkbox(p.name.c_str(), &v))
+                                if (InspectorCheckbox(p.name.c_str(), &v))
                                     animatorComp->parameters.bools[p.name] = v;
                             } else if (p.type == AnimatorParamType::Int) {
                                 int v = animatorComp->parameters.ints.count(p.name)
                                     ? animatorComp->parameters.ints[p.name]
                                     : p.defaultInt;
-                                if (ImGui::DragInt(p.name.c_str(), &v))
+                                if (InspectorDragInt(p.name.c_str(), &v))
                                     animatorComp->parameters.ints[p.name] = v;
                             }
                         }
 
-                        if (animatorComp->model && !animatorComp->model->animationNames.empty()) {
-                            ImGui::Separator();
-                            ImGui::Text("Clips on model");
-                            for (const std::string& clip : animatorComp->model->animationNames)
-                                ImGui::BulletText("%s", clip.c_str());
-                        }
                     }
-
-                    DrawAnimatorRuntimeDiagnostics(*animatorComp, m_IsPlaying);
                 }
-                EndInspectableComponent(*animatorComp);
+                EndInspectableComponent(*animatorComp, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<AnimatorComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, animatorComp);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* meshRendererComp = selectedEntity->GetComponent<MeshRendererComponent>();
+            auto* meshRendererComp = dynamic_cast<MeshRendererComponent*>(orderedComponent);
             if (meshRendererComp) {
                 removeComponent = false;
-                const bool open = BeginInspectableComponent("Mesh Renderer", *meshRendererComp, removeComponent, this);
+                const bool open = BeginInspectableComponent(
+                    "Mesh Renderer", *meshRendererComp, removeComponent, this, [&] {
+                        if (ImGui::MenuItem("Use Primitive Cube", nullptr, false,
+                                            meshRendererComp->meshPrimitive == "File")) {
+                            RecordUndoSnapshot();
+                            meshRendererComp->SetPrimitive("Cube", 1.0f);
+                        }
+                    });
                 if (!removeComponent && open) {
+                    const char* presetNames[] = {
+                        "Prop", "Corridor", "Character", "Viewmodel", "Floor"
+                    };
+                    int preset = static_cast<int>(meshRendererComp->typePreset);
+                    if (InspectorCombo("Type Preset", &preset, presetNames,
+                                       IM_ARRAYSIZE(presetNames),
+                                       InspectorValuesMixed(&meshRendererComp->typePreset))) {
+                        RecordUndoSnapshot();
+                        meshRendererComp->typePreset =
+                            static_cast<MeshRendererComponent::TypePreset>(
+                                std::clamp(preset, 0, 4));
+                        PropagateInspectorValues(&meshRendererComp->typePreset);
+                    }
                     if (meshRendererComp->meshPrimitive == "File") {
                         if (DrawAssetReferenceField(this, "Mesh", AssetKind::Model,
                                                     meshRendererComp->meshPath, "None (Mesh)")) {
@@ -5262,15 +6741,13 @@ void EditorApp::DrawInspectorPanel() {
                             if (!meshRendererComp->meshPath.empty())
                                 meshRendererComp->SetMeshFile(meshRendererComp->meshPath);
                         }
-                        if (ImGui::Button("Use Primitive Mesh", ImVec2(-1, 0)))
-                            meshRendererComp->SetPrimitive("Cube", 1.0f);
                     } else {
                         const char* meshTypes[] = { "Cube", "Sphere", "Plane", "Terrain" };
                         int currentMeshType = 0;
                         if (meshRendererComp->meshPrimitive == "Sphere") currentMeshType = 1;
                         else if (meshRendererComp->meshPrimitive == "Plane") currentMeshType = 2;
                         else if (meshRendererComp->meshPrimitive == "Terrain") currentMeshType = 3;
-                        if (ImGui::Combo("Mesh Type", &currentMeshType, meshTypes, IM_ARRAYSIZE(meshTypes))) {
+                        if (InspectorCombo("Mesh Type", &currentMeshType, meshTypes, IM_ARRAYSIZE(meshTypes))) {
                             meshRendererComp->SetPrimitive(meshTypes[currentMeshType], meshRendererComp->meshSize);
                             if (meshRendererComp->meshPrimitive == "Terrain") {
                                 auto* terrain = selectedEntity->GetComponent<TerrainComponent>();
@@ -5280,7 +6757,7 @@ void EditorApp::DrawInspectorPanel() {
                                 terrain->RebuildMesh(*meshRendererComp);
                             }
                         }
-                        if (ImGui::DragFloat("Mesh Size", &meshRendererComp->meshSize, 0.1f, 0.01f, 100.0f)) {
+                        if (InspectorDragFloat("Mesh Size", &meshRendererComp->meshSize, 0.1f, 0.01f, 100.0f)) {
                             meshRendererComp->RebuildMesh();
                             if (auto* terrain = selectedEntity->GetComponent<TerrainComponent>();
                                 terrain && meshRendererComp->meshPrimitive == "Terrain") {
@@ -5291,38 +6768,123 @@ void EditorApp::DrawInspectorPanel() {
                     }
 
                     DrawMaterialSlot(*meshRendererComp);
-                    EditorTheme::Checkbox("Editor Only", &meshRendererComp->editorOnly);
-                    EditorTheme::Checkbox("PS1 View Model", &meshRendererComp->viewModel);
-                    if (meshRendererComp->viewModel) {
-                        ImGui::TextWrapped("Draws this mesh in the PS1 first-person foreground pass.");
+                    InspectorCheckbox("Editor Only", &meshRendererComp->editorOnly);
+                    switch (meshRendererComp->typePreset) {
+                    case MeshRendererComponent::TypePreset::Corridor:
+                        ImGui::TextDisabled("Near-field static geometry; close clipping and cache optimized.");
+                        break;
+                    case MeshRendererComponent::TypePreset::Character:
+                        ImGui::TextDisabled("Dynamic world object; prioritized without static projection caching.");
+                        break;
+                    case MeshRendererComponent::TypePreset::Viewmodel:
+                        ImGui::TextDisabled("First-person foreground pass with a reduced near clip.");
+                        break;
+                    case MeshRendererComponent::TypePreset::Floor:
+                        ImGui::TextDisabled("Static floor; PS1 export tessellates large faces to reduce affine warping.");
+                        break;
+                    case MeshRendererComponent::TypePreset::Prop:
+                    default:
+                        ImGui::TextDisabled("Static world object; projection and lighting cache optimized.");
+                        break;
                     }
 
                 }
-                EndInspectableComponent(*meshRendererComp);
+                EndInspectableComponent(*meshRendererComp, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<MeshRendererComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, meshRendererComp);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* terrainComp = selectedEntity->GetComponent<TerrainComponent>();
+            auto* meshSubdividerComp =
+                dynamic_cast<MeshSubdividerComponent*>(orderedComponent);
+            if (meshSubdividerComp) {
+                removeComponent = false;
+                const bool open = BeginInspectableComponent(
+                    "Mesh Subdivider", *meshSubdividerComp, removeComponent, this);
+                if (!removeComponent && open) {
+                    bool changed = false;
+                    changed |= InspectorSliderInt(
+                        "Max Levels", &meshSubdividerComp->maxLevels, 0, 4);
+                    changed |= InspectorDragFloat(
+                        "Max Edge Length", &meshSubdividerComp->maxEdgeLength,
+                        0.05f, 0.0f, 1000.0f);
+                    changed |= InspectorCheckbox("Preview Subdivision",
+                                                 &meshSubdividerComp->preview);
+                    meshSubdividerComp->maxLevels = std::clamp(
+                        meshSubdividerComp->maxLevels, 0, 4);
+                    meshSubdividerComp->maxEdgeLength = std::max(
+                        0.0f, meshSubdividerComp->maxEdgeLength);
+                    if (changed) {
+                        meshSubdividerComp->InvalidatePreview();
+                        m_SceneDirty = true;
+                    }
+
+                    const auto* renderer =
+                        selectedEntity->GetComponent<MeshRendererComponent>();
+                    const size_t sourceTris = renderer && renderer->mesh
+                        ? renderer->mesh->GetIndexCount() / 3u : 0u;
+                    const size_t previewTris = meshSubdividerComp->previewMesh
+                        ? meshSubdividerComp->previewMesh->GetIndexCount() / 3u
+                        : sourceTris;
+                    ImGui::TextDisabled(
+                        "PS1 render geometry only; colliders stay unchanged.");
+                    ImGui::TextDisabled("%zu tris -> %zu preview tris",
+                                        sourceTris, previewTris);
+                }
+                EndInspectableComponent(*meshSubdividerComp, open);
+                if (removeComponent) {
+                    RemoveCurrentInspectorComponents(*selectedEntity, meshSubdividerComp);
+                    ImGui::End();
+                    return;
+                }
+            }
+
+            auto* terrainComp = dynamic_cast<TerrainComponent*>(orderedComponent);
 
             if (terrainComp) {
                 removeComponent = false;
-                const bool open = BeginInspectableComponent("Terrain", *terrainComp, removeComponent, this);
+                const auto rebuildTerrain = [&] {
+                    auto* mr = selectedEntity->GetComponent<MeshRendererComponent>();
+                    if (!mr)
+                        mr = &selectedEntity->AddComponent<MeshRendererComponent>();
+                    terrainComp->RebuildMesh(*mr);
+                    if (!mr->texture)
+                        mr->texture = std::make_shared<Texture>(Texture::CreateCheckerboard(256, 32));
+                    m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+                };
+                const bool open = BeginInspectableComponent(
+                    "Terrain", *terrainComp, removeComponent, this, [&] {
+                        if (ImGui::MenuItem("Flatten Terrain")) {
+                            RecordUndoSnapshot();
+                            terrainComp->ResetProcedural();
+                            rebuildTerrain();
+                        }
+                        if (ImGui::MenuItem("Clear Paint")) {
+                            RecordUndoSnapshot();
+                            terrainComp->ClearPaint();
+                            rebuildTerrain();
+                        }
+                        if (ImGui::MenuItem("Fill Layer")) {
+                            RecordUndoSnapshot();
+                            terrainComp->EnsureData();
+                            std::fill(terrainComp->paintColors.begin(),
+                                      terrainComp->paintColors.end(), terrainComp->brushColor);
+                            rebuildTerrain();
+                        }
+                    });
                 if (!removeComponent && open) {
                     bool changed = false;
                     ImGui::TextDisabled("Terrain Data");
-                    changed |= ImGui::DragFloat("Size", &terrainComp->size, 0.25f, 0.1f, 512.0f);
+                    changed |= InspectorDragFloat("Size", &terrainComp->size, 0.25f, 0.1f, 512.0f);
                     const int oldSubdivisions = terrainComp->subdivisions;
-                    changed |= ImGui::SliderInt("Resolution", &terrainComp->subdivisions, 1, 128);
+                    changed |= InspectorSliderInt("Resolution", &terrainComp->subdivisions, 1, 128);
 
                     if (changed)
                         terrainComp->subdivisions = std::clamp(terrainComp->subdivisions, 1, 128);
 
-                    const bool flatten = ImGui::Button("Flatten Terrain", ImVec2(-1, 0));
-                    if (flatten || oldSubdivisions != terrainComp->subdivisions)
+                    if (oldSubdivisions != terrainComp->subdivisions)
                         terrainComp->ResetProcedural();
 
                     ImGui::SeparatorText("Terrain Tools");
@@ -5347,78 +6909,63 @@ void EditorApp::DrawInspectorPanel() {
                     }
 
                     ImGui::Spacing();
-                    brushSettingsChanged |= EditorTheme::Checkbox("Enable Scene Brush", &terrainComp->brushEnabled);
+                    brushSettingsChanged |= InspectorCheckbox("Enable Scene Brush", &terrainComp->brushEnabled);
                     ImGui::BeginDisabled(!terrainComp->brushEnabled);
-                    brushSettingsChanged |= ImGui::SliderFloat("Brush Size", &terrainComp->brushRadius, 0.05f, 64.0f, "%.2f");
-                    brushSettingsChanged |= ImGui::SliderFloat("Opacity", &terrainComp->brushStrength, 0.0f, 10.0f, "%.2f");
+                    brushSettingsChanged |= InspectorSliderFloat("Brush Size", &terrainComp->brushRadius, 0.05f, 64.0f, "%.2f");
+                    brushSettingsChanged |= InspectorSliderFloat("Opacity", &terrainComp->brushStrength, 0.0f, 10.0f, "%.2f");
                     if (terrainComp->brushMode == TerrainComponent::BrushMode::Paint)
-                        brushSettingsChanged |= ImGui::ColorEdit4("Terrain Layer Color", glm::value_ptr(terrainComp->brushColor));
+                        brushSettingsChanged |= InspectorColorEdit4("Terrain Layer Color", glm::value_ptr(terrainComp->brushColor));
                     ImGui::EndDisabled();
 
                     ImGui::TextDisabled("Scene View: left-drag to paint. Shift lowers in Raise/Lower mode.");
                     if (brushSettingsChanged)
                         m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
 
-                    ImGui::Columns(2, nullptr, false);
-                    if (ImGui::Button("Clear Paint", ImVec2(-1, 0))) {
-                        terrainComp->ClearPaint();
-                        changed = true;
-                    }
-                    ImGui::NextColumn();
-                    if (ImGui::Button("Fill Layer", ImVec2(-1, 0))) {
-                        terrainComp->EnsureData();
-                        std::fill(terrainComp->paintColors.begin(), terrainComp->paintColors.end(), terrainComp->brushColor);
-                        changed = true;
-                    }
-                    ImGui::Columns(1);
-
-                    if (changed || flatten) {
-                        auto* mr = selectedEntity->GetComponent<MeshRendererComponent>();
-                        if (!mr)
-                            mr = &selectedEntity->AddComponent<MeshRendererComponent>();
-                        terrainComp->RebuildMesh(*mr);
-                        if (!mr->texture)
-                            mr->texture = std::make_shared<Texture>(Texture::CreateCheckerboard(256, 32));
-                        m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
-                    }
+                    if (changed)
+                        rebuildTerrain();
 
                     ImGui::TextDisabled("%d x %d vertices, %d tris",
                         terrainComp->subdivisions + 1,
                         terrainComp->subdivisions + 1,
                         terrainComp->subdivisions * terrainComp->subdivisions * 2);
                 }
-                EndInspectableComponent(*terrainComp);
+                EndInspectableComponent(*terrainComp, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<TerrainComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, terrainComp);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* collider = selectedEntity->GetComponent<ColliderComponent>();
+            auto* collider = dynamic_cast<ColliderComponent*>(orderedComponent);
             if (collider) {
                 removeComponent = false;
-                const bool open = BeginInspectableComponent("Collider", *collider, removeComponent, this);
+                auto* colliderMeshRenderer = selectedEntity->GetComponent<MeshRendererComponent>();
+                const bool canFitCollider = colliderMeshRenderer && colliderMeshRenderer->mesh;
+                const bool open = BeginInspectableComponent(
+                    "Collider", *collider, removeComponent, this, [&] {
+                        if (ImGui::MenuItem("Fit to Mesh", nullptr, false, canFitCollider)) {
+                            RecordUndoSnapshot();
+                            ColliderUtils::FitColliderToMesh(*collider,
+                                                             *colliderMeshRenderer->mesh);
+                            if (m_IsPlaying)
+                                m_Engine->GetPhysicsWorld().RefreshBodies(m_Engine->GetScene());
+                        }
+                    });
                 if (!removeComponent && open) {
                     const char* shapeNames[] = { "Box", "Sphere", "Capsule", "Mesh" };
                     int shapeIdx = static_cast<int>(collider->shape);
                     if (shapeIdx > 3) shapeIdx = 0;
-                    if (ImGui::Combo("Shape", &shapeIdx, shapeNames, IM_ARRAYSIZE(shapeNames)))
+                    if (InspectorCombo("Shape", &shapeIdx, shapeNames, IM_ARRAYSIZE(shapeNames),
+                                       InspectorValuesMixed(&collider->shape))) {
                         collider->shape = static_cast<ColliderShape>(shapeIdx);
-
-                    if (ImGui::Button("Fit to Mesh", ImVec2(-1, 0))) {
-                        if (auto* mr = selectedEntity->GetComponent<MeshRendererComponent>();
-                            mr && mr->mesh) {
-                            ColliderUtils::FitColliderToMesh(*collider, *mr->mesh);
-                            if (m_IsPlaying)
-                                m_Engine->GetPhysicsWorld().RefreshBodies(m_Engine->GetScene());
-                        }
+                        PropagateInspectorValues(&collider->shape);
                     }
 
-                    ImGui::DragFloat3("Center", glm::value_ptr(collider->center), 0.01f);
+                    InspectorDragFloat3("Center", glm::value_ptr(collider->center), 0.01f);
                     if (collider->shape == ColliderShape::Box || collider->shape == ColliderShape::Mesh) {
                         if (collider->shape == ColliderShape::Mesh) {
-                            if (EditorTheme::Checkbox("Convex", &collider->convex)) {
+                            if (InspectorCheckbox("Convex", &collider->convex)) {
                                 m_SceneDirty = true;
                                 if (m_IsPlaying)
                                     m_Engine->GetPhysicsWorld().RefreshBodies(m_Engine->GetScene());
@@ -5434,23 +6981,23 @@ void EditorApp::DrawInspectorPanel() {
                                 }
                             }
                         }
-                        ImGui::DragFloat3("Half Extents", glm::value_ptr(collider->halfExtents), 0.01f, 0.01f, 100.0f);
+                        InspectorDragFloat3("Half Extents", glm::value_ptr(collider->halfExtents), 0.01f, 0.01f, 100.0f);
                     } else {
-                        ImGui::DragFloat("Radius", &collider->radius, 0.01f, 0.01f, 50.0f);
+                        InspectorDragFloat("Radius", &collider->radius, 0.01f, 0.01f, 50.0f);
                         if (collider->shape == ColliderShape::Capsule)
-                            ImGui::DragFloat("Height", &collider->capsuleHeight, 0.01f, 0.01f, 50.0f);
+                            InspectorDragFloat("Height", &collider->capsuleHeight, 0.01f, 0.01f, 50.0f);
                     }
-                    EditorTheme::Checkbox("Is Trigger", &collider->isTrigger);
-                    if (EditorTheme::Checkbox("Camera Shot Trigger", &collider->cameraShotTrigger)) {
+                    InspectorCheckbox("Is Trigger", &collider->isTrigger);
+                    if (InspectorCheckbox("Camera Shot Trigger", &collider->cameraShotTrigger)) {
                         if (collider->cameraShotTrigger)
                             collider->isTrigger = true;
                         ResetShotCameraState();
                         m_SceneDirty = true;
                     }
                 }
-                EndInspectableComponent(*collider);
+                EndInspectableComponent(*collider, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<ColliderComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, collider);
                     if (m_IsPlaying)
                         m_Engine->GetPhysicsWorld().RefreshBodies(m_Engine->GetScene());
                     ImGui::End();
@@ -5458,21 +7005,24 @@ void EditorApp::DrawInspectorPanel() {
                 }
             }
 
-            auto* rigidbody = selectedEntity->GetComponent<RigidbodyComponent>();
+            auto* rigidbody = dynamic_cast<RigidbodyComponent*>(orderedComponent);
             if (rigidbody) {
                 removeComponent = false;
                 const bool open = BeginInspectableComponent("Rigidbody", *rigidbody, removeComponent, this);
                 if (!removeComponent && open) {
                     const char* bodyNames[] = { "Static", "Kinematic", "Dynamic" };
                     int bodyIdx = static_cast<int>(rigidbody->bodyType);
-                    if (ImGui::Combo("Body Type", &bodyIdx, bodyNames, IM_ARRAYSIZE(bodyNames)))
+                    if (InspectorCombo("Body Type", &bodyIdx, bodyNames, IM_ARRAYSIZE(bodyNames),
+                                       InspectorValuesMixed(&rigidbody->bodyType))) {
                         rigidbody->bodyType = static_cast<RigidbodyType>(bodyIdx);
+                        PropagateInspectorValues(&rigidbody->bodyType);
+                    }
                     if (rigidbody->bodyType == RigidbodyType::Dynamic) {
-                        ImGui::DragFloat("Mass", &rigidbody->mass, 0.1f, 0.001f, 10000.0f);
-                        EditorTheme::Checkbox("Use Gravity", &rigidbody->useGravity);
-                        ImGui::DragFloat("Linear Drag", &rigidbody->linearDrag, 0.01f, 0.0f, 10.0f);
-                        ImGui::DragFloat("Bounciness", &rigidbody->bounciness, 0.01f, 0.0f, 1.0f);
-                        EditorTheme::Checkbox("Freeze Rotation", &rigidbody->freezeRotation);
+                        InspectorDragFloat("Mass", &rigidbody->mass, 0.1f, 0.001f, 10000.0f);
+                        InspectorCheckbox("Use Gravity", &rigidbody->useGravity);
+                        InspectorDragFloat("Linear Drag", &rigidbody->linearDrag, 0.01f, 0.0f, 10.0f);
+                        InspectorDragFloat("Bounciness", &rigidbody->bounciness, 0.01f, 0.0f, 1.0f);
+                        InspectorCheckbox("Freeze Rotation", &rigidbody->freezeRotation);
                     } else if (rigidbody->bodyType == RigidbodyType::Kinematic) {
                         if (rigidbody->characterController)
                             ImGui::TextDisabled("Character controller (Jolt CharacterVirtual)");
@@ -5480,9 +7030,9 @@ void EditorApp::DrawInspectorPanel() {
                             ImGui::TextDisabled("Moved by transform / scripts");
                     }
                 }
-                EndInspectableComponent(*rigidbody);
+                EndInspectableComponent(*rigidbody, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<RigidbodyComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, rigidbody);
                     if (m_IsPlaying)
                         m_Engine->GetPhysicsWorld().RefreshBodies(m_Engine->GetScene());
                     ImGui::End();
@@ -5490,82 +7040,90 @@ void EditorApp::DrawInspectorPanel() {
                 }
             }
 
-            auto* rectTransform = selectedEntity->GetComponent<RectTransformComponent>();
+            auto* rectTransform = dynamic_cast<RectTransformComponent*>(orderedComponent);
             if (rectTransform) {
                 removeComponent = false;
                 const bool open = BeginInspectableComponent("Rect Transform", *rectTransform, removeComponent, this);
                 if (!removeComponent && open) {
-                    ImGui::DragFloat2("Anchor Min", glm::value_ptr(rectTransform->anchorMin), 0.01f, 0.0f, 1.0f);
-                    ImGui::DragFloat2("Anchor Max", glm::value_ptr(rectTransform->anchorMax), 0.01f, 0.0f, 1.0f);
-                    ImGui::DragFloat2("Pivot", glm::value_ptr(rectTransform->pivot), 0.01f, 0.0f, 1.0f);
-                    ImGui::DragFloat2("Anchored Position", glm::value_ptr(rectTransform->anchoredPosition), 1.0f);
-                    ImGui::DragFloat2("Size Delta", glm::value_ptr(rectTransform->sizeDelta), 1.0f);
+                    InspectorDragFloat2("Anchor Min", glm::value_ptr(rectTransform->anchorMin), 0.01f, 0.0f, 1.0f);
+                    InspectorDragFloat2("Anchor Max", glm::value_ptr(rectTransform->anchorMax), 0.01f, 0.0f, 1.0f);
+                    InspectorDragFloat2("Pivot", glm::value_ptr(rectTransform->pivot), 0.01f, 0.0f, 1.0f);
+                    InspectorDragFloat2("Anchored Position", glm::value_ptr(rectTransform->anchoredPosition), 1.0f);
+                    InspectorDragFloat2("Size Delta", glm::value_ptr(rectTransform->sizeDelta), 1.0f);
                 }
-                EndInspectableComponent(*rectTransform);
+                EndInspectableComponent(*rectTransform, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<RectTransformComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, rectTransform);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* canvas = selectedEntity->GetComponent<CanvasComponent>();
+            auto* canvas = dynamic_cast<CanvasComponent*>(orderedComponent);
             if (canvas) {
                 removeComponent = false;
                 const bool open = BeginInspectableComponent("Canvas", *canvas, removeComponent, this);
                 if (!removeComponent && open) {
                     const char* renderModes[] = { "Screen Space - Overlay", "Screen Space - Camera", "World Space" };
                     int renderMode = static_cast<int>(canvas->renderMode);
-                    if (ImGui::Combo("Render Mode", &renderMode, renderModes, IM_ARRAYSIZE(renderModes)))
+                    if (InspectorCombo("Render Mode", &renderMode, renderModes,
+                                       IM_ARRAYSIZE(renderModes),
+                                       InspectorValuesMixed(&canvas->renderMode))) {
                         canvas->renderMode = static_cast<UICanvasRenderMode>(renderMode);
+                        PropagateInspectorValues(&canvas->renderMode);
+                    }
 
                     const char* scaleModes[] = { "Constant Pixel Size", "Scale With Screen Size" };
                     int scaleMode = static_cast<int>(canvas->scaleMode);
-                    if (ImGui::Combo("UI Scale Mode", &scaleMode, scaleModes, IM_ARRAYSIZE(scaleModes)))
+                    if (InspectorCombo("UI Scale Mode", &scaleMode, scaleModes,
+                                       IM_ARRAYSIZE(scaleModes),
+                                       InspectorValuesMixed(&canvas->scaleMode))) {
                         canvas->scaleMode = static_cast<UICanvasScaleMode>(scaleMode);
+                        PropagateInspectorValues(&canvas->scaleMode);
+                    }
 
-                    ImGui::DragInt("Sort Order", &canvas->sortOrder, 1.0f, -100, 100);
-                    ImGui::DragFloat2("Reference Resolution", glm::value_ptr(canvas->referenceResolution), 1.0f, 1.0f, 8192.0f);
-                    ImGui::SliderFloat("Match Width Or Height", &canvas->matchWidthOrHeight, 0.0f, 1.0f);
+                    InspectorDragInt("Sort Order", &canvas->sortOrder, 1.0f, -100, 100);
+                    InspectorDragFloat2("Reference Resolution", glm::value_ptr(canvas->referenceResolution), 1.0f, 1.0f, 8192.0f);
+                    InspectorSliderFloat("Match Width Or Height", &canvas->matchWidthOrHeight, 0.0f, 1.0f);
 
                     if (canvas->renderMode == UICanvasRenderMode::ScreenSpaceCamera ||
                         canvas->renderMode == UICanvasRenderMode::WorldSpace) {
                         int camId = static_cast<int>(canvas->eventCameraEntityId);
-                        if (ImGui::InputInt("Event Camera Entity ID", &camId)) {
+                        if (InspectorInputInt("Event Camera Entity ID", &camId)) {
                             canvas->eventCameraEntityId = static_cast<uint32_t>(std::max(camId, 0));
                         }
                         ImGui::TextDisabled("0 = primary camera");
                     }
                     if (canvas->renderMode == UICanvasRenderMode::ScreenSpaceCamera)
-                        ImGui::DragFloat("Plane Distance", &canvas->planeDistance, 0.5f, 0.1f, 500.0f);
+                        InspectorDragFloat("Plane Distance", &canvas->planeDistance, 0.5f, 0.1f, 500.0f);
                 }
-                EndInspectableComponent(*canvas);
+                EndInspectableComponent(*canvas, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<CanvasComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, canvas);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* uiImage = selectedEntity->GetComponent<UIImageComponent>();
+            auto* uiImage = dynamic_cast<UIImageComponent*>(orderedComponent);
             if (uiImage) {
                 removeComponent = false;
                 const bool open = BeginInspectableComponent("Image", *uiImage, removeComponent, this);
                 if (!removeComponent && open) {
-                    ImGui::ColorEdit4("Color", glm::value_ptr(uiImage->color));
-                    if (EditorTheme::Checkbox("Preserve Aspect", &uiImage->preserveAspect))
+                    InspectorColorEdit4("Color", glm::value_ptr(uiImage->color));
+                    if (InspectorCheckbox("Preserve Aspect", &uiImage->preserveAspect))
                         RecordUndoSnapshot();
                     DrawUITextureSlot(*uiImage);
                 }
-                EndInspectableComponent(*uiImage);
+                EndInspectableComponent(*uiImage, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<UIImageComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, uiImage);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* uiText = selectedEntity->GetComponent<UITextComponent>();
+            auto* uiText = dynamic_cast<UITextComponent*>(orderedComponent);
             if (uiText) {
                 removeComponent = false;
                 const bool open = BeginInspectableComponent("Text", *uiText, removeComponent, this);
@@ -5573,89 +7131,84 @@ void EditorApp::DrawInspectorPanel() {
                     char textBuffer[1024];
                     memset(textBuffer, 0, sizeof(textBuffer));
                     strncpy(textBuffer, uiText->text.c_str(), sizeof(textBuffer) - 1);
-                    if (ImGui::InputTextMultiline("##TextContent", textBuffer, sizeof(textBuffer), ImVec2(-1, 60)))
+                    if (DrawInspectorPropertyRow("Text", [&] {
+                            return ImGui::InputTextMultiline(
+                                "##value", textBuffer, sizeof(textBuffer), ImVec2(-1, 60));
+                        }))
                         uiText->text = textBuffer;
-                    ImGui::ColorEdit4("Color", glm::value_ptr(uiText->color));
-                    ImGui::DragFloat("Font Size", &uiText->fontSize, 0.5f, 8.0f, 96.0f);
+                    InspectorColorEdit4("Color", glm::value_ptr(uiText->color));
+                    InspectorDragFloat("Font Size", &uiText->fontSize, 0.5f, 8.0f, 96.0f);
                     const char* alignments[] = { "Left", "Center", "Right" };
                     int align = static_cast<int>(uiText->alignment);
-                    if (ImGui::Combo("Alignment", &align, alignments, IM_ARRAYSIZE(alignments)))
+                    if (InspectorCombo("Alignment", &align, alignments, IM_ARRAYSIZE(alignments),
+                                       InspectorValuesMixed(&uiText->alignment))) {
                         uiText->alignment = static_cast<UITextAlignment>(align);
+                        PropagateInspectorValues(&uiText->alignment);
+                    }
                 }
-                EndInspectableComponent(*uiText);
+                EndInspectableComponent(*uiText, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<UITextComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, uiText);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* uiButtonGroup = selectedEntity->GetComponent<UIButtonGroupComponent>();
+            auto* uiButtonGroup = dynamic_cast<UIButtonGroupComponent*>(orderedComponent);
             if (uiButtonGroup) {
                 removeComponent = false;
                 const bool open = BeginInspectableComponent("Button Group", *uiButtonGroup, removeComponent, this);
                 if (!removeComponent && open) {
-                    ImGui::DragInt("Selected Index", &uiButtonGroup->selectedIndex, 1.0f, 0, 999);
-                    EditorTheme::Checkbox("Wrap Navigation", &uiButtonGroup->wrapNavigation);
-                    EditorTheme::Checkbox("Keyboard Navigation", &uiButtonGroup->keyboardNavigation);
-                    EditorTheme::Checkbox("Gamepad Navigation", &uiButtonGroup->gamepadNavigation);
+                    InspectorDragInt("Selected Index", &uiButtonGroup->selectedIndex, 1.0f, 0, 999);
+                    InspectorCheckbox("Wrap Navigation", &uiButtonGroup->wrapNavigation);
+                    InspectorCheckbox("Keyboard Navigation", &uiButtonGroup->keyboardNavigation);
+                    InspectorCheckbox("Gamepad Navigation", &uiButtonGroup->gamepadNavigation);
                     ImGui::SeparatorText("Confirm");
-                    EditorTheme::Checkbox("Keyboard Confirm", &uiButtonGroup->keyboardConfirm);
+                    InspectorCheckbox("Keyboard Confirm", &uiButtonGroup->keyboardConfirm);
                     const char* keyNames[] = { "Enter", "Space", "Z", "X", "E", "F" };
                     int key = static_cast<int>(uiButtonGroup->confirmKey);
-                    if (ImGui::Combo("PC Key", &key, keyNames, IM_ARRAYSIZE(keyNames)))
+                    if (InspectorCombo("PC Key", &key, keyNames, IM_ARRAYSIZE(keyNames),
+                                       InspectorValuesMixed(&uiButtonGroup->confirmKey))) {
                         uiButtonGroup->confirmKey = static_cast<UIConfirmKey>(key);
-                    EditorTheme::Checkbox("Gamepad Confirm", &uiButtonGroup->gamepadConfirm);
+                        PropagateInspectorValues(&uiButtonGroup->confirmKey);
+                    }
+                    InspectorCheckbox("Gamepad Confirm", &uiButtonGroup->gamepadConfirm);
                     const char* buttonNames[] = { "South / Cross / A", "East / Circle / B",
                                                   "West / Square / X", "North / Triangle / Y", "Start" };
                     int button = static_cast<int>(uiButtonGroup->confirmButton);
-                    if (ImGui::Combo("Controller Button", &button, buttonNames, IM_ARRAYSIZE(buttonNames)))
+                    if (InspectorCombo("Controller Button", &button, buttonNames,
+                                       IM_ARRAYSIZE(buttonNames),
+                                       InspectorValuesMixed(&uiButtonGroup->confirmButton))) {
                         uiButtonGroup->confirmButton = static_cast<UIConfirmGamepadButton>(button);
+                        PropagateInspectorValues(&uiButtonGroup->confirmButton);
+                    }
                     ImGui::SeparatorText("Cursor");
                     DrawUIButtonGroupCursorSlot(*uiButtonGroup);
-                    ImGui::DragFloat2("Cursor Offset", glm::value_ptr(uiButtonGroup->cursorOffset), 1.0f);
-                    ImGui::DragFloat2("Cursor Size", glm::value_ptr(uiButtonGroup->cursorSize), 1.0f, 1.0f, 512.0f);
-                    EditorTheme::Checkbox("Pressed This Frame", &uiButtonGroup->pressedThisFrame);
-                    ImGui::TextDisabled("Pressed This Frame is runtime state; useful for quick debugging.");
+                    InspectorDragFloat2("Cursor Offset", glm::value_ptr(uiButtonGroup->cursorOffset), 1.0f);
+                    InspectorDragFloat2("Cursor Size", glm::value_ptr(uiButtonGroup->cursorSize), 1.0f, 1.0f, 512.0f);
                 }
-                EndInspectableComponent(*uiButtonGroup);
+                EndInspectableComponent(*uiButtonGroup, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<UIButtonGroupComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, uiButtonGroup);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* uiButton = selectedEntity->GetComponent<UIButtonComponent>();
+            auto* uiButton = dynamic_cast<UIButtonComponent*>(orderedComponent);
             if (uiButton) {
                 removeComponent = false;
-                const bool open = BeginInspectableComponent("Button", *uiButton, removeComponent, this);
-                if (!removeComponent && open) {
-                    bool interactable = uiButton->interactable;
-                    if (EditorTheme::Checkbox("Interactable", &interactable)) {
-                        RecordUndoSnapshot();
-                        uiButton->interactable = interactable;
-                        m_SceneDirty = true;
+                bool hasTextChild = false;
+                for (uint32_t childId : selectedEntity->GetChildIDs()) {
+                    Entity* child = m_Engine->GetScene().FindEntity(childId);
+                    if (child && child->HasComponent<UITextComponent>()) {
+                        hasTextChild = true;
+                        break;
                     }
-                    DrawUIButtonBackgroundSlot(*uiButton);
-                    if (EditorTheme::Checkbox("Preserve Aspect", &uiButton->preserveAspect))
-                        RecordUndoSnapshot();
-                    ImGui::ColorEdit4("Normal", glm::value_ptr(uiButton->normalColor));
-                    ImGui::ColorEdit4("Selected", glm::value_ptr(uiButton->selectedColor));
-                    ImGui::ColorEdit4("Pressed", glm::value_ptr(uiButton->pressedColor));
-                    bool hasTextChild = false;
-                    for (uint32_t childId : selectedEntity->GetChildIDs()) {
-                        Entity* child = m_Engine->GetScene().FindEntity(childId);
-                        if (child && child->HasComponent<UITextComponent>()) {
-                            hasTextChild = true;
-                            break;
-                        }
-                    }
-                    ImGui::TextDisabled("Button text is a child Text object.");
-                    if (!hasTextChild) {
-                        if (EditorTheme::AeroButton("Create Child Text",
-                                                     ImVec2(-1.0f, EditorTheme::ButtonHeight),
-                                                     AeroButtonKind::Secondary)) {
+                }
+                const bool open = BeginInspectableComponent(
+                    "Button", *uiButton, removeComponent, this, [&] {
+                        if (ImGui::MenuItem("Create Child Text", nullptr, false, !hasTextChild)) {
                             RecordUndoSnapshot();
                             Scene& scene = m_Engine->GetScene();
                             Entity* textEntity = scene.CreateEntity("Text");
@@ -5674,7 +7227,25 @@ void EditorApp::DrawInspectorPanel() {
                             m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
                             m_SceneDirty = true;
                         }
+                        if (ImGui::MenuItem("Add On Click Listener")) {
+                            RecordUndoSnapshot();
+                            uiButton->onClick.emplace_back();
+                            m_SceneDirty = true;
+                        }
+                    });
+                if (!removeComponent && open) {
+                    bool interactable = uiButton->interactable;
+                    if (InspectorCheckbox("Interactable", &interactable)) {
+                        RecordUndoSnapshot();
+                        uiButton->interactable = interactable;
+                        m_SceneDirty = true;
                     }
+                    DrawUIButtonBackgroundSlot(*uiButton);
+                    if (InspectorCheckbox("Preserve Aspect", &uiButton->preserveAspect))
+                        RecordUndoSnapshot();
+                    InspectorColorEdit4("Normal", glm::value_ptr(uiButton->normalColor));
+                    InspectorColorEdit4("Selected", glm::value_ptr(uiButton->selectedColor));
+                    InspectorColorEdit4("Pressed", glm::value_ptr(uiButton->pressedColor));
                     if (!FindButtonGroupAncestor(m_Engine->GetScene(), selectedEntity))
                         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f),
                                            "Button is not under a Button Group.");
@@ -5715,7 +7286,8 @@ void EditorApp::DrawInspectorPanel() {
                                 targetLabel = "Entity #" + std::to_string(target->GetID());
                         }
                         ImGui::SetNextItemWidth(-1.0f);
-                        ImGui::Button(targetLabel.c_str(), ImVec2(-1.0f, 0.0f));
+                        const bool openTargetPicker =
+                            DrawInspectorObjectReferenceButton(targetLabel.c_str());
                         if (ImGui::BeginDragDropTarget()) {
                             if (const ImGuiPayload* payload =
                                     ImGui::AcceptDragDropPayload(DragDrop::kEntityId)) {
@@ -5741,7 +7313,21 @@ void EditorApp::DrawInspectorPanel() {
                                 listener.methodName.clear();
                                 m_SceneDirty = true;
                             }
-                            ImGui::EndPopup();
+                                ImGui::EndPopup();
+                            }
+                        if (openTargetPicker) {
+                            s_InspectorObjectSearch[0] = '\0';
+                            s_InspectorObjectCandidate = listener.targetEntityId;
+                            ImGui::OpenPopup("##scene_object_picker");
+                        }
+                        uint32_t pickedTargetId = listener.targetEntityId;
+                        if (DrawInspectorSceneObjectPickerPopup(
+                                scene, "Entity", pickedTargetId)) {
+                            RecordUndoSnapshot();
+                            listener.targetEntityId = pickedTargetId;
+                            listener.scriptPath.clear();
+                            listener.methodName.clear();
+                            m_SceneDirty = true;
                         }
 
                         const std::string functionPreview = listener.methodName.empty()
@@ -5796,76 +7382,128 @@ void EditorApp::DrawInspectorPanel() {
                         uiButton->onClick.erase(uiButton->onClick.begin() + removeListener);
                         m_SceneDirty = true;
                     }
-                    if (EditorTheme::AeroButton("+ Add On Click Listener",
-                                                ImVec2(-1.0f, EditorTheme::ButtonHeight),
-                                                AeroButtonKind::Secondary)) {
-                        RecordUndoSnapshot();
-                        uiButton->onClick.emplace_back();
-                        m_SceneDirty = true;
-                    }
                 }
-                EndInspectableComponent(*uiButton);
+                EndInspectableComponent(*uiButton, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<UIButtonComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, uiButton);
                     ImGui::End();
                     return;
                 }
             }
 
-            auto* uiSpectrum = selectedEntity->GetComponent<UIAudioSpectrumComponent>();
+            auto* uiSpectrum = dynamic_cast<UIAudioSpectrumComponent*>(orderedComponent);
             if (uiSpectrum) {
                 removeComponent = false;
                 const bool open = BeginInspectableComponent("Audio Spectrum", *uiSpectrum, removeComponent, this);
                 if (!removeComponent && open) {
                     int sourceId = static_cast<int>(uiSpectrum->sourceEntityId);
-                    if (ImGui::InputInt("Audio Source Entity ID", &sourceId))
+                    if (InspectorInputInt("Audio Source Entity ID", &sourceId))
                         uiSpectrum->sourceEntityId = static_cast<uint32_t>(std::max(sourceId, 0));
                     ImGui::TextDisabled("0 = first playing Audio Source");
-                    ImGui::ColorEdit4("Bar Color", glm::value_ptr(uiSpectrum->color));
-                    ImGui::ColorEdit4("Background", glm::value_ptr(uiSpectrum->backgroundColor));
-                    ImGui::SliderInt("Bars", &uiSpectrum->barCount, 4, 32);
-                    ImGui::DragFloat("Gap", &uiSpectrum->barGap, 0.25f, 0.0f, 32.0f);
-                    ImGui::DragFloat("Sensitivity", &uiSpectrum->sensitivity, 0.02f, 0.1f, 8.0f);
-                    ImGui::SliderFloat("Smoothing", &uiSpectrum->smoothing, 0.0f, 0.98f);
+                    InspectorColorEdit4("Bar Color", glm::value_ptr(uiSpectrum->color));
+                    InspectorColorEdit4("Background", glm::value_ptr(uiSpectrum->backgroundColor));
+                    InspectorSliderInt("Bars", &uiSpectrum->barCount, 4, 32);
+                    InspectorDragFloat("Gap", &uiSpectrum->barGap, 0.25f, 0.0f, 32.0f);
+                    InspectorDragFloat("Sensitivity", &uiSpectrum->sensitivity, 0.02f, 0.1f, 8.0f);
+                    InspectorSliderFloat("Smoothing", &uiSpectrum->smoothing, 0.0f, 0.98f);
                 }
-                EndInspectableComponent(*uiSpectrum);
+                EndInspectableComponent(*uiSpectrum, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent<UIAudioSpectrumComponent>();
+                    RemoveCurrentInspectorComponents(*selectedEntity, uiSpectrum);
                     ImGui::End();
                     return;
                 }
             }
 
-            const auto mipsScripts = selectedEntity->GetComponents<MipsScriptComponent>();
-            for (auto* mipsScript : mipsScripts) {
+            auto* mipsScript = dynamic_cast<MipsScriptComponent*>(orderedComponent);
+            if (mipsScript) {
                 removeComponent = false;
-                const bool open = BeginInspectableComponent("Mips# Script", *mipsScript, removeComponent, this);
+                const bool open = BeginInspectableComponent(
+                    "Mips# Script", *mipsScript, removeComponent, this,
+                    [&] { DrawMipsScriptIdeMenuItems(mipsScript->scriptPath); });
                 if (!removeComponent && open) {
+                    std::vector<MipsScriptComponent*> peerScripts;
+                    for (Component* peer : s_InspectorMultiEdit.peers) {
+                        if (auto* script = dynamic_cast<MipsScriptComponent*>(peer))
+                            peerScripts.push_back(script);
+                    }
+                    const bool scriptPathMixed = std::any_of(
+                        peerScripts.begin(), peerScripts.end(),
+                        [&](const MipsScriptComponent* script) {
+                            return script->scriptPath != mipsScript->scriptPath;
+                        });
                     if (DrawAssetReferenceField(this, "Script", AssetKind::Script,
                                                 mipsScript->scriptPath, "None (Mips# Script)")) {
                         RecordUndoSnapshot();
                         mipsScript->module.reset();
                         mipsScript->fieldValues.clear();
                         mipsScript->fieldAssetPaths.clear();
+                        for (MipsScriptComponent* script : peerScripts) {
+                            script->module.reset();
+                            script->fieldValues.clear();
+                            script->fieldAssetPaths.clear();
+                        }
                     }
-                    DrawMipsScriptIdeActions(mipsScript->scriptPath);
-                    ImGui::Spacing();
-
                     std::vector<std::string> compileErrors;
                     const bool compiled =
+                        !scriptPathMixed &&
                         Mips::MipsRuntime::EnsureScriptReady(*mipsScript, compileErrors);
+                    if (scriptPathMixed)
+                        ImGui::TextDisabled("Select one common script to edit its fields.");
+                    if (compiled) {
+                        for (MipsScriptComponent* script : peerScripts) {
+                            std::vector<std::string> peerErrors;
+                            Mips::MipsRuntime::EnsureScriptReady(*script, peerErrors);
+                        }
+                    }
                     for (const auto& err : compileErrors)
                         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "%s", err.c_str());
 
                     if (compiled && mipsScript->module) {
-                        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Class: %s",
-                                           mipsScript->module->className.c_str());
-
                         if (m_IsPlaying)
                             ImGui::BeginDisabled();
 
                         for (size_t i = 0; i < mipsScript->module->fields.size(); ++i) {
                             const auto& field = mipsScript->module->fields[i];
+                            const bool isVector3Start =
+                                field.typeName == "Vector3.x" && i + 2 < mipsScript->module->fields.size() &&
+                                mipsScript->module->fields[i + 1].typeName == "Vector3.y" &&
+                                mipsScript->module->fields[i + 2].typeName == "Vector3.z";
+                            if (isVector3Start) {
+                                float value[3] = {
+                                    static_cast<float>(mipsScript->fieldValues[i]),
+                                    static_cast<float>(mipsScript->fieldValues[i + 1]),
+                                    static_cast<float>(mipsScript->fieldValues[i + 2]),
+                                };
+                                const std::string label = field.name.size() > 2
+                                    ? field.name.substr(0, field.name.size() - 2)
+                                    : field.name;
+                                bool mixedAxes[3]{};
+                                for (int axis = 0; axis < 3; ++axis) {
+                                    mixedAxes[axis] = std::any_of(
+                                        peerScripts.begin(), peerScripts.end(),
+                                        [&](const MipsScriptComponent* script) {
+                                            return i + static_cast<size_t>(axis) >= script->fieldValues.size() ||
+                                                   script->fieldValues[i + static_cast<size_t>(axis)] !=
+                                                       mipsScript->fieldValues[i + static_cast<size_t>(axis)];
+                                        });
+                                }
+                                if (InspectorDragFloat3(label.c_str(), value, 0.1f,
+                                                        0.0f, 0.0f, "%.3f", mixedAxes)) {
+                                    mipsScript->fieldValues[i] = static_cast<double>(value[0]);
+                                    mipsScript->fieldValues[i + 1] = static_cast<double>(value[1]);
+                                    mipsScript->fieldValues[i + 2] = static_cast<double>(value[2]);
+                                    for (MipsScriptComponent* script : peerScripts) {
+                                        if (script->fieldValues.size() <= i + 2)
+                                            script->fieldValues.resize(i + 3);
+                                        script->fieldValues[i] = static_cast<double>(value[0]);
+                                        script->fieldValues[i + 1] = static_cast<double>(value[1]);
+                                        script->fieldValues[i + 2] = static_cast<double>(value[2]);
+                                    }
+                                }
+                                i += 2;
+                                continue;
+                            }
                             const bool isFloat = field.typeName == "float";
                             const bool isInt = field.typeName == "int";
                             const bool isBool = field.typeName == "bool";
@@ -5904,49 +7542,77 @@ void EditorApp::DrawInspectorPanel() {
                                 }
 
                                 ImGui::PushID(static_cast<int>(i));
-                                ImGui::AlignTextToFramePadding();
-                                ImGui::TextUnformatted(field.name.c_str());
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(-1.0f);
-                                ImGui::Button(label.c_str(), ImVec2(-1.0f, 0.0f));
-                                if (ImGui::BeginDragDropTarget()) {
-                                    if (const ImGuiPayload* payload =
-                                            ImGui::AcceptDragDropPayload(DragDrop::kEntityId)) {
-                                        if (payload->DataSize >= static_cast<int>(sizeof(uint32_t))) {
-                                            const uint32_t droppedId =
-                                                *static_cast<const uint32_t*>(payload->Data);
-                                            Entity* dropped = scene.FindEntity(droppedId);
-                                            const bool compatible = dropped &&
-                                                (field.typeName != "Camera" ||
-                                                 dropped->HasComponent<CameraComponent>());
-                                            if (compatible) {
-                                                RecordUndoSnapshot();
-                                                mipsScript->fieldValues[i] =
-                                                    static_cast<double>(droppedId);
-                                                m_SceneDirty = true;
+                                DrawInspectorPropertyRow(field.name.c_str(), [&] {
+                                    const bool openPicker =
+                                        DrawInspectorObjectReferenceButton(label.c_str());
+                                    if (ImGui::BeginDragDropTarget()) {
+                                        if (const ImGuiPayload* payload =
+                                                ImGui::AcceptDragDropPayload(DragDrop::kEntityId)) {
+                                            if (payload->DataSize >= static_cast<int>(sizeof(uint32_t))) {
+                                                const uint32_t droppedId =
+                                                    *static_cast<const uint32_t*>(payload->Data);
+                                                Entity* dropped = scene.FindEntity(droppedId);
+                                                const bool compatible = dropped &&
+                                                    (field.typeName != "Camera" ||
+                                                     dropped->HasComponent<CameraComponent>());
+                                                if (compatible) {
+                                                    RecordUndoSnapshot();
+                                                    mipsScript->fieldValues[i] =
+                                                        static_cast<double>(droppedId);
+                                                    m_SceneDirty = true;
+                                                }
                                             }
                                         }
+                                        ImGui::EndDragDropTarget();
                                     }
-                                    ImGui::EndDragDropTarget();
-                                }
-                                if (referenced && ImGui::BeginPopupContextItem("ReferenceContext")) {
-                                    if (ImGui::MenuItem("Clear")) {
+                                    if (referenced &&
+                                        ImGui::BeginPopupContextItem("ReferenceContext")) {
+                                        if (ImGui::MenuItem("Clear")) {
+                                            RecordUndoSnapshot();
+                                            mipsScript->fieldValues[i] = 0.0;
+                                            m_SceneDirty = true;
+                                        }
+                                        ImGui::EndPopup();
+                                    }
+                                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
+                                        field.typeName == "Camera") {
+                                        ImGui::SetTooltip(
+                                            "Drag a Scene object with a Camera component here.");
+                                    }
+                                    if (openPicker) {
+                                        s_InspectorObjectSearch[0] = '\0';
+                                        s_InspectorObjectCandidate = referencedId;
+                                        ImGui::OpenPopup("##scene_object_picker");
+                                    }
+                                    uint32_t pickedId = referencedId;
+                                    if (DrawInspectorSceneObjectPickerPopup(
+                                            scene, field.typeName, pickedId)) {
                                         RecordUndoSnapshot();
-                                        mipsScript->fieldValues[i] = 0.0;
+                                        mipsScript->fieldValues[i] =
+                                            static_cast<double>(pickedId);
                                         m_SceneDirty = true;
                                     }
-                                    ImGui::EndPopup();
-                                }
-                                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
-                                    field.typeName == "Camera")
-                                    ImGui::SetTooltip("Drag a Scene object with a Camera component here.");
+                                    return false;
+                                });
                                 ImGui::PopID();
                                 continue;
                             }
                             if (isBool) {
                                 bool value = mipsScript->fieldValues[i] != 0.0;
-                                if (EditorTheme::Checkbox(field.name.c_str(), &value))
+                                const bool mixed = std::any_of(
+                                    peerScripts.begin(), peerScripts.end(),
+                                    [&](const MipsScriptComponent* script) {
+                                        return i >= script->fieldValues.size() ||
+                                               (script->fieldValues[i] != 0.0) != value;
+                                    });
+                                if (InspectorCheckbox(field.name.c_str(), &value, mixed)) {
                                     mipsScript->fieldValues[i] = value ? 1.0 : 0.0;
+                                    for (MipsScriptComponent* script : peerScripts) {
+                                        if (script->fieldValues.size() <= i)
+                                            script->fieldValues.resize(i + 1);
+                                        script->fieldValues[i] = value ? 1.0 : 0.0;
+                                    }
+                                }
                                 continue;
                             }
                             if (!isFloat && !isInt)
@@ -5955,21 +7621,49 @@ void EditorApp::DrawInspectorPanel() {
                             bool valueChanged = false;
                             if (isInt) {
                                 int value = static_cast<int>(std::lround(mipsScript->fieldValues[i]));
-                                if (ImGui::DragInt(field.name.c_str(), &value)) {
+                                const bool mixed = std::any_of(
+                                    peerScripts.begin(), peerScripts.end(),
+                                    [&](const MipsScriptComponent* script) {
+                                        return i >= script->fieldValues.size() ||
+                                               static_cast<int>(std::lround(script->fieldValues[i])) != value;
+                                    });
+                                if (InspectorDragInt(field.name.c_str(), &value,
+                                                     1.0f, 0, 0, mixed)) {
                                     mipsScript->fieldValues[i] = static_cast<double>(value);
+                                    for (MipsScriptComponent* script : peerScripts) {
+                                        if (script->fieldValues.size() <= i)
+                                            script->fieldValues.resize(i + 1);
+                                        script->fieldValues[i] = static_cast<double>(value);
+                                    }
                                     valueChanged = true;
                                 }
                             } else {
                                 float value = static_cast<float>(mipsScript->fieldValues[i]);
-                                if (ImGui::DragFloat(field.name.c_str(), &value, 0.1f)) {
+                                const bool mixed = std::any_of(
+                                    peerScripts.begin(), peerScripts.end(),
+                                    [&](const MipsScriptComponent* script) {
+                                        return i >= script->fieldValues.size() ||
+                                               static_cast<float>(script->fieldValues[i]) != value;
+                                    });
+                                if (InspectorDragFloat(field.name.c_str(), &value, 0.1f,
+                                                       0.0f, 0.0f, "%.3f", mixed)) {
                                     mipsScript->fieldValues[i] = static_cast<double>(value);
+                                    for (MipsScriptComponent* script : peerScripts) {
+                                        if (script->fieldValues.size() <= i)
+                                            script->fieldValues.resize(i + 1);
+                                        script->fieldValues[i] = static_cast<double>(value);
+                                    }
                                     valueChanged = true;
                                 }
                             }
                             if (valueChanged) {
-                                if (m_IsPlaying)
+                                if (m_IsPlaying) {
                                     m_Engine->GetMipsRuntime().ApplyFieldOverrides(
                                         selectedEntity, *mipsScript);
+                                    for (MipsScriptComponent* script : peerScripts)
+                                        m_Engine->GetMipsRuntime().ApplyFieldOverrides(
+                                            script->entity, *script);
+                                }
                             }
                         }
 
@@ -5981,61 +7675,103 @@ void EditorApp::DrawInspectorPanel() {
                         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "No script assigned");
                     }
                 }
-                EndInspectableComponent(*mipsScript);
+                EndInspectableComponent(*mipsScript, open);
                 if (removeComponent) {
-                    selectedEntity->RemoveComponent(mipsScript);
+                    RemoveCurrentInspectorComponents(*selectedEntity, mipsScript);
                     break;
                 }
             }
+            EndInspectorMultiEdit();
+            }
 
             ImGui::Spacing();
+            auto allInspectorEntitiesHave = [&]<typename T>() {
+                return std::all_of(inspectorEntities.begin(), inspectorEntities.end(),
+                                   [](Entity* entity) { return entity->HasComponent<T>(); });
+            };
+            auto addMissingInspectorComponents = [&]<typename T>(auto&& initialize) {
+                for (Entity* entity : inspectorEntities) {
+                    if (entity->HasComponent<T>())
+                        continue;
+                    T& component = entity->AddComponent<T>();
+                    initialize(*entity, component);
+                }
+                m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+                m_SceneDirty = true;
+            };
             if (ImGui::Button("Add Component", ImVec2(-1, 0))) {
                 ImGui::OpenPopup("AddComponentPopup");
             }
 
             if (ImGui::BeginPopup("AddComponentPopup")) {
                 if (ImGui::BeginMenu("Mesh")) {
-                  if (!selectedEntity->HasComponent<MeshRendererComponent>()) {
+                  if (!allInspectorEntitiesHave.operator()<MeshRendererComponent>()) {
                     if (ImGui::MenuItem("Mesh Renderer")) {
                         RecordUndoSnapshot();
-                        auto& mr = selectedEntity->AddComponent<MeshRendererComponent>();
-                        mr.SetPrimitive("Cube", 1.0f);
-                        mr.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
+                        addMissingInspectorComponents.operator()<MeshRendererComponent>(
+                            [](Entity&, MeshRendererComponent& mr) {
+                                mr.SetPrimitive("Cube", 1.0f);
+                                mr.texture = std::make_shared<Texture>(
+                                    Texture::CreateCheckerboard(128, 16));
+                            });
                         ImGui::CloseCurrentPopup();
                     }
                 }
-                if (!selectedEntity->HasComponent<SkinnedMeshRendererComponent>()) {
+                if (!allInspectorEntitiesHave.operator()<SkinnedMeshRendererComponent>()) {
                     if (ImGui::MenuItem("Skinned Mesh Renderer")) {
                         RecordUndoSnapshot();
-                        auto& sk = selectedEntity->AddComponent<SkinnedMeshRendererComponent>();
-                        sk.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
+                        addMissingInspectorComponents.operator()<SkinnedMeshRendererComponent>(
+                            [](Entity&, SkinnedMeshRendererComponent& sk) {
+                                sk.texture = std::make_shared<Texture>(
+                                    Texture::CreateCheckerboard(128, 16));
+                            });
                         ImGui::CloseCurrentPopup();
                     }
                 }
-                if (!selectedEntity->HasComponent<TerrainComponent>()) {
+                if (!allInspectorEntitiesHave.operator()<TerrainComponent>()) {
                     if (ImGui::MenuItem("Terrain")) {
                         RecordUndoSnapshot();
-                        auto& terrain = selectedEntity->AddComponent<TerrainComponent>();
-                        auto* mr = selectedEntity->GetComponent<MeshRendererComponent>();
-                        if (!mr) {
-                            mr = &selectedEntity->AddComponent<MeshRendererComponent>();
-                            mr->texture = std::make_shared<Texture>(Texture::CreateCheckerboard(256, 32));
-                        }
-                        terrain.RebuildMesh(*mr);
+                        addMissingInspectorComponents.operator()<TerrainComponent>(
+                            [](Entity& entity, TerrainComponent& terrain) {
+                                auto* mr = entity.GetComponent<MeshRendererComponent>();
+                                if (!mr) {
+                                    mr = &entity.AddComponent<MeshRendererComponent>();
+                                    mr->texture = std::make_shared<Texture>(
+                                        Texture::CreateCheckerboard(256, 32));
+                                }
+                                terrain.RebuildMesh(*mr);
+                            });
                         ImGui::CloseCurrentPopup();
                     }
                 }
-                if (!selectedEntity->HasComponent<ProModelerComponent>()) {
+                if (!allInspectorEntitiesHave.operator()<ProModelerComponent>()) {
                     if (ImGui::MenuItem("ProModeler Mesh")) {
                         RecordUndoSnapshot();
-                        auto& pb = selectedEntity->AddComponent<ProModelerComponent>();
-                        auto* mr = selectedEntity->GetComponent<MeshRendererComponent>();
-                        if (!mr) {
-                            mr = &selectedEntity->AddComponent<MeshRendererComponent>();
-                            mr->texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
-                        }
-                        pb.ResetBox();
-                        pb.RebuildMesh(*mr);
+                        addMissingInspectorComponents.operator()<ProModelerComponent>(
+                            [&](Entity& entity, ProModelerComponent& pb) {
+                                auto* mr = entity.GetComponent<MeshRendererComponent>();
+                                if (!mr) {
+                                    mr = &entity.AddComponent<MeshRendererComponent>();
+                                    mr->texture = std::make_shared<Texture>(
+                                        Texture::CreateCheckerboard(128, 16));
+                                }
+                                pb.ResetBox();
+                                pb.RebuildMesh(*mr);
+                                AddProModelerMeshCollider(entity, *mr);
+                            });
+                        ImGui::CloseCurrentPopup();
+                    }
+                }
+                if (!allInspectorEntitiesHave.operator()<MeshSubdividerComponent>()) {
+                    const bool hasMesh = std::all_of(
+                        inspectorEntities.begin(), inspectorEntities.end(),
+                        [](Entity* entity) {
+                            return entity->HasComponent<MeshRendererComponent>();
+                        });
+                    if (ImGui::MenuItem("Mesh Subdivider", nullptr, false, hasMesh)) {
+                        RecordUndoSnapshot();
+                        addMissingInspectorComponents.operator()<MeshSubdividerComponent>(
+                            [](Entity&, MeshSubdividerComponent&) {});
                         ImGui::CloseCurrentPopup();
                     }
                 }
@@ -6043,14 +7779,16 @@ void EditorApp::DrawInspectorPanel() {
                 }
 
                 if (ImGui::BeginMenu("Animation")) {
-                  if (!selectedEntity->HasComponent<AnimatorComponent>()) {
+                  if (!allInspectorEntitiesHave.operator()<AnimatorComponent>()) {
                     if (ImGui::MenuItem("Animator")) {
                         RecordUndoSnapshot();
-                        auto& anim = selectedEntity->AddComponent<AnimatorComponent>();
-                        if (auto* sk = selectedEntity->GetComponent<SkinnedMeshRendererComponent>()) {
-                            anim.modelPath = sk->modelPath;
-                            anim.ReloadAssets();
-                        }
+                        addMissingInspectorComponents.operator()<AnimatorComponent>(
+                            [](Entity& entity, AnimatorComponent& anim) {
+                                if (auto* sk = entity.GetComponent<SkinnedMeshRendererComponent>()) {
+                                    anim.modelPath = sk->modelPath;
+                                    anim.ReloadAssets();
+                                }
+                            });
                         ImGui::CloseCurrentPopup();
                     }
                 }
@@ -6058,40 +7796,64 @@ void EditorApp::DrawInspectorPanel() {
                 }
 
                 if (ImGui::BeginMenu("Rendering")) {
-                  if (!selectedEntity->HasComponent<CameraComponent>()) {
+                  if (!allInspectorEntitiesHave.operator()<CameraComponent>()) {
                     if (ImGui::MenuItem("Camera")) {
                         RecordUndoSnapshot();
-                        selectedEntity->AddComponent<CameraComponent>();
-                        SyncSelectedCameraFromTransform(selectedEntity);
+                        addMissingInspectorComponents.operator()<CameraComponent>(
+                            [&](Entity& entity, CameraComponent&) {
+                                SyncSelectedCameraFromTransform(&entity);
+                            });
                         ImGui::CloseCurrentPopup();
                     }
                 }
-                if (!selectedEntity->HasComponent<PostProcessVolumeComponent>()) {
+                if (!allInspectorEntitiesHave.operator()<DistanceCullComponent>()) {
+                    if (ImGui::MenuItem("Distance Cull")) {
+                        RecordUndoSnapshot();
+                        addMissingInspectorComponents.operator()<DistanceCullComponent>(
+                            [](Entity&, DistanceCullComponent&) {});
+                        ImGui::CloseCurrentPopup();
+                    }
+                }
+                if (!allInspectorEntitiesHave.operator()<FrustumCullComponent>()) {
+                    if (ImGui::MenuItem("Frustum Cull")) {
+                        RecordUndoSnapshot();
+                        addMissingInspectorComponents.operator()<FrustumCullComponent>(
+                            [](Entity&, FrustumCullComponent&) {});
+                        ImGui::CloseCurrentPopup();
+                    }
+                }
+                if (!allInspectorEntitiesHave.operator()<PostProcessVolumeComponent>()) {
                     if (ImGui::MenuItem("Post Process Volume")) {
                         RecordUndoSnapshot();
-                        selectedEntity->AddComponent<PostProcessVolumeComponent>();
-                        m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+                        addMissingInspectorComponents.operator()<PostProcessVolumeComponent>(
+                            [](Entity&, PostProcessVolumeComponent&) {});
                         ImGui::CloseCurrentPopup();
                     }
                 }
-                if (!selectedEntity->HasComponent<LightComponent>()) {
+                if (!allInspectorEntitiesHave.operator()<LightComponent>()) {
                     if (ImGui::BeginMenu("Light")) {
                         if (ImGui::MenuItem("Directional")) {
                             RecordUndoSnapshot();
-                            auto& light = selectedEntity->AddComponent<LightComponent>();
-                            light.type = LightType::Directional;
+                            addMissingInspectorComponents.operator()<LightComponent>(
+                                [](Entity&, LightComponent& light) {
+                                    light.type = LightType::Directional;
+                                });
                             ImGui::CloseCurrentPopup();
                         }
                         if (ImGui::MenuItem("Point")) {
                             RecordUndoSnapshot();
-                            auto& light = selectedEntity->AddComponent<LightComponent>();
-                            light.type = LightType::Point;
+                            addMissingInspectorComponents.operator()<LightComponent>(
+                                [](Entity&, LightComponent& light) {
+                                    light.type = LightType::Point;
+                                });
                             ImGui::CloseCurrentPopup();
                         }
                         if (ImGui::MenuItem("Spot")) {
                             RecordUndoSnapshot();
-                            auto& light = selectedEntity->AddComponent<LightComponent>();
-                            light.type = LightType::Spot;
+                            addMissingInspectorComponents.operator()<LightComponent>(
+                                [](Entity&, LightComponent& light) {
+                                    light.type = LightType::Spot;
+                                });
                             ImGui::CloseCurrentPopup();
                         }
                         ImGui::EndMenu();
@@ -6101,10 +7863,11 @@ void EditorApp::DrawInspectorPanel() {
                 }
 
                 if (ImGui::BeginMenu("Audio")) {
-                  if (!selectedEntity->HasComponent<AudioSourceComponent>()) {
+                  if (!allInspectorEntitiesHave.operator()<AudioSourceComponent>()) {
                     if (ImGui::MenuItem("Audio Source")) {
                         RecordUndoSnapshot();
-                        selectedEntity->AddComponent<AudioSourceComponent>();
+                        addMissingInspectorComponents.operator()<AudioSourceComponent>(
+                            [](Entity&, AudioSourceComponent&) {});
                         ImGui::CloseCurrentPopup();
                     }
                   }
@@ -6112,19 +7875,21 @@ void EditorApp::DrawInspectorPanel() {
                 }
 
                 if (ImGui::BeginMenu("Physics")) {
-                  if (!selectedEntity->HasComponent<ColliderComponent>()) {
+                  if (!allInspectorEntitiesHave.operator()<ColliderComponent>()) {
                     if (ImGui::BeginMenu("Collider")) {
                     auto addCollider = [&](ColliderShape shape) {
                         RecordUndoSnapshot();
-                        auto& col = selectedEntity->AddComponent<ColliderComponent>();
-                        col.shape = shape;
-                        if (auto* mr = selectedEntity->GetComponent<MeshRendererComponent>();
-                            mr && mr->mesh)
-                            ColliderUtils::FitColliderToMesh(col, *mr->mesh);
-                        else if (shape == ColliderShape::Capsule) {
-                            col.radius = 0.35f;
-                            col.capsuleHeight = 1.0f;
-                        }
+                        addMissingInspectorComponents.operator()<ColliderComponent>(
+                            [&](Entity& entity, ColliderComponent& col) {
+                                col.shape = shape;
+                                if (auto* mr = entity.GetComponent<MeshRendererComponent>();
+                                    mr && mr->mesh)
+                                    ColliderUtils::FitColliderToMesh(col, *mr->mesh);
+                                else if (shape == ColliderShape::Capsule) {
+                                    col.radius = 0.35f;
+                                    col.capsuleHeight = 1.0f;
+                                }
+                            });
                         ImGui::CloseCurrentPopup();
                     };
                     if (ImGui::MenuItem("Box"))
@@ -6138,10 +7903,11 @@ void EditorApp::DrawInspectorPanel() {
                     ImGui::EndMenu();
                     }
                 }
-                if (!selectedEntity->HasComponent<RigidbodyComponent>()) {
+                if (!allInspectorEntitiesHave.operator()<RigidbodyComponent>()) {
                     if (ImGui::MenuItem("Rigidbody")) {
                         RecordUndoSnapshot();
-                        selectedEntity->AddComponent<RigidbodyComponent>();
+                        addMissingInspectorComponents.operator()<RigidbodyComponent>(
+                            [](Entity&, RigidbodyComponent&) {});
                         ImGui::CloseCurrentPopup();
                     }
                 }
@@ -6149,81 +7915,84 @@ void EditorApp::DrawInspectorPanel() {
                 }
 
                 if (ImGui::BeginMenu("UI")) {
-                  if (!selectedEntity->HasComponent<CanvasComponent>()) {
+                  if (!allInspectorEntitiesHave.operator()<CanvasComponent>()) {
                     if (ImGui::MenuItem("Canvas")) {
                         RecordUndoSnapshot();
-                        selectedEntity->AddComponent<CanvasComponent>();
-                        if (!selectedEntity->HasComponent<RectTransformComponent>()) {
-                            auto& rect = selectedEntity->AddComponent<RectTransformComponent>();
-                            rect.anchorMin = { 0.0f, 0.0f };
-                            rect.anchorMax = { 1.0f, 1.0f };
-                            rect.sizeDelta = { 0.0f, 0.0f };
-                        }
+                        addMissingInspectorComponents.operator()<CanvasComponent>(
+                            [](Entity& entity, CanvasComponent&) {
+                                if (!entity.HasComponent<RectTransformComponent>()) {
+                                    auto& rect = entity.AddComponent<RectTransformComponent>();
+                                    rect.anchorMin = { 0.0f, 0.0f };
+                                    rect.anchorMax = { 1.0f, 1.0f };
+                                    rect.sizeDelta = { 0.0f, 0.0f };
+                                }
+                            });
                         ImGui::CloseCurrentPopup();
                     }
                 }
-                if (!selectedEntity->HasComponent<RectTransformComponent>()) {
+                if (!allInspectorEntitiesHave.operator()<RectTransformComponent>()) {
                     if (ImGui::MenuItem("Rect Transform")) {
                         RecordUndoSnapshot();
-                        selectedEntity->AddComponent<RectTransformComponent>();
+                        addMissingInspectorComponents.operator()<RectTransformComponent>(
+                            [](Entity&, RectTransformComponent&) {});
                         ImGui::CloseCurrentPopup();
                     }
                 }
-                if (!selectedEntity->HasComponent<UIImageComponent>()) {
+                if (!allInspectorEntitiesHave.operator()<UIImageComponent>()) {
                     if (ImGui::MenuItem("Image")) {
                         RecordUndoSnapshot();
-                        selectedEntity->AddComponent<UIImageComponent>();
+                        addMissingInspectorComponents.operator()<UIImageComponent>(
+                            [](Entity&, UIImageComponent&) {});
                         ImGui::CloseCurrentPopup();
                     }
                 }
-                if (!selectedEntity->HasComponent<UITextComponent>()) {
+                if (!allInspectorEntitiesHave.operator()<UITextComponent>()) {
                     if (ImGui::MenuItem("Text")) {
                         RecordUndoSnapshot();
-                        selectedEntity->AddComponent<UITextComponent>();
+                        addMissingInspectorComponents.operator()<UITextComponent>(
+                            [](Entity&, UITextComponent&) {});
                         ImGui::CloseCurrentPopup();
                     }
                 }
-                if (!selectedEntity->HasComponent<UIButtonGroupComponent>()) {
+                if (!allInspectorEntitiesHave.operator()<UIButtonGroupComponent>()) {
                     if (ImGui::MenuItem("Button Group")) {
                         RecordUndoSnapshot();
                         Scene& scene = m_Engine->GetScene();
-                        Entity* canvas = selectedEntity->HasComponent<CanvasComponent>()
-                            ? selectedEntity
-                            : FindCanvasAncestor(scene, selectedEntity);
-                        if (!canvas) {
-                            canvas = CreateUICanvas(nullptr);
-                            scene.SetParent(selectedEntity, canvas);
-                        }
-                        if (!selectedEntity->HasComponent<RectTransformComponent>())
-                            selectedEntity->AddComponent<RectTransformComponent>();
-                        selectedEntity->AddComponent<UIButtonGroupComponent>();
+                        addMissingInspectorComponents.operator()<UIButtonGroupComponent>(
+                            [&](Entity& entity, UIButtonGroupComponent&) {
+                                Entity* canvas = entity.HasComponent<CanvasComponent>()
+                                    ? &entity
+                                    : FindCanvasAncestor(scene, &entity);
+                                if (!canvas) {
+                                    canvas = CreateUICanvas(nullptr);
+                                    scene.SetParent(&entity, canvas, true);
+                                }
+                                if (!entity.HasComponent<RectTransformComponent>())
+                                    entity.AddComponent<RectTransformComponent>();
+                            });
                         m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
                         ImGui::CloseCurrentPopup();
                     }
                 }
-                if (!selectedEntity->HasComponent<UIButtonComponent>()) {
+                if (!allInspectorEntitiesHave.operator()<UIButtonComponent>()) {
                     if (ImGui::MenuItem("Button")) {
                         RecordUndoSnapshot();
                         Scene& scene = m_Engine->GetScene();
-                        if (selectedEntity->HasComponent<CanvasComponent>() ||
-                            selectedEntity->HasComponent<UIButtonGroupComponent>()) {
-                            if (Entity* button = CreateUIButton(selectedEntity))
-                                SelectSingleEntity(button->GetID());
-                        } else {
-                            Entity* group = FindButtonGroupAncestor(scene, selectedEntity);
+                        addMissingInspectorComponents.operator()<UIButtonComponent>(
+                            [&](Entity& entity, UIButtonComponent& button) {
+                            Entity* group = FindButtonGroupAncestor(scene, &entity);
                             if (!group) {
-                                Entity* canvas = FindCanvasAncestor(scene, selectedEntity);
+                                Entity* canvas = FindCanvasAncestor(scene, &entity);
                                 if (!canvas)
                                     canvas = CreateUICanvas(nullptr);
                                 group = CreateUIButtonGroup(canvas);
                             }
                             if (group)
-                                scene.SetParent(selectedEntity, group);
-                            if (!selectedEntity->HasComponent<RectTransformComponent>())
-                                selectedEntity->AddComponent<RectTransformComponent>();
-                            auto& button = selectedEntity->AddComponent<UIButtonComponent>();
+                                scene.SetParent(&entity, group, true);
+                            if (!entity.HasComponent<RectTransformComponent>())
+                                entity.AddComponent<RectTransformComponent>();
                             Entity* textEntity = scene.CreateEntity("Text");
-                            scene.SetParent(textEntity, selectedEntity);
+                            scene.SetParent(textEntity, &entity);
                             auto& textRect = textEntity->AddComponent<RectTransformComponent>();
                             textRect.anchorMin = { 0.0f, 0.0f };
                             textRect.anchorMax = { 1.0f, 1.0f };
@@ -6235,38 +8004,27 @@ void EditorApp::DrawInspectorPanel() {
                             text.fontSize = 24.0f;
                             text.alignment = UITextAlignment::Center;
                             text.color = button.textColor;
-                            m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
-                        }
+                            });
+                        m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
                         ImGui::CloseCurrentPopup();
                     }
                 }
-                if (!selectedEntity->HasComponent<UIAudioSpectrumComponent>()) {
+                if (!allInspectorEntitiesHave.operator()<UIAudioSpectrumComponent>()) {
                     if (ImGui::MenuItem("Audio Spectrum")) {
                         RecordUndoSnapshot();
-                        selectedEntity->AddComponent<UIAudioSpectrumComponent>();
-                        if (!selectedEntity->HasComponent<RectTransformComponent>())
-                            selectedEntity->AddComponent<RectTransformComponent>();
+                        addMissingInspectorComponents.operator()<UIAudioSpectrumComponent>(
+                            [](Entity& entity, UIAudioSpectrumComponent&) {
+                                if (!entity.HasComponent<RectTransformComponent>())
+                                    entity.AddComponent<RectTransformComponent>();
+                            });
                         ImGui::CloseCurrentPopup();
                     }
                 }
                   ImGui::EndMenu();
                 }
-                DrawAddComponentScriptMenu(*selectedEntity);
+                DrawAddComponentScriptMenu(inspectorEntities);
                 ImGui::EndPopup();
             }
-        }
-    } else {
-        if (ImGui::CollapsingHeader("PS1 Render Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
-            auto& settings = m_Engine->GetRenderer().GetPS1Settings();
-            ImGui::DragFloat("Vertex Jitter (Res)", &settings.vertexJitter, 1.0f, 16.0f, 640.0f);
-            EditorTheme::Checkbox("Affine Mapping (Warp)", &settings.affineMapping);
-            EditorTheme::Checkbox("15-bit Color Limit", &settings.colorDepthLimit);
-            EditorTheme::Checkbox("Bayer Dithering", &settings.ditheringEnabled);
-            EditorTheme::Checkbox("Wireframe", &settings.wireframeMode);
-
-            ImGui::Separator();
-            ImGui::TextColored(EditorTheme::TextMuted,
-                "Fog / Color Grading / Vignette are configured by a Post Process Volume object.");
         }
     }
 
@@ -6297,11 +8055,11 @@ void EditorApp::SpawnModelFromProjectAsset(const std::string& projectRelPath,
             viewMin->x, viewMin->y, viewSize->x, viewSize->y, 0.0f);
         if (auto* transform = spawned->GetComponent<TransformComponent>())
             transform->position = pos;
+    } else {
+        m_Engine->GetScene().SetWorldPosition(*spawned, GetSceneViewSpawnPosition());
     }
 
-    m_SelectedEntityID = spawned->GetID();
-    if (m_AssetBrowser)
-        m_AssetBrowser->ClearAssetSelection();
+    SelectSingleEntity(spawned->GetID());
     m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
     UpdateSceneDirtyState();
     MIPSYNC_INFO("Model placed in scene: {}", projectRelPath);
@@ -6316,8 +8074,16 @@ void EditorApp::DispatchProjectAssetDrop(const std::string& projectRelPath,
         const std::string abs = AssetManager::Get().ToAbsolute(projectRelPath);
         std::string err;
         if (Entity* spawned = SceneIO::InstantiateFromFile(m_Engine->GetScene(), abs, err)) {
-            m_SelectedEntityID = spawned->GetID();
-            if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+            if (viewMin && viewSize && viewSize->x > 0.0f && viewSize->y > 0.0f) {
+                const ImGuiIO& io = ImGui::GetIO();
+                m_Engine->GetScene().SetWorldPosition(
+                    *spawned,
+                    PickPointOnPlane(m_SceneCamera.GetCamera(), io.MousePos.x, io.MousePos.y,
+                                     viewMin->x, viewMin->y, viewSize->x, viewSize->y, 0.0f));
+            } else {
+                m_Engine->GetScene().SetWorldPosition(*spawned, GetSceneViewSpawnPosition());
+            }
+            SelectSingleEntity(spawned->GetID());
             m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
             MIPSYNC_INFO("Prefab instantiated: {}", projectRelPath);
         } else {
@@ -6343,6 +8109,9 @@ void EditorApp::DispatchProjectAssetDrop(const std::string& projectRelPath,
                     m_SceneCamera.GetCamera(), io.MousePos.x, io.MousePos.y,
                     viewMin->x, viewMin->y, viewSize->x, viewSize->y, 0.0f);
             }
+        } else {
+            m_Engine->GetScene().SetWorldPosition(
+                *audioEntity, GetSceneViewSpawnPosition());
         }
         SelectSingleEntity(audioEntity->GetID());
         m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
@@ -6432,8 +8201,7 @@ void EditorApp::AcceptSceneViewDrops(const ImVec2& imageMin, const ImVec2& image
                         std::string err;
                         if (Material::Load(AssetManager::Get().ToAbsolute(projectRel), mat, err)) {
                             AssetManager::Get().ApplyMaterialToMeshRenderer(*mr, mat, projectRel);
-                            m_SelectedEntityID = target->GetID();
-                            if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+                            SelectSingleEntity(target->GetID());
                             m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
                             MIPSYNC_INFO("Material applied: {} 遶翫・{}", projectRel, target->GetID());
                         } else {
@@ -6450,8 +8218,7 @@ void EditorApp::AcceptSceneViewDrops(const ImVec2& imageMin, const ImVec2& image
                         uiButton->backgroundTexture = AssetManager::Get().GetTexture(projectRel);
                         uiButton->preserveAspect = true;
                         FitRectTransformToTextureAspect(target, uiButton->backgroundTexture.get());
-                        m_SelectedEntityID = target->GetID();
-                        if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+                        SelectSingleEntity(target->GetID());
                         m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
                         MIPSYNC_INFO("UI button background applied: {}", projectRel);
                     } else if (auto* uiImage = target->GetComponent<UIImageComponent>()) {
@@ -6460,8 +8227,7 @@ void EditorApp::AcceptSceneViewDrops(const ImVec2& imageMin, const ImVec2& image
                         uiImage->texture = AssetManager::Get().GetTexture(projectRel);
                         uiImage->preserveAspect = true;
                         FitRectTransformToTextureAspect(target, uiImage->texture.get());
-                        m_SelectedEntityID = target->GetID();
-                        if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+                        SelectSingleEntity(target->GetID());
                         m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
                         MIPSYNC_INFO("UI image texture applied: {} 遶翫・{}", projectRel, target->GetID());
                     } else if (target->GetComponent<CanvasComponent>()) {
@@ -6474,8 +8240,7 @@ void EditorApp::AcceptSceneViewDrops(const ImVec2& imageMin, const ImVec2& image
                                 uiImage->preserveAspect = true;
                                 FitRectTransformToTextureAspect(img, uiImage->texture.get());
                             }
-                            m_SelectedEntityID = img->GetID();
-                            if (m_AssetBrowser) m_AssetBrowser->ClearAssetSelection();
+                            SelectSingleEntity(img->GetID());
                             m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
                             MIPSYNC_INFO("UI image created from texture: {}", projectRel);
                         }
@@ -6526,54 +8291,19 @@ void EditorApp::DrawMaterialAssetInspector(const std::string& projectRelPath) {
     ImGui::Separator();
 
     bool changed = false;
-    if (ImGui::ColorEdit4("Color", glm::value_ptr(mat.color)))
+    if (InspectorColorEdit4("Color", glm::value_ptr(mat.color)))
         changed = true;
 
-    ImGui::Spacing();
-    ImGui::Text("Texture");
-
-    const float preview = 128.0f;
-    if (!mat.texturePath.empty()) {
-        if (auto tex = AssetManager::Get().GetTexture(mat.texturePath)) {
-            if (tex->GetID() != 0)
-                ImGui::Image((ImTextureID)(intptr_t)tex->GetID(), ImVec2(preview, preview));
-        }
-        ImGui::TextWrapped("%s", mat.texturePath.c_str());
-    } else {
-        ImGui::TextColored(EditorTheme::TextMuted, "(none)");
-    }
-
-    ImGui::PushStyleColor(ImGuiCol_Button, EditorTheme::InputBg);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, EditorTheme::BtnFace);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, EditorTheme::BtnFaceLight);
-    ImGui::Button("<drop texture here>", ImVec2(-1.0f, 28.0f));
-    ImGui::PopStyleColor(3);
-
-    if (ImGui::BeginDragDropTarget()) {
-        const ImGuiPayload* p = ImGui::AcceptDragDropPayload(DragDrop::kAssetMove);
-        if (!p)
-            p = ImGui::AcceptDragDropPayload(DragDrop::kAssetTexture);
-        if (p) {
-            const std::vector<std::string> paths = PathsFromDragPayload(p);
-            if (paths.size() == 1 &&
-                AssetBrowserPanel::ClassifyAssetByPath(paths[0]) == AssetKind::Texture) {
-                mat.texturePath = paths[0];
-                changed = true;
-            }
-        }
-        ImGui::EndDragDropTarget();
-    }
-
-    if (!mat.texturePath.empty() && ImGui::SmallButton("Clear texture")) {
-        mat.texturePath.clear();
+    if (DrawAssetReferenceField(this, "Texture", AssetKind::Texture,
+                                mat.texturePath, "None (Texture)")) {
         changed = true;
     }
 
     ImGui::Spacing();
     ImGui::TextColored(EditorTheme::TextSecondary, "Main Maps");
-    if (ImGui::DragFloat2("Tiling", glm::value_ptr(mat.mainTextureTiling), 0.01f, 0.001f, 100.0f))
+    if (InspectorDragFloat2("Tiling", glm::value_ptr(mat.mainTextureTiling), 0.01f, 0.001f, 100.0f))
         changed = true;
-    if (ImGui::DragFloat2("Offset", glm::value_ptr(mat.mainTextureOffset), 0.01f, -100.0f, 100.0f))
+    if (InspectorDragFloat2("Offset", glm::value_ptr(mat.mainTextureOffset), 0.01f, -100.0f, 100.0f))
         changed = true;
 
     auto commitMaterial = [&]() {
@@ -6597,107 +8327,46 @@ void EditorApp::DrawMaterialAssetInspector(const std::string& projectRelPath) {
 }
 
 void EditorApp::DrawMaterialSlot(MeshRendererComponent& mr) {
-    ImGui::Text("Material:");
-    ImGui::SameLine();
-    const ImVec2 slotSize(160.0f, 28.0f);
-    const std::string label = mr.materialPath.empty() ? "<drop material here>" : mr.materialPath;
-
-    ImGui::PushStyleColor(ImGuiCol_Button, EditorTheme::InputBg);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, EditorTheme::BtnFace);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, EditorTheme::BtnFaceLight);
-    ImGui::PushStyleColor(ImGuiCol_Text, mr.materialPath.empty() ? EditorTheme::TextMuted : EditorTheme::TextPrimary);
-    ImGui::Button(label.c_str(), slotSize);
-    ImGui::PopStyleColor(4);
-
-    if (ImGui::BeginDragDropTarget()) {
-        const ImGuiPayload* p = ImGui::AcceptDragDropPayload(DragDrop::kAssetMove);
-        if (!p)
-            p = ImGui::AcceptDragDropPayload(DragDrop::kAssetMaterial);
-        if (p) {
-            const std::vector<std::string> paths = PathsFromDragPayload(p);
-            if (paths.size() == 1 &&
-                AssetBrowserPanel::ClassifyAssetByPath(paths[0]) == AssetKind::Material) {
-                Material mat;
-                std::string err;
-                if (Material::Load(AssetManager::Get().ToAbsolute(paths[0]), mat, err)) {
-                    RecordUndoSnapshot();
-                    AssetManager::Get().ApplyMaterialToMeshRenderer(mr, mat, paths[0]);
-                    m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
-                } else {
-                    MIPSYNC_WARN("Material load failed: {}", err);
-                }
+    std::string materialPath = mr.materialPath;
+    if (DrawAssetReferenceField(this, "Material", AssetKind::Material,
+                                materialPath, "None (Material)")) {
+        RecordUndoSnapshot();
+        if (materialPath.empty()) {
+            AssetManager::Get().ClearMeshRendererMaterial(mr);
+        } else {
+            Material material;
+            std::string error;
+            if (Material::Load(AssetManager::Get().ToAbsolute(materialPath),
+                               material, error)) {
+                AssetManager::Get().ApplyMaterialToMeshRenderer(
+                    mr, material, materialPath);
+            } else {
+                MIPSYNC_WARN("Material load failed: {}", error);
             }
         }
-        ImGui::EndDragDropTarget();
-    }
-
-    ImGui::SameLine();
-    if (ImGui::SmallButton("X##clearmat")) {
-        RecordUndoSnapshot();
-        AssetManager::Get().ClearMeshRendererMaterial(mr);
         m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
     }
-
 }
 
 void EditorApp::DrawMaterialSlot(SkinnedMeshRendererComponent& mr) {
-    ImGui::Text("Material:");
-    ImGui::SameLine();
-    const ImVec2 slotSize(160.0f, 28.0f);
-    const std::string label = mr.materialPath.empty() ? "<drop material here>" : mr.materialPath;
-
-    ImGui::PushStyleColor(ImGuiCol_Button, EditorTheme::InputBg);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, EditorTheme::BtnFace);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, EditorTheme::BtnFaceLight);
-    ImGui::PushStyleColor(ImGuiCol_Text, mr.materialPath.empty() ? EditorTheme::TextMuted : EditorTheme::TextPrimary);
-    ImGui::Button(label.c_str(), slotSize);
-    ImGui::PopStyleColor(4);
-
-    if (ImGui::BeginDragDropTarget()) {
-        const ImGuiPayload* p = ImGui::AcceptDragDropPayload(DragDrop::kAssetMove);
-        if (!p)
-            p = ImGui::AcceptDragDropPayload(DragDrop::kAssetMaterial);
-        if (p) {
-            const std::vector<std::string> paths = PathsFromDragPayload(p);
-            if (paths.size() == 1 &&
-                AssetBrowserPanel::ClassifyAssetByPath(paths[0]) == AssetKind::Material) {
-                Material mat;
-                std::string err;
-                if (Material::Load(AssetManager::Get().ToAbsolute(paths[0]), mat, err)) {
-                    RecordUndoSnapshot();
-                    AssetManager::Get().ApplyMaterialToSkinnedMeshRenderer(mr, mat, paths[0]);
-                    m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
-                } else {
-                    MIPSYNC_WARN("Material load failed: {}", err);
-                }
-            }
-        }
-        ImGui::EndDragDropTarget();
-    }
-
-    ImGui::SameLine();
-    if (ImGui::SmallButton("X##clearskmat")) {
+    std::string materialPath = mr.materialPath;
+    if (DrawAssetReferenceField(this, "Material", AssetKind::Material,
+                                materialPath, "None (Material)")) {
         RecordUndoSnapshot();
-        AssetManager::Get().ClearSkinnedMeshRendererMaterial(mr);
-        m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
-    }
-
-    if (!mr.materialPath.empty()) {
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Save##sksavemat")) {
-            Material mat;
-            mat.color = mr.color;
-            mat.texturePath = mr.texturePath;
-            mat.mainTextureTiling = mr.textureTiling;
-            mat.mainTextureOffset = mr.textureOffset;
-            std::string err;
-            if (Material::Save(AssetManager::Get().ToAbsolute(mr.materialPath), mat, err)) {
-                AssetThumbnail::Get().DropMaterialThumbnail(mr.materialPath);
-                MIPSYNC_INFO("Material saved: {}", mr.materialPath);
+        if (materialPath.empty()) {
+            AssetManager::Get().ClearSkinnedMeshRendererMaterial(mr);
+        } else {
+            Material material;
+            std::string error;
+            if (Material::Load(AssetManager::Get().ToAbsolute(materialPath),
+                               material, error)) {
+                AssetManager::Get().ApplyMaterialToSkinnedMeshRenderer(
+                    mr, material, materialPath);
             } else {
-                MIPSYNC_WARN("Material save failed: {}", err);
+                MIPSYNC_WARN("Material load failed: {}", error);
             }
         }
+        m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
     }
 }
 
@@ -6739,9 +8408,9 @@ void EditorApp::DrawConsolePanel() {
             const std::string command = m_CommandInput;
             m_CommandInput[0] = '\0';
             if (!command.empty()) {
-                MIPSYNC_INFO("> {}", command);
+                MIPSYNC_CONSOLE_INFO("> {}", command);
                 const std::string output = m_CommandHost->ExecuteConsoleLine(command);
-                if (!output.empty()) MIPSYNC_INFO("{}", output);
+                if (!output.empty()) MIPSYNC_CONSOLE_INFO("{}", output);
             }
             ImGui::SetKeyboardFocusHere(-1);
         }

@@ -157,13 +157,31 @@ static Entity* PickUIEntityOnCanvasPlane(Scene& scene, const Camera& camera, con
     return closest;
 }
 
+static Entity* ResolveScenePickRoot(Scene& scene, Entity* entity) {
+    Entity* current = entity;
+    while (current) {
+        const uint32_t parentId = current->GetParentID();
+        if (parentId == 0)
+            break;
+        Entity* parent = scene.FindEntity(parentId);
+        if (!parent)
+            break;
+        // Camera children remain independently selectable in the Scene View.
+        if (parent->GetComponent<CameraComponent>())
+            break;
+        current = parent;
+    }
+    return current;
+}
+
 Entity* PickEntityAtPoint(
     Scene& scene,
     const Camera& camera,
     float mouseX, float mouseY,
     float viewportMinX, float viewportMinY,
     float viewportWidth, float viewportHeight,
-    int uiLayoutWidth, int uiLayoutHeight)
+    int uiLayoutWidth, int uiLayoutHeight,
+    uint32_t selectionContextId)
 {
     if (viewportWidth <= 0.0f || viewportHeight <= 0.0f)
         return nullptr;
@@ -225,24 +243,28 @@ Entity* PickEntityAtPoint(
             closest = uiHit;
     }
 
-    if (closest) {
-        Entity* current = closest;
-        while (current) {
-            uint32_t parentId = current->GetParentID();
-            if (parentId == 0)
-                break;
-            Entity* parent = const_cast<Entity*>(scene.FindEntity(parentId));
-            if (!parent)
-                break;
-            // Do not select camera entities – stop before reaching them.
-            if (parent->GetComponent<CameraComponent>())
-                break;
-            current = parent;
+    if (!closest)
+        return nullptr;
+
+    Entity* directHit = closest;
+    Entity* pickedRoot = ResolveScenePickRoot(scene, directHit);
+
+    /* First click selects the hierarchy root, matching the established Scene
+     * View behavior. Once anything in that same hierarchy is already active,
+     * subsequent clicks drill straight to the rendered child under the
+     * cursor. This also keeps sibling-to-sibling picking direct after the user
+     * has entered a hierarchy instead of bouncing back to its parent. */
+    if (selectionContextId != 0) {
+        if (Entity* selected = scene.FindEntity(selectionContextId)) {
+            Entity* selectedRoot = ResolveScenePickRoot(scene, selected);
+            if (selectedRoot && pickedRoot &&
+                selectedRoot->GetID() == pickedRoot->GetID()) {
+                return directHit;
+            }
         }
-        closest = current;
     }
 
-    return closest;
+    return pickedRoot;
 }
 
 glm::vec3 PickPointOnPlane(

@@ -108,7 +108,10 @@ pub fn load_from_dir(project_dir: &str) -> Result<ProjectInfo, String> {
     let root = PathBuf::from(project_dir);
     let file_path = root.join(PROJECT_FILE);
     if !file_path.is_file() {
-        return Err(format!("missing nostalty.project in: {}", root.display()));
+        return Err(format!(
+            "missing nostalty.project in: {}",
+            root.display()
+        ));
     }
     let text = fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
     let j: ProjectFile = serde_json::from_str(&text).map_err(|e| e.to_string())?;
@@ -143,10 +146,7 @@ pub fn save_to_dir(info: &ProjectInfo) -> Result<(), String> {
         "defaultScene".into(),
         serde_json::Value::String(info.default_scene.clone()),
     );
-    root.insert(
-        "lastOpened".into(),
-        serde_json::Value::Number(info.last_opened.into()),
-    );
+    root.insert("lastOpened".into(), serde_json::Value::Number(info.last_opened.into()));
 
     root.entry("editorLastScene")
         .or_insert_with(|| serde_json::Value::String(info.default_scene.clone()));

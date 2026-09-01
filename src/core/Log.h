@@ -30,6 +30,8 @@ public:
 
     static std::shared_ptr<spdlog::logger>& GetEngineLogger()  { return s_EngineLogger; }
     static std::shared_ptr<spdlog::logger>& GetEditorLogger()  { return s_EditorLogger; }
+    /// User-facing project Console output (script logs, script errors and commands).
+    static std::shared_ptr<spdlog::logger>& GetConsoleLogger() { return s_ConsoleLogger; }
 
     // Get recent log entries for the console panel
     static std::vector<LogEntry> GetRecentEntries();
@@ -38,6 +40,7 @@ public:
 private:
     static std::shared_ptr<spdlog::logger> s_EngineLogger;
     static std::shared_ptr<spdlog::logger> s_EditorLogger;
+    static std::shared_ptr<spdlog::logger> s_ConsoleLogger;
     static std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> s_RingBuffer;
     static std::mutex s_Mutex;
 };
@@ -57,3 +60,9 @@ private:
 #define EDITOR_INFO(...)      ::MipsyncEngine::Log::GetEditorLogger()->info(__VA_ARGS__)
 #define EDITOR_WARN(...)      ::MipsyncEngine::Log::GetEditorLogger()->warn(__VA_ARGS__)
 #define EDITOR_ERROR(...)     ::MipsyncEngine::Log::GetEditorLogger()->error(__VA_ARGS__)
+
+// Explicitly user-facing project Console logging. Engine/editor diagnostics
+// stay in stdout and the project log file instead of entering this channel.
+#define MIPSYNC_CONSOLE_INFO(...)  ::MipsyncEngine::Log::GetConsoleLogger()->info(__VA_ARGS__)
+#define MIPSYNC_CONSOLE_WARN(...)  ::MipsyncEngine::Log::GetConsoleLogger()->warn(__VA_ARGS__)
+#define MIPSYNC_CONSOLE_ERROR(...) ::MipsyncEngine::Log::GetConsoleLogger()->error(__VA_ARGS__)

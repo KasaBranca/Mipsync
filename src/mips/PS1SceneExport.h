@@ -59,12 +59,32 @@ struct Ps1ExportedEntity {
     float textureOffset[2] = { 0.0f, 0.0f };
     uint8_t textureIndex = 0; // 0 = none; 1+ into texturePaths
     bool meshEnabled = false;
-    bool viewModel = false;
+    /// 0=Prop, 1=Corridor, 2=Character, 3=Viewmodel, 4=Floor.
+    uint8_t renderPreset = 0;
     bool prerenderOccluder = false;
     bool seamFill = false;
+    uint8_t meshSubdivisionLevels = 0;
+    float meshSubdivisionMaxEdgeLength = 0.0f;
+    bool meshSubdivisionExplicit = false;
     uint16_t vertexAnimFirstMeshIndex = 0;
     uint16_t vertexAnimFrameCount = 0;
     uint8_t vertexAnimFps = 0;
+    std::string vertexIdleMeshPath;
+    uint16_t vertexIdleFirstMeshIndex = 0;
+    uint16_t vertexIdleFrameCount = 0;
+    uint8_t vertexIdleFps = 0;
+    std::string vertexWalkMeshPath;
+    uint16_t vertexWalkFirstMeshIndex = 0;
+    uint16_t vertexWalkFrameCount = 0;
+    uint8_t vertexWalkFps = 0;
+    std::string vertexAimMeshPath;
+    uint16_t vertexAimFirstMeshIndex = 0;
+    uint16_t vertexAimFrameCount = 0;
+    uint8_t vertexAimFps = 0;
+    std::string vertexTriggerMeshPath;
+    uint16_t vertexTriggerFirstMeshIndex = 0;
+    uint16_t vertexTriggerFrameCount = 0;
+    uint8_t vertexTriggerFps = 0;
     uint16_t vertexAnimTargetTris = 320;
     uint16_t vertexAnimTargetVerts = 1000;
     uint16_t rigidAnimFirstFrame = 0;
@@ -83,6 +103,11 @@ struct Ps1ExportedEntity {
     uint16_t rigidTriggerFrameCount = 0;
     uint8_t rigidTriggerFps = 0;
     uint16_t animatorTriggerParameterHash = 0;
+    /// Effective time from trigger-state entry to its first Exit Time,
+    /// unsigned 8.8 seconds. Zero keeps the legacy full-clip one-shot length.
+    uint16_t animatorTriggerExitDurationQ8 = 0;
+    /// Outgoing Animator transition blend duration, unsigned 8.8 seconds.
+    uint16_t animatorTriggerTransitionDurationQ8 = 0;
     uint32_t rigidRootEntityId = 0;
     int rigidRootEntityIndex = -1;
 
@@ -99,6 +124,14 @@ struct Ps1ExportedEntity {
     float cameraFov = 60.0f;
     float cameraNear = 0.1f;
     float cameraFar = 100.0f;
+    bool cameraDistanceCullEnabled = false;
+    float cameraDistanceCullDistance = 0.0f;
+    bool cameraDistanceCullMeshes = true;
+    bool cameraDistanceCullSkinned = true;
+    bool cameraFrustumCullEnabled = false;
+    float cameraFrustumCullMargin = 0.0f;
+    bool cameraFrustumCullMeshes = true;
+    bool cameraFrustumCullSkinned = true;
     std::string prerenderedBackgroundPath; // project-relative PNG for pre-rendered BG
     uint8_t cameraBackgroundTextureIndex = 0; // 0 = none; 1+ into texturePaths
     uint32_t cameraShotTriggerId = 0;
@@ -113,6 +146,7 @@ struct Ps1ExportedEntity {
     float colliderCapsuleHeight = 0.0f;
     bool colliderIsTrigger = false;
     bool colliderConvex = true;
+    uint16_t colliderMeshIndex = 0;
     bool colliderCameraShotTrigger = false;
     uint32_t colliderCameraTargetId = 0;
     int colliderCameraTargetEntityIndex = -1;
@@ -217,6 +251,9 @@ struct Ps1ProModelerMeshData {
     std::vector<float> uvs;       // uv pairs
     std::vector<uint32_t> colors;  // RGBA packed
     std::vector<uint32_t> indices;
+    // Local material slot N is stored as vertex alpha N+1 during export.
+    std::vector<std::string> faceMaterialPaths;
+    std::vector<uint8_t> faceMaterialTextureIndices;
 };
 
 struct Ps1SkinnedAnimMeshData {
@@ -270,6 +307,10 @@ struct Ps1SceneExportResult {
     std::vector<std::string> meshPaths; // unique project-relative
     std::vector<bool> meshViewModelVariants; // parallel to meshPaths; true = first-person variant
     std::vector<bool> meshOccluderVariants; // parallel to meshPaths; true = pre-render mask variant
+    std::vector<uint8_t> meshSubdivisionLevels; // parallel to meshPaths
+    std::vector<float> meshSubdivisionMaxEdges; // parallel to meshPaths, world units
+    std::vector<glm::vec3> meshSubdivisionScales; // parallel to meshPaths
+    std::vector<bool> meshSubdivisionExplicit; // parallel to meshPaths
     std::vector<Ps1TerrainMeshData> terrainMeshes;
     std::vector<Ps1ProModelerMeshData> proModelerMeshes;
     std::vector<Ps1SkinnedAnimMeshData> skinnedAnimMeshes;
