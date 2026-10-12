@@ -1,0 +1,20 @@
+class PS1Controls : MipsBehaviour
+{
+    public float horizontal = 0;
+    public float vertical = 0;
+    public float lookX = 0;
+    public float lookY = 0;
+    public bool cross = false;
+    public bool pressed = false;
+    public bool released = false;
+    void Update()
+    {
+        horizontal = Input.GetAxis("LeftStickX");
+        vertical = Input.GetAxis("LeftStickY");
+        lookX = Input.GetAxis("RightStickX");
+        lookY = Input.GetAxis("RightStickY");
+        cross = Input.GetButton("Cross");
+        pressed = Input.GetButtonDown("Cross");
+        released = Input.GetButtonUp("Cross");
+    }
+}

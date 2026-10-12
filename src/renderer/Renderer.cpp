@@ -1,14 +1,44 @@
 #include "Renderer.h"
+#include "../ps1/PSyncGeometry.h"
+#include "../ps1/Ps1ColorGrading.h"
 #include "../animation/AnimationTypes.h"
 #include "../animation/SkinnedMesh.h"
 #include "../core/Log.h"
 #include <glad/glad.h>
 #include <algorithm>
 #include <cstring>
+#include <bit>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
 namespace MipsyncEngine {
+
+namespace {
+void SetColorGradingUniforms(Shader& shader, const PS1Settings& settings) {
+    shader.SetInt("uColorGradingEnabled",settings.colorGradingEnabled ? 1 : 0);
+    if (!settings.colorGradingEnabled) return;
+    const auto transform=Ps1::BuildColorGradingTransform({true,settings.exposure,settings.contrast,
+        settings.saturation,{settings.colorFilter.r,settings.colorFilter.g,settings.colorFilter.b}});
+    glm::mat3 matrix;
+    for (int row=0; row<3; ++row) for (int col=0; col<3; ++col)
+        matrix[col][row]=static_cast<float>(transform.matrix[row*3+col]);
+    shader.SetMat3("uColorGradingMatrix",matrix);
+    shader.SetVec3("uColorGradingOffset",glm::vec3(transform.offset[0],transform.offset[1],transform.offset[2]));
+}
+uint64_t PSyncMatrixSignature(const glm::mat4& matrix) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r)
+        hash = (hash ^ std::bit_cast<uint32_t>(matrix[c][r])) * 1099511628211ULL;
+    return hash;
+}
+uint64_t PSyncLightSignature(const SceneLightGpu* lights, int count, const glm::vec4& color) {
+    uint64_t hash = 1469598103934665603ULL;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(lights);
+    for (size_t i = 0; i < sizeof(SceneLightGpu) * count; ++i) hash = (hash ^ bytes[i]) * 1099511628211ULL;
+    for (int i = 0; i < 4; ++i) hash = (hash ^ std::bit_cast<uint32_t>(color[i])) * 1099511628211ULL;
+    return hash;
+}
+}
 
 // ─────────────────────────────────────────────
 // PS1-style vertex shader (embedded GLSL)
@@ -28,6 +58,7 @@ out vec3 vNormal;
 out vec4 vColor;
 out float vFogFactor;
 out float vDepth;
+uniform int uRenderMode;
 
 uniform mat4 uModel;
 uniform mat4 uView;
@@ -123,10 +154,12 @@ void main() {
     vUVAffine = tiledUV * clipPos.w;
 
     // Gouraud lighting (per-vertex)
-    vec3 worldNormal = normalize(mat3(transpose(inverse(uModel))) * aNormal);
-    vec3 lighting = EvaluateVertexLighting(worldPos.xyz, worldNormal);
-    vColor = aColor * vec4(lighting, 1.0);
-    vNormal = worldNormal;
+    vNormal = vec3(0.0, 1.0, 0.0);
+    vColor = aColor;
+    if (uRenderMode != 1) {
+        vNormal = normalize(mat3(transpose(inverse(uModel))) * aNormal);
+        if (uRenderMode == 0) vColor *= vec4(EvaluateVertexLighting(worldPos.xyz, vNormal), 1.0);
+    }
 
     // Fog (distance-based in view space)
     float dist = length(projectedViewPos.xyz);
@@ -152,6 +185,7 @@ out vec3 vNormal;
 out vec4 vColor;
 out float vFogFactor;
 out float vDepth;
+uniform int uRenderMode;
 
 uniform mat4 uEntityWorld;
 uniform mat4 uPartGeometryToWorld;
@@ -230,6 +264,7 @@ void main() {
             (uBones[bi3] * vec4(aPosition, 1.0)) * aBoneWeights.w;
         skinnedPos /= weightSum;
 
+        if (uRenderMode != 1) {
         vec3 n0 = mat3(transpose(inverse(uBones[bi0]))) * aNormal;
         vec3 n1 = mat3(transpose(inverse(uBones[bi1]))) * aNormal;
         vec3 n2 = mat3(transpose(inverse(uBones[bi2]))) * aNormal;
@@ -237,6 +272,7 @@ void main() {
         skinnedNormal =
             n0 * aBoneWeights.x + n1 * aBoneWeights.y + n2 * aBoneWeights.z + n3 * aBoneWeights.w;
         skinnedNormal = normalize(skinnedNormal);
+        }
     }
 
     vec4 geoPos = uPartGeometryToWorld * skinnedPos;
@@ -258,11 +294,13 @@ void main() {
     vAffineW = clipPos.w;
     vUVAffine = tiledUV * clipPos.w;
 
-    vec3 geoNormal = mat3(transpose(inverse(uPartGeometryToWorld))) * skinnedNormal;
-    vec3 worldNormal = normalize(mat3(transpose(inverse(uEntityWorld))) * geoNormal);
-    vec3 lighting = EvaluateVertexLighting(worldPos.xyz, worldNormal);
-    vColor = aColor * vec4(lighting, 1.0);
-    vNormal = worldNormal;
+    vNormal = vec3(0.0, 1.0, 0.0);
+    vColor = aColor;
+    if (uRenderMode != 1) {
+        vec3 geoNormal = mat3(transpose(inverse(uPartGeometryToWorld))) * skinnedNormal;
+        vNormal = normalize(mat3(transpose(inverse(uEntityWorld))) * geoNormal);
+        if (uRenderMode == 0) vColor *= vec4(EvaluateVertexLighting(worldPos.xyz, vNormal), 1.0);
+    }
 
     float dist = length(viewPos.xyz);
     vFogFactor = clamp((uFogEnd - dist) / (uFogEnd - uFogStart), 0.0, 1.0);
@@ -294,10 +332,8 @@ uniform bool uColorDepthLimit;
 uniform bool uDitheringEnabled;
 uniform int uFogEnabled;
 uniform int uColorGradingEnabled;
-uniform float uExposure;
-uniform float uContrast;
-uniform float uSaturation;
-uniform vec3 uColorFilter;
+uniform mat3 uColorGradingMatrix;
+uniform vec3 uColorGradingOffset;
 uniform int uVignetteEnabled;
 uniform vec3 uVignetteColor;
 uniform float uVignetteIntensity;
@@ -317,12 +353,7 @@ const float bayerMatrix[16] = float[16](
 );
 
 vec3 ApplyColorGrading(vec3 color) {
-    color *= exp2(uExposure);
-    color = (color - 0.5) * uContrast + 0.5;
-    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
-    color = mix(vec3(luma), color, uSaturation);
-    color *= uColorFilter;
-    return clamp(color, 0.0, 1.0);
+    return clamp(uColorGradingMatrix * color + uColorGradingOffset, 0.0, 1.0);
 }
 
 vec3 ApplyVignette(vec3 color) {
@@ -357,12 +388,7 @@ void main() {
     if (texColor.a < 0.5) {
         discard;
     }
-    vec3 color;
-    if (uRenderMode == 1) {
-        color = texColor.rgb * uMaterialColor.rgb;
-    } else {
-        color = texColor.rgb * vColor.rgb * uMaterialColor.rgb;
-    }
+    vec3 color = texColor.rgb * vColor.rgb * uMaterialColor.rgb;
 
     // Color depth limit + dither only apply to lit/unlit textured modes
     if (uColorDepthLimit) {
@@ -390,7 +416,7 @@ void main() {
         color = ApplyVignette(color);
     }
 
-    float alpha = texColor.a * uMaterialColor.a * (uRenderMode == 1 ? 1.0 : vColor.a);
+    float alpha = texColor.a * uMaterialColor.a * vColor.a;
     fragColor = vec4(color, alpha);
 }
 )";
@@ -609,6 +635,7 @@ void Renderer::EnsureOutlineMaskFBO(int width, int height) {
 }
 
 void Renderer::SetSceneLights(const SceneLightGpu* lights, int count) {
+    m_MeshLightingUploaded = m_SkinnedLightingUploaded = false;
     m_SceneLightCount = std::clamp(count, 0, kMaxSceneLights);
     for (int i = 0; i < m_SceneLightCount; ++i)
         m_SceneLights[i] = lights[i];
@@ -630,6 +657,23 @@ void Renderer::ClearSkyboxTexture() {
 }
 
 void Renderer::BeginScene(const Camera& camera, Framebuffer* targetFBO, const Texture* backgroundTexture) {
+    m_Statistics = {};
+    m_MeshLightingUploaded = m_SkinnedLightingUploaded = false;
+    if (m_PSyncWorkload) {
+        m_PSyncPrevious.swap(m_PSyncCurrent);
+        m_PSyncCurrent.clear();
+        m_PSyncCachedVertices = 0;
+        m_PSyncWorkload->lights = m_SceneLightCount;
+        for (int i = 0; i < m_SceneLightCount; ++i) {
+            if (m_SceneLights[i].posType.w == 1.0f) ++m_PSyncWorkload->pointLights;
+            if (m_SceneLights[i].posType.w == 2.0f) ++m_PSyncWorkload->spotLights;
+        }
+        if (backgroundTexture || m_SkyboxTexture) {
+            // Exported prerender/sky background is one textured full-screen FT4.
+            m_PSyncWorkload->gpuCycles += 320.0 * 240.0 * 2.0;
+            m_PSyncWorkload->dmaWords += 10;
+        }
+    }
     if (targetFBO) {
         targetFBO->Bind();
     } else {
@@ -718,37 +762,14 @@ void Renderer::BeginScene(const Camera& camera, Framebuffer* targetFBO, const Te
     m_PS1Shader.SetInt("uAffineMapping", m_PS1Settings.affineMapping ? 1 : 0);
     m_PS1Shader.SetInt("uColorDepthLimit", m_PS1Settings.colorDepthLimit ? 1 : 0);
     m_PS1Shader.SetInt("uDitheringEnabled", m_PS1Settings.ditheringEnabled ? 1 : 0);
-    m_PS1Shader.SetInt("uLightCount", m_SceneLightCount);
-    if (m_SceneLightCount > 0) {
-        glm::vec4 posType[kMaxSceneLights];
-        glm::vec4 dirRange[kMaxSceneLights];
-        glm::vec4 colorIntensity[kMaxSceneLights];
-        glm::vec4 spot[kMaxSceneLights];
-        for (int i = 0; i < m_SceneLightCount; ++i) {
-            posType[i] = m_SceneLights[i].posType;
-            dirRange[i] = m_SceneLights[i].dirRange;
-            colorIntensity[i] = m_SceneLights[i].colorIntensity;
-            spot[i] = m_SceneLights[i].spotParams;
-        }
-        m_PS1Shader.SetVec4Array("uLightPosType", posType, m_SceneLightCount);
-        m_PS1Shader.SetVec4Array("uLightDirRange", dirRange, m_SceneLightCount);
-        m_PS1Shader.SetVec4Array("uLightColorIntensity", colorIntensity, m_SceneLightCount);
-        m_PS1Shader.SetVec4Array("uLightSpot", spot, m_SceneLightCount);
-    }
-    m_PS1Shader.SetVec3("uLightDir", m_Light.direction);
-    m_PS1Shader.SetVec3("uLightColor", m_Light.color);
-    m_PS1Shader.SetFloat("uAmbient", m_Light.ambient);
+    // Lighting is uploaded lazily by the first Lit draw of each shader.
     const float fogStart = std::max(0.0f, m_PS1Settings.fogStart);
     const float fogEnd = std::max(fogStart + 0.1f, m_PS1Settings.fogEnd);
     m_PS1Shader.SetFloat("uFogStart", fogStart);
     m_PS1Shader.SetFloat("uFogEnd", fogEnd);
     m_PS1Shader.SetVec3("uFogColor", m_PS1Settings.fogColor);
     m_PS1Shader.SetInt("uFogEnabled", m_PS1Settings.fogEnabled ? 1 : 0);
-    m_PS1Shader.SetInt("uColorGradingEnabled", m_PS1Settings.colorGradingEnabled ? 1 : 0);
-    m_PS1Shader.SetFloat("uExposure", m_PS1Settings.exposure);
-    m_PS1Shader.SetFloat("uContrast", std::max(0.0f, m_PS1Settings.contrast));
-    m_PS1Shader.SetFloat("uSaturation", std::max(0.0f, m_PS1Settings.saturation));
-    m_PS1Shader.SetVec3("uColorFilter", m_PS1Settings.colorFilter);
+    SetColorGradingUniforms(m_PS1Shader,m_PS1Settings);
     m_PS1Shader.SetInt("uVignetteEnabled", m_PS1Settings.vignetteEnabled ? 1 : 0);
     m_PS1Shader.SetVec3("uVignetteColor", m_PS1Settings.vignetteColor);
     m_PS1Shader.SetFloat("uVignetteIntensity", std::clamp(m_PS1Settings.vignetteIntensity, 0.0f, 1.0f));
@@ -781,6 +802,31 @@ void Renderer::EndScene(Framebuffer* targetFBO) {
         m_PS1Framebuffer.Unbind();
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
     m_RenderMode = RenderMode::Shaded;
+    m_ObjectUnlit = false;
+}
+
+void Renderer::UploadLightingUniforms(Shader& shader, bool& uploaded) {
+    if (uploaded) return;
+    shader.SetInt("uLightCount", m_SceneLightCount);
+    if (m_SceneLightCount > 0) {
+        glm::vec4 posType[kMaxSceneLights], dirRange[kMaxSceneLights];
+        glm::vec4 colorIntensity[kMaxSceneLights], spot[kMaxSceneLights];
+        for (int i = 0; i < m_SceneLightCount; ++i) {
+            posType[i] = m_SceneLights[i].posType;
+            dirRange[i] = m_SceneLights[i].dirRange;
+            colorIntensity[i] = m_SceneLights[i].colorIntensity;
+            spot[i] = m_SceneLights[i].spotParams;
+        }
+        shader.SetVec4Array("uLightPosType", posType, m_SceneLightCount);
+        shader.SetVec4Array("uLightDirRange", dirRange, m_SceneLightCount);
+        shader.SetVec4Array("uLightColorIntensity", colorIntensity, m_SceneLightCount);
+        shader.SetVec4Array("uLightSpot", spot, m_SceneLightCount);
+    }
+    shader.SetVec3("uLightDir", m_Light.direction);
+    shader.SetVec3("uLightColor", m_Light.color);
+    shader.SetFloat("uAmbient", m_Light.ambient);
+    uploaded = true;
+    ++m_Statistics.lightingUploads;
 }
 
 void Renderer::DrawSkinnedMesh(const SkinnedMesh& mesh, const glm::mat4& entityWorld,
@@ -815,37 +861,13 @@ void Renderer::DrawSkinnedMesh(const SkinnedMesh& mesh, const glm::mat4& entityW
     m_PS1SkinnedShader.SetInt("uAffineMapping", m_PS1Settings.affineMapping ? 1 : 0);
     m_PS1SkinnedShader.SetInt("uColorDepthLimit", m_PS1Settings.colorDepthLimit ? 1 : 0);
     m_PS1SkinnedShader.SetInt("uDitheringEnabled", m_PS1Settings.ditheringEnabled ? 1 : 0);
-    m_PS1SkinnedShader.SetInt("uLightCount", m_SceneLightCount);
-    if (m_SceneLightCount > 0) {
-        glm::vec4 posType[kMaxSceneLights];
-        glm::vec4 dirRange[kMaxSceneLights];
-        glm::vec4 colorIntensity[kMaxSceneLights];
-        glm::vec4 spot[kMaxSceneLights];
-        for (int i = 0; i < m_SceneLightCount; ++i) {
-            posType[i] = m_SceneLights[i].posType;
-            dirRange[i] = m_SceneLights[i].dirRange;
-            colorIntensity[i] = m_SceneLights[i].colorIntensity;
-            spot[i] = m_SceneLights[i].spotParams;
-        }
-        m_PS1SkinnedShader.SetVec4Array("uLightPosType", posType, m_SceneLightCount);
-        m_PS1SkinnedShader.SetVec4Array("uLightDirRange", dirRange, m_SceneLightCount);
-        m_PS1SkinnedShader.SetVec4Array("uLightColorIntensity", colorIntensity, m_SceneLightCount);
-        m_PS1SkinnedShader.SetVec4Array("uLightSpot", spot, m_SceneLightCount);
-    }
-    m_PS1SkinnedShader.SetVec3("uLightDir", m_Light.direction);
-    m_PS1SkinnedShader.SetVec3("uLightColor", m_Light.color);
-    m_PS1SkinnedShader.SetFloat("uAmbient", m_Light.ambient);
     const float fogStart = std::max(0.0f, m_PS1Settings.fogStart);
     const float fogEnd = std::max(fogStart + 0.1f, m_PS1Settings.fogEnd);
     m_PS1SkinnedShader.SetFloat("uFogStart", fogStart);
     m_PS1SkinnedShader.SetFloat("uFogEnd", fogEnd);
     m_PS1SkinnedShader.SetVec3("uFogColor", m_PS1Settings.fogColor);
     m_PS1SkinnedShader.SetInt("uFogEnabled", m_PS1Settings.fogEnabled ? 1 : 0);
-    m_PS1SkinnedShader.SetInt("uColorGradingEnabled", m_PS1Settings.colorGradingEnabled ? 1 : 0);
-    m_PS1SkinnedShader.SetFloat("uExposure", m_PS1Settings.exposure);
-    m_PS1SkinnedShader.SetFloat("uContrast", std::max(0.0f, m_PS1Settings.contrast));
-    m_PS1SkinnedShader.SetFloat("uSaturation", std::max(0.0f, m_PS1Settings.saturation));
-    m_PS1SkinnedShader.SetVec3("uColorFilter", m_PS1Settings.colorFilter);
+    SetColorGradingUniforms(m_PS1SkinnedShader,m_PS1Settings);
     m_PS1SkinnedShader.SetInt("uVignetteEnabled", m_PS1Settings.vignetteEnabled ? 1 : 0);
     m_PS1SkinnedShader.SetVec3("uVignetteColor", m_PS1Settings.vignetteColor);
     m_PS1SkinnedShader.SetFloat("uVignetteIntensity", std::clamp(m_PS1Settings.vignetteIntensity, 0.0f, 1.0f));
@@ -859,9 +881,11 @@ void Renderer::DrawSkinnedMesh(const SkinnedMesh& mesh, const glm::mat4& entityW
         case RenderMode::Unlit: shaderRenderMode = 1; break;
         case RenderMode::Normals: shaderRenderMode = 2; break;
         case RenderMode::Wireframe: shaderRenderMode = 1; break;
-        default: shaderRenderMode = 0; break;
+        default: shaderRenderMode = m_ObjectUnlit ? 1 : 0; break;
     }
     m_PS1SkinnedShader.SetInt("uRenderMode", shaderRenderMode);
+    if (shaderRenderMode == 0)
+        UploadLightingUniforms(m_PS1SkinnedShader, m_SkinnedLightingUploaded);
     m_PS1SkinnedShader.SetVec3("uOverrideColor", glm::vec3(0.0f));
     m_PS1SkinnedShader.SetVec4("uMaterialColor", materialColor);
     m_PS1SkinnedShader.SetVec4("uMainTexST",
@@ -881,10 +905,34 @@ void Renderer::DrawSkinnedMesh(const SkinnedMesh& mesh, const glm::mat4& entityW
     if (indexCount == 0)
         indexCount = mesh.GetIndexCount();
 
+    if (m_PSyncWorkload) {
+        const glm::mat4 vp = m_ProjectionMatrix * m_ViewMatrix * entityWorld;
+        const auto project = [&](const SkinnedVertex& v) {
+            const glm::vec4 position(v.position, 1.0f);
+            glm::vec4 skinned(0.0f);
+            const float weight = v.boneWeights.x + v.boneWeights.y + v.boneWeights.z + v.boneWeights.w;
+            if (weight > 1e-6f) {
+                for (int i = 0; i < 4; ++i) {
+                    const int bone = std::clamp(static_cast<int>(v.boneIndices[i] + 0.5f), 0, kMaxBones - 1);
+                    skinned += palette[bone] * position * v.boneWeights[i];
+                }
+                skinned /= weight;
+            } else skinned = position;
+            const glm::vec3 fitted = (glm::vec3(partGeometryToWorld * skinned) - displayCenter) * displayScale;
+            return vp * glm::vec4(fitted, 1.0f);
+        };
+        ProfilePSyncGeometry(*m_PSyncWorkload, mesh.GetVertices(), mesh.GetIndices(), indexOffset,
+            indexCount, project, texture != nullptr, true,
+            PSyncLightSignature(m_SceneLights, shaderRenderMode == 0 ? m_SceneLightCount : 0, materialColor),
+            m_PSyncPrevious, m_PSyncCurrent, m_PSyncCachedVertices,
+            PSyncMatrixSignature(entityWorld), true, false, shaderRenderMode == 0);
+    }
+
     mesh.Bind();
     const void* indexPtr =
         reinterpret_cast<const void*>(static_cast<uintptr_t>(indexOffset) * sizeof(uint32_t));
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(indexCount), GL_UNSIGNED_INT, indexPtr);
+    m_Statistics.RecordGeometry(indexCount);
     mesh.Unbind();
 
     if (cullWasEnabled)
@@ -894,16 +942,55 @@ void Renderer::DrawSkinnedMesh(const SkinnedMesh& mesh, const glm::mat4& entityW
 void Renderer::DrawMesh(const Mesh& mesh, const glm::mat4& transform, const Texture* texture,
                         const glm::vec4& materialColor, const glm::vec2& textureTiling,
                         const glm::vec2& textureOffset, uint32_t indexOffset, uint32_t indexCount,
-                        float projectionDepthClamp, bool doubleSided) {
+                        float projectionDepthClamp, bool doubleSided, PSyncDrawOptions syncOptions) {
     if (indexCount == 0)
         indexCount = mesh.GetIndexCount();
     if (indexCount == 0)
         return;
 
+    const int objectRenderMode = m_RenderMode == RenderMode::Normals ? 2 :
+        (m_RenderMode == RenderMode::Unlit || m_RenderMode == RenderMode::Wireframe || m_ObjectUnlit ? 1 : 0);
+
+    if (m_PSyncWorkload) {
+        const glm::mat4 mvp = m_ProjectionMatrix * m_ViewMatrix * transform;
+        const uint64_t world = PSyncMatrixSignature(transform);
+        const uint64_t lighting = PSyncLightSignature(m_SceneLights, objectRenderMode == 0 ? m_SceneLightCount : 0, materialColor) ^ world;
+        if (syncOptions.plane) {
+            // Use the same material-boundary cells as the PS1 runtime, including
+            // offsets and the compact atlas used only for very dense repeats.
+            const float atlas=std::abs(textureTiling.x)>8 || std::abs(textureTiling.y)>8 ? 8.f : 1.f;
+            ps1_plane_span spansX[PS1_PLANE_AXIS_CAP],spansZ[PS1_PLANE_AXIS_CAP];
+            const int nx=PSyncPlaneAxis(texture ? textureTiling.x/atlas : 0,textureOffset.x/atlas,
+                syncOptions.subdivisionLevels,spansX);
+            const int nz=PSyncPlaneAxis(texture ? textureTiling.y/atlas : 0,textureOffset.y/atlas,
+                syncOptions.subdivisionLevels,spansZ);
+            const auto lo = mesh.GetBoundsMin(), hi = mesh.GetBoundsMax();
+            std::vector<glm::vec4> positions;
+            std::vector<uint32_t> triangles;
+            for (int z=0; z<nz; ++z) for (int x=0; x<nx; ++x) {
+                const float x0=glm::mix(lo.x,hi.x,spansX[x].start_q16/65536.f), x1=glm::mix(lo.x,hi.x,spansX[x].end_q16/65536.f);
+                const float z0=glm::mix(lo.z,hi.z,spansZ[z].start_q16/65536.f), z1=glm::mix(lo.z,hi.z,spansZ[z].end_q16/65536.f);
+                const uint32_t first=static_cast<uint32_t>(positions.size());
+                positions.insert(positions.end(), {{x0,lo.y,z0,1}, {x1,lo.y,z0,1}, {x1,lo.y,z1,1}, {x0,lo.y,z1,1}});
+                triangles.insert(triangles.end(), {first,first+1,first+2,first,first+2,first+3});
+            }
+            ProfilePSyncGeometry(*m_PSyncWorkload, positions, triangles, 0, static_cast<uint32_t>(triangles.size()),
+                [&](const glm::vec4& p) { return mvp*p; }, texture != nullptr, true, lighting,
+                m_PSyncPrevious,m_PSyncCurrent,m_PSyncCachedVertices,world,false,false,objectRenderMode == 0);
+        } else ProfilePSyncGeometry(*m_PSyncWorkload, mesh.GetVertices(), mesh.GetIndices(), indexOffset,
+            indexCount, [&](const Vertex& v) { return mvp * glm::vec4(v.position, 1.0f); },
+            texture != nullptr, doubleSided, lighting,
+            m_PSyncPrevious, m_PSyncCurrent, m_PSyncCachedVertices,world,
+            syncOptions.flatShading,syncOptions.cacheable,objectRenderMode == 0);
+    }
+
     m_PS1Shader.Bind();
     m_PS1Shader.SetMat4("uModel", transform);
     m_PS1Shader.SetMat4("uView", m_ViewMatrix);
     m_PS1Shader.SetMat4("uProjection", m_ProjectionMatrix);
+    m_PS1Shader.SetInt("uRenderMode", objectRenderMode);
+    if (objectRenderMode == 0)
+        UploadLightingUniforms(m_PS1Shader, m_MeshLightingUploaded);
     m_PS1Shader.SetFloat("uProjectionDepthClamp", projectionDepthClamp);
     m_PS1Shader.SetVec4("uMaterialColor", materialColor);
     m_PS1Shader.SetVec4("uMainTexST",
@@ -924,6 +1011,7 @@ void Renderer::DrawMesh(const Mesh& mesh, const glm::mat4& transform, const Text
     const void* indexPtr =
         reinterpret_cast<const void*>(static_cast<uintptr_t>(indexOffset) * sizeof(uint32_t));
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(indexCount), GL_UNSIGNED_INT, indexPtr);
+    m_Statistics.RecordGeometry(indexCount);
 
     if (m_RenderMode == RenderMode::ShadedWireframe) {
         glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
@@ -932,8 +1020,9 @@ void Renderer::DrawMesh(const Mesh& mesh, const glm::mat4& transform, const Text
         m_PS1Shader.SetInt("uRenderMode", 3);
         m_PS1Shader.SetVec3("uOverrideColor", glm::vec3(0.05f, 0.05f, 0.05f));
         glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(indexCount), GL_UNSIGNED_INT, indexPtr);
+        m_Statistics.RecordGeometry(indexCount);
 
-        m_PS1Shader.SetInt("uRenderMode", 0);
+        m_PS1Shader.SetInt("uRenderMode", objectRenderMode);
         m_PS1Shader.SetVec3("uOverrideColor", glm::vec3(0.0f));
 
         glDepthFunc(GL_LESS);

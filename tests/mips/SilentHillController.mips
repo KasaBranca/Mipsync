@@ -6,14 +6,19 @@
 //      Cross (X) jump, R2 aim, right stick camera orbit.
 class SilentHillController : MipsBehaviour
 {
+    // Movement
     public float walkSpeed = 1.8;
     public float runSpeed = 4.2;
     public float backwardSpeed = 1.25;
     public float sidestepSpeed = 1.6;
     public float turnSpeed = 110.0;
     public float runningTurnMultiplier = 0.82;
+
+    // Jump and physics
     public float jumpSpeed = 5.5;
     public float gravity = 18.0;
+
+    // Character options
     public float modelForwardYawOffset = 0.0;
     public float fixedY = 0.0;
     public int lockY = 0;
@@ -24,6 +29,8 @@ class SilentHillController : MipsBehaviour
     public int driveAnimator = 1;
     public float walkThreshold = 0.01;
     public float verticalVelocity = 0.0;
+
+    // Camera
     public Camera followCamera;
     public int followCameraEnabled = 1;
     public float cameraDistance = 5.0;
@@ -44,38 +51,34 @@ class SilentHillController : MipsBehaviour
 
     void Update()
     {
-        var dt = Time.deltaTime;
+        float dt = Time.deltaTime;
         if (dt > 0.1) dt = 0.1;
 
-        var forwardInput = 0.0;
-        if (Input.GetKey("W")) forwardInput = forwardInput + 1.0;
-        if (Input.GetKey("S")) forwardInput = forwardInput - 1.0;
+        float forwardInput = Input.GetAxis("LeftStickY");
 
-        var turnInput = 0.0;
-        if (Input.GetKey("A")) turnInput = turnInput + 1.0;
-        if (Input.GetKey("D")) turnInput = turnInput - 1.0;
+        float turnInput = 0.0 - Input.GetAxis("LeftStickX");
 
-        var strafeInput = 0.0;
+        float strafeInput = 0.0;
         if (allowSidestep != 0)
         {
-            if (Input.GetKey("StrafeLeft")) strafeInput = strafeInput - 1.0;
-            if (Input.GetKey("StrafeRight")) strafeInput = strafeInput + 1.0;
+            if (Input.GetButton("L1")) strafeInput = strafeInput - 1.0;
+            if (Input.GetButton("R1")) strafeInput = strafeInput + 1.0;
         }
 
-        var running = Input.GetKey("Run");
-        var aiming = Input.GetKey("Aim");
-        var controllerYaw = transform.rotation.y - modelForwardYawOffset;
+        bool running = Input.GetButton("Square");
+        bool aiming = Input.GetButton("R2");
+        float controllerYaw = transform.rotation.y - modelForwardYawOffset;
         if (controllerYaw > 180.0) controllerYaw = controllerYaw - 360.0;
         if (controllerYaw < -180.0) controllerYaw = controllerYaw + 360.0;
 
-        var grounded = Physics.IsGrounded();
+        bool grounded = Physics.IsGrounded();
         if (lockY == 0)
         {
             if (grounded != 0)
             {
                 if (allowJump != 0)
                 {
-                    if (Input.GetKeyDown("Jump"))
+                    if (Input.GetButtonDown("Cross"))
                     {
                         verticalVelocity = jumpSpeed;
                         grounded = 0;
@@ -94,12 +97,12 @@ class SilentHillController : MipsBehaviour
             verticalVelocity = 0.0;
         }
 
-        var steering = turnInput;
+        float steering = turnInput;
         if (reverseSteeringWhileBacking != 0)
         {
             if (forwardInput < 0.0) steering = 0.0 - steering;
         }
-        var currentTurnSpeed = turnSpeed;
+        float currentTurnSpeed = turnSpeed;
         if (running != 0) currentTurnSpeed = currentTurnSpeed * runningTurnMultiplier;
         controllerYaw = controllerYaw + steering * currentTurnSpeed * dt;
 
@@ -107,40 +110,40 @@ class SilentHillController : MipsBehaviour
         if (controllerYaw < -180.0) controllerYaw = controllerYaw + 360.0;
         transform.rotation.y = controllerYaw + modelForwardYawOffset;
 
-        var cameraMoveInput = 0.0;
+        float cameraMoveInput = 0.0;
         if (forwardInput != 0.0) cameraMoveInput = 1.0;
         if (turnInput != 0.0) cameraMoveInput = 1.0;
         if (strafeInput != 0.0) cameraMoveInput = 1.0;
         if (cameraMoveInput != 0.0)
         {
-            var cameraReturnBlend = cameraReturnSharpness * dt;
+            float cameraReturnBlend = cameraReturnSharpness * dt;
             if (cameraReturnBlend > 1.0) cameraReturnBlend = 1.0;
             cameraYawOffset = Mathf.Lerp(cameraYawOffset, 0.0, cameraReturnBlend);
             cameraPitchOffset = Mathf.Lerp(cameraPitchOffset, 0.0, cameraReturnBlend);
         }
         else
         {
-            cameraYawOffset = cameraYawOffset + Input.mouseDeltaX * cameraLookSensitivity;
-            cameraPitchOffset = cameraPitchOffset + Input.mouseDeltaY * cameraLookSensitivity;
+            cameraYawOffset = cameraYawOffset + Input.GetAxis("RightStickX") * cameraLookSensitivity * 960.0 * dt;
+            cameraPitchOffset = cameraPitchOffset + Input.GetAxis("RightStickY") * cameraLookSensitivity * 960.0 * dt;
             cameraPitchOffset = Mathf.Clamp(cameraPitchOffset, cameraMinPitch, cameraMaxPitch);
             if (cameraYawOffset > 180.0) cameraYawOffset = cameraYawOffset - 360.0;
             if (cameraYawOffset < -180.0) cameraYawOffset = cameraYawOffset + 360.0;
         }
 
-        var yawRadians = controllerYaw * 0.0174532925;
-        var sinYaw = Mathf.Sin(yawRadians);
-        var cosYaw = Mathf.Cos(yawRadians);
-        var forwardX = 0.0 - sinYaw;
-        var forwardZ = 0.0 - cosYaw;
-        var rightX = cosYaw;
-        var rightZ = 0.0 - sinYaw;
+        float yawRadians = controllerYaw * 0.0174532925;
+        float sinYaw = Mathf.Sin(yawRadians);
+        float cosYaw = Mathf.Cos(yawRadians);
+        float forwardX = 0.0 - sinYaw;
+        float forwardZ = 0.0 - cosYaw;
+        float rightX = cosYaw;
+        float rightZ = 0.0 - sinYaw;
 
-        var moveSpeed = walkSpeed;
+        float moveSpeed = walkSpeed;
         if (forwardInput < 0.0) moveSpeed = backwardSpeed;
         else if (running != 0) moveSpeed = runSpeed;
 
-        var velocityX = forwardX * forwardInput * moveSpeed;
-        var velocityZ = forwardZ * forwardInput * moveSpeed;
+        float velocityX = forwardX * forwardInput * moveSpeed;
+        float velocityZ = forwardZ * forwardInput * moveSpeed;
         velocityX = velocityX + rightX * strafeInput * sidestepSpeed;
         velocityZ = velocityZ + rightZ * strafeInput * sidestepSpeed;
 
@@ -164,7 +167,7 @@ class SilentHillController : MipsBehaviour
             }
             else if (verticalVelocity < 0.0)
             {
-                var landingProbeDistance =
+                float landingProbeDistance =
                     Mathf.Abs(verticalVelocity) * 0.1667 + 0.05;
                 landingProbeDistance = Mathf.Clamp(landingProbeDistance, 0.0, 3.0);
                 if (Physics.IsGroundedWithin(landingProbeDistance))
@@ -174,7 +177,7 @@ class SilentHillController : MipsBehaviour
 
         if (driveAnimator != 0)
         {
-            var moving = 0.0;
+            float moving = 0.0;
             if (forwardInput != 0.0) moving = 1.0;
             if (strafeInput != 0.0) moving = 1.0;
             Animator.SetFloat("Speed", moving);
@@ -193,7 +196,7 @@ class SilentHillController : MipsBehaviour
     {
         if (followCameraEnabled != 0)
         {
-            var controllerYaw = transform.rotation.y - modelForwardYawOffset;
+            float controllerYaw = transform.rotation.y - modelForwardYawOffset;
             Camera.Follow(followCamera, controllerYaw + cameraYawOffset, cameraDistance,
                           cameraHeight, cameraLookHeight, cameraFollowSharpness,
                           cameraPitchOffset);

@@ -130,14 +130,24 @@
     X(ANIMATOR_RELEASE_TRIGGER, Animator_ReleaseTrigger, 73) \
     X(PHYSICS_USE_CHARACTER_CONTROLLER, Physics_UseCharacterController, 74) \
     X(PHYSICS_USE_KINEMATIC_CONTROLLER, Physics_UseKinematicController, 75) \
-    X(PHYSICS_MOVE_KINEMATIC, Physics_MoveKinematic, 76)
+    X(PHYSICS_MOVE_KINEMATIC, Physics_MoveKinematic, 76) \
+    X(UI_SET_TEXT_VISIBLE, UI_SetTextVisible, 77) \
+    X(UI_SET_IMAGE_VISIBLE, UI_SetImageVisible, 78) \
+    X(ANIMATOR_NORMALIZED_TIME, Animator_GetNormalizedTime, 79) \
+    X(INPUT_GETBUTTON, Input_GetButton, 80) \
+    X(INPUT_GETBUTTONDOWN, Input_GetButtonDown, 81) \
+    X(INPUT_GETBUTTONUP, Input_GetButtonUp, 82) \
+    X(CAMERA_ROTATEPITCH, Camera_RotatePitch, 83) \
+    X(UI_SET_TEXT, UI_SetText, 84) \
+    X(UI_SET_TEXT_NUMBER, UI_SetTextNumber, 85) \
+    X(UI_SET_COLOR, UI_SetColor, 86)
 
 /* PS1 runtime capacities. The exporter validates these before emitting C. */
 #define MIPSYNC_PS1_MODULE_CAP      4
 #define MIPSYNC_PS1_INSTANCE_CAP   32
 #define VM_STACK_CAP               64
 #define VM_LOCAL_CAP               64
-#define VM_FIELD_CAP               32
+#define VM_FIELD_CAP               64
 #define VM_NUMBER_CAP             128
 #define VM_STRING_CAP             128
 #define VM_STRING_LEN              96
@@ -151,5 +161,7 @@
 #define VM_ARRAY_CAP                8
 #define VM_ARRAY_LENGTH            32
 #define VM_COROUTINE_CAP            4
+#define MIPSYNC_UI_DYNAMIC_CAP      64
+#define MIPSYNC_UI_TEXT_BYTES       96
 
 #endif /* MIPSYNC_BYTECODE_ABI_H */

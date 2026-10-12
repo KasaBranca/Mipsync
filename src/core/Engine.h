@@ -45,6 +45,7 @@ public:
 
     /// Project-relative path, e.g. "scenes/level2.nscene". Applied at end of frame.
     void RequestSceneLoad(const std::string& projectRelativePath);
+    void CancelPendingSceneLoad() { m_PendingSceneLoad.clear(); }
     /// Index into build scene list (player build or project player settings).
     void RequestSceneLoadBuildIndex(int buildIndex);
     void RequestQuit();
@@ -59,6 +60,10 @@ public:
     Mips::MipsRuntime& GetMipsRuntime() { return *m_MipsRuntime; }
     PhysicsWorld& GetPhysicsWorld() { return *m_PhysicsWorld; }
     AudioSystem& GetAudioSystem() { return *m_AudioSystem; }
+    PSyncState& GetPSyncState() { return m_PSync; }
+    void QueueCliSteps(unsigned frames,float delta) { m_CliFrames=frames;m_CliFrameDelta=delta; }
+    void ClearCliSteps() { m_CliFrames=0;Input::ClearInjectedPS1Input(); }
+    unsigned GetQueuedCliFrames() const { return m_CliFrames; }
 
     const std::string& GetProjectPath() const { return m_ProjectPath; }
     const std::string& GetProjectName() const { return m_ProjectName; }
@@ -69,7 +74,6 @@ private:
     void ProcessDeferredActions();
     void SetupDefaultScene();
     bool EnsureBuiltinScripts();
-    bool EnsureDemoContent();
 
     static Engine* s_Instance;
 
@@ -90,6 +94,10 @@ private:
     std::string m_PendingSceneLoad;
     bool m_RequestQuit = false;
     bool m_Running = true;
+    PSyncState m_PSync;
+    double m_PSyncLastTime = 0.0;
+    unsigned m_CliFrames = 0;
+    float m_CliFrameDelta = 1.0f/60.0f;
 };
 
 } // namespace MipsyncEngine

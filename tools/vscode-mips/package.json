@@ -2,7 +2,7 @@
   "name": "mipsync-mipssharp-vscode",
   "displayName": "Mips# for Mipsync Engine",
   "description": "Mips# language support for Mipsync Engine projects.",
-  "version": "0.2.2",
+  "version": "0.2.5",
   "publisher": "mipsync",
   "engines": {
     "vscode": "^1.88.0"
@@ -78,6 +78,25 @@
           "type": [
             "support.type.mips",
             "storage.type.mips"
+          ],
+          "parameter": [
+            "variable.parameter.mips"
+          ],
+          "enumMember": [
+            "constant.other.enum.mips"
+          ],
+          "keyword": [
+            "keyword.control.mips",
+            "storage.modifier.mips"
+          ],
+          "operator": [
+            "keyword.operator.mips"
+          ],
+          "number": [
+            "constant.numeric.mips"
+          ],
+          "decorator": [
+            "support.type.attribute.mips"
           ]
         }
       }
@@ -96,7 +115,14 @@
           "function:mipssharp": "#DCDCAA",
           "method:mipssharp": "#DCDCAA",
           "property:mipssharp": "#9CDCFE",
-          "variable:mipssharp": "#9CDCFE"
+          "variable:mipssharp": "#9CDCFE",
+          "parameter:mipssharp": "#9CDCFE",
+          "enumMember:mipssharp": "#4FC1FF",
+          "keyword:mipssharp": "#C586C0",
+          "operator:mipssharp": "#C8CCD0",
+          "number:mipssharp": "#B5CEA8",
+          "type.defaultLibrary:mipssharp": "#569CD6",
+          "decorator:mipssharp": "#4EC9B0"
         }
       },
       "editor.tokenColorCustomizations": {
@@ -118,11 +144,42 @@
             "settings": {
               "foreground": "#9CDCFE"
             }
+          },
+          {
+            "scope": "variable.other.mips, variable.parameter.mips",
+            "settings": {
+              "foreground": "#9CDCFE"
+            }
+          },
+          {
+            "scope": "keyword.operator.mips, punctuation.mips",
+            "settings": {
+              "foreground": "#C8CCD0"
+            }
+          },
+          {
+            "scope": "entity.name.type.mips",
+            "settings": {
+              "foreground": "#4EC9B0"
+            }
+          },
+          {
+            "scope": "storage.type.mips",
+            "settings": {
+              "foreground": "#569CD6"
+            }
+          },
+          {
+            "scope": "support.type.attribute.mips",
+            "settings": {
+              "foreground": "#4EC9B0"
+            }
           }
         ]
       },
       "[mipssharp]": {
-        "editor.semanticHighlighting.enabled": true
+        "editor.semanticHighlighting.enabled": true,
+        "editor.bracketPairColorization.enabled": true
       }
     },
     "configuration": {
@@ -152,6 +209,11 @@
     }
   },
   "devDependencies": {
-    "@vscode/vsce": "^3.9.2"
+    "@vscode/vsce": "^3.9.2",
+    "vscode-textmate": "^9.3.2",
+    "vscode-oniguruma": "^2.0.1"
+  },
+  "scripts": {
+    "test": "node ../../tests/MipsLanguageToolsTests.js"
   }
 }

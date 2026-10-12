@@ -109,6 +109,7 @@
 //   Input.GetAxis("Horizontal"), Input.GetAxis("Vertical")
 //   Input.mouseDeltaX / mouseDeltaY, Input.SetCursorLocked(1)
 //   Camera.Follow(camera, yaw, distance, height, lookHeight, sharpness[, pitchOffset])
+//   Camera.RotatePitch(camera, deltaDegrees, minPitch, maxPitch) -> float
 //
 // Common helpers:
 //   Debug.Log("value=", value)  // alias of Log.Info

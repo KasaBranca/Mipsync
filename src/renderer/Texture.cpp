@@ -1,3 +1,4 @@
+#include "../core/AssetFiles.h"
 #include "Texture.h"
 #include "../core/Log.h"
 #include "../assets/AssetManager.h"
@@ -58,8 +59,10 @@ Texture::Texture(const std::string& path, const TextureParams& params) {
     // stb_image opens narrow paths through the Windows ANSI code page.  Read through
     // std::filesystem instead so UTF-8 project paths (for example Japanese asset names)
     // reach the wide Windows file API, then let stb decode the in-memory bytes.
-    std::ifstream file(PathUtf8::FromString(path), std::ios::binary | std::ios::ate);
+    std::ifstream file;
+    if (!AssetFiles::IsPackedPath(PathUtf8::FromString(path))) file.open(PathUtf8::FromString(path), std::ios::binary | std::ios::ate);
     std::vector<unsigned char> encoded;
+    if (AssetFiles::IsPackedPath(PathUtf8::FromString(path))) encoded=AssetFiles::Read(PathUtf8::FromString(path));
     if (file.is_open()) {
         const std::streamoff length = file.tellg();
         if (length > 0 && length <= static_cast<std::streamoff>(std::numeric_limits<int>::max())) {

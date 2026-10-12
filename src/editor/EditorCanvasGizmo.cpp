@@ -49,7 +49,7 @@ Entity* FindCanvasEntity(Scene& scene, Entity* entity) {
 void DrawSceneCanvases(Scene& scene, const Camera& editorSceneCamera, const glm::mat4& view,
                        const glm::mat4& proj, const ImVec2& rectMin, const ImVec2& rectSize,
                        ImDrawList* drawList, uint32_t selectedEntityId, int layoutViewportWidth,
-                       int layoutViewportHeight) {
+                       int layoutViewportHeight, bool sceneViewPreview, uint32_t activeCameraEntityId) {
     const float layoutW = static_cast<float>(std::max(layoutViewportWidth, 1));
     const float layoutH = static_cast<float>(std::max(layoutViewportHeight, 1));
 
@@ -63,6 +63,13 @@ void DrawSceneCanvases(Scene& scene, const Camera& editorSceneCamera, const glm:
         auto* canvas = entityPtr->GetComponent<CanvasComponent>();
         if (!canvas || !canvas->enabled)
             continue;
+        if (!sceneViewPreview && canvas->renderMode == UICanvasRenderMode::ScreenSpaceCamera &&
+            canvas->eventCameraEntityId != 0) {
+            uint32_t cameraId = activeCameraEntityId;
+            if (!cameraId)
+                if (Entity* primary = scene.GetPrimaryCameraEntity()) cameraId = primary->GetID();
+            if (cameraId && canvas->eventCameraEntityId != cameraId) continue;
+        }
 
         const bool isTarget = targetCanvas && targetCanvas->GetID() == entityPtr->GetID();
         if (targetCanvas && !isTarget)
@@ -71,29 +78,40 @@ void DrawSceneCanvases(Scene& scene, const Camera& editorSceneCamera, const glm:
         const float scale = ComputeCanvasScaleFactor(*canvas, layoutViewportWidth, layoutViewportHeight);
         const float aspect =
             rectSize.y > 0.0f ? (rectSize.x / rectSize.y) : 1.0f;
-        const float unitsPerPixel = ComputeSceneViewCanvasUnitsPerPixel(
-            editorSceneCamera, canvas->planeDistance, layoutViewportWidth, layoutViewportHeight, aspect);
+        const float unitsPerPixel = sceneViewPreview ? ComputeSceneViewCanvasUnitsPerPixel(
+            editorSceneCamera, canvas->planeDistance, layoutViewportWidth, layoutViewportHeight, aspect)
+            : kCanvasUnitsPerPixel;
         const glm::mat4 planeWorld = BuildCanvasWorldMatrix(scene, *entityPtr, *canvas, editorSceneCamera,
-                                                            unitsPerPixel, true);
+                                                            unitsPerPixel, sceneViewPreview);
 
         UILayoutContext ctx;
         ctx.viewportWidth = layoutW;
         ctx.viewportHeight = layoutH;
         ctx.scaleFactor = scale;
-        ctx.pixelSpace = false;
+        ctx.pixelSpace = !sceneViewPreview && canvas->renderMode == UICanvasRenderMode::ScreenSpaceOverlay;
+
+        const auto drawRect = [&](const UIRect& rect, ImU32 color, float thickness) {
+            if (ctx.pixelSpace) {
+                ImVec2 min, max;
+                UIRectToScreenOverlay(rect, layoutW, layoutH, rectMin, rectSize, min, max);
+                drawList->AddRect(min, max, color, 0.0f, 0, thickness);
+            } else {
+                DrawRectWireframe3D(rect, planeWorld, view, proj, rectMin, rectSize, drawList, color, thickness);
+            }
+        };
 
         bool drewRoot = false;
         VisitCanvasUI(scene, *entityPtr, *canvas, ctx, [&](Entity& entity, const UIRect& rect) {
             const bool isRoot = entity.GetID() == entityPtr->GetID();
             const ImU32 color = isRoot ? kCanvasColor : kChildRectColor;
             const float thickness = isRoot ? 2.0f : 1.0f;
-            DrawRectWireframe3D(rect, planeWorld, view, proj, rectMin, rectSize, drawList, color, thickness);
+            drawRect(rect, color, thickness);
             drewRoot = drewRoot || isRoot;
         });
 
         if (!drewRoot) {
             UIRect full{ 0.0f, 0.0f, layoutW, layoutH };
-            DrawRectWireframe3D(full, planeWorld, view, proj, rectMin, rectSize, drawList, kCanvasColor, 2.0f);
+            drawRect(full, kCanvasColor, 2.0f);
         }
     }
 }

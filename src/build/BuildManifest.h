@@ -6,7 +6,7 @@
 
 namespace MipsyncEngine {
 
-/// Runtime boot manifest (Unity-style: sits next to exe in `<Product>_Data/boot.json`).
+/// Runtime boot manifest stored inside protected game.mpak (legacy players use boot.json).
 struct BuildManifest {
     std::string productName;
     std::string companyName;

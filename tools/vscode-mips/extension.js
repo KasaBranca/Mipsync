@@ -199,140 +199,15 @@ function toVsCodeCompletion(item) {
   return result;
 }
 
-const semanticTokenTypes = [
-  "class",
-  "enum",
-  "function",
-  "method",
-  "property",
-  "variable",
-  "type",
-];
-const semanticTokenModifiers = ["declaration", "static"];
-const semanticTokenLegend = new vscode.SemanticTokensLegend(semanticTokenTypes, semanticTokenModifiers);
-
-const builtinTypeNames = [
-  "MipsBehaviour",
-  "IEnumerator",
-  "WaitForSeconds",
-  "AudioClip",
-  "Entity",
-  "Transform",
-  "Vector3",
-  "Animator",
-  "AudioSource",
-  "Collider",
-  "Rigidbody",
-  "bool",
-  "int",
-  "float",
-  "string",
-  "void",
-];
-const staticClassNames = [
-  "Time",
-  "Input",
-  "Log",
-  "Debug",
-  "Mathf",
-  "Physics",
-  "Scene",
-  "Application",
-  "Save",
-];
-const mipsTypeRegex = "(?:bool|int|float|string|void|IEnumerator|Vector3|AudioClip|Entity|Transform|Animator|AudioSource|Collider|Rigidbody|[A-Za-z_][A-Za-z0-9_]*(?:\\[\\])?)";
-
-function makeCodeOnlyText(text) {
-  const chars = Array.from(text);
-  let i = 0;
-  while (i < chars.length) {
-    if (chars[i] === "/" && chars[i + 1] === "/") {
-      while (i < chars.length && chars[i] !== "\n") chars[i++] = " ";
-      continue;
-    }
-    if (chars[i] === "/" && chars[i + 1] === "*") {
-      chars[i++] = " ";
-      chars[i++] = " ";
-      while (i < chars.length) {
-        if (chars[i] === "*" && chars[i + 1] === "/") {
-          chars[i++] = " ";
-          chars[i++] = " ";
-          break;
-        }
-        if (chars[i] !== "\n") chars[i] = " ";
-        i++;
-      }
-      continue;
-    }
-    if (chars[i] === "\"") {
-      chars[i++] = " ";
-      while (i < chars.length) {
-        if (chars[i] === "\\") {
-          chars[i++] = " ";
-          if (i < chars.length && chars[i] !== "\n") chars[i++] = " ";
-          continue;
-        }
-        const done = chars[i] === "\"";
-        if (chars[i] !== "\n") chars[i] = " ";
-        i++;
-        if (done) break;
-      }
-      continue;
-    }
-    i++;
-  }
-  return chars.join("");
-}
-
-function addSemanticRegex(tokens, text, regex, groupIndex, type, modifiers = [], priority = 0) {
-  for (const match of text.matchAll(regex)) {
-    const value = match[groupIndex];
-    if (!value) continue;
-    const offsetInMatch = match[0].indexOf(value);
-    if (offsetInMatch < 0) continue;
-    tokens.push({
-      start: match.index + offsetInMatch,
-      length: value.length,
-      type,
-      modifiers,
-      priority,
-    });
-  }
-}
-
+const { TOKEN_TYPES, analyze } = require("./mips-language-server/lib/language");
+const semanticTokenLegend = new vscode.SemanticTokensLegend(TOKEN_TYPES, ["declaration", "static", "defaultLibrary"]);
 function buildMipsSemanticTokens(document) {
-  const source = makeCodeOnlyText(document.getText());
-  const tokens = [];
-
-  addSemanticRegex(tokens, source, /\b(class)\s+([A-Za-z_][A-Za-z0-9_]*)/g, 2, "class", ["declaration"], 100);
-  addSemanticRegex(tokens, source, /\b(enum)\s+([A-Za-z_][A-Za-z0-9_]*)/g, 2, "enum", ["declaration"], 100);
-  addSemanticRegex(tokens, source, new RegExp(`\\b(?:public\\s+|private\\s+)?${mipsTypeRegex}\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()`, "g"), 1, "function", ["declaration"], 90);
-  addSemanticRegex(tokens, source, new RegExp(`\\b(public|private)\\s+${mipsTypeRegex}\\s+([A-Za-z_][A-Za-z0-9_]*)\\b(?!\\s*\\()`, "g"), 2, "property", ["declaration"], 80);
-  addSemanticRegex(tokens, source, new RegExp(`\\b(?:var|bool|int|float|string|Vector3|AudioClip|Entity|Transform|Animator|AudioSource|Collider|Rigidbody)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b(?!\\s*\\()`, "g"), 1, "variable", ["declaration"], 70);
-  addSemanticRegex(tokens, source, new RegExp(`\\b(${builtinTypeNames.join("|")})\\b`, "g"), 1, "type", [], 60);
-  addSemanticRegex(tokens, source, new RegExp(`\\b(${staticClassNames.join("|")})\\b`, "g"), 1, "class", ["static"], 60);
-  addSemanticRegex(tokens, source, /\.(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()/g, 2, "method", [], 50);
-  addSemanticRegex(tokens, source, /\b(?!if\b|for\b|while\b|switch\b|return\b|new\b|class\b|enum\b)([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()/g, 1, "function", [], 40);
-  addSemanticRegex(tokens, source, /\.(\s*)([A-Za-z_][A-Za-z0-9_]*)\b/g, 2, "property", [], 30);
-
-  tokens.sort((a, b) => a.start - b.start || b.priority - a.priority || b.length - a.length);
-
-  const filtered = [];
-  let lastLine = -1;
-  let lastEnd = -1;
-  for (const token of tokens) {
+  const builder = new vscode.SemanticTokensBuilder(semanticTokenLegend);
+  for (const token of analyze(document.getText()).tokens) {
     const start = document.positionAt(token.start);
     const end = document.positionAt(token.start + token.length);
-    if (start.line !== end.line) continue;
-    if (start.line === lastLine && start.character < lastEnd) continue;
-    filtered.push({ ...token, startPosition: start, endPosition: end });
-    lastLine = start.line;
-    lastEnd = end.character;
-  }
-
-  const builder = new vscode.SemanticTokensBuilder(semanticTokenLegend);
-  for (const token of filtered) {
-    builder.push(new vscode.Range(token.startPosition, token.endPosition), token.type, token.modifiers);
+    if (start.line === end.line)
+      builder.push(new vscode.Range(start, end), token.type, token.modifiers);
   }
   return builder.build();
 }
@@ -371,7 +246,7 @@ function activate(context) {
       });
       return new vscode.CompletionList((result.items || []).map(toVsCodeCompletion), Boolean(result.isIncomplete));
     },
-  }, "."));
+  }, ".", "["));
 
   context.subscriptions.push(vscode.languages.registerHoverProvider(mipsLanguageSelector, {
     async provideHover(document, position) {

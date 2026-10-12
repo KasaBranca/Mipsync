@@ -1,0 +1,132 @@
+/* Port of EditorSurface::DrawRaisedFace and EditorTheme's dark button palette.
+ * ImGui quantizes the shade endpoints to bytes: +17/-11, or -6/+4 held.
+ * Clamp each endpoint before sRGB interpolation, especially on blue faces.
+ */
+:is(.btn, .support-card-button, .smooth-select-trigger, .toast-close, .nav-highlight) {
+  --raised-radius: 4px;
+  --raised-r: 68;
+  --raised-g: 71;
+  --raised-b: 75;
+  --raised-top: 17;
+  --raised-bottom: -11;
+  --raised-rim-top: rgb(255 255 255 / 0.1882352941);
+  --raised-rim-bottom: rgb(0 0 0 / 0.2274509804);
+  position: relative;
+  border: 1px solid #27292c;
+  border-radius: var(--raised-radius);
+  background-image: linear-gradient(to bottom,
+    rgb(clamp(0, calc(var(--raised-r) + var(--raised-top)), 255)
+        clamp(0, calc(var(--raised-g) + var(--raised-top)), 255)
+        clamp(0, calc(var(--raised-b) + var(--raised-top)), 255)),
+    rgb(clamp(0, calc(var(--raised-r) + var(--raised-bottom)), 255)
+        clamp(0, calc(var(--raised-g) + var(--raised-bottom)), 255)
+        clamp(0, calc(var(--raised-b) + var(--raised-bottom)), 255)));
+  background-origin: border-box;
+  background-size: calc(100% - 1px) calc(100% - 1px);
+  background-position: center;
+  background-repeat: no-repeat;
+  color: #eceef1;
+  transition: none;
+}
+
+.btn,
+.support-card-button,
+.toast-close {
+  --raised-radius: var(--radius-pill);
+}
+
+:is(.btn, .support-card-button, .smooth-select-trigger, .toast-close):hover:not(:disabled),
+.smooth-select.open > .smooth-select-trigger {
+  --raised-r: 80;
+  --raised-g: 84;
+  --raised-b: 90;
+}
+
+:is(.btn, .support-card-button, .smooth-select-trigger, .toast-close):active:not(:disabled),
+.nav:has(.nav-item.active:active) > .nav-highlight {
+  --raised-r: 42;
+  --raised-g: 45;
+  --raised-b: 48;
+  --raised-top: -6;
+  --raised-bottom: 4;
+  --raised-rim-top: rgb(0 0 0 / 0.1764705882);
+  --raised-rim-bottom: rgb(255 255 255 / 0.0784313725);
+}
+
+.btn:active:not(:disabled) {
+  transform: none;
+}
+
+.btn-primary,
+.nav-highlight {
+  --raised-radius: var(--radius-pill);
+  --raised-r: 13;
+  --raised-g: 153;
+  --raised-b: 255;
+  border-color: #0d99ff;
+  color: #fff;
+}
+
+.btn-primary:hover:not(:disabled),
+.nav:has(.nav-item.active:hover) > .nav-highlight {
+  --raised-r: 58;
+  --raised-g: 169;
+  --raised-b: 255;
+}
+
+.btn-primary:active:not(:disabled),
+.nav:has(.nav-item.active:active) > .nav-highlight {
+  --raised-r: 8;
+  --raised-g: 120;
+  --raised-b: 201;
+}
+
+/* The moving selection plate owns the active navigation button's face. */
+.nav-highlight {
+  position: absolute;
+  transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+:is(.btn, .support-card-button, .smooth-select-trigger, .toast-close, .nav-highlight)::before,
+:is(.btn, .support-card-button, .smooth-select-trigger, .toast-close, .nav-highlight)::after {
+  content: "";
+  position: absolute;
+  /* CSS borders are outer edges; ImGui's inset contour is a centered stroke. */
+  inset: 0;
+  border: 1px solid var(--raised-rim-top);
+  border-radius: calc(var(--raised-radius) - 1px);
+  pointer-events: none;
+  mask-image: linear-gradient(to bottom, #000 0.5px, transparent calc(35% + 0.85px));
+}
+
+:is(.btn, .support-card-button, .smooth-select-trigger, .toast-close, .nav-highlight)::after {
+  border-color: var(--raised-rim-bottom);
+  mask-image: linear-gradient(to top, #000 0.5px, transparent calc(35% + 0.85px));
+}
+
+:is(.btn, .support-card-button, .nav-item, .smooth-select-trigger, .toast-close):focus-visible {
+  outline: 2px solid #0d99ff;
+  outline-offset: 1px;
+}
+
+/* Reverse the face lighting for the recessed, capsule-shaped search field.
+ * Inset shadows follow the rounded edge and stay inside the input's hit area.
+ */
+.search input,
+.search input:focus {
+  background-color: #2a2d30;
+  background-image: linear-gradient(to bottom, #24272a, #2e3134);
+  box-shadow:
+    inset 0 1px 3px rgb(0 0 0 / 0.28),
+    inset 0 -1px 1px rgb(255 255 255 / 0.0784313725);
+  color: #eceef1;
+  transition: border-color 160ms ease;
+}
+
+.search input {
+  border-color: var(--border);
+}
+
+.search input:focus {
+  border-color: #0d99ff;
+}

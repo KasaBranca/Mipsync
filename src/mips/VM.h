@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <array>
 
 namespace MipsyncEngine {
 
@@ -37,6 +38,7 @@ struct CoroutineState {
 struct ScriptInstance {
     std::shared_ptr<CompiledModule> module;
     Entity* entity = nullptr;
+    uint32_t entityId = 0;
     MipsScriptComponent* sourceComponent = nullptr;
     std::vector<double> fields;
     std::vector<Value> runtimeFields;
@@ -53,6 +55,11 @@ public:
     void SetPhysicsOtherEntityId(uint32_t entityId) { m_PhysicsOtherEntityId = entityId; }
     void SetExecutionLimits(const VMExecutionLimits& limits) { m_Limits = limits; }
     const VMExecutionLimits& GetExecutionLimits() const { return m_Limits; }
+    size_t GetLastInvocationInstructions() const { return m_LastInvocationInstructions; }
+    void SetPerformanceCounting(bool enabled) { m_PerformanceCounting = enabled; }
+    void ResetPerformanceCounts() { m_OpcodeCounts.fill(0); m_HostCounts.fill(0); }
+    const auto& GetOpcodeCounts() const { return m_OpcodeCounts; }
+    const auto& GetHostCounts() const { return m_HostCounts; }
 
     bool RunMethod(ScriptInstance& instance, const std::string& methodName,
                    std::vector<std::string>& outErrors);
@@ -69,6 +76,7 @@ private:
 
     float m_DeltaTime = 0.0f;
     uint32_t m_PhysicsOtherEntityId = 0;
+    size_t m_LastInvocationInstructions = 0;
     Scene* m_Scene = nullptr;
     PhysicsWorld* m_PhysicsWorld = nullptr;
     ScriptInstance* m_Instance = nullptr;
@@ -78,6 +86,8 @@ private:
     std::vector<Value> m_Locals; // re-used per Execute (supports Host refs)
     std::vector<std::string> m_RuntimeStrings;
     VMExecutionLimits m_Limits;
+    bool m_PerformanceCounting = false;
+    std::array<uint64_t, 256> m_OpcodeCounts{}, m_HostCounts{};
     size_t m_RuntimeStringBytes = 0;
     bool m_RuntimeStringLimitExceeded = false;
 

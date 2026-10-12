@@ -1,3 +1,4 @@
+#include "../core/PreparationCancellation.h"
 #include "PhysicsWorld.h"
 #include "ColliderUtils.h"
 #include "../core/Log.h"
@@ -460,6 +461,7 @@ void PhysicsWorld::RebuildBodies(Scene& scene) {
     std::vector<Entity*> rigidEntities;
 
     for (const auto& entityPtr : scene.GetEntities()) {
+        CheckPreparationCancelled();
         Entity* entity = entityPtr.get();
         if (!entity->IsActive()) continue;
         auto* collider = entity->GetComponent<ColliderComponent>();
@@ -474,6 +476,7 @@ void PhysicsWorld::RebuildBodies(Scene& scene) {
     }
 
     auto addRigidBody = [&](Entity* entity) {
+        CheckPreparationCancelled();
         auto* collider = entity->GetComponent<ColliderComponent>();
         auto* rb = entity->GetComponent<RigidbodyComponent>();
         const RigidbodyType requestedBodyType = ResolveBodyType(*entity);
@@ -488,6 +491,7 @@ void PhysicsWorld::RebuildBodies(Scene& scene) {
             ColliderUtils::ComputePhysicsWorldPose(scene, *entity, *collider, rb);
         const Mesh* mesh = ResolveMeshForCollider(*entity, *collider);
         JPH::RefConst<JPH::Shape> shape = ColliderUtils::CreateShape(*collider, mesh, pose.lossyScale);
+        CheckPreparationCancelled();
         if (!shape) {
             MIPSYNC_WARN("Physics: failed to create shape for '{}'", EntityDebugName(*entity));
             return;
@@ -527,6 +531,7 @@ void PhysicsWorld::RebuildBodies(Scene& scene) {
     };
 
     auto addCharacter = [&](Entity* entity) {
+        CheckPreparationCancelled();
         auto* collider = entity->GetComponent<ColliderComponent>();
         auto* rb = entity->GetComponent<RigidbodyComponent>();
         const glm::vec3 pivot = scene.GetWorldPosition(*entity);
@@ -731,11 +736,12 @@ bool PhysicsWorld::IsCharacterGrounded(Entity& entity) const {
 // ─────────────────────────────────────────────────
 // Main step
 // ─────────────────────────────────────────────────
-void PhysicsWorld::Simulate(Scene& scene, float deltaTime) {
+void PhysicsWorld::Simulate(Scene& scene, float deltaTime, float maxFrameDeltaTime) {
     if (!m_Impl->active || !m_Impl->physicsSystem) return;
     if (!std::isfinite(deltaTime) || deltaTime <= 0.0f) return;
 
-    deltaTime = std::min(deltaTime, 1.0f / 20.0f);
+    if (!std::isfinite(maxFrameDeltaTime) || maxFrameDeltaTime <= 0.0f) return;
+    deltaTime = std::min(deltaTime, maxFrameDeltaTime);
 
     SyncKinematicAndStaticFromScene(scene, deltaTime);
 

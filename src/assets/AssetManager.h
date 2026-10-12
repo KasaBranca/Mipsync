@@ -57,7 +57,7 @@ public:
     std::shared_ptr<Texture> GetSkyboxTexture(const std::string& projectRelativePath);
     void DropTexture(const std::string& projectRelativePath);
 
-    std::shared_ptr<Mesh> GetMesh(const std::string& projectRelativePath);
+    std::shared_ptr<Mesh> GetMesh(const std::string& projectRelativePath, int meshPart = -1);
     void DropMesh(const std::string& projectRelativePath);
 
     std::shared_ptr<SkeletalModelAsset> GetSkeletalModel(const std::string& projectRelativePath);

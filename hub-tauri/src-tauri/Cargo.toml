@@ -1,6 +1,6 @@
 [package]
 name = "mipsync-hub"
-version = "2026.9.1"
+version = "2026.10.12"
 description = "Mipsync Hub - PS1 Game Engine Launcher & Hub"
 authors = ["Mipsync"]
 edition = "2021"

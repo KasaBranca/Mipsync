@@ -25,11 +25,25 @@ public:
     bool SaveProject(std::string& outError);
 
     void Draw();
-    bool RunPcNativeBuild(std::string& outMessage);
-    bool RunBuild(std::string& outMessage);
+    bool RunPcNativeBuild(std::string& outMessage, bool revealOutput = true, bool showDialog = true);
+    bool RunBuild(std::string& outMessage, bool revealOutput = true, bool showDialog = true);
     bool RunBuildAndRun(std::string& outMessage);
-    bool RunBuildDiscFolder(std::string& outMessage);
+    bool RunBuildDiscFolder(std::string& outMessage, bool revealOutput = true, bool showDialog = true);
     bool IsBuildInProgress() const { return m_BuildInProgress; }
+    bool HasBuildFinished() const { return m_BuildFinished; }
+    bool WasBuildSuccessful() const { return m_LastBuildOk; }
+    float GetBuildProgress() const { return m_BuildProgress; }
+    const std::string& GetBuildMessage() const { return m_LastBuildMessage; }
+    const std::string& GetBuildStage() const { return m_BuildStage; }
+    const std::string& GetBuildLog() const { return m_BuildLog; }
+    bool WasBuildCancelled() const { return m_BuildCancelled; }
+    unsigned long GetBuildExitCode() const { return m_BuildExitCode; }
+    bool HasBuildDialog() const { return m_BuildDialogRequested || m_BuildDialogVisible; }
+    void UpdateBuildProcess() { PollBuildProcess(); }
+    void CommandCancelBuild() { CancelBuildProcess(); }
+    bool CommandCloseBuildDialog(std::string& outError);
+    const Ps1::Ps1BuildResult& GetPs1BuildResult() const { return m_LastPs1Build; }
+    const PlayerBuildResult& GetPcBuildResult() const { return m_LastPcBuild; }
 
 private:
     enum class BuildJobKind { Ps1, Ps1AndRun, PcNative, DiscFolder };
@@ -41,7 +55,7 @@ private:
     void AddScenePath(const std::string& projectRelative);
     bool SaveEditorPrefs(std::string& outError);
     void AutoSaveProject();
-    bool StartBuildProcess(BuildJobKind kind, const char* cliFlag, std::string& outMessage);
+    bool StartBuildProcess(BuildJobKind kind, const char* cliFlag, std::string& outMessage, bool revealOutput = true, bool showDialog = true);
     void PollBuildProcess();
     void ConsumeBuildOutput(const char* bytes, size_t size);
     void ConsumeBuildLine(const std::string& line);
@@ -61,10 +75,13 @@ private:
 
     BuildJobKind m_BuildKind = BuildJobKind::Ps1;
     bool m_BuildInProgress = false;
+    bool m_RevealOutput = true;
     bool m_BuildFinished = false;
     bool m_BuildCancelled = false;
     bool m_BuildDialogRequested = false;
     bool m_BuildDialogCloseRequested = false;
+    bool m_BuildDialogVisible = false;
+    unsigned long m_BuildExitCode = 0;
     float m_BuildProgress = 0.0f;
     double m_BuildStartedAt = 0.0;
     std::string m_BuildStage;

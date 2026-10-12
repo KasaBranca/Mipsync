@@ -29,7 +29,10 @@ public:
 
     void Bind() const;
     void Unbind() const;
+    void UpdateVertexData(const std::vector<SkinnedVertex>& vertices);
     uint32_t GetIndexCount() const { return m_IndexCount; }
+    const std::vector<SkinnedVertex>& GetVertices() const { return m_Vertices; }
+    const std::vector<uint32_t>& GetIndices() const { return m_Indices; }
     const glm::vec3& GetBoundsMin() const { return m_BoundsMin; }
     const glm::vec3& GetBoundsMax() const { return m_BoundsMax; }
 
@@ -39,6 +42,8 @@ private:
 
     GLuint m_VAO = 0, m_VBO = 0, m_EBO = 0;
     uint32_t m_IndexCount = 0;
+    std::vector<SkinnedVertex> m_Vertices;
+    std::vector<uint32_t> m_Indices;
     glm::vec3 m_BoundsMin{ 0.0f };
     glm::vec3 m_BoundsMax{ 0.0f };
 };

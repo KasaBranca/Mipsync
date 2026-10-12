@@ -3,8 +3,8 @@
     "configurePresets": [
         {
             "name": "default",
-            "displayName": "Default (MinGW Release)",
-            "generator": "MinGW Makefiles",
+            "displayName": "Default (MinGW + Ninja Release)",
+            "generator": "Ninja",
             "binaryDir": "${sourceDir}/build",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
@@ -13,8 +13,8 @@
         },
         {
             "name": "debug",
-            "displayName": "Debug (MinGW)",
-            "generator": "MinGW Makefiles",
+            "displayName": "Debug (MinGW + Ninja)",
+            "generator": "Ninja",
             "binaryDir": "${sourceDir}/build-debug",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",

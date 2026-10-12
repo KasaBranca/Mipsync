@@ -13,7 +13,16 @@
       "include": "#numbers"
     },
     {
+      "include": "#attributes"
+    },
+    {
       "include": "#declarations"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#types"
     },
     {
       "include": "#members"
@@ -22,10 +31,13 @@
       "include": "#function-calls"
     },
     {
-      "include": "#keywords"
+      "include": "#operators"
     },
     {
-      "include": "#types"
+      "include": "#punctuation"
+    },
+    {
+      "include": "#identifiers"
     }
   ],
   "repository": {
@@ -68,47 +80,87 @@
     "declarations": {
       "patterns": [
         {
-          "name": "meta.class.mips",
-          "match": "\\b(class)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "\\b(class|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": {
-              "name": "storage.type.class.mips"
+              "name": "storage.type.mips"
             },
             "2": {
-              "name": "entity.name.type.class.mips"
+              "name": "entity.name.type.mips"
             }
           }
         },
         {
-          "name": "meta.enum.mips",
-          "match": "\\b(enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
-          "captures": {
-            "1": {
-              "name": "storage.type.enum.mips"
-            },
-            "2": {
-              "name": "entity.name.type.enum.mips"
-            }
-          }
-        },
-        {
-          "name": "meta.function.mips",
-          "match": "\\b(?:public\\s+|private\\s+)?(?:void|bool|int|float|string|IEnumerator|Vector3|AudioClip|Entity|Transform|Animator|AudioSource|Collider|Rigidbody|[A-Za-z_][A-Za-z0-9_]*(?:\\[\\])?)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
-          "captures": {
-            "1": {
-              "name": "entity.name.function.mips"
-            }
-          }
-        },
-        {
-          "name": "meta.field.mips",
-          "match": "\\b(public|private)\\s+(?:bool|int|float|string|Vector3|AudioClip|Entity|Transform|Animator|AudioSource|Collider|Rigidbody|[A-Za-z_][A-Za-z0-9_]*(?:\\[\\])?)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b(?!\\s*\\()",
+          "match": "\\b(?:(public)\\s+)?((?!if\\b|else\\b|while\\b|for\\b|return\\b|yield\\b|break\\b|continue\\b|new\\b|class\\b|enum\\b|var\\b)[A-Za-z_][A-Za-z0-9_]*(?:\\s*\\[\\s*\\])?)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
           "captures": {
             "1": {
               "name": "storage.modifier.mips"
             },
             "2": {
+              "name": "support.type.mips",
+              "patterns": [
+                {
+                  "match": "\\b(void|bool|int|float|string)\\b",
+                  "name": "storage.type.mips"
+                }
+              ]
+            },
+            "3": {
+              "name": "entity.name.function.mips"
+            }
+          }
+        },
+        {
+          "match": "\\b(public)\\s+((?!if\\b|else\\b|while\\b|for\\b|return\\b|yield\\b|break\\b|continue\\b|new\\b|class\\b|enum\\b|var\\b)[A-Za-z_][A-Za-z0-9_]*(?:\\s*\\[\\s*\\])?)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "captures": {
+            "1": {
+              "name": "storage.modifier.mips"
+            },
+            "2": {
+              "name": "support.type.mips",
+              "patterns": [
+                {
+                  "match": "\\b(void|bool|int|float|string)\\b",
+                  "name": "storage.type.mips"
+                }
+              ]
+            },
+            "3": {
               "name": "variable.other.member.mips"
+            }
+          }
+        },
+        {
+          "match": "\\b(var|[A-Za-z_][A-Za-z0-9_]*(?:\\s*\\[\\s*\\])?)\\s+((?!if\\b|else\\b|while\\b|for\\b|return\\b|yield\\b|break\\b|continue\\b|new\\b|class\\b|enum\\b|var\\b)[A-Za-z_][A-Za-z0-9_]*)\\s*(?==|;|,|\\)|\\{)",
+          "captures": {
+            "1": {
+              "name": "storage.type.mips"
+            },
+            "2": {
+              "name": "variable.other.local.mips"
+            }
+          }
+        },
+        {
+          "match": "\\b(GetComponent)\\s*(<)\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(>)",
+          "captures": {
+            "1": {
+              "name": "support.function.mips"
+            },
+            "2": {
+              "name": "punctuation.definition.typeparameters.begin.mips"
+            },
+            "3": {
+              "name": "support.type.mips",
+              "patterns": [
+                {
+                  "match": "\\b(void|bool|int|float|string)\\b",
+                  "name": "storage.type.mips"
+                }
+              ]
+            },
+            "4": {
+              "name": "punctuation.definition.typeparameters.end.mips"
             }
           }
         }
@@ -153,11 +205,11 @@
       "patterns": [
         {
           "name": "keyword.control.mips",
-          "match": "\\b(if|else|while|for|break|continue|return|yield)\\b"
+          "match": "\\b(if|else|while|for|break|continue|return|yield|extends)\\b"
         },
         {
           "name": "storage.modifier.mips",
-          "match": "\\b(public|private)\\b"
+          "match": "\\b(public|private|get|set)\\b"
         },
         {
           "name": "storage.type.mips",
@@ -173,11 +225,70 @@
       "patterns": [
         {
           "name": "support.type.mips",
-          "match": "\\b(MipsBehaviour|IEnumerator|WaitForSeconds|AudioClip|Entity|Transform|Vector3|Animator|AudioSource|Collider|Rigidbody)\\b"
+          "match": "\\b(MipsBehaviour|IEnumerator|WaitForSeconds|AudioClip|Entity|Camera|Transform|Vector3|Animator|AudioSource|Collider|Rigidbody)\\b"
         },
         {
           "name": "support.class.mips",
-          "match": "\\b(Time|Input|Log|Debug|Mathf|Physics|Scene|Application|Save)\\b"
+          "match": "\\b(Time|Input|Log|Debug|Mathf|Physics|Camera|UI|Scene|Application|Save)\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.mips",
+          "match": "==|!=|<=|>=|&&|\\|\\||[+*/%=!<>-]"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.mips",
+          "match": "[{}()\\[\\],;:.]"
+        }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "name": "variable.other.mips",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "attributes": {
+      "begin": "\\[(?=\\s*(?:Header|Space|Tooltip|Range|Min|ReadOnly|HideInInspector|InspectorName|Order)(?:Attribute)?\\b)",
+      "end": "\\]",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.attribute.begin.mips"
+        }
+      },
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.attribute.end.mips"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#comments"
+        },
+        {
+          "include": "#strings"
+        },
+        {
+          "include": "#numbers"
+        },
+        {
+          "name": "support.type.attribute.mips",
+          "match": "\\b(?:Header|Space|Tooltip|Range|Min|ReadOnly|HideInInspector|InspectorName|Order)(?:Attribute)?\\b"
+        },
+        {
+          "include": "#operators"
+        },
+        {
+          "include": "#punctuation"
         }
       ]
     }

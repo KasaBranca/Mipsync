@@ -1,3 +1,4 @@
+#include "../core/AssetFiles.h"
 #include "Mesh.h"
 #include "../core/Log.h"
 #include "../assets/AssetManager.h"
@@ -22,17 +23,49 @@
 namespace MipsyncEngine {
 
 Mesh::Mesh(const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices, bool dynamicVbo,
-           bool skipGpuUpload) {
+           bool skipGpuUpload, std::vector<MeshPart> parts) : m_Parts(std::move(parts)) {
     m_Vertices = vertices;
     m_Indices = indices;
     m_VertexCount = static_cast<uint32_t>(vertices.size());
     m_IndexCount = static_cast<uint32_t>(indices.size());
+    for (auto& part : m_Parts) {
+        if (!part.indexCount || static_cast<size_t>(part.indexOffset) + part.indexCount > indices.size()) continue;
+        glm::vec3 low = vertices[indices[part.indexOffset]].position, high = low;
+        for (size_t i = part.indexOffset; i < static_cast<size_t>(part.indexOffset) + part.indexCount; ++i) {
+            low = glm::min(low, vertices[indices[i]].position);
+            high = glm::max(high, vertices[indices[i]].position);
+        }
+        part.origin = (low + high) * .5f;
+    }
     ComputeBounds(vertices);
     if (!skipGpuUpload)
         Setup(vertices, indices, dynamicVbo);
 }
 
 Mesh::~Mesh() { Cleanup(); }
+
+Mesh Mesh::ExtractPart(const Mesh& source, int partIndex, bool cpuOnly) {
+    if (partIndex < 0 || static_cast<size_t>(partIndex) >= source.m_Parts.size()) return {};
+    const auto& part = source.m_Parts[partIndex];
+    if (static_cast<size_t>(part.indexOffset) + part.indexCount > source.m_Indices.size()) return {};
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    std::unordered_map<uint32_t, uint32_t> remap;
+    indices.reserve(part.indexCount);
+    for (size_t i = part.indexOffset; i < static_cast<size_t>(part.indexOffset) + part.indexCount; ++i) {
+        const uint32_t original = source.m_Indices[i];
+        if (original >= source.m_Vertices.size()) return {};
+        auto [entry, added] = remap.emplace(original, static_cast<uint32_t>(vertices.size()));
+        if (added) {
+            vertices.push_back(source.m_Vertices[original]);
+            vertices.back().position -= part.origin;
+        }
+        indices.push_back(entry->second);
+    }
+    Mesh result(vertices, indices, false, cpuOnly);
+    result.m_IsModelPart = true;
+    return result;
+}
 
 Mesh Mesh::CreateSubdivided(const Mesh& source, int maxLevels,
                             float maxEdgeLength, const glm::vec3& worldScale,
@@ -115,7 +148,7 @@ Mesh::Mesh(Mesh&& o) noexcept
       m_IndexCount(o.m_IndexCount), m_VertexCount(o.m_VertexCount),
       m_BoundsMin(o.m_BoundsMin), m_BoundsMax(o.m_BoundsMax),
       m_Vertices(std::move(o.m_Vertices)),
-      m_Indices(std::move(o.m_Indices)) {
+      m_Indices(std::move(o.m_Indices)), m_Parts(std::move(o.m_Parts)), m_IsModelPart(o.m_IsModelPart) {
     o.m_VAO = o.m_VBO = o.m_EBO = 0;
     o.m_IndexCount = o.m_VertexCount = 0;
     o.m_BoundsMin = o.m_BoundsMax = glm::vec3(0.0f);
@@ -129,6 +162,8 @@ Mesh& Mesh::operator=(Mesh&& o) noexcept {
         m_BoundsMin = o.m_BoundsMin; m_BoundsMax = o.m_BoundsMax;
         m_Vertices = std::move(o.m_Vertices);
         m_Indices = std::move(o.m_Indices);
+        m_Parts = std::move(o.m_Parts);
+        m_IsModelPart = o.m_IsModelPart;
         o.m_VAO = o.m_VBO = o.m_EBO = 0;
         o.m_IndexCount = o.m_VertexCount = 0;
         o.m_BoundsMin = o.m_BoundsMax = glm::vec3(0.0f);
@@ -467,7 +502,8 @@ Vertex MakeVertex(const glm::vec3& pos, const glm::vec3& normal, const glm::vec2
 }
 
 std::vector<uint8_t> ReadBinaryFile(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
+    if(AssetFiles::IsPackedPath(PathUtf8::FromString(path))) return AssetFiles::Read(PathUtf8::FromString(path));
+    std::ifstream in(PathUtf8::FromString(path), std::ios::binary);
     if (!in)
         return {};
     in.seekg(0, std::ios::end);
@@ -679,7 +715,12 @@ Mesh Mesh::LoadOBJ(const std::string& path, bool cpuOnly) {
     const std::string mtlDir = PathUtf8::ToString(
         PathUtf8::FromString(path).parent_path());
 
-    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, path.c_str(), mtlDir.c_str())) {
+    std::istringstream packedObj;
+    const bool packed=AssetFiles::IsPackedPath(PathUtf8::FromString(path));
+    if(packed) packedObj.str(AssetFiles::ReadText(PathUtf8::FromString(path)));
+    const bool loaded=packed ? tinyobj::LoadObj(&attrib,&shapes,&materials,&warn,&err,&packedObj,nullptr,true)
+                            : tinyobj::LoadObj(&attrib,&shapes,&materials,&warn,&err,path.c_str(),mtlDir.c_str());
+    if (!loaded) {
         MIPSYNC_ERROR("OBJ load failed {}: {}", path, err);
         return CreateCube(1.0f);
     }
@@ -689,7 +730,9 @@ Mesh Mesh::LoadOBJ(const std::string& path, bool cpuOnly) {
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
 
+    std::vector<MeshPart> parts;
     for (const auto& shape : shapes) {
+        const uint32_t begin = static_cast<uint32_t>(indices.size());
         size_t indexOffset = 0;
         for (size_t f = 0; f < shape.mesh.num_face_vertices.size(); ++f) {
             const int fv = shape.mesh.num_face_vertices[f];
@@ -726,6 +769,8 @@ Mesh Mesh::LoadOBJ(const std::string& path, bool cpuOnly) {
             }
             indexOffset += static_cast<size_t>(fv);
         }
+        if (indices.size() > begin)
+            parts.push_back({shape.name, begin, static_cast<uint32_t>(indices.size()) - begin});
     }
 
     if (vertices.empty()) {
@@ -735,14 +780,17 @@ Mesh Mesh::LoadOBJ(const std::string& path, bool cpuOnly) {
 
     CenterAndFit(vertices);
     MIPSYNC_INFO("Loaded OBJ: {} ({} verts, {} tris)", path, vertices.size(), indices.size() / 3);
-    return Mesh(vertices, indices, false, cpuOnly);
+    return Mesh(vertices, indices, false, cpuOnly, std::move(parts));
 }
 
 Mesh Mesh::LoadFBX(const std::string& path, bool cpuOnly) {
     ufbx_load_opts opts{};
     opts.generate_missing_normals = true;
     ufbx_error error{};
-    ufbx_scene* scene = ufbx_load_file(path.c_str(), &opts, &error);
+    const bool packed=AssetFiles::IsPackedPath(PathUtf8::FromString(path));
+    std::vector<uint8_t> packedBytes;
+    if(packed) {packedBytes=AssetFiles::Read(PathUtf8::FromString(path));opts.filename={path.data(),path.size()};opts.load_external_files=false;}
+    ufbx_scene* scene = packed ? ufbx_load_memory(packedBytes.data(),packedBytes.size(),&opts,&error) : ufbx_load_file(path.c_str(), &opts, &error);
     if (!scene) {
         MIPSYNC_ERROR("FBX load failed {}: {}", path, error.description.data);
         return CreateCube(1.0f);
@@ -751,7 +799,10 @@ Mesh Mesh::LoadFBX(const std::string& path, bool cpuOnly) {
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
 
-    auto appendMesh = [&](const ufbx_mesh* mesh, const ufbx_matrix& geometryToWorld) {
+    std::vector<MeshPart> parts;
+    auto appendMesh = [&](const ufbx_mesh* mesh, const ufbx_matrix& geometryToWorld,
+                          const std::string& name) {
+        const uint32_t begin = static_cast<uint32_t>(indices.size());
         const ufbx_matrix normalMatrix = ufbx_matrix_for_normals(&geometryToWorld);
         const ufbx_vec2 defaultUv{ 0.0f, 0.0f };
 
@@ -783,6 +834,8 @@ Mesh Mesh::LoadFBX(const std::string& path, bool cpuOnly) {
                 indices.push_back(static_cast<uint32_t>(vertices.size() - 1));
             }
         }
+        if (indices.size() > begin)
+            parts.push_back({name, begin, static_cast<uint32_t>(indices.size()) - begin});
     };
 
     for (size_t mi = 0; mi < scene->meshes.count; ++mi) {
@@ -795,10 +848,12 @@ Mesh Mesh::LoadFBX(const std::string& path, bool cpuOnly) {
                 const ufbx_node* node = mesh->instances.data[ni];
                 const ufbx_matrix world =
                     node ? node->geometry_to_world : ufbx_identity_matrix;
-                appendMesh(mesh, world);
+                const auto& name = node && node->name.length ? node->name : mesh->name;
+                appendMesh(mesh, world, std::string(name.data ? name.data : "Mesh", name.data ? name.length : 4));
             }
         } else {
-            appendMesh(mesh, ufbx_identity_matrix);
+            appendMesh(mesh, ufbx_identity_matrix,
+                       std::string(mesh->name.data ? mesh->name.data : "Mesh", mesh->name.data ? mesh->name.length : 4));
         }
     }
 
@@ -811,7 +866,7 @@ Mesh Mesh::LoadFBX(const std::string& path, bool cpuOnly) {
 
     CenterAndFit(vertices);
     MIPSYNC_INFO("Loaded FBX: {} ({} verts, {} tris)", path, vertices.size(), indices.size() / 3);
-    return Mesh(vertices, indices, false, cpuOnly);
+    return Mesh(vertices, indices, false, cpuOnly, std::move(parts));
 }
 
 Mesh Mesh::LoadGLB(const std::string& path, bool cpuOnly) {
@@ -866,13 +921,15 @@ Mesh Mesh::LoadGLB(const std::string& path, bool cpuOnly) {
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
 
-    auto appendMesh = [&](int meshIndex, const glm::mat4& world) {
+    std::vector<MeshPart> parts;
+    auto appendMesh = [&](int meshIndex, const glm::mat4& world, const std::string& nodeName) {
         if (!root.contains("meshes") || meshIndex < 0 ||
             meshIndex >= static_cast<int>(root["meshes"].size()))
             return;
 
         const glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(world)));
         const json& mesh = root["meshes"][meshIndex];
+        const uint32_t begin = static_cast<uint32_t>(indices.size());
         if (!mesh.contains("primitives") || !mesh["primitives"].is_array())
             return;
 
@@ -928,6 +985,9 @@ Mesh Mesh::LoadGLB(const std::string& path, bool cpuOnly) {
                 }
             }
         }
+        if (indices.size() > begin)
+            parts.push_back({nodeName.empty() ? mesh.value("name", "Mesh") : nodeName,
+                             begin, static_cast<uint32_t>(indices.size()) - begin});
     };
 
     std::function<void(int, const glm::mat4&)> visitNode = [&](int nodeIndex, const glm::mat4& parent) {
@@ -937,7 +997,7 @@ Mesh Mesh::LoadGLB(const std::string& path, bool cpuOnly) {
         const json& node = root["nodes"][nodeIndex];
         const glm::mat4 world = parent * GltfNodeLocalMatrix(node);
         if (node.contains("mesh"))
-            appendMesh(node["mesh"].get<int>(), world);
+            appendMesh(node["mesh"].get<int>(), world, node.value("name", std::string{}));
         if (node.contains("children") && node["children"].is_array()) {
             for (const json& child : node["children"])
                 visitNode(child.get<int>(), world);
@@ -961,7 +1021,7 @@ Mesh Mesh::LoadGLB(const std::string& path, bool cpuOnly) {
             visitNode(ni, glm::mat4(1.0f));
     } else if (!visitedScene && root.contains("meshes")) {
         for (int mi = 0; mi < static_cast<int>(root["meshes"].size()); ++mi)
-            appendMesh(mi, glm::mat4(1.0f));
+            appendMesh(mi, glm::mat4(1.0f), {});
     }
 
     if (vertices.empty()) {
@@ -971,7 +1031,7 @@ Mesh Mesh::LoadGLB(const std::string& path, bool cpuOnly) {
 
     CenterAndFit(vertices);
     MIPSYNC_INFO("Loaded GLB: {} ({} verts, {} tris)", path, vertices.size(), indices.size() / 3);
-    return Mesh(vertices, indices, false, cpuOnly);
+    return Mesh(vertices, indices, false, cpuOnly, std::move(parts));
 }
 
 Mesh Mesh::LoadFromFileCpu(const std::string& path) {

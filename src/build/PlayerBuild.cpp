@@ -1,248 +1,135 @@
 #include "PlayerBuild.h"
 #include "BuildManifest.h"
 #include "../assets/AssetManager.h"
+#include "../core/AssetFiles.h"
 #include "../core/Log.h"
+#include "../core/NativePaths.h"
+#include "../mips/MipsScriptLoader.h"
+#include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
-#include <system_error>
-
+#include <set>
+#include <stdexcept>
 #ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
-#endif
 #include <windows.h>
 #endif
-
 namespace MipsyncEngine {
 namespace {
-
-namespace fs = std::filesystem;
-
-bool ShouldSkipProjectEntry(const fs::path& relative) {
-    const std::string rel = PathUtf8::ToString(relative);
-    if (rel.empty())
-        return false;
-    if (rel == "Builds" || rel.rfind("Builds/", 0) == 0 || rel.rfind("Builds\\", 0) == 0)
-        return true;
-    if (rel == ".nostalty" || rel.rfind(".nostalty/", 0) == 0 ||
-        rel.rfind(".nostalty\\", 0) == 0)
-        return true;
-    if (rel == ".git" || rel.rfind(".git/", 0) == 0 || rel.rfind(".git\\", 0) == 0)
-        return true;
-    if (rel == "editor_layout.ini")
-        return true;
-    return false;
+namespace fs=std::filesystem;
+using Json=nlohmann::json;
+std::string ProductName(std::string name) {
+    for(char& c:name) if(static_cast<unsigned char>(c)<32 || std::string("/\\:*?\"<>|").find(c)!=std::string::npos)c='_';
+    while(!name.empty() && (name.back()=='.' || name.back()==' '))name.pop_back();
+    return name.empty()?"Game":name;
 }
-
-bool IsMissingFileError(const std::error_code& ec) {
-    if (!ec)
-        return false;
-    if (ec == std::make_error_code(std::errc::no_such_file_or_directory))
-        return true;
-#ifdef _WIN32
-    return ec.value() == ERROR_FILE_NOT_FOUND || ec.value() == ERROR_PATH_NOT_FOUND;
-#else
-    return false;
-#endif
+bool RuntimeAsset(const fs::path& path) {
+    static const std::set<std::string> extensions={".fbx",".nmodel",".obj",".mtl",".gltf",".glb",".bin",".png",".jpg",".jpeg",".bmp",".tga",".hdr",".wav",".mp3",".ogg",".flac",".vag",".mid",".midi",".nmat",".nanim",".ncontroller",".nprefab",".prefab",".mips",".ttf",".otf"};
+    auto ext=PathUtf8::ToString(path.extension());
+    std::transform(ext.begin(),ext.end(),ext.begin(),[](unsigned char c){return std::tolower(c);});
+    return extensions.count(ext)!=0;
 }
-
-void CopyProjectTree(const fs::path& sourceRoot, const fs::path& destRoot, std::string& outError) {
-    std::error_code ec;
-    for (auto it = fs::recursive_directory_iterator(
-             sourceRoot, fs::directory_options::skip_permission_denied, ec);
-         it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec) {
-            ec.clear();
-            continue;
+fs::path ConfinedFile(const fs::path& root,const fs::path& relative) {
+    if(relative.is_absolute() || relative.has_root_name())throw std::runtime_error("Player assets must be project-relative");
+    for(const auto& part:relative)if(part=="..")throw std::runtime_error("Player asset path escapes project");
+    auto actual=NativePaths::Canonical(root/relative),rel=actual.lexically_relative(root);
+    if(rel.empty() || rel.is_absolute())throw std::runtime_error("Invalid player asset path");
+    for(const auto& part:rel)if(part=="..")throw std::runtime_error("Linked player asset escapes project");
+    return actual;
+}
+void CopyOptional(const fs::path& source,const fs::path& dest) {
+    if(fs::exists(source))NativePaths::CopyTree(source,dest);
+}
+AssetFiles::Bytes TextBytes(const Json& j) {auto s=j.dump();return {s.begin(),s.end()};}
+AssetFiles::Entries Collect(const fs::path& root,const PlayerSettings& settings) {
+    AssetFiles::Entries files;
+    auto add=[&](const fs::path& relative) {
+        auto source=ConfinedFile(root,relative);
+        auto name=PathUtf8::ToString(relative.lexically_normal());std::replace(name.begin(),name.end(),'\\','/');
+        auto bytes=AssetFiles::Read(source);
+        auto extension=PathUtf8::ToString(source.extension());
+        std::transform(extension.begin(),extension.end(),extension.begin(),[](unsigned char c){return std::tolower(c);});
+        if(extension==".mips") {
+            std::vector<std::string> errors;auto module=Mips::MipsScriptLoader::CompileFile(root,name,errors);
+            if(!module || !errors.empty())throw std::runtime_error("Player script compilation failed: "+name+(errors.empty()?"":"\n"+errors.front()));
+            bytes=Mips::SerializePlayerModule(*module);
         }
-        const fs::path rel = fs::relative(it->path(), sourceRoot, ec);
-        if (ec || rel.empty())
-            continue;
-        if (ShouldSkipProjectEntry(rel)) {
-            if (it->is_directory(ec))
-                it.disable_recursion_pending();
-            continue;
-        }
-
-        const fs::path destPath = destRoot / rel;
-        if (it->is_directory(ec)) {
-            fs::create_directories(destPath, ec);
-            continue;
-        }
-        if (!it->is_regular_file(ec))
-            continue;
-
-        std::error_code existsEc;
-        if (!fs::exists(it->path(), existsEc)) {
-            MIPSYNC_WARN("Player build skipped missing project file: {}",
-                         PathUtf8::ToString(it->path()));
-            continue;
-        }
-
-        fs::create_directories(destPath.parent_path(), ec);
-        fs::copy_file(it->path(), destPath, fs::copy_options::overwrite_existing, ec);
-        if (ec) {
-            if (IsMissingFileError(ec)) {
-                MIPSYNC_WARN("Player build skipped missing project file: {}",
-                             PathUtf8::ToString(it->path()));
-                ec.clear();
-                continue;
-            }
-            outError = "Copy failed: " + PathUtf8::ToString(it->path()) + " — " + ec.message();
-            return;
+        files.emplace("Project/"+name,std::move(bytes));
+    };
+    for(const auto& scene:settings.scenesInBuild) {
+        auto relative=PathUtf8::FromString(scene);
+        if(relative.extension()!=".nscene")throw std::runtime_error("Build scene must be an .nscene file");
+        add(relative);
+    }
+    // Include runtime formats, including assets selected dynamically by scripts.
+    // Exclude authoring files, caches, installers and unrelated project contents.
+    for(const char* folder:{"assets","scripts"}) {
+        if(!fs::is_directory(NativePaths::FilePath(root/folder)))continue;
+        for(auto it=fs::recursive_directory_iterator(NativePaths::FilePath(root/folder));it!=fs::recursive_directory_iterator();++it) {
+            auto filename=PathUtf8::ToString(it->path().filename());
+            if(it->is_directory()) {if(!filename.empty() && filename.front()=='.')it.disable_recursion_pending();continue;}
+            if(it->is_regular_file() && RuntimeAsset(it->path()))add(NativePaths::OrdinaryPath(it->path()).lexically_relative(root));
         }
     }
+    Json boot={{"version",2},{"productName",settings.productName},{"companyName",settings.companyName},{"startupSceneIndex",settings.startupSceneIndex},{"scenesInBuild",settings.scenesInBuild}};
+    files.emplace("boot.json",TextBytes(boot));
+    Json project={{"name",settings.productName},{"defaultScene",BuildManifestIO::FromPlayerSettings(settings).StartupScenePath()},{"playerSettings",boot}};
+    files.emplace("Project/nostalty.project",TextBytes(project));return files;
 }
-
-void CopyIfExists(const fs::path& src, const fs::path& dst, bool recursive, std::string& outError) {
-    std::error_code ec;
-    if (!fs::exists(src, ec))
-        return;
-    if (recursive)
-        fs::copy(src, dst, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
-    else
-        fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
-    if (ec)
-        outError = "Copy failed: " + PathUtf8::ToString(src) + " — " + ec.message();
 }
-
-std::string SanitizeProductName(std::string name) {
-    if (name.empty())
-        name = "Game";
-    for (char& c : name) {
-        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' ||
-            c == '>' || c == '|')
-            c = '_';
-    }
-    return name;
-}
-
-} // namespace
-
-std::string PlayerBuild::DefaultOutputParent(const std::string& projectPath) {
-    return PathUtf8::ToString(PathUtf8::FromString(projectPath) / "Builds" / "Windows");
-}
-
+std::string PlayerBuild::DefaultOutputParent(const std::string& path) {return PathUtf8::ToString(PathUtf8::FromString(path)/"Builds"/"Windows");}
 std::string PlayerBuild::GetRunningEngineDirectory() {
 #ifdef _WIN32
-    wchar_t modulePath[MAX_PATH]{};
-    if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) == 0)
-        return {};
-    return PathUtf8::ToString(fs::path(modulePath).parent_path());
+    wchar_t path[32768]{};if(!GetModuleFileNameW(nullptr,path,32768))return {};
+    return PathUtf8::ToString(fs::path(path).parent_path());
 #else
     return PathUtf8::ToString(fs::current_path());
 #endif
 }
-
 PlayerBuildResult PlayerBuild::BuildWindows(const PlayerBuildRequest& request) {
-    PlayerBuildResult result;
-    const auto progress = [&](float fraction, const char* stage) {
-        if (request.progress)
-            request.progress(fraction, stage);
-    };
-    progress(0.03f, "Validating PC build settings");
-    PlayerSettings settings = request.settings;
-    settings.productName = SanitizeProductName(settings.productName);
-    if (settings.scenesInBuild.empty()) {
-        result.message = "No scenes in build list. Add scenes in Build Settings.";
-        return result;
-    }
-
-    const fs::path projectRoot = PathUtf8::FromString(request.projectPath);
-    std::error_code ec;
-    if (!fs::is_directory(projectRoot, ec)) {
-        result.message = "Invalid project path.";
-        return result;
-    }
-
-    const fs::path engineDir = request.engineDirectory.empty()
-        ? PathUtf8::FromString(GetRunningEngineDirectory())
-        : PathUtf8::FromString(request.engineDirectory);
-    const fs::path engineExe = engineDir / "MipsyncEngine.exe";
-    if (!fs::is_regular_file(engineExe, ec)) {
-        result.message = "MipsyncEngine.exe not found in: " + PathUtf8::ToString(engineDir);
-        return result;
-    }
-
-    const fs::path outputParent = request.outputParent.empty()
-        ? PathUtf8::FromString(DefaultOutputParent(request.projectPath))
-        : PathUtf8::FromString(request.outputParent);
-    const fs::path buildRoot = outputParent / settings.productName;
-    const fs::path dataDir = buildRoot / (settings.productName + "_Data");
-    const fs::path projectCopy = dataDir / "Project";
-    const fs::path resourcesDir = dataDir / "Resources";
-
-    std::string error;
+    PlayerBuildResult result;fs::path staging;
+    auto progress=[&](float f,const char* stage){if(request.progress)request.progress(f,stage);};
     try {
-        progress(0.12f, "Preparing output folders");
-        fs::create_directories(buildRoot, ec);
-        fs::create_directories(dataDir, ec);
-        fs::create_directories(projectCopy, ec);
-        fs::create_directories(resourcesDir, ec);
-
-        progress(0.25f, "Copying project assets");
-        CopyProjectTree(projectRoot, projectCopy, error);
-        if (!error.empty()) {
-            result.message = error;
-            return result;
+        progress(.03f,"Validating protected PC build");auto settings=request.settings;settings.productName=ProductName(settings.productName);
+        if(settings.scenesInBuild.empty())throw std::runtime_error("No scenes in build list. Add scenes in Build Settings.");
+        if(settings.startupSceneIndex<0 || settings.startupSceneIndex>=static_cast<int>(settings.scenesInBuild.size()))throw std::runtime_error("Invalid startup scene index");
+        auto root=NativePaths::Canonical(PathUtf8::FromString(request.projectPath));
+        auto engineDir=PathUtf8::FromString(request.engineDirectory.empty()?GetRunningEngineDirectory():request.engineDirectory);
+        auto parent=fs::absolute(PathUtf8::FromString(request.outputParent.empty()?DefaultOutputParent(request.projectPath):request.outputParent)).lexically_normal();
+        auto output=parent/PathUtf8::FromString(settings.productName);
+        if(output==root || fs::exists(NativePaths::FilePath(output/"nostalty.project")) || fs::exists(NativePaths::FilePath(output/"MipsyncEngine.exe")))throw std::runtime_error("Output contains a project or editor installation");
+        if(fs::exists(NativePaths::FilePath(output)) && (!fs::is_directory(NativePaths::FilePath(output/PathUtf8::FromString(settings.productName+"_Data"))) || !fs::is_regular_file(NativePaths::FilePath(output/PathUtf8::FromString(settings.productName+".exe")))))
+            throw std::runtime_error("Existing output is not a generated player build; choose another output folder");
+        auto key=AssetFiles::RandomKey();std::string suffix;const char* hex="0123456789abcdef";
+        for(size_t i=0;i<8;++i){suffix+=hex[key[i]>>4];suffix+=hex[key[i]&15];}
+        staging=parent/PathUtf8::FromString(settings.productName+".building-"+suffix);fs::create_directories(NativePaths::FilePath(staging));
+        auto data=staging/PathUtf8::FromString(settings.productName+"_Data");fs::create_directories(NativePaths::FilePath(data));
+        progress(.2f,"Compiling scripts and collecting runtime assets");auto files=Collect(root,settings);
+        progress(.5f,"Encrypting player data");std::string error;
+        if(!AssetFiles::WritePack(data/"game.mpak",files,key,error))throw std::runtime_error(error);files.clear();
+        auto exe=staging/PathUtf8::FromString(settings.productName+".exe");NativePaths::CopyRegularFile(engineDir/"MipsyncEngine.exe",exe);
+        if(!AssetFiles::BindPlayerKey(exe,key,error))throw std::runtime_error(error);
+        progress(.8f,"Packaging runtime libraries");
+        for(const auto& entry:fs::directory_iterator(engineDir)) {
+            auto ext=PathUtf8::ToString(entry.path().extension());
+            if(entry.is_regular_file() && (ext==".dll" || ext==".DLL"))NativePaths::CopyRegularFile(entry.path(),staging/entry.path().filename());
         }
-
-        progress(0.48f, "Writing player manifest");
-        const BuildManifest manifest = BuildManifestIO::FromPlayerSettings(settings);
-        const fs::path bootPath = dataDir / "boot.json";
-        if (!BuildManifestIO::SaveToFile(PathUtf8::ToString(bootPath), manifest, error)) {
-            result.message = error;
-            return result;
-        }
-
-        progress(0.62f, "Packaging player executable");
-        const fs::path builtExe = buildRoot / (settings.productName + ".exe");
-        fs::copy_file(engineExe, builtExe, fs::copy_options::overwrite_existing, ec);
-        if (ec) {
-            result.message = "Failed to copy executable: " + ec.message();
-            return result;
-        }
-
-        for (const auto& entry : fs::directory_iterator(engineDir, ec)) {
-            if (!entry.is_regular_file(ec))
-                continue;
-            const std::string ext = PathUtf8::ToString(entry.path().extension());
-            if (ext != ".dll" && ext != ".DLL")
-                continue;
-            fs::copy_file(entry.path(), buildRoot / entry.path().filename(),
-                          fs::copy_options::overwrite_existing, ec);
-        }
-
-        progress(0.78f, "Copying runtime resources");
-        CopyIfExists(engineDir / "resources", resourcesDir, true, error);
-        if (!error.empty()) {
-            result.message = error;
-            return result;
-        }
-        CopyIfExists(engineDir / "resources", buildRoot / "resources", true, error);
-        if (!error.empty()) {
-            result.message = error;
-            return result;
-        }
-
-        const std::string bat = "@echo off\r\ncd /d \"%~dp0\"\r\n\"" +
-                                settings.productName + ".exe\" --player --data \"" +
-                                settings.productName + "_Data\"\r\n";
-        std::ofstream playBat(buildRoot / "Play.bat", std::ios::binary);
-        if (playBat)
-            playBat << bat;
-
-        result.success = true;
-        result.outputDirectory = PathUtf8::ToString(buildRoot);
-        result.executablePath = PathUtf8::ToString(builtExe);
-        result.message = "Build succeeded: " + result.outputDirectory;
-        progress(0.98f, "Finalizing PC build");
-        MIPSYNC_INFO("Player build: {}", result.message);
-    } catch (const std::exception& ex) {
-        result.message = ex.what();
-    }
+        CopyOptional(engineDir/"resources",data/"Resources");
+        std::ofstream launcher(NativePaths::FilePath(staging/"Play.bat"),std::ios::binary);
+        launcher<<"@echo off\r\ncd /d \"%~dp0\"\r\n\""<<settings.productName<<".exe\" --player --data \""<<settings.productName<<"_Data\"\r\n";
+        launcher.close();if(!launcher)throw std::runtime_error("Cannot write player launcher");
+        // Replace complete generated output, including old loose Project files.
+        auto backup=parent/PathUtf8::FromString(settings.productName+".previous-"+suffix);
+        if(fs::exists(NativePaths::FilePath(output)))fs::rename(NativePaths::FilePath(output),NativePaths::FilePath(backup));
+        try{fs::rename(NativePaths::FilePath(staging),NativePaths::FilePath(output));}catch(...){if(fs::exists(NativePaths::FilePath(backup)))fs::rename(NativePaths::FilePath(backup),NativePaths::FilePath(output));throw;}
+        staging.clear();if(fs::exists(NativePaths::FilePath(backup)))NativePaths::RemoveTree(backup);
+        result.success=true;result.outputDirectory=PathUtf8::ToString(output);
+        result.executablePath=PathUtf8::ToString(output/PathUtf8::FromString(settings.productName+".exe"));
+        result.message="Protected PC build succeeded: "+result.outputDirectory;
+        progress(1.f,"Protected PC build complete");MIPSYNC_INFO("Player build: {}",result.message);
+    }catch(const std::exception& e){result.message=e.what();if(!staging.empty()){try{NativePaths::RemoveTree(staging);}catch(...){}}}
     return result;
 }
-
-} // namespace MipsyncEngine
+}

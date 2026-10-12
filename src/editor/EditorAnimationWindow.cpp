@@ -2,6 +2,7 @@
 
 #include "AssetBrowserPanel.h"
 #include "EditorTheme.h"
+#include "EditorToolbar.h"
 #include "../assets/AssetManager.h"
 #include "../animation/AnimatorControllerIO.h"
 #include "../animation/AnimationTypes.h"
@@ -290,6 +291,9 @@ bool EditorApp::SaveAnimationClipFromWindow(std::string* outError) {
 
     std::filesystem::path abs = PathUtf8::FromString(AssetManager::Get().ToAbsolute(state.clipPath));
     std::error_code ec;
+    if (!RecordAssetUndoSnapshot(PathUtf8::ToString(abs))) {
+        if (outError) *outError = "Cannot record animation edit"; return false;
+    }
     std::filesystem::create_directories(abs.parent_path(), ec);
 
     json j;
@@ -317,6 +321,8 @@ bool EditorApp::SaveAnimationClipFromWindow(std::string* outError) {
         return false;
     }
     file << j.dump(2) << '\n';
+    file.close();
+    if (!file) { if (outError) *outError = "Cannot save animation"; return false; }
     if (m_AssetBrowser) {
         m_AssetBrowser->Refresh();
         m_AssetBrowser->RevealAndSelectAsset(state.clipPath);
@@ -354,6 +360,7 @@ void EditorApp::EnsureAnimatorForAnimationWindowClip() {
     ctrl.states.push_back(st);
 
     std::string error;
+    if (!RecordAssetUndoSnapshot(controllerAbs)) return;
     if (!SaveAnimatorController(controllerAbs, ctrl, error)) {
         MIPSYNC_WARN("Animation Window: failed to save controller {}: {}", controllerRel, error);
         return;
@@ -427,6 +434,7 @@ void EditorApp::SampleAnimationWindowToEntity() {
         return;
 
     SortKeys(state.keys);
+    m_UndoStack.IgnorePreviewTransform(entity->GetID());
     const int frame = std::max(0, state.frame);
     const AnimationKeyframe* prev = &state.keys.front();
     const AnimationKeyframe* next = &state.keys.back();
@@ -559,23 +567,22 @@ void EditorApp::DrawAnimationPanel() {
         ? target->GetComponent<TagComponent>()->tag.c_str()
         : "None";
 
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5, 3));
-    ImGui::SetNextItemWidth(220.0f);
+    EditorToolbar toolbar;
     const char* clipPreview = state.clipName.empty() ? "<No Animation Clip>" : state.clipName.c_str();
-    if (ImGui::BeginCombo("##AnimationClipDropdown", clipPreview)) {
+    if (toolbar.BeginCombo("##AnimationClipDropdown", clipPreview, 220.0f)) {
         if (controllerClips.empty()) {
             ImGui::TextDisabled("No clips in Animator Controller");
         } else {
             for (const auto& choice : controllerClips) {
                 const bool isSelected = state.controllerStateName == choice.stateName &&
                                         state.clipName == choice.clipName;
-                if (ImGui::Selectable(choice.label.c_str(), isSelected))
+                if (EditorDropdown::Selectable(choice.label.c_str(), isSelected))
                     selectControllerClip(choice);
                 if (isSelected)
                     ImGui::SetItemDefaultFocus();
             }
         }
-        ImGui::EndCombo();
+        EditorDropdown::EndCombo();
     }
     if (ImGui::IsItemHovered()) {
         if (!state.clipSourcePath.empty())
@@ -583,19 +590,13 @@ void EditorApp::DrawAnimationPanel() {
         else
             ImGui::SetTooltip("Animation clips attached to the selected object's Animator");
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Preview"))
+    if (toolbar.Button(state.preview ? "Preview On" : "Preview"))
         state.preview = !state.preview;
-    if (state.preview) {
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.40f, 0.75f, 1.0f, 1.0f), "On");
-    }
-    ImGui::SameLine();
     const ImVec4 recordColor = state.record ? ImVec4(1.0f, 0.18f, 0.14f, 1.0f)
                                             : ImVec4(0.80f, 0.18f, 0.16f, 1.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, recordColor);
     ImGui::BeginDisabled(state.clipReadOnly || !target);
-    if (ImGui::Button(state.record ? "●" : "○", ImVec2(28, 0))) {
+    if (toolbar.Button(state.record ? "●" : "○", 32.0f)) {
         state.record = !state.record;
         if (state.record) {
             state.preview = true;
@@ -618,27 +619,26 @@ void EditorApp::DrawAnimationPanel() {
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Record");
-    ImGui::SameLine();
     enum class AnimationTransportIcon { First, Previous, PlayPause, Next, Last };
+    toolbar.SetX(toolbar.CursorX() + 6.0f);
     auto animationTransportButton = [&](const char* id, AnimationTransportIcon icon,
                                         bool active = false) {
         constexpr float width = 30.0f;
-        constexpr float height = 22.0f;
+        const float height = toolbar.Height();
         const ImVec2 pos = ImGui::GetCursorScreenPos();
         ImGui::InvisibleButton(id, ImVec2(width, height));
         const bool hovered = ImGui::IsItemHovered();
         const bool held = ImGui::IsItemActive();
         const bool pressed = ImGui::IsItemClicked();
         ImDrawList* draw = ImGui::GetWindowDrawList();
-        const ImVec2 min(pos.x + 1.0f, pos.y + 1.0f);
-        const ImVec2 max(pos.x + width - 1.0f, pos.y + height - 1.0f);
+        const ImVec2 min = pos;
+        const ImVec2 max(pos.x + width, pos.y + height);
         ImVec4 face = active ? UiTokens::Success : UiTokens::BgTertiary;
         if (held)
             face = UiTokens::BgPressed;
         else if (hovered && !active)
             face = UiTokens::BgHover;
-        draw->AddRectFilled(min, max, ImGui::ColorConvertFloat4ToU32(face), 2.0f);
-        draw->AddRect(min, max, ImGui::ColorConvertFloat4ToU32(UiTokens::BorderHighlight), 2.0f);
+        toolbar.CapsuleFace(face, static_cast<int>(icon), 5);
 
         const ImU32 color = ImGui::ColorConvertFloat4ToU32(UiTokens::Icon);
         const ImVec2 center((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f);
@@ -681,6 +681,7 @@ void EditorApp::DrawAnimationPanel() {
                                 ImVec2(center.x + 5.0f, center.y + 5.0f), color);
             break;
         }
+        toolbar.Item(false);
         return pressed;
     };
 
@@ -689,41 +690,37 @@ void EditorApp::DrawAnimationPanel() {
         state.playing = false;
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("First frame");
-    ImGui::SameLine(0.0f, 3.0f);
     if (animationTransportButton("##AnimationPrevious", AnimationTransportIcon::Previous)) {
         state.frame = std::max(0, state.frame - 1);
         state.playing = false;
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Previous frame");
-    ImGui::SameLine(0.0f, 3.0f);
     if (animationTransportButton("##AnimationPlayPause", AnimationTransportIcon::PlayPause,
                                  state.playing))
         state.playing = !state.playing;
     if (ImGui::IsItemHovered()) ImGui::SetTooltip(state.playing ? "Pause" : "Play");
-    ImGui::SameLine(0.0f, 3.0f);
     if (animationTransportButton("##AnimationNext", AnimationTransportIcon::Next)) {
         state.frame += 1;
         state.playing = false;
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next frame");
-    ImGui::SameLine(0.0f, 3.0f);
     if (animationTransportButton("##AnimationLast", AnimationTransportIcon::Last)) {
         state.frame = AnimationWindowPlaybackEndFrame(state);
         state.playing = false;
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Last key frame");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(72);
-    ImGui::DragInt("Frame", &state.frame, 0.2f, 0, 1000000);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(58);
-    ImGui::DragInt("FPS", &state.fps, 0.1f, 1, 120);
-    ImGui::SameLine();
+    toolbar.SetX(toolbar.CursorX() + 6.0f);
+    toolbar.DragInt("Frame", &state.frame, 72.0f, 0.2f, 0, 1000000);
+    const bool fpsChanged = toolbar.DragInt("FPS", &state.fps, 58.0f, 0.1f, 1, 120);
+    if (fpsChanged && !state.clipReadOnly && !state.clipPath.empty()) {
+        std::string error;
+        if (!SaveAnimationClipFromWindow(&error)) MIPSYNC_WARN("Animation Window: {}", error);
+    }
     state.frame = std::max(0, state.frame);
     if (!state.clipReadOnly)
         state.lengthFrames = ClipEndFrame(state);
-    ImGui::TextDisabled("End %d", state.lengthFrames);
-    ImGui::PopStyleVar();
+    toolbar.Text(("End " + std::to_string(state.lengthFrames)).c_str(), EditorTheme::TextMuted);
+    toolbar.End();
 
     const double now = ImGui::GetTime();
     if (state.playing && state.preview && state.fps > 0) {
@@ -742,8 +739,6 @@ void EditorApp::DrawAnimationPanel() {
         state.lastTick = now;
     }
 
-    ImGui::Separator();
-
     if (!target) {
         const float availW = ImGui::GetContentRegionAvail().x;
         const float y = ImGui::GetCursorPosY() + 46.0f;
@@ -758,17 +753,22 @@ void EditorApp::DrawAnimationPanel() {
         return;
     }
 
-    ImGui::Text("Clip");
-    ImGui::SameLine(58);
+    EditorToolbar clipBar;
+    clipBar.Text("Clip", EditorTheme::TextSecondary, 58.0f);
     char nameBuf[128]{};
     std::snprintf(nameBuf, sizeof(nameBuf), "%s", state.clipName.c_str());
     ImGui::SetNextItemWidth(210);
     ImGui::BeginDisabled(state.clipReadOnly);
-    if (ImGui::InputText("##clipName", nameBuf, sizeof(nameBuf)))
+    if (ImGui::InputText("##clipName", nameBuf, sizeof(nameBuf))) {
         state.clipName = nameBuf;
+        if (!state.clipPath.empty()) {
+            std::string error;
+            if (!SaveAnimationClipFromWindow(&error)) MIPSYNC_WARN("Animation Window: {}", error);
+        }
+    }
     ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (ImGui::Button("Create")) {
+    clipBar.Item();
+    if (clipBar.Button("Create")) {
         const std::string stem = SafeFileStem(state.clipName.empty() ? targetName : state.clipName);
         state.clipName = stem;
         state.clipPath = "assets/animations/" + stem + ".nanim";
@@ -785,18 +785,16 @@ void EditorApp::DrawAnimationPanel() {
         if (!SaveAnimationClipFromWindow(&err) && !err.empty())
             MIPSYNC_WARN("Animation Window: {}", err);
     }
-    ImGui::SameLine();
     ImGui::BeginDisabled(state.clipReadOnly);
-    if (ImGui::Button("Save")) {
+    if (clipBar.Button("Save")) {
         std::string err;
         if (!SaveAnimationClipFromWindow(&err) && !err.empty())
             MIPSYNC_WARN("Animation Window: {}", err);
     }
     ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", state.clipReadOnly
+    clipBar.Text(state.clipReadOnly
         ? "Imported clip (read-only)"
-        : (state.clipPath.empty() ? "No clip" : state.clipPath.c_str()));
+        : (state.clipPath.empty() ? "No clip" : state.clipPath.c_str()), EditorTheme::TextMuted);
 
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetMove)) {
@@ -813,29 +811,28 @@ void EditorApp::DrawAnimationPanel() {
         }
         ImGui::EndDragDropTarget();
     }
+    clipBar.End();
 
-    ImGui::Text("Target");
-    ImGui::SameLine(58);
-    ImGui::TextUnformatted(targetName);
-    ImGui::SameLine();
-    if (selected && ImGui::Button("Use Selection")) {
+    EditorToolbar targetBar;
+    targetBar.Text("Target", EditorTheme::TextSecondary, 58.0f);
+    targetBar.Text(targetName, EditorTheme::TextPrimary, 210.0f);
+    if (selected && targetBar.Button("Use Selection")) {
         state.targetEntityId = selected->GetID();
         state.recordBaselineValid = false;
         if (state.keys.empty())
             AddAnimationWindowKeyAtCurrentFrame();
     }
-    ImGui::SameLine();
     ImGui::BeginDisabled(state.clipReadOnly);
-    if (ImGui::Button("Add Key"))
+    if (targetBar.Button("Add Key"))
         AddAnimationWindowKeyAtCurrentFrame();
-    ImGui::SameLine();
-    if (ImGui::Button("Delete Key")) {
+    if (targetBar.Button("Delete Key")) {
         DeleteAnimationWindowKeyAtCurrentFrame();
         std::string err;
         if (!SaveAnimationClipFromWindow(&err) && !err.empty())
             MIPSYNC_WARN("Animation Window: {}", err);
     }
     ImGui::EndDisabled();
+    targetBar.End();
 
     if (state.record && target) {
         if (auto* tr = target->GetComponent<TransformComponent>()) {

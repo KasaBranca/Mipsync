@@ -1,6 +1,9 @@
+#include "core/AssetFiles.h"
 #include "core/BootSplash.h"
+#include "core/PlayLoadingProcess.h"
 #include "core/Engine.h"
 #include "core/Log.h"
+#include "core/ProcessArguments.h"
 #include "project/Project.h"
 #include "build/PlayerBuild.h"
 #include "ps1/Ps1Build.h"
@@ -104,12 +107,12 @@ CliArgs ParseArgs(int argc, char** argv) {
 
 std::filesystem::path ModulePathFromArgv0(const char* argv0) {
 #ifdef _WIN32
-    wchar_t modulePath[MAX_PATH]{};
-    if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) != 0)
+    wchar_t modulePath[32768]{};
+    if (GetModuleFileNameW(nullptr, modulePath, 32768) != 0)
         return std::filesystem::path(modulePath);
 #endif
     if (argv0 && *argv0)
-        return std::filesystem::absolute(std::filesystem::path(argv0));
+        return std::filesystem::absolute(MipsyncEngine::PathUtf8::FromString(argv0));
     return {};
 }
 
@@ -121,8 +124,8 @@ std::string DetectAdjacentPlayerDataDirectory(const char* argv0) {
     const std::filesystem::path dir = modulePath.parent_path();
     const std::filesystem::path stemData = dir / (modulePath.stem().wstring() + L"_Data");
     std::error_code ec;
-    if (std::filesystem::is_regular_file(stemData / "boot.json", ec))
-        return stemData.string();
+    if ((std::filesystem::is_regular_file(stemData / "boot.json", ec) || std::filesystem::is_regular_file(stemData / "game.mpak", ec)))
+        return MipsyncEngine::PathUtf8::ToString(stemData);
 
     for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
         if (ec)
@@ -133,8 +136,8 @@ std::string DetectAdjacentPlayerDataDirectory(const char* argv0) {
         const std::wstring name = candidate.filename().wstring();
         if (name.size() < 5 || name.substr(name.size() - 5) != L"_Data")
             continue;
-        if (std::filesystem::is_regular_file(candidate / "boot.json", ec))
-            return candidate.string();
+        if ((std::filesystem::is_regular_file(candidate / "boot.json", ec) || std::filesystem::is_regular_file(candidate / "game.mpak", ec)))
+            return MipsyncEngine::PathUtf8::ToString(candidate);
     }
     return {};
 }
@@ -417,6 +420,13 @@ void EmitPcBuildResult(const MipsyncEngine::PlayerBuildResult& result) {
 
 int main(int argc, char** argv) {
     try {
+        auto utf8Arguments=MipsyncEngine::ReadProcessArguments(argc,argv);
+        std::vector<char*> utf8Argv;
+        for(auto& argument:utf8Arguments)utf8Argv.push_back(argument.data());
+        argc=static_cast<int>(utf8Argv.size());
+        argv=utf8Argv.data();
+        if (argc == 3 && std::string(argv[1]) == "--editor-play-loading")
+            return MipsyncEngine::RunPlayLoadingProcess(argv[2]);
         CliArgs args = ParseArgs(argc, argv);
 
         MipsyncEngine::Log::Init();
@@ -492,12 +502,7 @@ int main(int argc, char** argv) {
                 std::cerr << "Project load failed: " << err << std::endl;
                 return 1;
             }
-            std::string engineRoot = std::filesystem::current_path().string();
-#ifdef _WIN32
-            wchar_t modulePath[MAX_PATH]{};
-            if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) != 0)
-                engineRoot = std::filesystem::path(modulePath).parent_path().string();
-#endif
+            const std::string engineRoot = MipsyncEngine::PlayerBuild::GetRunningEngineDirectory();
             MipsyncEngine::Ps1::Ps1BuildRequest req;
             req.projectPath = args.projectPath;
             req.settings = info.player;
@@ -563,12 +568,7 @@ int main(int argc, char** argv) {
                 std::cerr << "Project load failed: " << err << std::endl;
                 return 1;
             }
-            std::string engineRoot = std::filesystem::current_path().string();
-#ifdef _WIN32
-            wchar_t modulePath[MAX_PATH]{};
-            if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) != 0)
-                engineRoot = std::filesystem::path(modulePath).parent_path().string();
-#endif
+            const std::string engineRoot = MipsyncEngine::PlayerBuild::GetRunningEngineDirectory();
             MipsyncEngine::Ps1::Ps1BuildRequest req;
             req.projectPath = args.projectPath;
             req.settings = info.player;
@@ -585,6 +585,12 @@ int main(int argc, char** argv) {
         const auto launchMode = args.playerMode
             ? MipsyncEngine::EngineLaunchMode::Player
             : MipsyncEngine::EngineLaunchMode::Editor;
+        if (args.playerMode && !args.playerDataDir.empty() &&
+            std::filesystem::is_regular_file(MipsyncEngine::PathUtf8::FromString(args.playerDataDir) / "game.mpak")) {
+            std::string packageError;
+            if (!MipsyncEngine::AssetFiles::MountPlayer(MipsyncEngine::PathUtf8::FromString(args.playerDataDir), packageError))
+                throw std::runtime_error(packageError);
+        }
         MipsyncEngine::Engine engine(args.projectPath, launchMode, args.playerDataDir);
         engine.Run();
     } catch (const std::exception& e) {

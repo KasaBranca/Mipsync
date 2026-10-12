@@ -2,8 +2,11 @@
 #include "vm.h"
 #include "fixedp.h"
 #include "input.h"
+#include "pad_mapping.h"
 #include "physics.h"
 #include "scene.h"
+#include "scene_loader.h"
+#include "ui.h"
 #include "audio.h"
 
 #include <psxgpu.h>
@@ -11,6 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 
 #define LOG_LINES 12
 #define LOG_COLS  40
@@ -191,6 +195,34 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
     }
 
     switch (host_id) {
+        case HF_UI_SET_TEXT:
+            push_bool(vm,argc>=2&&a[1].tag==HOST_VAL_STRING&&ps1_ui_set_text((uint32_t)(a[0].ival/FIX16_ONE),vm_module_string(vm,a[1].str_idx)));return 1;
+        case HF_UI_SET_TEXT_NUMBER: {
+            char text[24];int value=argc>=2?a[1].ival/FIX16_ONE:0;
+            snprintf(text,sizeof(text),"%d",value);
+            push_bool(vm,argc>=2&&ps1_ui_set_text((uint32_t)(a[0].ival/FIX16_ONE),text));return 1;
+        }
+        case HF_UI_SET_COLOR: {
+            uint8_t color[4];int i;
+            for(i=0;i<4;++i){int v=argc>=5?(int)(((int64_t)a[i+1].ival*255)/FIX16_ONE):0;if(v<0)v=0;if(v>255)v=255;color[i]=(uint8_t)v;}
+            push_bool(vm,argc>=5&&ps1_ui_set_color((uint32_t)(a[0].ival/FIX16_ONE),color[0],color[1],color[2],color[3]));return 1;
+        }
+        case HF_UI_SET_IMAGE_VISIBLE:
+            push_bool(vm, argc >= 2 && a[0].tag == HOST_VAL_NUMBER &&
+                ps1_ui_set_image_visible((uint32_t)(a[0].ival / FIX16_ONE), a[1].ival != 0));
+            return 1;
+        case HF_UI_SET_TEXT_VISIBLE:
+            push_bool(vm, argc >= 2 && a[0].tag == HOST_VAL_NUMBER &&
+                ps1_ui_set_text_visible((uint32_t)(a[0].ival / FIX16_ONE), a[1].ival != 0));
+            return 1;
+        case HF_SCENE_LOAD:
+            push_bool(vm, argc >= 1 && a[0].tag == HOST_VAL_STRING &&
+                ps1_scene_request_load_path(vm_module_string(vm, a[0].str_idx)));
+            return 1;
+        case HF_SCENE_LOAD_BUILD_INDEX:
+            push_bool(vm, argc >= 1 && a[0].tag == HOST_VAL_NUMBER &&
+                ps1_scene_request_load_index((int)((fix16_t)a[0].ival / FIX16_ONE)));
+            return 1;
         case HF_LOG_INFO: {
             char buf[LOG_COLS + 1];
             buf[0] = 0;
@@ -292,17 +324,22 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
                 push_number(vm, 0);
             }
             return 1;
+        case HF_INPUT_GETBUTTON:
+        case HF_INPUT_GETBUTTONDOWN:
+        case HF_INPUT_GETBUTTONUP:
+            if (argc >= 1 && a[0].tag == HOST_VAL_STRING) {
+                const char* button=vm_module_string(vm,a[0].str_idx);
+                int pressed=0;
+                if (ps1_named_button_mask(button) || (button && strcmp(button,"QuickTurn")==0))
+                    pressed=host_id==HF_INPUT_GETBUTTONDOWN ? ps1_input_key_down(button) :
+                        host_id==HF_INPUT_GETBUTTONUP ? ps1_input_key_up(button) : ps1_input_key_held(button);
+                push_number(vm,pressed ? FIX16_ONE : 0);
+            } else push_number(vm,0);
+            return 1;
         case HF_INPUT_GETAXIS:
             if (argc >= 1 && a[0].tag == HOST_VAL_STRING) {
                 const char* axis = vm_module_string(vm, a[0].str_idx);
-                fix16_t value = 0;
-                if (axis && strcmp(axis, "Horizontal") == 0) {
-                    if (ps1_input_key_held("A")) value -= FIX16_ONE;
-                    if (ps1_input_key_held("D")) value += FIX16_ONE;
-                } else if (axis && strcmp(axis, "Vertical") == 0) {
-                    if (ps1_input_key_held("S")) value -= FIX16_ONE;
-                    if (ps1_input_key_held("W")) value += FIX16_ONE;
-                }
+                const fix16_t value = ps1_input_axis_q16(axis);
                 push_number(vm, value);
             } else {
                 push_number(vm, 0);
@@ -425,14 +462,23 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
             push_nil(vm);
             return 1;
         }
+        case HF_ANIMATOR_NORMALIZED_TIME: {
+            unsigned entity=(unsigned)vm_instance_entity_index(vm);int offset=0;
+            if(argc && a[0].tag==HOST_VAL_HOST){entity=a[0].ref.entity_idx;offset=1;}
+            const char* name=argc>offset && a[offset].tag==HOST_VAL_STRING ? vm_module_string(vm,a[offset].str_idx):0;
+            push_number(vm,ps1_scene_animator_normalized_time(entity,name));return 1;
+        }
         case HF_AUDIO_PLAY:
         case HF_AUDIO_STOP:
         case HF_AUDIO_PAUSE:
         case HF_AUDIO_UNPAUSE: {
             unsigned int entity_index = (unsigned int)vm_instance_entity_index(vm);
-            if (argc >= 1 && a[0].tag == HOST_VAL_HOST &&
-                a[0].ref.kind == HOST_REF_AUDIO_SOURCE)
-                entity_index = a[0].ref.entity_idx;
+            if (argc >= 1) {
+                if (a[0].tag == HOST_VAL_HOST && a[0].ref.kind == HOST_REF_AUDIO_SOURCE) entity_index = a[0].ref.entity_idx;
+                else if (a[0].tag == HOST_VAL_NUMBER && a[0].ival >= FIX16_ONE) entity_index = (unsigned)(a[0].ival/FIX16_ONE)-1u;
+                else {push_bool(vm,0);return 1;}
+            }
+            if (entity_index >= ps1_scene_entity_count()) {push_bool(vm,0);return 1;}
             if (host_id == HF_AUDIO_PLAY) push_bool(vm, ps1_audio_play(entity_index));
             else if (host_id == HF_AUDIO_STOP) { ps1_audio_stop(entity_index); push_bool(vm, 1); }
             else if (host_id == HF_AUDIO_PAUSE) { ps1_audio_pause(entity_index); push_bool(vm, 1); }
@@ -445,35 +491,37 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
         case HF_AUDIO_SET_MUTE:
         case HF_AUDIO_SET_AWAKE:
         case HF_AUDIO_SET_ENABLED: {
-            if (argc < 2 || a[0].tag != HOST_VAL_HOST ||
-                a[0].ref.kind != HOST_REF_AUDIO_SOURCE) {
+            unsigned int entity_index=0;
+            if (argc >= 2 && a[0].tag == HOST_VAL_HOST && a[0].ref.kind == HOST_REF_AUDIO_SOURCE) entity_index=a[0].ref.entity_idx;
+            else if (argc >= 2 && a[0].tag == HOST_VAL_NUMBER && a[0].ival>=FIX16_ONE) entity_index=(unsigned)(a[0].ival/FIX16_ONE)-1u;
+            else {
                 push_bool(vm, 0);
                 return 1;
             }
-            ps1_entity* entity = ps1_scene_mutable_entity(a[0].ref.entity_idx);
+            ps1_entity* entity = ps1_scene_mutable_entity(entity_index);
             if (!entity) { push_bool(vm, 0); return 1; }
             if (host_id == HF_AUDIO_SET_CLIP) {
                 int index = (int)((fix16_t)a[1].ival / FIX16_ONE);
                 if (index < 0) index = 0;
                 if (index > (int)g_ps1_audio_clip_count) index = (int)g_ps1_audio_clip_count;
-                ps1_audio_stop(a[0].ref.entity_idx);
+                ps1_audio_stop(entity_index);
                 entity->audio_clip_index = (uint8_t)index;
             } else if (host_id == HF_AUDIO_SET_VOLUME) {
                 fix16_t value = (fix16_t)a[1].ival;
                 if (value < 0) value = 0;
                 if (value > FIX16_ONE) value = FIX16_ONE;
                 entity->audio_volume_q8 = (uint8_t)(((int64_t)value * 255) / FIX16_ONE);
-                ps1_audio_apply_entity(a[0].ref.entity_idx);
+                ps1_audio_apply_entity(entity_index);
             } else if (host_id == HF_AUDIO_SET_LOOP) {
                 entity->audio_loop = a[1].ival != 0;
             } else if (host_id == HF_AUDIO_SET_MUTE) {
                 entity->audio_mute = a[1].ival != 0;
-                ps1_audio_apply_entity(a[0].ref.entity_idx);
+                ps1_audio_apply_entity(entity_index);
             } else if (host_id == HF_AUDIO_SET_AWAKE) {
                 entity->audio_play_on_awake = a[1].ival != 0;
             } else if (host_id == HF_AUDIO_SET_ENABLED) {
                 entity->audio_enabled = a[1].ival != 0;
-                if (!entity->audio_enabled) ps1_audio_stop(a[0].ref.entity_idx);
+                if (!entity->audio_enabled) ps1_audio_stop(entity_index);
             }
             /* Runtime clip-path swapping is intentionally unavailable on PS1;
              * all playable samples are fixed into SPU RAM at build time. */
@@ -508,6 +556,26 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
             fix16_t v = 0;
             active_camera_planar_axes(0, 0, 0, 0, &v);
             push_number(vm, v);
+            return 1;
+        }
+        case HF_CAMERA_ROTATEPITCH: {
+            const int handle = argc >= 1 ? (int)((fix16_t)a[0].ival / FIX16_ONE) : 0;
+            const int index = handle == 0 ? vm_instance_entity_index(vm) : handle - 1;
+            ps1_entity* camera = index >= 0 ? ps1_scene_mutable_entity((unsigned int)index) : 0;
+            const ps1_entity* parent = camera && camera->parent_entity_index >= 0 ?
+                ps1_scene_entity((unsigned int)camera->parent_entity_index) : 0;
+            fix16_t parent_pitch = parent ? parent->rotation[0] : 0;
+            fix16_t minimum, maximum, pitch;
+            if (argc < 4 || !camera || !camera->has_camera) { push_number(vm, 0); return 1; }
+            minimum = (fix16_t)a[2].ival; maximum = (fix16_t)a[3].ival;
+            if (minimum > maximum) { fix16_t swap = minimum; minimum = maximum; maximum = swap; }
+            pitch = fix16_add(fix16_sub(camera->rotation[0], parent_pitch), (fix16_t)a[1].ival);
+            if (pitch < minimum) pitch = minimum;
+            if (pitch > maximum) pitch = maximum;
+            /* Runtime transforms are flattened world values. Keep the parent
+             * contribution while clamping the camera's own local pitch. */
+            camera->rotation[0] = fix16_add(parent_pitch, pitch);
+            push_number(vm, pitch);
             return 1;
         }
         case HF_CAMERA_FOLLOW: {

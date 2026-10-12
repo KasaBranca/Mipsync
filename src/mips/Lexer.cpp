@@ -228,9 +228,11 @@ const std::vector<Token>& Lexer::Tokenize() {
         case '&':
             if (Peek() == '&') push(TokenType::AndAnd, "&&", 2);
             else goto invalid_char;
+            break;
         case '|':
             if (Peek() == '|') push(TokenType::OrOr, "||", 2);
             else goto invalid_char;
+            break;
         default:
         invalid_char:
             m_Errors.push_back(m_FileName + "(" + std::to_string(start.line) + "," +

@@ -1,8 +1,32 @@
 #include "Log.h"
 #include "EngineVersion.h"
 #include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/base_sink.h>
+#include "../assets/AssetManager.h"
+#include <fstream>
 
 namespace MipsyncEngine {
+namespace {
+class Utf8FileSink final : public spdlog::sinks::base_sink<std::mutex> {
+public:
+    explicit Utf8FileSink(const std::string& path) {
+        auto file=PathUtf8::FromString(path);
+        std::filesystem::create_directories(file.parent_path());
+        stream.open(file,std::ios::binary|std::ios::trunc);
+        if(!stream)throw spdlog::spdlog_ex("Cannot open log file: "+path);
+    }
+protected:
+    void sink_it_(const spdlog::details::log_msg& message) override {
+        spdlog::memory_buf_t text;
+        formatter_->format(message,text);
+        stream.write(text.data(),static_cast<std::streamsize>(text.size()));
+        if(!stream)throw spdlog::spdlog_ex("Cannot write log file");
+    }
+    void flush_() override {stream.flush();}
+private:
+    std::ofstream stream;
+};
+}
 
 std::shared_ptr<spdlog::logger> Log::s_EngineLogger;
 std::shared_ptr<spdlog::logger> Log::s_EditorLogger;
@@ -56,7 +80,7 @@ void Log::AddFileSink(const std::string& absolutePath) {
     if (s_FileSinkPath == absolutePath)
         return;
     s_FileSinkPath = absolutePath;
-    auto fileSink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(absolutePath, true);
+    auto fileSink = std::make_shared<Utf8FileSink>(absolutePath);
     fileSink->set_pattern("[%Y-%m-%d %T] [%l] %v");
     s_EngineLogger->sinks().push_back(fileSink);
     if (s_EditorLogger)

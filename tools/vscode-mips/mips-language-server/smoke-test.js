@@ -30,7 +30,7 @@ function readMessages(processHandle, onMessage) {
 }
 
 async function main() {
-  const enginePath = process.argv[2] || "D:/Nostalty/build/src/MipsyncEngine.exe";
+  const cliPath = process.argv[2] || "D:/Nostalty/build/src/mipsync.exe";
   const server = childProcess.spawn(process.execPath, ["tools/mips-language-server/server.js"], {
     cwd: process.cwd(),
     stdio: ["pipe", "pipe", "pipe"],
@@ -68,7 +68,7 @@ async function main() {
     method: "initialize",
     params: {
       initializationOptions: {
-        enginePath,
+        cliPath,
         validationDebounceMs: 10,
       },
     },
@@ -80,7 +80,7 @@ async function main() {
       params: {
         textDocument: {
           uri: "file:///D:/Nostalty/tests/mips/Foo.mips",
-          languageId: "mips",
+          languageId: "mipssharp",
           version: 1,
           text,
         },

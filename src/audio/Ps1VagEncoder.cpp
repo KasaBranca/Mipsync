@@ -84,8 +84,13 @@ bool EncodeAudioForPs1(const std::string& absolutePath, bool loop, Ps1VagData& o
     outData.sampleRate = std::clamp<uint32_t>(decoded.sampleRate, 4000, maxSampleRate);
     const std::vector<int16_t> pcm = Resample(decoded, outData.sampleRate);
     if (pcm.empty()) { outError = "audio contains no samples"; return false; }
+    outData.frames = EncodePcmForPs1(pcm, loop);
+    return true;
+}
+
+std::vector<uint8_t> EncodePcmForPs1(const std::vector<int16_t>& pcm, bool loop) {
     const size_t frameCount = (pcm.size() + 27) / 28;
-    outData.frames.resize(frameCount * 16);
+    std::vector<uint8_t> frames(frameCount * 16);
     int history1 = 0, history2 = 0;
     for (size_t frame = 0; frame < frameCount; ++frame) {
         uint8_t flags = 0;
@@ -94,9 +99,9 @@ bool EncodeAudioForPs1(const std::string& absolutePath, bool loop, Ps1VagData& o
         const size_t offset = frame * 28;
         const int count = static_cast<int>(std::min<size_t>(28, pcm.size() - offset));
         EncodeFrame(pcm.data() + offset, count, history1, history2, flags,
-                    outData.frames.data() + frame * 16);
+                    frames.data() + frame * 16);
     }
-    return true;
+    return frames;
 }
 
 } // namespace MipsyncEngine

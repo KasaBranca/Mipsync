@@ -1,3 +1,4 @@
+#include "../core/AssetFiles.h"
 #include "AssetManager.h"
 #include "Material.h"
 #include "../renderer/Texture.h"
@@ -68,7 +69,7 @@ std::shared_ptr<Texture> AssetManager::GetTexture(const std::string& projectRela
 
     const std::string abs = ToAbsolute(projectRelativePath);
     std::error_code ec;
-    if (!fs::exists(PathUtf8::FromString(abs), ec)) {
+    if (!AssetFiles::Exists(PathUtf8::FromString(abs))) {
         MIPSYNC_WARN("Texture not found: {}", abs);
         m_FailedTexturePaths.insert(projectRelativePath);
         return nullptr;
@@ -100,7 +101,7 @@ std::shared_ptr<Texture> AssetManager::GetSkyboxTexture(const std::string& proje
 
     const std::string abs = ToAbsolute(projectRelativePath);
     std::error_code ec;
-    if (!fs::exists(PathUtf8::FromString(abs), ec)) {
+    if (!AssetFiles::Exists(PathUtf8::FromString(abs))) {
         MIPSYNC_WARN("Skybox texture not found: {}", abs);
         m_FailedSkyboxTexturePaths.insert(projectRelativePath);
         return nullptr;
@@ -131,9 +132,20 @@ void AssetManager::DropTexture(const std::string& projectRelativePath) {
     m_FailedSkyboxTexturePaths.erase(projectRelativePath);
 }
 
-std::shared_ptr<Mesh> AssetManager::GetMesh(const std::string& projectRelativePath) {
+std::shared_ptr<Mesh> AssetManager::GetMesh(const std::string& projectRelativePath, int meshPart) {
     if (projectRelativePath.empty())
         return nullptr;
+
+    if (meshPart >= 0) {
+        const std::string key = projectRelativePath + "\npart=" + std::to_string(meshPart);
+        if (auto it = m_Meshes.find(key); it != m_Meshes.end()) return it->second;
+        auto source = GetMesh(projectRelativePath);
+        if (!source || static_cast<size_t>(meshPart) >= source->GetParts().size()) return nullptr;
+        auto part = std::make_shared<Mesh>(Mesh::ExtractPart(*source, meshPart));
+        if (!part->GetVertexCount()) return nullptr;
+        m_Meshes.emplace(key, part);
+        return part;
+    }
 
     if (m_FailedMeshPaths.count(projectRelativePath))
         return nullptr;
@@ -144,7 +156,7 @@ std::shared_ptr<Mesh> AssetManager::GetMesh(const std::string& projectRelativePa
 
     const std::string abs = ToAbsolute(projectRelativePath);
     std::error_code ec;
-    if (!fs::exists(PathUtf8::FromString(abs), ec)) {
+    if (!AssetFiles::Exists(PathUtf8::FromString(abs))) {
         MIPSYNC_WARN("Mesh not found: {}", abs);
         m_FailedMeshPaths.insert(projectRelativePath);
         return nullptr;
@@ -163,6 +175,11 @@ std::shared_ptr<Mesh> AssetManager::GetMesh(const std::string& projectRelativePa
 
 void AssetManager::DropMesh(const std::string& projectRelativePath) {
     m_Meshes.erase(projectRelativePath);
+    const std::string prefix = projectRelativePath + "\npart=";
+    for (auto it = m_Meshes.begin(); it != m_Meshes.end(); ) {
+        if (it->first.rfind(prefix, 0) == 0) it = m_Meshes.erase(it);
+        else ++it;
+    }
     m_FailedMeshPaths.erase(projectRelativePath);
     AssetThumbnail::Get().DropMeshThumbnail(projectRelativePath);
 }
@@ -180,7 +197,7 @@ std::shared_ptr<SkeletalModelAsset> AssetManager::GetSkeletalModel(const std::st
 
     const std::string abs = ToAbsolute(projectRelativePath);
     std::error_code ec;
-    if (!fs::exists(PathUtf8::FromString(abs), ec)) {
+    if (!AssetFiles::Exists(PathUtf8::FromString(abs))) {
         MIPSYNC_WARN("Skeletal model not found: {}", abs);
         m_FailedSkeletalModelPaths.insert(projectRelativePath);
         return nullptr;
@@ -213,7 +230,7 @@ std::shared_ptr<AnimatorControllerAsset> AssetManager::GetAnimatorController(
 
     const std::string abs = ToAbsolute(projectRelPath);
     std::error_code ec;
-    if (!fs::exists(PathUtf8::FromString(abs), ec)) {
+    if (!AssetFiles::Exists(PathUtf8::FromString(abs))) {
         outError = "controller not found: " + abs;
         return nullptr;
     }

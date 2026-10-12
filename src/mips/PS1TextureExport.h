@@ -19,6 +19,7 @@ bool LoadPsxTextureFromFile(const std::string& absPath, int maxSize, PsxExported
 bool EmitTexturesDataC(const std::vector<std::string>& projectRelativePaths,
                        const std::string& projectRoot, const std::string& outCFile,
                        std::string& outError,
-                       const std::vector<std::string>& backgroundPaths = {});
+                       const std::vector<std::string>& backgroundPaths = {},
+                       const std::vector<int>& textureMaxSizes = {});
 
 } // namespace MipsyncEngine::Mips

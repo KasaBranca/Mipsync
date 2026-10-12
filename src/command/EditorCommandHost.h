@@ -25,7 +25,7 @@ public:
 
     bool Start(std::string& outError);
     void Stop();
-    void Pump();
+    void Pump(bool preparationOnly = false);
     std::string ExecuteConsoleLine(const std::string& line);
 
     CommandResult ExecuteEditorCommand(const CommandRequest& request) override;

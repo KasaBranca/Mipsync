@@ -164,14 +164,16 @@ static void get_world_aabb(const ps1_entity* e, fix16_t min_out[3], fix16_t max_
     scale_y = fix16_abs(e->scale[1]);
     scale_z = fix16_abs(e->scale[2]);
 
-    /* Character controllers use an upright capsule with an origin-centred
-     * X/Z offset. Yaw cannot change that AABB, so avoid rebuilding Euler axes
-     * (three software divisions plus six trig lookups) on every ground and
-     * movement query. */
+    /* First-person character controllers use an upright capsule even though
+     * the Camera entity carries pitch for looking up/down.  Rotating the
+     * collider center and AABB with that pitch made every ground resolution
+     * move the camera by a slightly different amount, which appeared as
+     * vibration while looking, walking and jumping. */
     if (e->collider_shape == 2 &&
         e->collider_center[0] == 0 && e->collider_center[2] == 0 &&
-        fix16_abs(e->rotation[0]) <= FIX16_ONE / 1024 &&
-        fix16_abs(e->rotation[2]) <= FIX16_ONE / 1024) {
+        (e->has_camera ||
+         (fix16_abs(e->rotation[0]) <= FIX16_ONE / 1024 &&
+          fix16_abs(e->rotation[2]) <= FIX16_ONE / 1024))) {
         const fix16_t radius = fix16_mul(e->collider_radius, scale_x);
         const fix16_t height =
             fix16_mul(e->collider_capsule_height, scale_y);
@@ -1745,7 +1747,8 @@ void ps1_physics_move(fix16_t vx, fix16_t vy, fix16_t vz, fix16_t dt) {
                         continue;
                     }
                 }
-                if (axis != 1 && other->shape == 3 &&
+                if (axis != 1 &&
+                    (other->shape == 0 || other->shape == 3) &&
                     other->min_q6[1] == other->max_q6[1])
                     continue;
                 cached_collider_bounds(other, min_b, max_b);
@@ -1779,10 +1782,12 @@ void ps1_physics_move(fix16_t vx, fix16_t vy, fix16_t vz, fix16_t dt) {
                         break;
                     continue;
                 }
-                if (axis != 1 && other->collider_shape == 3 &&
-                    other->collider_half_extents[1] == 0)
-                    continue;
                 get_world_aabb(other, min_b, max_b);
+                if (axis != 1 &&
+                    (other->collider_shape == 0 ||
+                     other->collider_shape == 3) &&
+                    min_b[1] == max_b[1])
+                    continue;
                 if (resolve_axis_collision(e, axis, disp, axis_start,
                                            previous_min, previous_max,
                                            min_a, max_a, min_b, max_b))

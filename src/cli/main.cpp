@@ -13,6 +13,13 @@
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#endif
 
 namespace fs = std::filesystem;
 using namespace MipsyncEngine::Command;
@@ -84,8 +91,29 @@ void EnsureProjectSkill(const std::string& projectPath,
 } // namespace
 
 int main(int argc, char** argv) {
-    for (int i = 1; i < argc; ++i) {
-        const std::string argument = argv[i];
+    std::vector<std::string> arguments;
+#ifdef _WIN32
+    // Narrow CRT argv uses the Windows ANSI code page. JSON, Japanese scene
+    // paths and text arguments must reach the command platform as UTF-8.
+    int wideCount = 0;
+    wchar_t** wideArguments = CommandLineToArgvW(GetCommandLineW(), &wideCount);
+    if (!wideArguments) {
+        std::cerr << "mipsync: unable to read command line\n";
+        return 2;
+    }
+    for (int i = 1; i < wideCount; ++i) {
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, wideArguments[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string utf8(static_cast<size_t>(bytes), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, wideArguments[i], -1, utf8.data(), bytes, nullptr, nullptr);
+        if (!utf8.empty()) utf8.pop_back();
+        arguments.push_back(std::move(utf8));
+    }
+    LocalFree(wideArguments);
+#else
+    arguments.reserve(argc > 1 ? static_cast<size_t>(argc - 1) : 0);
+    for (int i = 1; i < argc; ++i) arguments.emplace_back(argv[i]);
+#endif
+    for (const std::string& argument : arguments) {
         if (argument == "--version" || argument == "-V") {
             std::cout << "MipsyncCLI " << MIPSYNC_ENGINE_VERSION
                       << " (protocol " << kProtocolVersion << ")\n";
@@ -97,9 +125,6 @@ int main(int argc, char** argv) {
     SymbolRegistry symbols;
     RegisterCoreCommands(commands, symbols);
 
-    std::vector<std::string> arguments;
-    arguments.reserve(argc > 1 ? static_cast<size_t>(argc - 1) : 0);
-    for (int i = 1; i < argc; ++i) arguments.emplace_back(argv[i]);
     ParsedCommandLine parsed = ParseCommandLine(arguments, commands);
     if (!parsed.valid) {
         std::cerr << "mipsync: " << parsed.error << "\nRun 'mipsync help' to list commands.\n";

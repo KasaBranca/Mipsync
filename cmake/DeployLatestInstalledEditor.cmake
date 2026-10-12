@@ -36,6 +36,24 @@ endif()
 list(SORT _version_dirs COMPARE NATURAL ORDER DESCENDING)
 list(GET _version_dirs 0 _latest_install)
 
+# Template-only builds must reach the installed PS1 worker even when no native
+# source changed and the editor's POST_BUILD command therefore does not run.
+if(PS1_TEMPLATES_ONLY)
+    set(_copy_templates_command copy_directory)
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.26)
+        set(_copy_templates_command copy_directory_if_different)
+    endif()
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E ${_copy_templates_command}
+                "${BUILD_DIR}/templates/ps1" "${_latest_install}/templates/ps1"
+        RESULT_VARIABLE _copy_templates_result)
+    if(NOT _copy_templates_result EQUAL 0)
+        message(FATAL_ERROR "Failed to deploy PS1 templates to ${_latest_install}")
+    endif()
+    message(STATUS "Deployed PS1 templates to latest install: ${_latest_install}")
+    return()
+endif()
+
 set(_editor_exe "${BUILD_DIR}/MipsyncEngine.exe")
 if(NOT EXISTS "${_editor_exe}")
     message(FATAL_ERROR "Built editor executable not found: ${_editor_exe}")
@@ -51,10 +69,26 @@ if(NOT _copy_exe_result EQUAL 0)
         "Failed to deploy MipsyncEngine.exe to ${_latest_install}. Close the installed editor and rebuild.")
 endif()
 
+# Keep the CLI compiler and command descriptors in step with the editor.
+if(EXISTS "${BUILD_DIR}/mipsync.exe")
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${BUILD_DIR}/mipsync.exe" "${_latest_install}/mipsync.exe"
+        RESULT_VARIABLE _copy_cli_result
+    )
+    if(NOT _copy_cli_result EQUAL 0)
+        message(FATAL_ERROR "Failed to deploy mipsync.exe to ${_latest_install}")
+    endif()
+endif()
+
 foreach(_runtime_dir IN ITEMS resources templates ps1_runtime tools skills)
     if(IS_DIRECTORY "${BUILD_DIR}/${_runtime_dir}")
+        set(_copy_directory_command copy_directory)
+        if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.26)
+            set(_copy_directory_command copy_directory_if_different)
+        endif()
         execute_process(
-            COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            COMMAND "${CMAKE_COMMAND}" -E ${_copy_directory_command}
                     "${BUILD_DIR}/${_runtime_dir}"
                     "${_latest_install}/${_runtime_dir}"
             RESULT_VARIABLE _copy_dir_result

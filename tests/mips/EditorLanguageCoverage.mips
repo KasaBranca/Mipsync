@@ -1,0 +1,43 @@
+// Grammar and semantic-token fixture. Unicode inside comments must preserve offsets: 日本語 😀
+enum EditorMode { Idle, Walking = 2 };
+class EditorLanguageCoverage : MipsBehaviour
+{
+    [Header("Camera"), Space(12), Tooltip("日本語 😀"), InspectorName("Follow Camera"), Order(-1)]
+    public Camera followCamera;
+    [ReadOnly]
+    public AudioSource sound;
+    [Range(0, 10), Min(0)]
+    public float Speed { get; set; };
+    [HideInInspector]
+    public EditorMode mode = EditorMode.Idle;
+    public string label = "class Fake {} // not code: 日本語 😀";
+    public int[] values = [1, 2, 3];
+
+    public void Move(float delta, Vector3 direction)
+    {
+        float velocity = delta * 2.0;
+        var animator = GetComponent<Animator>();
+        GetComponent<Animator>().SetFloat("Speed", velocity);
+        Vector3 offset = Vector3(1, 2, 3);
+        int[] buffer = new int[4];
+        for (int index = 0; index < 4; index = index + 1)
+        {
+            buffer[index] = index % 2;
+            if (index == 1) continue;
+            else if (index != 0 && velocity >= 2.0) break;
+        }
+        while (velocity > 0.0 || false) velocity = velocity - 1.0;
+        if (!Input.cursorLocked) Input.SetCursorLocked(true);
+        UI.SetTextVisible(gameObject.id, true);
+        sound.Play();
+        transform.position = offset;
+        return;
+    }
+
+    public IEnumerator Routine()
+    {
+        yield return null;
+        yield return new WaitForSeconds(0.5);
+        yield break;
+    }
+}

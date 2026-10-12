@@ -1,3 +1,4 @@
+#include "AssetFiles.h"
 #include "Engine.h"
 #include "Log.h"
 #include "mips/MipsTest.h"
@@ -13,6 +14,8 @@
 #include "RuntimePaths.h"
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
+#include <thread>
+#include <chrono>
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
 #include <cmath>
@@ -63,9 +66,9 @@ Engine::Engine(const std::string& projectPath, EngineLaunchMode launchMode,
     m_UIRenderer->Init();
 
     AssetManager::Get().SetProjectRoot(m_ProjectPath);
-    Log::AddFileSink(PathUtf8::ToString(PathUtf8::FromString(m_ProjectPath) / "mipsync.log"));
+    Log::AddFileSink(PathUtf8::ToString((IsPlayerMode() ? GetExeDirectory() : PathUtf8::FromString(m_ProjectPath)) / "mipsync.log"));
 
-    ProjectBootstrap::EnsureProjectDirectories(m_ProjectPath);
+    if (!IsPlayerMode()) ProjectBootstrap::EnsureProjectDirectories(m_ProjectPath);
 
     if (m_LaunchMode != EngineLaunchMode::Player) {
         const AgentIntegrationResult agentIntegration = EnsureAgentIntegration(
@@ -78,8 +81,7 @@ Engine::Engine(const std::string& projectPath, EngineLaunchMode launchMode,
         }
     }
 
-    const bool builtinScriptsUpdated = EnsureBuiltinScripts();
-    const bool demoContentUpdated = EnsureDemoContent();
+    const bool builtinScriptsUpdated = !IsPlayerMode() && EnsureBuiltinScripts();
 
     m_Scene = std::make_unique<Scene>();
     m_MipsRuntime = std::make_unique<Mips::MipsRuntime>();
@@ -111,12 +113,14 @@ Engine::Engine(const std::string& projectPath, EngineLaunchMode launchMode,
         PathUtf8::ToString(projectRoot / PathUtf8::FromString(defaultSceneRelPath));
 
     std::error_code fsEc;
-    if (std::filesystem::exists(PathUtf8::FromString(defaultScenePath), fsEc)) {
+    if (AssetFiles::Exists(PathUtf8::FromString(defaultScenePath))) {
         std::string loadError;
         if (SceneIO::LoadFromFile(*m_Scene, defaultScenePath, loadError))
             MIPSYNC_INFO("Loaded scene: {}", defaultScenePath);
         else
             MIPSYNC_WARN("Scene load failed: {}", loadError);
+    } else if (IsPlayerMode()) {
+        throw std::runtime_error("Startup scene is missing from player data");
     } else {
         SetupDefaultScene();
         std::string saveError;
@@ -126,15 +130,11 @@ Engine::Engine(const std::string& projectPath, EngineLaunchMode launchMode,
 
     if (builtinScriptsUpdated) {
         m_MipsRuntime->ResetScriptsByFileName(*m_Scene, "FirstPersonController.mips");
-        m_MipsRuntime->ResetScriptsByFileName(*m_Scene, "RadioController.mips");
-        m_MipsRuntime->ResetScriptsByFileName(*m_Scene, "SilentHillController.mips");
     }
-    if (demoContentUpdated)
-        m_MipsRuntime->ResetScriptsByFileName(*m_Scene, "AnimatedCharacter.mips");
 
     m_MipsRuntime->SyncEditSnapshot(*m_Scene);
 
-    Mips::RunMipsPhase1Tests();
+    if (!IsPlayerMode()) Mips::RunMipsPhase1Tests();
 
     m_Editor = std::make_unique<EditorApp>(this);
     if (m_LaunchMode == EngineLaunchMode::Player)
@@ -145,10 +145,10 @@ Engine::Engine(const std::string& projectPath, EngineLaunchMode launchMode,
 Engine::~Engine() {
     // Construction performs several fallible platform/graphics operations.
     // Keep teardown valid even when an exception interrupts initialization.
-    if (m_AudioSystem)
-        m_AudioSystem->EndPlay();
     if (m_Editor)
         m_Editor->Shutdown();
+    if (m_AudioSystem)
+        m_AudioSystem->EndPlay();
     if (m_UIRenderer)
         m_UIRenderer->Shutdown();
     if (m_Renderer)
@@ -162,25 +162,71 @@ bool Engine::EnsureBuiltinScripts() {
     namespace fs = std::filesystem;
     const fs::path scriptsDir = PathUtf8::FromString(m_ProjectPath) / "assets" / "scripts";
     const fs::path fpsPath = scriptsDir / "FirstPersonController.mips";
-    const fs::path radioPath = scriptsDir / "RadioController.mips";
-    const fs::path silentHillPath = scriptsDir / "SilentHillController.mips";
 
-    // Bump this any time the embedded source below changes; existing files with
-    // an older marker will be overwritten so users get fixes automatically.
-    static constexpr const char* kFpsScriptVersion = "// @mipsync-builtin v10";
-    static constexpr const char* kRadioScriptVersion = "// @mipsync-builtin-radio v23";
-    static constexpr const char* kSilentHillScriptVersion = "// @mipsync-builtin-silent-hill v9";
+    // Older engine-managed scripts migrate automatically. A project-owned
+    // script without the builtin marker must never be overwritten by name.
+    static constexpr const char* kFpsScriptVersion = "// @mipsync-builtin v15";
 
-    static constexpr const char* kFpsScript = R"(// @mipsync-builtin v10
+    static constexpr const char* kFpsScript = R"(// @mipsync-builtin v15
 class FirstPersonController : MipsBehaviour
 {
+    // Movement
+    [Header("Movement")]
+    [Space(8)]
+    [Order(0)]
+    [InspectorName("Move Speed")]
+    [Tooltip("Movement speed in world units per second.")]
+    [Min(0)]
     public float moveSpeed = 5.0;
-    public float mouseSensitivity = 0.15;
+
+    // Right stick look
+    [Header("Look")]
+    [Space(8)]
+    [Order(10)]
+    [InspectorName("View Camera")]
+    [Tooltip("Child camera used for vertical look. Leave None for a legacy camera on this object.")]
+    public Camera viewCamera = 0;
+    [Order(10)]
+    [InspectorName("Look Speed")]
+    [Tooltip("Right stick look speed in degrees per second.")]
+    [Min(0)]
+    public float lookSpeed = 144.0;
+    [Order(10)]
+    [InspectorName("Min Pitch")]
+    [Tooltip("Lowest vertical look angle in degrees.")]
+    [Range(-89, 89)]
     public float minPitch = -85.0;
+    [Order(10)]
+    [InspectorName("Max Pitch")]
+    [Tooltip("Highest vertical look angle in degrees.")]
+    [Range(-89, 89)]
     public float maxPitch = 85.0;
+
+    // Jump and physics
+    [Header("Jump and Gravity")]
+    [Space(8)]
+    [Order(20)]
+    [InspectorName("Jump Speed")]
+    [Tooltip("Initial upward speed in world units per second.")]
+    [Min(0)]
     public float jumpSpeed = 6.0;
+    [Order(20)]
+    [InspectorName("Gravity")]
+    [Tooltip("Downward acceleration in world units per second squared.")]
+    [Min(0)]
     public float gravity = 18.0;
+    [Header("Runtime")]
+    [Space(8)]
+    [Order(1000)]
+    [InspectorName("Vertical Speed")]
+    [Tooltip("Current vertical speed, updated by the script.")]
+    [ReadOnly]
     public float verticalSpeed = 0.0;
+    [Order(1000)]
+    [InspectorName("View Pitch")]
+    [Tooltip("Current vertical camera angle in degrees.")]
+    [ReadOnly]
+    public float viewPitch = 0.0;
 
     void Start()
     {
@@ -188,48 +234,53 @@ class FirstPersonController : MipsBehaviour
         Input.SetCursorLocked(1);
     }
 
-    void OnDestroy()
-    {
-        Input.SetCursorLocked(0);
-    }
-
     void Update()
     {
-        var dt = Time.deltaTime;
+        float dt = Time.deltaTime;
 
-        // Mouse look: yaw = rotation.y (world up), pitch = rotation.x (after yaw).
-        transform.rotation.y = transform.rotation.y - Input.mouseDeltaX * mouseSensitivity;
-        var pitch = transform.rotation.x + Input.mouseDeltaY * mouseSensitivity;
-        transform.rotation.x = Mathf.Clamp(pitch, minPitch, maxPitch);
+        // The body turns around Y; the child camera handles vertical look.
+        float lookX = Input.GetAxis("RightStickX");
+        float lookY = Input.GetAxis("RightStickY");
+        // Digital PS1 pads can look with L1/R1 and Triangle/Circle.
+        if (Input.GetButton("L1")) lookX = lookX - 1.0;
+        if (Input.GetButton("R1")) lookX = lookX + 1.0;
+        if (Input.GetButton("Triangle")) lookY = lookY + 1.0;
+        if (Input.GetButton("Circle")) lookY = lookY - 1.0;
+        float lookLength = Mathf.Sqrt(lookX * lookX + lookY * lookY);
+        if (lookLength > 1.0)
+        {
+            lookX = lookX / lookLength;
+            lookY = lookY / lookLength;
+        }
+        transform.rotation.y = transform.rotation.y - lookX * lookSpeed * dt;
+        viewPitch = Camera.RotatePitch(viewCamera, lookY * lookSpeed * dt, minPitch, maxPitch);
 
         // Forward / right from current yaw (Y-up, -Z forward).
-        var yawRad = transform.rotation.y * 0.01745329;
-        var sinY = Mathf.Sin(yawRad);
-        var cosY = Mathf.Cos(yawRad);
-        var forwardX = 0.0 - sinY;
-        var forwardZ = 0.0 - cosY;
-        var rightX = cosY;
-        var rightZ = 0.0 - sinY;
+        float yawRad = transform.rotation.y * 0.01745329;
+        float sinY = Mathf.Sin(yawRad);
+        float cosY = Mathf.Cos(yawRad);
+        float forwardX = 0.0 - sinY;
+        float forwardZ = 0.0 - cosY;
+        float rightX = cosY;
+        float rightZ = 0.0 - sinY;
 
-        // WASD planar input → unit direction.
-        var dx = 0.0;
-        var dz = 0.0;
-        if (Input.GetKey("W")) { dx = dx + forwardX; dz = dz + forwardZ; }
-        if (Input.GetKey("S")) { dx = dx - forwardX; dz = dz - forwardZ; }
-        if (Input.GetKey("D")) { dx = dx + rightX;   dz = dz + rightZ;   }
-        if (Input.GetKey("A")) { dx = dx - rightX;   dz = dz - rightZ;   }
-        var len = Mathf.Sqrt(dx * dx + dz * dz);
-        if (len > 0.0)
+        // PS1 left stick / D-pad movement.
+        float moveX = Input.GetAxis("LeftStickX");
+        float moveY = Input.GetAxis("LeftStickY");
+        float dx = forwardX * moveY + rightX * moveX;
+        float dz = forwardZ * moveY + rightZ * moveX;
+        float len = Mathf.Sqrt(dx * dx + dz * dz);
+        if (len > 1.0)
         {
             dx = dx / len;
             dz = dz / len;
         }
 
         // Vertical velocity: gravity in air, jump impulse on ground.
-        var grounded = Physics.IsGrounded();
+        bool grounded = Physics.IsGrounded();
         if (grounded != 0.0)
         {
-            if (Input.GetKeyDown("Space"))
+            if (Input.GetButtonDown("Cross"))
                 verticalSpeed = jumpSpeed;
             else if (verticalSpeed < 0.0)
                 verticalSpeed = 0.0;
@@ -246,457 +297,6 @@ class FirstPersonController : MipsBehaviour
 }
 )";
 
-    static constexpr const char* kRadioScript = R"(// @mipsync-builtin-radio v23
-class RadioController : MipsBehaviour
-{
-    public float moveSpeed = 3.0;
-    public float aimTurnSpeed = 90.0;
-    public float turnSmoothSpeed = 540.0;
-    public float modelForwardYawOffset = 0.0;
-    public float fixedY = 0.0;
-    public int lockY = 0;
-    public int driveAnimator = 1;
-    public float walkThreshold = 0.01;
-    public int aimStopsMovement = 1;
-    public int snapCameraDirections = 1;
-    public int heldW = 0;
-    public int heldA = 0;
-    public int heldS = 0;
-    public int heldD = 0;
-    public float heldWX = 0.0;
-    public float heldWZ = -1.0;
-    public float heldAX = -1.0;
-    public float heldAZ = 0.0;
-    public float heldSX = 0.0;
-    public float heldSZ = 1.0;
-    public float heldDX = 1.0;
-    public float heldDZ = 0.0;
-    public int invertTurnDirection = 0;
-    public float activeTurnTarget = 9999.0;
-    public float activeTurnDirection = 0.0;
-
-    void Start()
-    {
-        Physics.UseKinematicController();
-    }
-
-    void Update()
-    {
-        var dt = Time.deltaTime;
-        var controllerYaw = transform.rotation.y - modelForwardYawOffset;
-        if (controllerYaw > 180.0) controllerYaw = controllerYaw - 360.0;
-        if (controllerYaw < -180.0) controllerYaw = controllerYaw + 360.0;
-
-        var dx = 0.0;
-        var dz = 0.0;
-        if (Input.GetKey("D")) dx = dx + 1.0;
-        if (Input.GetKey("A")) dx = dx - 1.0;
-        if (Input.GetKey("W")) dz = dz - 1.0;
-        if (Input.GetKey("S")) dz = dz + 1.0;
-
-        // Fixed-camera movement stays on the world's cardinal axes even when
-        // the shot itself is diagonal. One key therefore always moves in a
-        // straight line; diagonals are produced only by pressing two keys.
-        var cameraForwardX = Camera.forwardX;
-        var cameraForwardZ = Camera.forwardZ;
-        var cameraRightX = Camera.rightX;
-        var cameraRightZ = Camera.rightZ;
-        if (snapCameraDirections != 0)
-        {
-            var absForwardX = cameraForwardX;
-            var absForwardZ = cameraForwardZ;
-            if (absForwardX < 0.0) absForwardX = 0.0 - absForwardX;
-            if (absForwardZ < 0.0) absForwardZ = 0.0 - absForwardZ;
-            if (absForwardX > absForwardZ)
-            {
-                if (cameraForwardX < 0.0) cameraForwardX = -1.0;
-                else cameraForwardX = 1.0;
-                cameraForwardZ = 0.0;
-            }
-            else
-            {
-                cameraForwardX = 0.0;
-                if (cameraForwardZ < 0.0) cameraForwardZ = -1.0;
-                else cameraForwardZ = 1.0;
-            }
-            cameraRightX = 0.0 - cameraForwardZ;
-            cameraRightZ = cameraForwardX;
-        }
-
-        // Lock each key to the camera basis from the moment that key was
-        // pressed. Keys already held through a camera cut keep their old
-        // direction, while newly pressed keys immediately use the new camera.
-        if (Input.GetKey("W"))
-        {
-            if (heldW == 0)
-            {
-                heldWX = cameraForwardX;
-                heldWZ = cameraForwardZ;
-                heldW = 1;
-            }
-        }
-        else heldW = 0;
-        if (Input.GetKey("S"))
-        {
-            if (heldS == 0)
-            {
-                heldSX = 0.0 - cameraForwardX;
-                heldSZ = 0.0 - cameraForwardZ;
-                heldS = 1;
-            }
-        }
-        else heldS = 0;
-        if (Input.GetKey("D"))
-        {
-            if (heldD == 0)
-            {
-                heldDX = cameraRightX;
-                heldDZ = cameraRightZ;
-                heldD = 1;
-            }
-        }
-        else heldD = 0;
-        if (Input.GetKey("A"))
-        {
-            if (heldA == 0)
-            {
-                heldAX = 0.0 - cameraRightX;
-                heldAZ = 0.0 - cameraRightZ;
-                heldA = 1;
-            }
-        }
-        else heldA = 0;
-
-        var aiming = Input.GetKey("LeftShift");
-        var aimTurn = 0.0;
-        if (aiming != 0)
-        {
-            aimTurn = dx;
-            controllerYaw = controllerYaw - aimTurn * aimTurnSpeed * dt;
-            if (controllerYaw > 180.0) controllerYaw = controllerYaw - 360.0;
-            if (controllerYaw < -180.0) controllerYaw = controllerYaw + 360.0;
-            transform.rotation.y = controllerYaw + modelForwardYawOffset;
-            if (aimStopsMovement != 0)
-            {
-                dx = 0.0;
-                dz = 0.0;
-            }
-        }
-
-        var speed = 0.0;
-        var inputLen = Mathf.Sqrt(dx * dx + dz * dz);
-        if (inputLen > 0.0)
-        {
-            dx = dx / inputLen;
-            dz = dz / inputLen;
-
-            var worldX = 0.0;
-            var worldZ = 0.0;
-            if (heldW != 0) { worldX = worldX + heldWX; worldZ = worldZ + heldWZ; }
-            if (heldS != 0) { worldX = worldX + heldSX; worldZ = worldZ + heldSZ; }
-            if (heldD != 0) { worldX = worldX + heldDX; worldZ = worldZ + heldDZ; }
-            if (heldA != 0) { worldX = worldX + heldAX; worldZ = worldZ + heldAZ; }
-            var worldLen = Mathf.Sqrt(worldX * worldX + worldZ * worldZ);
-            if (worldLen > 0.0001)
-            {
-                worldX = worldX / worldLen;
-                worldZ = worldZ / worldLen;
-                speed = 1.0;
-
-            var targetYaw = Mathf.Atan2(0.0 - worldX, 0.0 - worldZ) * 57.2957795;
-            if (targetYaw > 180.0) targetYaw = targetYaw - 360.0;
-            if (targetYaw < -180.0) targetYaw = targetYaw + 360.0;
-            if (controllerYaw > 180.0) controllerYaw = controllerYaw - 360.0;
-            if (controllerYaw < -180.0) controllerYaw = controllerYaw + 360.0;
-
-            if (activeTurnTarget != targetYaw)
-            {
-                var shortestYawDelta = targetYaw - controllerYaw;
-                if (shortestYawDelta > 180.0) shortestYawDelta = shortestYawDelta - 360.0;
-                if (shortestYawDelta < -180.0) shortestYawDelta = shortestYawDelta + 360.0;
-
-                activeTurnDirection = 0.0;
-                if (shortestYawDelta > 0.0) activeTurnDirection = 1.0;
-                if (shortestYawDelta < 0.0) activeTurnDirection = -1.0;
-
-                // Only a 180-degree turn has two equally short routes.
-                // Let the camera-relative turn preference choose that tie,
-                // but never turn 270/315 degrees for ordinary direction changes.
-                var oppositeDirection = 0;
-                if (shortestYawDelta >= 179.999) oppositeDirection = 1;
-                if (shortestYawDelta <= -179.999) oppositeDirection = 1;
-                if (oppositeDirection != 0)
-                {
-                    activeTurnDirection = 1.0;
-                    if (invertTurnDirection != 0)
-                        activeTurnDirection = -1.0;
-                }
-                activeTurnTarget = targetYaw;
-            }
-
-            var yawDelta = targetYaw - controllerYaw;
-            if (activeTurnDirection > 0.0)
-            {
-                if (yawDelta < 0.0)
-                    yawDelta = yawDelta + 360.0;
-            }
-            if (activeTurnDirection < 0.0)
-            {
-                if (yawDelta > 0.0)
-                    yawDelta = yawDelta - 360.0;
-            }
-            var maxYawStep = turnSmoothSpeed * dt;
-            var reachedTargetYaw = 0;
-            if (yawDelta <= maxYawStep)
-            {
-                if (yawDelta >= 0.0 - maxYawStep)
-                    reachedTargetYaw = 1;
-            }
-            if (reachedTargetYaw != 0)
-            {
-                controllerYaw = targetYaw;
-                activeTurnDirection = 0.0;
-            }
-            else
-            {
-                controllerYaw = controllerYaw + activeTurnDirection * maxYawStep;
-            }
-            transform.rotation.y = controllerYaw + modelForwardYawOffset;
-
-            Physics.Move(worldX * moveSpeed, 0.0, worldZ * moveSpeed);
-            }
-            else
-            {
-                activeTurnTarget = 9999.0;
-                activeTurnDirection = 0.0;
-            }
-        }
-        else
-        {
-            activeTurnTarget = 9999.0;
-            activeTurnDirection = 0.0;
-            Physics.Move(0.0, 0.0, 0.0);
-        }
-
-        if (lockY != 0) transform.position.y = fixedY;
-
-        if (driveAnimator != 0)
-        {
-            Animator.SetFloat("Speed", speed);
-            Animator.SetBool("Moving", speed > walkThreshold);
-            Animator.SetFloat("Move", (0.0 - dz) * speed);
-            Animator.SetFloat("Turn", dx * speed);
-            Animator.SetBool("Aiming", aiming != 0);
-            Animator.SetFloat("Aim", aiming);
-        }
-    }
-}
-)";
-
-    static constexpr const char* kSilentHillScript = R"(// @mipsync-builtin-silent-hill v9
-// Classic survival-horror tank controls for fixed or cinematic cameras.
-// PC: W/S move, A/D turn, Left Shift run, Q/E sidestep,
-//     Space jump, Right Shift aim.
-// PS1: D-pad/left stick move and turn, Square run, L1/R1 sidestep,
-//      Cross (X) jump, R2 aim, right stick camera orbit.
-class SilentHillController : MipsBehaviour
-{
-    public float walkSpeed = 1.8;
-    public float runSpeed = 4.2;
-    public float backwardSpeed = 1.25;
-    public float sidestepSpeed = 1.6;
-    public float turnSpeed = 110.0;
-    public float runningTurnMultiplier = 0.82;
-    public float jumpSpeed = 5.5;
-    public float gravity = 18.0;
-    public float modelForwardYawOffset = 0.0;
-    public float fixedY = 0.0;
-    public int lockY = 0;
-    public int allowSidestep = 1;
-    public int allowJump = 1;
-    public int reverseSteeringWhileBacking = 1;
-    public int aimStopsMovement = 0;
-    public int driveAnimator = 1;
-    public float walkThreshold = 0.01;
-    public float verticalVelocity = 0.0;
-    public Camera followCamera;
-    public int followCameraEnabled = 1;
-    public float cameraDistance = 5.0;
-    public float cameraHeight = 2.2;
-    public float cameraLookHeight = 1.2;
-    public float cameraFollowSharpness = 8.0;
-    public float cameraLookSensitivity = 2.5;
-    public float cameraReturnSharpness = 6.0;
-    public float cameraMinPitch = -35.0;
-    public float cameraMaxPitch = 55.0;
-    public float cameraYawOffset = 0.0;
-    public float cameraPitchOffset = 0.0;
-
-    void Start()
-    {
-        Physics.UseCharacterController();
-    }
-
-    void Update()
-    {
-        var dt = Time.deltaTime;
-        if (dt > 0.1) dt = 0.1;
-
-        var forwardInput = 0.0;
-        if (Input.GetKey("W")) forwardInput = forwardInput + 1.0;
-        if (Input.GetKey("S")) forwardInput = forwardInput - 1.0;
-
-        var turnInput = 0.0;
-        if (Input.GetKey("A")) turnInput = turnInput + 1.0;
-        if (Input.GetKey("D")) turnInput = turnInput - 1.0;
-
-        var strafeInput = 0.0;
-        if (allowSidestep != 0)
-        {
-            if (Input.GetKey("StrafeLeft")) strafeInput = strafeInput - 1.0;
-            if (Input.GetKey("StrafeRight")) strafeInput = strafeInput + 1.0;
-        }
-
-        var running = Input.GetKey("Run");
-        var aiming = Input.GetKey("Aim");
-        var controllerYaw = transform.rotation.y - modelForwardYawOffset;
-        if (controllerYaw > 180.0) controllerYaw = controllerYaw - 360.0;
-        if (controllerYaw < -180.0) controllerYaw = controllerYaw + 360.0;
-
-        var grounded = Physics.IsGrounded();
-        if (lockY == 0)
-        {
-            if (grounded != 0)
-            {
-                if (allowJump != 0)
-                {
-                    if (Input.GetKeyDown("Jump"))
-                    {
-                        verticalVelocity = jumpSpeed;
-                        grounded = 0;
-                        if (driveAnimator != 0) Animator.SetTriggerHeld("Jump");
-                    }
-                }
-                if (verticalVelocity < 0.0) verticalVelocity = 0.0;
-            }
-            else
-            {
-                verticalVelocity = verticalVelocity - gravity * dt;
-            }
-        }
-        else
-        {
-            verticalVelocity = 0.0;
-        }
-
-        var steering = turnInput;
-        if (reverseSteeringWhileBacking != 0)
-        {
-            if (forwardInput < 0.0) steering = 0.0 - steering;
-        }
-        var currentTurnSpeed = turnSpeed;
-        if (running != 0) currentTurnSpeed = currentTurnSpeed * runningTurnMultiplier;
-        controllerYaw = controllerYaw + steering * currentTurnSpeed * dt;
-
-        if (controllerYaw > 180.0) controllerYaw = controllerYaw - 360.0;
-        if (controllerYaw < -180.0) controllerYaw = controllerYaw + 360.0;
-        transform.rotation.y = controllerYaw + modelForwardYawOffset;
-
-        var cameraMoveInput = 0.0;
-        if (forwardInput != 0.0) cameraMoveInput = 1.0;
-        if (turnInput != 0.0) cameraMoveInput = 1.0;
-        if (strafeInput != 0.0) cameraMoveInput = 1.0;
-        if (cameraMoveInput != 0.0)
-        {
-            var cameraReturnBlend = cameraReturnSharpness * dt;
-            if (cameraReturnBlend > 1.0) cameraReturnBlend = 1.0;
-            cameraYawOffset = Mathf.Lerp(cameraYawOffset, 0.0, cameraReturnBlend);
-            cameraPitchOffset = Mathf.Lerp(cameraPitchOffset, 0.0, cameraReturnBlend);
-        }
-        else
-        {
-            cameraYawOffset = cameraYawOffset + Input.mouseDeltaX * cameraLookSensitivity;
-            cameraPitchOffset = cameraPitchOffset + Input.mouseDeltaY * cameraLookSensitivity;
-            cameraPitchOffset = Mathf.Clamp(cameraPitchOffset, cameraMinPitch, cameraMaxPitch);
-            if (cameraYawOffset > 180.0) cameraYawOffset = cameraYawOffset - 360.0;
-            if (cameraYawOffset < -180.0) cameraYawOffset = cameraYawOffset + 360.0;
-        }
-
-        var yawRadians = controllerYaw * 0.0174532925;
-        var sinYaw = Mathf.Sin(yawRadians);
-        var cosYaw = Mathf.Cos(yawRadians);
-        var forwardX = 0.0 - sinYaw;
-        var forwardZ = 0.0 - cosYaw;
-        var rightX = cosYaw;
-        var rightZ = 0.0 - sinYaw;
-
-        var moveSpeed = walkSpeed;
-        if (forwardInput < 0.0) moveSpeed = backwardSpeed;
-        else if (running != 0) moveSpeed = runSpeed;
-
-        var velocityX = forwardX * forwardInput * moveSpeed;
-        var velocityZ = forwardZ * forwardInput * moveSpeed;
-        velocityX = velocityX + rightX * strafeInput * sidestepSpeed;
-        velocityZ = velocityZ + rightZ * strafeInput * sidestepSpeed;
-
-        if (aiming != 0)
-        {
-            if (aimStopsMovement != 0)
-            {
-                velocityX = 0.0;
-                velocityZ = 0.0;
-            }
-        }
-
-        Physics.Move(velocityX, verticalVelocity, velocityZ);
-        if (lockY != 0) transform.position.y = fixedY;
-
-        if (driveAnimator != 0)
-        {
-            if (grounded != 0)
-            {
-                Animator.ReleaseTrigger("Jump");
-            }
-            else if (verticalVelocity < 0.0)
-            {
-                var landingProbeDistance =
-                    Mathf.Abs(verticalVelocity) * 0.1667 + 0.05;
-                landingProbeDistance = Mathf.Clamp(landingProbeDistance, 0.0, 3.0);
-                if (Physics.IsGroundedWithin(landingProbeDistance))
-                    Animator.ReleaseTrigger("Jump");
-            }
-        }
-
-        if (driveAnimator != 0)
-        {
-            var moving = 0.0;
-            if (forwardInput != 0.0) moving = 1.0;
-            if (strafeInput != 0.0) moving = 1.0;
-            Animator.SetFloat("Speed", moving);
-            Animator.SetBool("Moving", moving > walkThreshold);
-            Animator.SetBool("Running", running != 0);
-            Animator.SetBool("Backward", forwardInput < 0.0);
-            Animator.SetBool("Aiming", aiming != 0);
-            Animator.SetBool("Grounded", grounded != 0);
-            Animator.SetFloat("Move", forwardInput);
-            Animator.SetFloat("Turn", turnInput);
-            Animator.SetFloat("Strafe", strafeInput);
-        }
-    }
-
-    void LateUpdate()
-    {
-        if (followCameraEnabled != 0)
-        {
-            var controllerYaw = transform.rotation.y - modelForwardYawOffset;
-            Camera.Follow(followCamera, controllerYaw + cameraYawOffset, cameraDistance,
-                          cameraHeight, cameraLookHeight, cameraFollowSharpness,
-                          cameraPitchOffset);
-        }
-    }
-}
-)";
-
     std::error_code ec;
     fs::create_directories(scriptsDir, ec);
 
@@ -707,7 +307,8 @@ class SilentHillController : MipsBehaviour
             std::ifstream existing(path);
             std::string firstLine;
             std::getline(existing, firstLine);
-            if (firstLine.find(marker) == std::string::npos)
+            if (firstLine.rfind("// @mipsync-builtin v", 0) == 0 &&
+                firstLine.find(marker) == std::string::npos)
                 needsWrite = true;
         }
 
@@ -725,165 +326,6 @@ class SilentHillController : MipsBehaviour
 
     bool updated = false;
     updated |= writeIfMissingOrStale(fpsPath, kFpsScriptVersion, kFpsScript);
-    updated |= writeIfMissingOrStale(radioPath, kRadioScriptVersion, kRadioScript);
-    updated |= writeIfMissingOrStale(
-        silentHillPath, kSilentHillScriptVersion, kSilentHillScript);
-    return updated;
-}
-
-bool Engine::EnsureDemoContent() {
-    namespace fs = std::filesystem;
-    const fs::path root = PathUtf8::FromString(m_ProjectPath);
-    const fs::path scriptsDir = root / "assets" / "scripts";
-    const fs::path animDir = root / "assets" / "animations";
-    const fs::path scenesDir = root / "scenes";
-
-    static constexpr const char* kDemoScriptVersion = "// @mipsync-demo v1";
-
-    static constexpr const char* kAnimatedCharacterScript = R"(// @mipsync-demo v1
-class AnimatedCharacter : MipsBehaviour
-{
-    void Update()
-    {
-        var moving = 0.0;
-        if (Input.GetKey("W") != 0.0) moving = 1.0;
-        if (Input.GetKey("A") != 0.0) moving = 1.0;
-        if (Input.GetKey("S") != 0.0) moving = 1.0;
-        if (Input.GetKey("D") != 0.0) moving = 1.0;
-        Animator.SetFloat("Speed", moving);
-    }
-}
-)";
-
-    static constexpr const char* kAnimatedCharacterController = R"({
-  "defaultState": "Capoeira",
-  "model": "assets/models/Capoeira.fbx",
-  "parameters": [
-    { "name": "Speed", "type": "float", "default": 0.0 }
-  ],
-  "states": [
-    {
-      "name": "Capoeira",
-      "clip": "mixamo.com",
-      "clipModel": "assets/models/Capoeira.fbx",
-      "speed": 1.0,
-      "loop": true
-    },
-    {
-      "name": "HipHop",
-      "clip": "mixamo.com",
-      "clipModel": "assets/models/Hip Hop Dancing.fbx",
-      "speed": 1.0,
-      "loop": true
-    }
-  ],
-  "transitions": [
-    {
-      "from": "Capoeira",
-      "to": "HipHop",
-      "duration": 0.25,
-      "conditions": [{ "param": "Speed", "mode": "greater", "threshold": 0.5 }]
-    },
-    {
-      "from": "HipHop",
-      "to": "Capoeira",
-      "duration": 0.25,
-      "conditions": [{ "param": "Speed", "mode": "less", "threshold": 0.5 }]
-    }
-  ]
-}
-)";
-
-    static constexpr const char* kAnimatedCharacterScene = R"({
-  "version": 1,
-  "entities": [
-    {
-      "id": 1,
-      "name": "First Person Controller",
-      "transform": { "position": [0.0, 0.2, 4.0], "rotation": [0.0, 180.0, 0.0], "scale": [1.0, 1.0, 1.0] },
-      "camera": { "primary": true, "fov": 70.0, "nearClip": 0.1, "farClip": 200.0 },
-      "collider": {
-        "shape": 2,
-        "center": [0.0, -0.85, 0.0],
-        "halfExtents": [0.35, 0.5, 0.35],
-        "radius": 0.35,
-        "capsuleHeight": 1.0,
-        "isTrigger": false
-      },
-      "rigidbody": {
-        "bodyType": 1,
-        "mass": 70.0,
-        "useGravity": false,
-        "linearDrag": 0.05,
-        "bounciness": 0.2,
-        "freezeRotation": true,
-        "characterController": true
-      },
-      "mipsScript": { "path": "assets/scripts/FirstPersonController.mips" }
-    },
-    {
-      "id": 2,
-      "name": "Floor",
-      "transform": { "position": [0.0, -1.5, 0.0], "rotation": [0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0] },
-      "meshRenderer": { "primitive": "Plane", "size": 20.0, "color": [0.35, 0.35, 0.38, 1.0] },
-      "collider": {
-        "shape": 0,
-        "center": [0.0, 0.0, 0.0],
-        "halfExtents": [10.0, 0.05, 10.0],
-        "radius": 0.5,
-        "capsuleHeight": 1.0,
-        "isTrigger": false
-      },
-      "rigidbody": { "bodyType": 0, "mass": 1.0, "useGravity": true, "linearDrag": 0.05, "bounciness": 0.2, "freezeRotation": false }
-    },
-    {
-      "id": 3,
-      "name": "Animated Character",
-      "transform": { "position": [0.0, 0.0, 0.0], "rotation": [0.0, 180.0, 0.0], "scale": [1.0, 1.0, 1.0] },
-      "skinnedMeshRenderer": {
-        "model": "assets/models/Capoeira.fbx",
-        "color": [1.0, 1.0, 1.0, 1.0]
-      },
-      "animator": {
-        "controller": "assets/animations/AnimatedCharacter.ncontroller",
-        "model": "assets/models/Capoeira.fbx",
-        "floatParams": { "Speed": 0.0 }
-      },
-      "mipsScript": { "path": "assets/scripts/AnimatedCharacter.mips" }
-    }
-  ]
-}
-)";
-
-    auto writeIfMissingOrStale = [&](const fs::path& path, const char* marker,
-                                     const char* content) -> bool {
-        std::error_code ec;
-        fs::create_directories(path.parent_path(), ec);
-        bool needsWrite = !fs::exists(path, ec);
-        if (!needsWrite) {
-            std::ifstream existing(path);
-            std::string firstLine;
-            std::getline(existing, firstLine);
-            if (marker && firstLine.find(marker) == std::string::npos)
-                needsWrite = true;
-        }
-        if (!needsWrite)
-            return false;
-        std::ofstream file(path);
-        if (!file.is_open())
-            return false;
-        file << content;
-        MIPSYNC_INFO("Wrote demo asset: {}", PathUtf8::ToString(path));
-        return true;
-    };
-
-    bool updated = false;
-    updated |= writeIfMissingOrStale(scriptsDir / "AnimatedCharacter.mips", kDemoScriptVersion,
-                                     kAnimatedCharacterScript);
-    updated |= writeIfMissingOrStale(animDir / "AnimatedCharacter.ncontroller", nullptr,
-                                     kAnimatedCharacterController);
-    updated |= writeIfMissingOrStale(scenesDir / "AnimatedCharacterDemo.nscene", nullptr,
-                                     kAnimatedCharacterScene);
     return updated;
 }
 
@@ -934,6 +376,18 @@ void Engine::Run() {
     while (m_Running && !m_Window->ShouldClose()) {
         Time::Update();
 
+        // Never render, inspect the scene, sample gameplay, or process editor
+        // commands while preparation owns scene/assets and the GL context.
+        // The UI thread remains free to dispatch paint/focus/window messages.
+        m_Editor->TickPendingPlaySetup();
+        if (m_Editor->IsPlayPreparationRunning()) {
+            m_Editor->PumpPreparationCommands();
+            glfwPollEvents();
+            m_PSyncLastTime = glfwGetTime();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+
         m_Editor->BeginFrame();
         Input::Update();
         Update();
@@ -980,12 +434,21 @@ void Engine::Update() {
     const float dt = Time::GetDeltaTime();
     m_Editor->TickAutoPlayOnStart();
     bool stepOneFrame = false;
+    const bool cliStep = m_CliFrames > 0 && m_Editor && m_Editor->IsPlaying() && m_Editor->IsPaused();
+    if (m_Editor && (!m_Editor->IsPlaying() || !m_Editor->IsPaused())) m_CliFrames = 0;
     if (m_Editor) {
         m_Editor->HandlePlayModeShortcuts();
-        stepOneFrame = m_Editor->ConsumeSingleStepRequest();
+        stepOneFrame = m_Editor->ConsumeSingleStepRequest() || cliStep;
         if (stepOneFrame)
             m_MipsRuntime->SetPaused(false);
-        m_Editor->TickPendingPlaySetup();
+        if (m_Editor->IsPreparingPlay()) {
+            // Preparation may take seconds. Do not advance scripts/animation,
+            // physics, scene requests or game input with that elapsed time.
+            m_PSyncLastTime = glfwGetTime();
+            Time::Init();
+            Input::EndGameFrame();
+            return;
+        }
     }
 
     const bool animateCharacters = m_Editor && m_Editor->IsPlaying();
@@ -999,19 +462,39 @@ void Engine::Update() {
     const bool playing = m_MipsRuntime->IsPlaying() && !m_MipsRuntime->IsPaused();
     const bool playPaused = animateCharacters && m_MipsRuntime->IsPaused();
 
-    if (playing) {
+    const double now = glfwGetTime();
+    const double elapsed = m_PSyncLastTime > 0.0 ? now - m_PSyncLastTime : 0.0;
+    m_PSyncLastTime = now;
+    const bool sync = !IsPlayerMode() && m_Editor->GetGameViewSettings().pSync;
+    if (!sync || !playing || stepOneFrame) {
+        m_PSync.clock.Reset();
+    }
+    m_PSync.frameDue = !sync || !playing || stepOneFrame ||
+        m_PSync.clock.Advance(elapsed, m_PSync.estimate.frameSeconds);
+    const float gameDt = cliStep ? m_CliFrameDelta : sync && playing
+        ? (stepOneFrame ? PSyncSimulationDeltaTime(m_PSync.estimate.vblanks) : m_PSync.clock.SimulationDeltaTime()) : dt;
+
+    if (playing && m_PSync.frameDue) {
+        const bool inputWasEnabled = Input::IsGameInputEnabled();
+        if (cliStep) Input::SetGameInputEnabled(true);
+        Input::BeginGameFrame(sync);
+        if (cliStep) Input::BeginInjectedPS1Frame();
+        m_MipsRuntime->BeginPerformanceFrame(sync);
         // Scripts run before AnimationSystem so Animator.Set* applies same frame.
-        m_MipsRuntime->Update(*m_Scene, dt);
-        m_Scene->Update(dt);
-        m_PhysicsWorld->Simulate(*m_Scene, dt);
+        m_MipsRuntime->Update(*m_Scene, gameDt);
+        m_Scene->Update(gameDt);
+        m_PhysicsWorld->Simulate(*m_Scene, gameDt, sync ? PSyncSimulationDeltaTime(4) : 1.0f / 20.0f);
         m_MipsRuntime->DispatchPhysicsEvents(*m_Scene);
         // Camera and other follow behaviours must observe transforms written
         // back by the current physics step, especially characters riding
         // kinematic platforms.
-        m_MipsRuntime->LateUpdate(*m_Scene, dt);
-    } else if (!playPaused) {
+        m_MipsRuntime->LateUpdate(*m_Scene, gameDt);
+        Input::EndGameFrame();
+        if (cliStep) { --m_CliFrames; Input::SetGameInputEnabled(inputWasEnabled); }
+    } else if (!playing && !playPaused) {
         m_Scene->Update(dt);
     }
+    if (!playing) Input::EndGameFrame();
     if (m_Editor && m_Editor->IsPlaying())
         m_AudioSystem->Update(*m_Scene, m_Editor->IsPaused());
     if (stepOneFrame)

@@ -13,8 +13,8 @@ namespace MipsyncEngine {
 
 std::filesystem::path GetExecutablePath() {
 #ifdef _WIN32
-    wchar_t modulePath[MAX_PATH]{};
-    if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) > 0)
+    wchar_t modulePath[32768]{};
+    if (GetModuleFileNameW(nullptr, modulePath, 32768) > 0)
         return std::filesystem::path(modulePath);
 #endif
     return std::filesystem::current_path() / "MipsyncEngine.exe";
@@ -29,7 +29,7 @@ std::filesystem::path DetectPlayerDataDirectory() {
     const std::filesystem::path dataDir =
         exePath.parent_path() / (exePath.stem().wstring() + L"_Data");
     std::error_code ec;
-    if (std::filesystem::is_regular_file(dataDir / "boot.json", ec))
+    if ((std::filesystem::is_regular_file(dataDir / "boot.json", ec) || std::filesystem::is_regular_file(dataDir / "game.mpak", ec)))
         return dataDir;
     return {};
 }
@@ -52,8 +52,8 @@ std::filesystem::path GetBundledResourcesDirectory() {
 
 std::filesystem::path GetEngineSettingsDirectory() {
 #ifdef _WIN32
-    wchar_t appDataPath[MAX_PATH]{};
-    if (GetEnvironmentVariableW(L"APPDATA", appDataPath, MAX_PATH) > 0) {
+    wchar_t appDataPath[32768]{};
+    if (GetEnvironmentVariableW(L"APPDATA", appDataPath, 32768) > 0) {
         const std::filesystem::path dir =
             std::filesystem::path(appDataPath) / L"MipsyncEngine";
         std::error_code ec;

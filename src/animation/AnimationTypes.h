@@ -3,6 +3,7 @@
 #include <glm/glm.hpp>
 #include <string>
 #include <vector>
+#include <optional>
 
 namespace MipsyncEngine {
 
@@ -73,6 +74,9 @@ struct AnimatorControllerAsset {
     std::vector<AnimatorParameterDef> parameters;
     std::vector<AnimatorStateDef> states;
     std::vector<AnimatorTransitionDef> transitions;
+    /// Editor layout only; these positions do not affect animation playback.
+    std::optional<glm::vec2> entryGraphPosition;
+    glm::vec2 anyStateGraphPosition{40.0f, 56.0f};
 };
 
 } // namespace MipsyncEngine

@@ -4,30 +4,67 @@
 #include "fixedp.h"
 #include "lookat.h"
 #include "ui.h"
+#include "lighting.h"
+#include "color_grading.h"
+#include "plane_tiles.h"
+#include "viewmodel_projection.h"
+#include "clip_math.h"
+#include "projection_safety.h"
+#include "watertight_projection.h"
+#include "affine_subdivision.h"
 
 #include <stdint.h>
+#include <string.h>
 #include <psxapi.h>
 #include <psxgpu.h>
 #include "mipsync_gte.h"
+#if defined(__has_include)
+#if __has_include("../generated/render_limits.h")
+#include "../generated/render_limits.h"
+#endif
+#endif
 
 #define OT_LEN 2048
 #define PS1_WORLD_OT_MIN 2
+
+
+/* Lighting/fog calculations use the editor's 0..255 colour scale. Convert
+ * only when submitting a modulated texture: the GPU's neutral multiplier is
+ * 128, whereas an untextured polygon writes RGB directly. UI owns its own
+ * conversion in ui.c; raw background textures bypass modulation entirely. */
+static void add_world_primitive(uint32_t* bucket, void* primitive) {
+    uint8_t* bytes = (uint8_t*)primitive;
+    const uint8_t code = bytes[7];
+    if ((code & 0xe5u) == 0x24u) {
+        int vertex;
+        const int vertices = (code & 0x10u) ? ((code & 8u) ? 4 : 3) : 1;
+        for (vertex = 0; vertex < vertices; ++vertex) {
+            uint8_t* color = bytes + 4 + vertex * 12;
+            color[0] = (uint8_t)((color[0] + 1u) >> 1);
+            color[1] = (uint8_t)((color[1] + 1u) >> 1);
+            color[2] = (uint8_t)((color[2] + 1u) >> 1);
+        }
+    }
+    addPrim(bucket, primitive);
+}
 
 /* FBX winding is preserved at export (no runtime backface pass). */
 /* 1 editor world unit -> 64 PSX/GTE units (matches typical demo scales). */
 #define PSX_UNITS_PER_WORLD 64
 /* PSX fpscam default forward is +Z; Unity cameras look down -Z. */
 #define PSX_YAW_UNITY_OFFSET 2048
-#define PS1_VIEWMODEL_VERTEX_CACHE_MAX 1024
+#define PS1_VIEWMODEL_VERTEX_CACHE_MAX 2048
+#define PS1_VIEWMODEL_TRI_CACHE_MAX 4096
 #define PS1_RIGID_VERTEX_CACHE_MAX 2048
-#define PS1_STATIC_VERTEX_CACHE_MAX 2048
-/* The cache is shared by every visible instance, not just every unique mesh.
- * Four subdivided ProModeler floors alone use 1740 seam vertices and 4512
- * triangles.  A 4096-face pool therefore pushed the last floor back through
- * the full transform/light path every frame.  The PS1 build still has ample
- * main RAM; 8192 keeps the complete test scene on the compact cached path. */
-#define PS1_STATIC_VERTEX_CACHE_TOTAL 8192
-#define PS1_STATIC_TRI_CACHE_TOTAL 8192
+#define PS1_STATIC_VERTEX_CACHE_MAX 4096
+/* New exports size these pools for the scene's instances and largest clip
+ * frames. Keep the full capacity for older generated data without limits. */
+#ifndef PS1_STATIC_VERTEX_CACHE_TOTAL
+#define PS1_STATIC_VERTEX_CACHE_TOTAL 16384
+#endif
+#ifndef PS1_STATIC_TRI_CACHE_TOTAL
+#define PS1_STATIC_TRI_CACHE_TOTAL 16384
+#endif
 #define PS1_STATIC_ENTITY_CACHE_MAX 64
 #define PS1_STATIC_TOPOLOGY_CACHE_MAX 32
 #define PS1_UI_PACKET_RESERVE 4096
@@ -221,8 +258,27 @@ static tri_index s_sphere_tris[] = {
 static MATRIX s_scene_color_mtx;
 
 static MATRIX s_light_mtx;
+static int32_t s_normal_scale_q12[3] = { ONE, ONE, ONE };
+static ps1_lighting_light s_scene_lights[PS1_LIGHT_LIMIT];
+static unsigned int s_scene_light_count;
+static uint32_t s_scene_light_revision;
+static MATRIX s_shading_world, s_shading_rotation;
+static const ps1_mesh* s_shading_mesh;
+static const ps1_mesh* s_shading_next_mesh;
+static uint8_t s_shading_lerp_q8;
+static uint8_t s_shading_use_probe;
+static ps1_lighting_light s_shading_probe_lights[PS1_LIGHT_LIMIT];
+static unsigned int s_shading_probe_count;
+static const ps1_mesh* s_shading_probe_source;
+static void transform_point(const MATRIX* m, const SVECTOR* in, VECTOR* out);
+static void unity_euler_to_psx_object(fix16_t pitch, fix16_t yaw, fix16_t roll, SVECTOR* out);
+
+static void shade_scene_normal(const SVECTOR* normal, const SVECTOR* vertex,
+    uint8_t base_r, uint8_t base_g, uint8_t base_b,
+    uint8_t* out_r, uint8_t* out_g, uint8_t* out_b);
 
 static MATRIX s_cam_mtx;
+static const ps1_entity* s_render_camera_source = 0;
 static int     s_initialized = 0;
 static int     s_screen_w = 320;
 static int     s_screen_h = 240;
@@ -269,6 +325,7 @@ typedef struct {
     VECTOR psx_position;
     MATRIX rotation_matrix;
     MATRIX light_matrix;
+    int light_matrix_valid;
 } ps1_shared_character_transform;
 
 static ps1_shared_character_transform s_shared_character_transform;
@@ -335,6 +392,16 @@ static int corridor_near_z(void) {
 
 static int entity_is_viewmodel(const ps1_entity* ent) {
     return ent && ent->render_preset == PS1_RENDER_PRESET_VIEWMODEL;
+}
+
+static const ps1_entity* source_entity_by_id(uint32_t id) {
+    unsigned int i;
+    for (i = 0; i < g_ps1_scene.entity_count; ++i) {
+        const ps1_entity* source = ps1_scene_source_entity(i);
+        if (source && source->id == id)
+            return source;
+    }
+    return 0;
 }
 
 typedef struct {
@@ -598,19 +665,65 @@ typedef struct {
     int b;
 } ps1_clip_vert;
 
+/* Keep the original software camera-space projection for viewmodels.  Unlike
+ * world geometry it clamps against the much closer viewmodel near plane and
+ * preserves the authored camera-relative position correction.  The result is
+ * still cached once per vertex, while triangle lighting and redundant vertex
+ * animation work remain removed from the hot loop. */
 static VECTOR s_viewmodel_vertex_cache[PS1_VIEWMODEL_VERTEX_CACHE_MAX];
-static int16_t s_viewmodel_screen_x[PS1_VIEWMODEL_VERTEX_CACHE_MAX];
-static int16_t s_viewmodel_screen_y[PS1_VIEWMODEL_VERTEX_CACHE_MAX];
+static int32_t s_viewmodel_screen_cache[PS1_VIEWMODEL_VERTEX_CACHE_MAX];
+static int32_t s_viewmodel_depth_cache[PS1_VIEWMODEL_VERTEX_CACHE_MAX];
+static uint8_t s_viewmodel_face_light_cache[PS1_VIEWMODEL_TRI_CACHE_MAX][3];
+static const ps1_entity* s_viewmodel_light_entity = 0;
+static const ps1_mesh_tri* s_viewmodel_light_tris = 0;
+static MATRIX s_viewmodel_light_matrix;
+static MATRIX s_viewmodel_lighting_world;
+static int s_shading_unlit;
+static uint32_t s_viewmodel_light_revision;
+static const SVECTOR* s_viewmodel_lighting_vertices;
+static int32_t s_viewmodel_normal_scale_q12[3];
+static uint8_t s_viewmodel_light_base_r = 0;
+static uint8_t s_viewmodel_light_base_g = 0;
+static uint8_t s_viewmodel_light_base_b = 0;
+static uint8_t s_viewmodel_light_valid = 0;
 static int32_t s_rigid_screen_cache[PS1_RIGID_VERTEX_CACHE_MAX];
 static int32_t s_rigid_depth_cache[PS1_RIGID_VERTEX_CACHE_MAX];
 static int32_t s_static_screen_cache[PS1_STATIC_VERTEX_CACHE_TOTAL];
 static int32_t s_static_depth_cache[PS1_STATIC_VERTEX_CACHE_TOTAL];
+/* Unclamped camera-space coordinates are shared by near-plane clipping and
+ * conservative frustum rejection. GTE screen/depth output alone loses signed
+ * Z and saturates XY for the large triangles adjacent to the camera. */
+static VECTOR s_static_camera_cache[PS1_STATIC_VERTEX_CACHE_TOTAL];
+static uint8_t s_static_outcode_cache[PS1_STATIC_VERTEX_CACHE_TOTAL];
+static uint8_t s_static_projection_flags[PS1_STATIC_VERTEX_CACHE_TOTAL];
 /* Fog is Q8 in the inclusive 0..256 range. uint8_t would wrap fully opaque
  * fog (256) back to zero and make distant cached meshes appear unfogged. */
 static uint16_t s_static_fog_cache[PS1_STATIC_VERTEX_CACHE_TOTAL];
 static uint8_t s_static_light_cache[PS1_STATIC_VERTEX_CACHE_TOTAL][3];
 static uint8_t s_static_face_light_cache[PS1_STATIC_TRI_CACHE_TOTAL][3];
 static uint8_t s_static_quad_valid[PS1_STATIC_TRI_CACHE_TOTAL];
+static uint16_t s_static_visible_triangles[PS1_STATIC_TRI_CACHE_TOTAL];
+static uint8_t s_static_safe_clip_cache[PS1_STATIC_TRI_CACHE_TOTAL];
+#define PS1_VISIBILITY_BATCH_TRIANGLES 32
+#define PS1_VISIBILITY_BATCH_MAX ((PS1_STATIC_TRI_CACHE_TOTAL + 31) / 32 + PS1_STATIC_TOPOLOGY_CACHE_MAX)
+typedef struct {
+    uint32_t vertex_offset;
+    uint16_t vertex_count, triangle_begin, triangle_end;
+    SVECTOR center;
+    uint16_t extent[3];
+    int8_t plane_winding;
+} ps1_visibility_batch;
+typedef struct {
+    const ps1_mesh* mesh;
+    uint16_t batch_offset, batch_count;
+} ps1_visibility_topology;
+static ps1_visibility_topology s_visibility_topology[PS1_STATIC_TOPOLOGY_CACHE_MAX];
+static ps1_visibility_batch s_visibility_batches[PS1_VISIBILITY_BATCH_MAX];
+static uint16_t s_visibility_vertices[PS1_STATIC_TRI_CACHE_TOTAL * 3];
+static uint32_t s_visibility_vertex_used;
+static uint16_t s_visibility_batch_used;
+static uint8_t s_visibility_batch_outside[PS1_VISIBILITY_BATCH_MAX];
+static uint8_t s_static_active_vertex[PS1_STATIC_VERTEX_CACHE_TOTAL];
 
 typedef struct {
     const ps1_mesh* mesh;
@@ -627,20 +740,32 @@ typedef struct {
     const ps1_mesh* mesh;
     const ps1_mesh* next_mesh;
     const SVECTOR* lighting_norms;
+    const SVECTOR* lighting_face_norms;
     const ps1_mesh_tri* lighting_tris;
     MATRIX projected_matrix;
     MATRIX light_matrix;
+    int32_t normal_scale_q12[3];
+    MATRIX lighting_world;
+    uint32_t light_revision;
+    const SVECTOR* lighting_vertices;
+    const ps1_mesh* lighting_next_mesh;
+    uint8_t lighting_lerp_q8;
+    const ps1_mesh* lighting_probe_source;
     uint16_t vertex_offset;
     uint16_t vertex_capacity;
     uint16_t triangle_offset;
     uint16_t triangle_capacity;
     int geom_screen;
     int safe_clip_near_z;
+    int safe_clip_far_z;
     uint8_t vertex_lerp_q8;
     uint8_t base_r, base_g, base_b;
     uint8_t needs_safe_clip;
+    uint8_t visible_list_valid;
+    uint16_t visible_triangle_count;
     uint8_t projection_valid;
     uint8_t lighting_valid;
+    uint8_t lighting_unlit;
 } ps1_static_entity_cache;
 
 static ps1_static_entity_cache s_static_entity_caches[PS1_STATIC_ENTITY_CACHE_MAX];
@@ -648,6 +773,9 @@ static uint16_t s_static_vertex_cache_used;
 static uint16_t s_static_triangle_cache_used;
 
 static void reset_static_entity_caches(void) {
+    memset(s_visibility_topology, 0, sizeof(s_visibility_topology));
+    s_visibility_vertex_used = 0;
+    s_visibility_batch_used = 0;
     int i;
     s_static_vertex_cache_used = 0;
     s_static_triangle_cache_used = 0;
@@ -659,6 +787,79 @@ static void reset_static_entity_caches(void) {
     }
     for (i = 0; i < PS1_STATIC_TOPOLOGY_CACHE_MAX; ++i)
         s_static_topology_caches[i].mesh = 0;
+}
+
+/* Source topology is shared by instances. Group nearby exported faces and
+ * retain their unique position indices. An entire group can be rejected only
+ * when every vertex is outside the same frustum plane. */
+static const ps1_visibility_topology* visibility_topology_for(const ps1_mesh* mesh) {
+    ps1_visibility_topology* free_entry = 0;
+    const unsigned batches = (mesh->tri_count + PS1_VISIBILITY_BATCH_TRIANGLES - 1) / PS1_VISIBILITY_BATCH_TRIANGLES;
+    unsigned i;
+    for(i=0;i<PS1_STATIC_TOPOLOGY_CACHE_MAX;++i) {
+        if(s_visibility_topology[i].mesh == mesh) return &s_visibility_topology[i];
+        if(!s_visibility_topology[i].mesh && !free_entry) free_entry=&s_visibility_topology[i];
+    }
+    if(!free_entry || s_visibility_batch_used+batches>PS1_VISIBILITY_BATCH_MAX ||
+       s_visibility_vertex_used+(uint32_t)mesh->tri_count*3>PS1_STATIC_TRI_CACHE_TOTAL*3)
+        return 0;
+    free_entry->mesh=mesh;free_entry->batch_offset=s_visibility_batch_used;free_entry->batch_count=batches;
+    for(i=0;i<batches;++i) {
+        ps1_visibility_batch* batch=&s_visibility_batches[s_visibility_batch_used++];
+        unsigned end=(i+1)*PS1_VISIBILITY_BATCH_TRIANGLES, ti;
+        if(end>mesh->tri_count)end=mesh->tri_count;
+        batch->triangle_begin=i*PS1_VISIBILITY_BATCH_TRIANGLES;batch->triangle_end=end;
+        batch->vertex_offset=s_visibility_vertex_used;batch->vertex_count=0;
+        for(ti=batch->triangle_begin;ti<end;++ti) {
+            const ps1_mesh_tri* face=&mesh->tris[ti];
+            const uint16_t indices[3]={face->i0,face->i1,face->i2};
+            unsigned corner;
+            for(corner=0;corner<3;++corner) {
+                uint16_t p=indices[corner],j;
+                if(p>=mesh->vert_count)continue;
+                if(mesh->position_refs && mesh->position_refs[p]<mesh->vert_count)p=mesh->position_refs[p];
+                for(j=0;j<batch->vertex_count;++j)
+                    if(s_visibility_vertices[batch->vertex_offset+j]==p)break;
+                if(j==batch->vertex_count) {
+                    s_visibility_vertices[s_visibility_vertex_used++]=p;
+                    ++batch->vertex_count;
+                }
+            }
+        }
+        int minimum[3] = {32767,32767,32767}, maximum[3] = {-32768,-32768,-32768};
+        for (unsigned vi = 0; vi < batch->vertex_count; ++vi) {
+            const SVECTOR* vertex = &mesh->verts[s_visibility_vertices[batch->vertex_offset+vi]];
+            const int coordinates[3] = {vertex->vx,vertex->vy,vertex->vz};
+            for (unsigned axis = 0; axis < 3; ++axis) {
+                if (coordinates[axis] < minimum[axis]) minimum[axis] = coordinates[axis];
+                if (coordinates[axis] > maximum[axis]) maximum[axis] = coordinates[axis];
+            }
+        }
+        int center[3];
+        for (unsigned axis = 0; axis < 3; ++axis) {
+            center[axis] = (minimum[axis]+maximum[axis])/2;
+            const int a = center[axis]-minimum[axis], b = maximum[axis]-center[axis];
+            batch->extent[axis] = a > b ? a : b;
+        }
+        batch->center = (SVECTOR){center[0],center[1],center[2],0};
+        batch->plane_winding = 0;
+        if (!batch->extent[1] && batch->vertex_count) {
+            int sign = 0;
+            for (unsigned t = batch->triangle_begin; t < batch->triangle_end; ++t) {
+                const ps1_mesh_tri* face = &mesh->tris[t];
+                if (face->i0 >= mesh->vert_count || face->i1 >= mesh->vert_count || face->i2 >= mesh->vert_count) {sign=0;break;}
+                const SVECTOR* a=&mesh->verts[face->i0];
+                const SVECTOR* b=&mesh->verts[face->i1];
+                const SVECTOR* c=&mesh->verts[face->i2];
+                const int64_t ny=(int64_t)(b->vz-a->vz)*(c->vx-a->vx)-(int64_t)(b->vx-a->vx)*(c->vz-a->vz);
+                const int s=ny<0 ? -1 : ny>0 ? 1 : 0;
+                if (!s || (sign && s!=sign)) {sign=0;break;}
+                sign=s;
+            }
+            batch->plane_winding=sign;
+        }
+    }
+    return free_entry;
 }
 
 static int matrix_equal(const MATRIX* a, const MATRIX* b) {
@@ -747,6 +948,7 @@ static ps1_static_entity_cache* static_entity_cache_for(
     free_entry->mesh = 0;
     free_entry->next_mesh = 0;
     free_entry->lighting_norms = 0;
+    free_entry->lighting_face_norms = 0;
     free_entry->lighting_tris = 0;
     free_entry->vertex_offset = s_static_vertex_cache_used;
     free_entry->vertex_capacity = vertex_capacity;
@@ -754,6 +956,8 @@ static ps1_static_entity_cache* static_entity_cache_for(
     free_entry->triangle_capacity = triangle_capacity;
     free_entry->safe_clip_near_z = 0;
     free_entry->needs_safe_clip = 0;
+    free_entry->visible_list_valid = 0;
+    free_entry->visible_triangle_count = 0;
     free_entry->projection_valid = 0;
     free_entry->lighting_valid = 0;
     s_static_vertex_cache_used += vertex_capacity;
@@ -819,31 +1023,86 @@ static SVECTOR lerp_mesh_svector_q8(const SVECTOR* a, const ps1_mesh* current,
     return out;
 }
 
+/* The editor uses inverse-transpose(model) for normals. A rotation-only
+ * light matrix needs the reciprocal scale and renormalization first. */
+static SVECTOR scaled_shading_normal(const SVECTOR* normal) {
+    SVECTOR result = *normal;
+    if (s_normal_scale_q12[0] != ONE || s_normal_scale_q12[1] != ONE ||
+        s_normal_scale_q12[2] != ONE) {
+        VECTOR corrected;
+        corrected.vx = ((int32_t)normal->vx * s_normal_scale_q12[0]) >> 12;
+        corrected.vy = ((int32_t)normal->vy * s_normal_scale_q12[1]) >> 12;
+        corrected.vz = ((int32_t)normal->vz * s_normal_scale_q12[2]) >> 12;
+        VectorNormalS(&corrected, &result);
+    }
+    if (result.vx == 0 && result.vy == 0 && result.vz == 0)
+        result.vy = ONE;
+    return result;
+}
+
+static void shade_scene_normal(const SVECTOR* normal, const SVECTOR* vertex,
+    uint8_t base_r, uint8_t base_g, uint8_t base_b,
+    uint8_t* out_r, uint8_t* out_g, uint8_t* out_b) {
+    if (s_shading_unlit) { *out_r=base_r; *out_g=base_g; *out_b=base_b; return; }
+    SVECTOR corrected = scaled_shading_normal(normal);
+    int16_t world_normal[3];
+    int32_t world_position[3];
+    uint8_t base[3] = { base_r, base_g, base_b }, result[3];
+    VECTOR position;
+    SVECTOR interpolated;
+    int axis;
+    if (!s_shading_use_probe && vertex && s_shading_mesh && s_shading_next_mesh && s_shading_lerp_q8 &&
+        (uintptr_t)vertex >= (uintptr_t)s_shading_mesh->verts &&
+        (uintptr_t)vertex < (uintptr_t)(s_shading_mesh->verts + s_shading_mesh->vert_count)) {
+        unsigned int index = (unsigned int)(vertex - s_shading_mesh->verts);
+        interpolated = lerp_mesh_svector_q8(vertex, s_shading_mesh,
+            &s_shading_next_mesh->verts[index], s_shading_next_mesh, s_shading_lerp_q8);
+        vertex = &interpolated;
+    }
+    if (s_shading_use_probe) {
+        position.vx = position.vy = position.vz = 0;
+    } else if (vertex) transform_point(&s_shading_world, vertex, &position);
+    else {
+        position.vx = s_shading_world.t[0];
+        position.vy = s_shading_world.t[1];
+        position.vz = s_shading_world.t[2];
+    }
+    world_position[0] = position.vx;
+    world_position[1] = position.vy;
+    world_position[2] = position.vz;
+    for (axis = 0; axis < 3; ++axis)
+        world_normal[axis] = (int16_t)((
+            s_shading_rotation.m[axis][0] * (int32_t)corrected.vx +
+            s_shading_rotation.m[axis][1] * (int32_t)corrected.vy +
+            s_shading_rotation.m[axis][2] * (int32_t)corrected.vz) >> 12);
+    ps1_lighting_evaluate(s_shading_use_probe ? s_shading_probe_lights : s_scene_lights,
+        s_shading_use_probe ? s_shading_probe_count : s_scene_light_count,
+        world_position, world_normal, base, result);
+    *out_r = result[0]; *out_g = result[1]; *out_b = result[2];
+}
+
 /* Shade a mesh-local normal (12.4) with the current GTE light matrices. */
 static void gte_shade_normal_vec(SVECTOR* nSafe, uint8_t base_r, uint8_t base_g, uint8_t base_b,
                                  uint8_t* out_r, uint8_t* out_g, uint8_t* out_b) {
+    if (s_shading_unlit) { *out_r=base_r; *out_g=base_g; *out_b=base_b; return; }
     uint8_t lit[4];
-    int i;
+    if (s_scene_light_count) {
+        /* Rigid animation keeps its existing 27 normal bins. Evaluate point
+         * lights at the small rigid part's origin, not the character root. */
+        shade_scene_normal(nSafe, 0, base_r, base_g, base_b, out_r, out_g, out_b);
+        return;
+    }
 
-    if (nSafe->vx == 0 && nSafe->vy == 0 && nSafe->vz == 0)
-        nSafe->vy = 3800;
+    const SVECTOR corrected = scaled_shading_normal(nSafe);
 
     lit[0] = 128;
     lit[1] = 128;
     lit[2] = 128;
     lit[3] = 0;
     gte_ldrgb(lit);
-    gte_ldv0(nSafe);
+    gte_ldv0(&corrected);
     gte_ncs();
     gte_strgb(lit);
-
-    /* GTE MAC overflow / back-facing → 0 RGB. Lift shadows (half-Lambert-ish). */
-    for (i = 0; i < 3; ++i) {
-        if (lit[i] < 64)
-            lit[i] = 64;
-        else
-            lit[i] = (uint8_t)(((uint16_t)lit[i] * 3 + 80) >> 2);
-    }
 
     {
         int r = (int)(((uint16_t)lit[0] * (uint16_t)base_r) >> 8);
@@ -855,29 +1114,45 @@ static void gte_shade_normal_vec(SVECTOR* nSafe, uint8_t base_r, uint8_t base_g,
     }
 }
 
-static void gte_shade_normal(const SVECTOR* n, uint8_t base_r, uint8_t base_g, uint8_t base_b,
+static void gte_shade_normal(const SVECTOR* n, const SVECTOR* vertex, uint8_t base_r, uint8_t base_g, uint8_t base_b,
                              uint8_t* out_r, uint8_t* out_g, uint8_t* out_b) {
+    if (s_shading_unlit) { *out_r=base_r; *out_g=base_g; *out_b=base_b; return; }
+    if (s_scene_light_count) {
+        shade_scene_normal(n, vertex, base_r, base_g, base_b, out_r, out_g, out_b);
+        return;
+    }
     SVECTOR nSafe = *n;
     gte_shade_normal_vec(&nSafe, base_r, base_g, base_b, out_r, out_g, out_b);
 }
 
-static uint8_t clamp_textured_smooth_channel(uint8_t lit, uint8_t base) {
-    /* On textured PS1 primitives RGB 128 is neutral modulation. Values above
-     * it brighten the texel and turn smooth highlights into conspicuous,
-     * triangle-shaped overexposed regions. Preserve the full per-vertex
-     * gradient, but never let lighting amplify the source texture. */
-    const uint8_t ceiling = base < 128 ? base : 128;
-    return lit < ceiling ? lit : ceiling;
-}
-
-static void gte_shade_textured_smooth_normal(const SVECTOR* n,
+static void gte_shade_textured_smooth_normal(const SVECTOR* n, const SVECTOR* vertex,
                                              uint8_t base_r, uint8_t base_g, uint8_t base_b,
                                              uint8_t* out_r, uint8_t* out_g, uint8_t* out_b) {
-    uint8_t r, g, b;
-    gte_shade_normal(n, base_r, base_g, base_b, &r, &g, &b);
-    *out_r = clamp_textured_smooth_channel(r, base_r);
-    *out_g = clamp_textured_smooth_channel(g, base_g);
-    *out_b = clamp_textured_smooth_channel(b, base_b);
+    gte_shade_normal(n, vertex, base_r, base_g, base_b, out_r, out_g, out_b);
+}
+
+static SVECTOR mesh_face_center(const ps1_mesh* mesh, const ps1_mesh_tri* face) {
+    SVECTOR center = { 0, 0, 0, 0 };
+    /* Every caller uses this position only for lighting. Unlit does not
+     * need triangle-centre divisions or animated-position interpolation. */
+    if (s_shading_unlit)
+        return center;
+    if (face->i0 < mesh->vert_count && face->i1 < mesh->vert_count && face->i2 < mesh->vert_count) {
+        const SVECTOR* a = &mesh->verts[face->i0];
+        const SVECTOR* b = &mesh->verts[face->i1];
+        const SVECTOR* c = &mesh->verts[face->i2];
+        SVECTOR vertices[3];
+        if (s_scene_light_count && !s_shading_use_probe && mesh == s_shading_mesh && s_shading_next_mesh && s_shading_lerp_q8) {
+            vertices[0] = lerp_mesh_svector_q8(a, mesh, &s_shading_next_mesh->verts[face->i0], s_shading_next_mesh, s_shading_lerp_q8);
+            vertices[1] = lerp_mesh_svector_q8(b, mesh, &s_shading_next_mesh->verts[face->i1], s_shading_next_mesh, s_shading_lerp_q8);
+            vertices[2] = lerp_mesh_svector_q8(c, mesh, &s_shading_next_mesh->verts[face->i2], s_shading_next_mesh, s_shading_lerp_q8);
+            a = &vertices[0]; b = &vertices[1]; c = &vertices[2];
+        }
+        center.vx = ((int32_t)a->vx + b->vx + c->vx) / 3;
+        center.vy = ((int32_t)a->vy + b->vy + c->vy) / 3;
+        center.vz = ((int32_t)a->vz + b->vz + c->vz) / 3;
+    }
+    return center;
 }
 
 static void rigid_light_bin_normal(int bin, SVECTOR* out) {
@@ -894,37 +1169,46 @@ static void rigid_light_bin_normal(int bin, SVECTOR* out) {
         out->vy = 4096;
 }
 
-static void viewmodel_cpu_shade_normal(const MATRIX* light_mtx, const SVECTOR* n,
+static void viewmodel_cpu_shade_normal(const MATRIX* light_mtx, const SVECTOR* n, const SVECTOR* vertex,
                                        uint8_t base_r, uint8_t base_g, uint8_t base_b,
                                        uint8_t* out_r, uint8_t* out_g, uint8_t* out_b) {
+    if (s_shading_unlit) { *out_r=base_r; *out_g=base_g; *out_b=base_b; return; }
     const ps1_light* light = &g_ps1_scene.light;
     int32_t dot;
     int intensity;
     int r, g, b;
-
-    if (!light->enabled) {
-        *out_r = (uint8_t)(((uint16_t)128 * (uint16_t)base_r) >> 8);
-        *out_g = (uint8_t)(((uint16_t)128 * (uint16_t)base_g) >> 8);
-        *out_b = (uint8_t)(((uint16_t)128 * (uint16_t)base_b) >> 8);
+    const SVECTOR corrected = scaled_shading_normal(n);
+    if (s_scene_light_count) {
+        shade_scene_normal(n, vertex, base_r, base_g, base_b, out_r, out_g, out_b);
         return;
     }
 
-    dot = (int32_t)n->vx * light_mtx->m[0][0] +
-          (int32_t)n->vy * light_mtx->m[0][1] +
-          (int32_t)n->vz * light_mtx->m[0][2];
-    intensity = (int)(dot >> 12);
-    if (intensity < 0)
-        intensity = 0;
-    if (intensity > ONE)
-        intensity = ONE;
+    if (!light->enabled) {
+        /* Same legacy directional preview as Renderer::LightData. */
+        dot = (int32_t)corrected.vx * light_mtx->m[0][0] +
+              (int32_t)corrected.vy * light_mtx->m[0][1] +
+              (int32_t)corrected.vz * light_mtx->m[0][2];
+        intensity = (int)(dot >> 12);
+        if (intensity < 0) intensity = 0;
+        if (intensity > ONE) intensity = ONE;
+        r = 38 + (255 * intensity) / ONE;
+        g = 36 + (242 * intensity) / ONE;
+        b = 33 + (217 * intensity) / ONE;
+    } else {
+        dot = (int32_t)corrected.vx * light_mtx->m[0][0] +
+              (int32_t)corrected.vy * light_mtx->m[0][1] +
+              (int32_t)corrected.vz * light_mtx->m[0][2];
+        intensity = (int)(dot >> 12);
+        if (intensity < 0) intensity = 0;
+        if (intensity > ONE) intensity = ONE;
+        r = light->ambient_r + (int)(((int32_t)light->color_r * intensity) / ONE);
+        g = light->ambient_g + (int)(((int32_t)light->color_g * intensity) / ONE);
+        b = light->ambient_b + (int)(((int32_t)light->color_b * intensity) / ONE);
+    }
 
-    r = light->ambient_r + (int)(((int32_t)light->color_r * 3 * intensity) / (5 * ONE));
-    g = light->ambient_g + (int)(((int32_t)light->color_g * 3 * intensity) / (5 * ONE));
-    b = light->ambient_b + (int)(((int32_t)light->color_b * 3 * intensity) / (5 * ONE));
-
-    if (r < 48) r = 48; else if (r > 255) r = 255;
-    if (g < 48) g = 48; else if (g > 255) g = 255;
-    if (b < 48) b = 48; else if (b > 255) b = 255;
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
 
     *out_r = (uint8_t)(((uint16_t)r * (uint16_t)base_r) >> 8);
     *out_g = (uint8_t)(((uint16_t)g * (uint16_t)base_g) >> 8);
@@ -945,6 +1229,35 @@ static int triangle_outside_screen(int16_t x0, int16_t y0, int16_t x1, int16_t y
     return 0;
 }
 
+static uint8_t __attribute__((noinline)) camera_outcode(const VECTOR* p, int near_z) {
+    if ((uint32_t)p->vx + 1048575u <= 2097150u &&
+        (uint32_t)p->vy + 1048575u <= 2097150u &&
+        (uint32_t)p->vz + 1048575u <= 2097150u &&
+        (unsigned)s_geom_screen <= 1023u &&
+        (unsigned)s_screen_w <= 1024u && (unsigned)s_screen_h <= 1024u) {
+        const int32_t x = s_geom_screen * p->vx;
+        const int32_t y = s_geom_screen * p->vy;
+        const int32_t z = p->vz;
+        return (z < near_z ? 1 : 0) | (z > s_far_z ? 2 : 0) |
+            (x < -(s_screen_w / 2 + 2) * z ? 4 : 0) |
+            (x > (s_screen_w - s_screen_w / 2 + 2) * z ? 8 : 0) |
+            (y < -(s_screen_h / 2 + 2) * z ? 16 : 0) |
+            (y > (s_screen_h - s_screen_h / 2 + 2) * z ? 32 : 0);
+    }
+    const int64_t x = (int64_t)s_geom_screen * p->vx;
+    const int64_t y = (int64_t)s_geom_screen * p->vy;
+    const int64_t z = p->vz;
+    uint8_t result = 0;
+    if (z < near_z) result |= 1;
+    if (z > s_far_z) result |= 2;
+    /* Two pixels retain GTE rounding and the one-pixel seam expansion. */
+    if (x < -(s_screen_w / 2 + 2) * z) result |= 4;
+    if (x > (s_screen_w - s_screen_w / 2 + 2) * z) result |= 8;
+    if (y < -(s_screen_h / 2 + 2) * z) result |= 16;
+    if (y > (s_screen_h - s_screen_h / 2 + 2) * z) result |= 32;
+    return result;
+}
+
 static void update_fog_solid_distance(void) {
     const int span = s_fog_end_z - s_fog_start_z;
     /* Keep the authored fade range unchanged. Texture removal happens half a
@@ -959,6 +1272,41 @@ static void update_fog_solid_distance(void) {
 
 static void apply_scene_lighting(void) {
     const ps1_light* l = &g_ps1_scene.light;
+    unsigned int light_index;
+    unsigned int light_count = g_ps1_scene.light_count;
+    if (light_count > PS1_LIGHT_LIMIT) light_count = PS1_LIGHT_LIMIT;
+    if (light_count != s_scene_light_count) ++s_scene_light_revision;
+    s_scene_light_count = light_count;
+    for (light_index = 0; light_index < light_count; ++light_index) {
+        const ps1_scene_light* source = &g_ps1_scene.lights[light_index];
+        const ps1_entity* entity = source->entity_index >= 0
+            ? ps1_scene_entity((unsigned int)source->entity_index) : 0;
+        const ps1_entity* authored = source->entity_index >= 0
+            ? ps1_scene_source_entity((unsigned int)source->entity_index) : 0;
+        ps1_lighting_light light = { 0 };
+        int axis;
+        light.type = source->type;
+        light.range = world_to_psx(source->range);
+        if (source->range > 0 && light.range <= 0) light.range = 1;
+        light.cos_outer = source->cos_outer;
+        light.cos_inner = source->cos_inner;
+        for (axis = 0; axis < 3; ++axis) {
+            light.position[axis] = world_to_psx(entity ? entity->position[axis] : source->position[axis]);
+            light.direction[axis] = source->direction[axis];
+            light.color_q12[axis] = source->color_q12[axis];
+        }
+        if (entity && authored && memcmp(entity->rotation, authored->rotation, sizeof(entity->rotation))) {
+            MATRIX rotation;
+            SVECTOR euler;
+            unity_euler_to_psx_object(entity->rotation[0], entity->rotation[1], entity->rotation[2], &euler);
+            RotMatrix(&euler, &rotation);
+            for (axis = 0; axis < 3; ++axis) light.direction[axis] = rotation.m[axis][2];
+        }
+        if (memcmp(&s_scene_lights[light_index], &light, sizeof(light))) {
+            s_scene_lights[light_index] = light;
+            ++s_scene_light_revision;
+        }
+    }
     s_fog_start_z = world_to_psx(g_ps1_scene.fog_start);
     s_fog_end_z = world_to_psx(g_ps1_scene.fog_end);
     if (s_fog_end_z <= s_fog_start_z)
@@ -969,8 +1317,7 @@ static void apply_scene_lighting(void) {
         gte_SetBackColor(l->ambient_r, l->ambient_g, l->ambient_b);
 
         /* Color matrix: column 0 = light color (12.4, ONE=4096). */
-        /* Scale light down a bit to better match editor brightness. */
-        const int32_t scale = (ONE * 3) / 5; /* ~60% */
+        const int32_t scale = ONE;
         s_scene_color_mtx.m[0][0] = (int16_t)((int32_t)l->color_r * scale / 255);
         s_scene_color_mtx.m[1][0] = (int16_t)((int32_t)l->color_g * scale / 255);
         s_scene_color_mtx.m[2][0] = (int16_t)((int32_t)l->color_b * scale / 255);
@@ -985,20 +1332,16 @@ static void apply_scene_lighting(void) {
         s_light_mtx.m[1][0] = 0; s_light_mtx.m[1][1] = 0; s_light_mtx.m[1][2] = 0;
         s_light_mtx.m[2][0] = 0; s_light_mtx.m[2][1] = 0; s_light_mtx.m[2][2] = 0;
     } else {
-        /* A new scene has no explicit light yet. Keep the fallback close to
-         * the editor's neutral preview instead of driving white materials to
-         * 255 and washing out every untextured primitive. */
-        const int32_t fallback_scale = (ONE * 3) / 5;
-        gte_SetBackColor(32, 32, 32);
-        s_scene_color_mtx.m[0][0] = fallback_scale;
-        s_scene_color_mtx.m[1][0] = fallback_scale;
-        s_scene_color_mtx.m[2][0] = fallback_scale;
+        /* Renderer::LightData fallback: colour (1,.95,.85), ambient .15,
+         * surface-to-light direction normalize(.5,1,.3). */
+        gte_SetBackColor(38, 36, 33);
+        s_scene_color_mtx.m[0][0] = ONE;
+        s_scene_color_mtx.m[1][0] = 3891;
+        s_scene_color_mtx.m[2][0] = 3482;
         s_scene_color_mtx.m[0][1] = 0;   s_scene_color_mtx.m[1][1] = 0;   s_scene_color_mtx.m[2][1] = 0;
         s_scene_color_mtx.m[0][2] = 0;   s_scene_color_mtx.m[1][2] = 0;   s_scene_color_mtx.m[2][2] = 0;
         gte_SetColorMatrix(&s_scene_color_mtx);
-        /* No exported light: use a neutral overhead light.  Normals use the
-         * engine's +Y-up convention, so -Y would illuminate undersides. */
-        s_light_mtx.m[0][0] = 0; s_light_mtx.m[0][1] = ONE; s_light_mtx.m[0][2] = 0;
+        s_light_mtx.m[0][0] = 1769; s_light_mtx.m[0][1] = 3538; s_light_mtx.m[0][2] = 1061;
         s_light_mtx.m[1][0] = 0; s_light_mtx.m[1][1] = 0; s_light_mtx.m[1][2] = 0;
         s_light_mtx.m[2][0] = 0; s_light_mtx.m[2][1] = 0; s_light_mtx.m[2][2] = 0;
     }
@@ -1109,58 +1452,6 @@ static void apply_scene_fog_vertex3(int32_t z0, int32_t z1, int32_t z2,
     apply_scene_fog(z2, r2, g2, b2);
 }
 
-/* Convert one material UV axis to the texture's local pixel range. Tiling and
- * offset travel with the entity as signed 8.8 values, so primitive meshes use
- * the same material contract as exported custom meshes. `is_end` preserves
- * the last texel at a positive repeat boundary instead of wrapping it to 0. */
-static int primitive_material_uv(int texture_base, int texture_span,
-                                 int16_t tiling_q8, int16_t offset_q8,
-                                 int grid, int divisions, int is_end) {
-    int32_t coordinate_q8;
-    int32_t fraction_q8;
-    int pixel;
-    if (divisions < 1)
-        divisions = 1;
-    coordinate_q8 = (int32_t)offset_q8 +
-        ((int32_t)tiling_q8 * (int32_t)grid) / divisions;
-    fraction_q8 = coordinate_q8 % 256;
-    if (fraction_q8 < 0)
-        fraction_q8 += 256;
-    if (fraction_q8 == 0) {
-        if (is_end && tiling_q8 > 0)
-            fraction_q8 = 256;
-        else if (!is_end && tiling_q8 < 0)
-            fraction_q8 = 256;
-    }
-    pixel = texture_base + (int)((fraction_q8 * texture_span + 128) >> 8);
-    return clamp_u8(pixel);
-}
-
-static int primitive_plane_axis_tiles(int16_t tiling_q8, uint8_t subdivision_levels) {
-    int magnitude = (int)tiling_q8;
-    int repeats;
-    int subdivision_tiles = 4;
-    if (magnitude < 0)
-        magnitude = -magnitude;
-    repeats = (magnitude + 255) >> 8;
-    /* Four subdivisions remain the geometry-precision baseline. For repeated
-     * textures, every integral repeat needs its own polygon boundary because
-     * PS1 UV coordinates cannot wrap multiple times inside one primitive. */
-    if (repeats < 4)
-        repeats = 4;
-    if (subdivision_levels > 4)
-        subdivision_levels = 4;
-    if (subdivision_levels > 0)
-        subdivision_tiles = 1 << subdivision_levels;
-    if (repeats < subdivision_tiles)
-        repeats = subdivision_tiles;
-    /* Bound the generated plane to 512 triangles so a single material cannot
-     * consume the whole per-frame GPU packet buffer. */
-    if (repeats > 16)
-        repeats = 16;
-    return repeats;
-}
-
 static void transform_point(const MATRIX* m, const SVECTOR* in, VECTOR* out) {
     out->vx = (int)(((int64_t)m->m[0][0] * in->vx +
                      (int64_t)m->m[0][1] * in->vy +
@@ -1258,14 +1549,14 @@ static ps1_clip_vert lerp_clip_vert(const ps1_clip_vert* a, const ps1_clip_vert*
     const int az = near_z - a->p.vz;
     if (dz == 0)
         return *a;
-    out.p.vx = a->p.vx + (int)(((int64_t)(b->p.vx - a->p.vx) * az) / dz);
-    out.p.vy = a->p.vy + (int)(((int64_t)(b->p.vy - a->p.vy) * az) / dz);
+    out.p.vx = ps1_clip_lerp(a->p.vx, b->p.vx, az, dz);
+    out.p.vy = ps1_clip_lerp(a->p.vy, b->p.vy, az, dz);
     out.p.vz = near_z;
-    out.u = a->u + (int)(((int64_t)(b->u - a->u) * az) / dz);
-    out.v = a->v + (int)(((int64_t)(b->v - a->v) * az) / dz);
-    out.r = a->r + (int)(((int64_t)(b->r - a->r) * az) / dz);
-    out.g = a->g + (int)(((int64_t)(b->g - a->g) * az) / dz);
-    out.b = a->b + (int)(((int64_t)(b->b - a->b) * az) / dz);
+    out.u = ps1_clip_lerp(a->u, b->u, az, dz);
+    out.v = ps1_clip_lerp(a->v, b->v, az, dz);
+    out.r = ps1_clip_lerp(a->r, b->r, az, dz);
+    out.g = ps1_clip_lerp(a->g, b->g, az, dz);
+    out.b = ps1_clip_lerp(a->b, b->b, az, dz);
     return out;
 }
 
@@ -1293,16 +1584,28 @@ static int clip_triangle_near(const ps1_clip_vert in[3], ps1_clip_vert out[4], i
     return count;
 }
 
-typedef struct {
-    int32_t x;
-    int32_t y;
-    int32_t z;
-    int u;
-    int v;
-    int r;
-    int g;
-    int b;
-} ps1_screen_clip_vert;
+static int clip_world_depth(const ps1_clip_vert in[3], ps1_clip_vert out[6],
+                            int near_z, int far_z) {
+    if (in[0].p.vz >= near_z && in[0].p.vz <= far_z &&
+        in[1].p.vz >= near_z && in[1].p.vz <= far_z &&
+        in[2].p.vz >= near_z && in[2].p.vz <= far_z) {
+        /* Preserve the two original clipping passes' cyclic vertex order. */
+        out[0] = in[2]; out[1] = in[0]; out[2] = in[1];
+        return 3;
+    }
+    ps1_clip_vert near_clipped[4];
+    const int count = clip_triangle_near(in, near_clipped, near_z);
+    int output_count = 0;
+    for (int i = 0; i < count; ++i) {
+        const ps1_clip_vert* a = &near_clipped[i];
+        const ps1_clip_vert* b = &near_clipped[(i + 1) % count];
+        const int a_inside = a->p.vz <= far_z;
+        const int b_inside = b->p.vz <= far_z;
+        if (a_inside != b_inside) out[output_count++] = lerp_clip_vert(a, b, far_z);
+        if (b_inside) out[output_count++] = *b;
+    }
+    return output_count;
+}
 
 static void project_clip_vert_wide(const ps1_clip_vert* in,
                                    ps1_screen_clip_vert* out, int min_z) {
@@ -1311,8 +1614,9 @@ static void project_clip_vert_wide(const ps1_clip_vert* in,
     int64_t sy;
     if (z < min_z)
         z = min_z;
-    sx = (s_screen_w / 2) + ((int64_t)s_geom_screen * in->p.vx) / z;
-    sy = (s_screen_h / 2) + ((int64_t)s_geom_screen * in->p.vy) / z;
+    const uint32_t factor = ps1_projection_factor(s_geom_screen, z);
+    sx = ps1_projection_axis(in->p.vx, factor, s_screen_w / 2);
+    sy = ps1_projection_axis(in->p.vy, factor, s_screen_h / 2);
     /* Values farther away than this are equivalent for viewport clipping.
      * Bounding them keeps the following edge interpolation comfortably in
      * 64-bit range even for extreme authored scales. */
@@ -1334,20 +1638,25 @@ static ps1_screen_clip_vert lerp_screen_clip_vert(
         const ps1_screen_clip_vert* a, const ps1_screen_clip_vert* b,
         int axis, int boundary) {
     ps1_screen_clip_vert out;
+    /* Canonical edge direction also keeps perspective attributes identical. */
+    if ((axis == 0 ? a->x : a->y) > (axis == 0 ? b->x : b->y)) {
+        const ps1_screen_clip_vert* swap = a; a = b; b = swap;
+    }
     const int32_t av = axis == 0 ? a->x : a->y;
     const int32_t bv = axis == 0 ? b->x : b->y;
     const int32_t denominator = bv - av;
     const int32_t numerator = boundary - av;
     if (denominator == 0)
         return *a;
-    out.x = a->x + (int32_t)(((int64_t)(b->x - a->x) * numerator) / denominator);
-    out.y = a->y + (int32_t)(((int64_t)(b->y - a->y) * numerator) / denominator);
-    out.z = a->z + (int32_t)(((int64_t)(b->z - a->z) * numerator) / denominator);
-    out.u = a->u + (int)(((int64_t)(b->u - a->u) * numerator) / denominator);
-    out.v = a->v + (int)(((int64_t)(b->v - a->v) * numerator) / denominator);
-    out.r = a->r + (int)(((int64_t)(b->r - a->r) * numerator) / denominator);
-    out.g = a->g + (int)(((int64_t)(b->g - a->g) * numerator) / denominator);
-    out.b = a->b + (int)(((int64_t)(b->b - a->b) * numerator) / denominator);
+    out.x = a->x + (int32_t)ps1_clip_mul_div(b->x - a->x, numerator, denominator);
+    out.y = a->y + (int32_t)ps1_clip_mul_div(b->y - a->y, numerator, denominator);
+    const ps1_clip_weight weight = ps1_clip_make_weight(a->z,b->z,numerator,denominator);
+    out.z = ps1_clip_weight_attribute(a->z, b->z, &weight);
+    out.u = ps1_clip_weight_attribute(a->u, b->u, &weight);
+    out.v = ps1_clip_weight_attribute(a->v, b->v, &weight);
+    out.r = ps1_clip_weight_attribute(a->r, b->r, &weight);
+    out.g = ps1_clip_weight_attribute(a->g, b->g, &weight);
+    out.b = ps1_clip_weight_attribute(a->b, b->b, &weight);
     if (axis == 0)
         out.x = boundary;
     else
@@ -1360,24 +1669,24 @@ static int clip_screen_edge(const ps1_screen_clip_vert* input, int input_count,
                             int axis, int boundary, int keep_greater) {
     int output_count = 0;
     int i;
-    ps1_screen_clip_vert previous;
+    const ps1_screen_clip_vert* previous;
     if (input_count <= 0)
         return 0;
-    previous = input[input_count - 1];
+    previous = &input[input_count - 1];
     for (i = 0; i < input_count; ++i) {
-        const ps1_screen_clip_vert current = input[i];
-        const int32_t current_axis = axis == 0 ? current.x : current.y;
-        const int32_t previous_axis = axis == 0 ? previous.x : previous.y;
+        const ps1_screen_clip_vert* current = &input[i];
+        const int32_t current_axis = axis == 0 ? current->x : current->y;
+        const int32_t previous_axis = axis == 0 ? previous->x : previous->y;
         const int current_inside =
             keep_greater ? current_axis >= boundary : current_axis <= boundary;
         const int previous_inside =
             keep_greater ? previous_axis >= boundary : previous_axis <= boundary;
         if (current_inside != previous_inside && output_count < max_output) {
             output[output_count++] = lerp_screen_clip_vert(
-                &previous, &current, axis, boundary);
+                previous, current, axis, boundary);
         }
         if (current_inside && output_count < max_output)
-            output[output_count++] = current;
+            output[output_count++] = *current;
         previous = current;
     }
     return output_count;
@@ -1390,24 +1699,50 @@ static int clip_polygon_to_safe_screen(const ps1_screen_clip_vert* input,
     ps1_screen_clip_vert b[12];
     int count = input_count;
     int i;
+    unsigned planes = 0;
     if (count > 12)
         count = 12;
-    for (i = 0; i < count; ++i)
-        a[i] = input[i];
-    /* Leave two pixels below the GPU's 1023x511 maximum span so the one-pixel
-     * seam fill performed after clipping cannot push a primitive over it. */
-    count = clip_screen_edge(a, count, b, 12, 0, s_screen_w / 2 - 510, 1);
-    count = clip_screen_edge(b, count, a, 12, 0, s_screen_w / 2 + 510, 0);
-    count = clip_screen_edge(a, count, b, 12, 1, s_screen_h / 2 - 254, 1);
-    count = clip_screen_edge(b, count, output, 12, 1, s_screen_h / 2 + 254, 0);
+    for (i = 0; i < count; ++i) {
+        if (input[i].x < -2) planes |= 1;
+        if (input[i].x > s_screen_w + 1) planes |= 2;
+        if (input[i].y < -2) planes |= 4;
+        if (input[i].y > s_screen_h + 1) planes |= 8;
+    }
+    /* Clip to the visible viewport, with a two-pixel seam margin. Keeping the
+     * GPU's entire coordinate range left giant offscreen UV spans intact. */
+    const ps1_screen_clip_vert* current = input;
+    ps1_screen_clip_vert* scratch = a;
+    for (unsigned plane = 0; plane < 4 && count; ++plane) {
+        if (!(planes & (1u << plane))) continue;
+        const int boundary = plane == 0 || plane == 2 ? -2
+            : plane == 1 ? s_screen_w + 1 : s_screen_h + 1;
+        count = clip_screen_edge(current, count, scratch, 12,
+            plane >> 1, boundary, !(plane & 1));
+        current = scratch;
+        scratch = scratch == a ? b : a;
+    }
+    for (i = 0; i < count; ++i) output[i] = current[i];
     return count;
 }
 
-static int camera_triangle_needs_safe_clip(const ps1_clip_vert vert[3], int min_z) {
+static int authored_floor_face(const ps1_entity* ent, const ps1_mesh_tri* face) {
+    return ent->render_preset == PS1_RENDER_PRESET_FLOOR ||
+        (ent->render_preset == PS1_RENDER_PRESET_CORRIDOR &&
+         (face->ny >= 3584 || face->ny <= -3584));
+}
+
+static int camera_triangle_needs_safe_clip(const ps1_clip_vert vert[3], int min_z,
+                                          int affine_correction) {
     int i;
     for (i = 0; i < 3; ++i) {
-        if (vert[i].p.vz < min_z)
+        const int z = vert[i].p.vz;
+        if (z < min_z || z > s_far_z || (int64_t)z * 2 <= s_geom_screen)
             return 1;
+        const uint32_t factor = ps1_projection_factor(s_geom_screen, z);
+        const int64_t x = ps1_projection_axis(vert[i].p.vx, factor, s_screen_w / 2);
+        const int64_t y = ps1_projection_axis(vert[i].p.vy, factor, s_screen_h / 2);
+        if (x <= -1024 || x >= 1023 || y <= -1024 || y >= 1023) return 1;
+        if (x < -2 || x > s_screen_w + 1 || y < -2 || y > s_screen_h + 1) return 1;
     }
     for (i = 0; i < 3; ++i) {
         const int j = (i + 1) % 3;
@@ -1421,13 +1756,18 @@ static int camera_triangle_needs_safe_clip(const ps1_clip_vert vert[3], int min_
         if ((int64_t)s_geom_screen * dx > 1020 * zz ||
             (int64_t)s_geom_screen * dy > 508 * zz)
             return 1;
+        if (affine_correction && ((int64_t)s_geom_screen * dx > 64 * zz ||
+             (int64_t)s_geom_screen * dy > 64 * zz) &&
+            ((int64_t)vert[i].p.vz * 8 > (int64_t)vert[j].p.vz * 9 ||
+             (int64_t)vert[j].p.vz * 8 > (int64_t)vert[i].p.vz * 9))
+            return 1;
     }
     return 0;
 }
 
 static int cached_triangle_needs_safe_clip(
         int32_t sxy0, int32_t sxy1, int32_t sxy2,
-        int32_t z0, int32_t z1, int32_t z2, int min_z) {
+        int32_t z0, int32_t z1, int32_t z2, int min_z, int affine_correction) {
     const int x0 = (int16_t)(sxy0 & 0xffff);
     const int y0 = (int16_t)(sxy0 >> 16);
     const int x1 = (int16_t)(sxy1 & 0xffff);
@@ -1438,7 +1778,9 @@ static int cached_triangle_needs_safe_clip(
     int max_x = x0;
     int min_y = y0;
     int max_y = y0;
-    if (z0 < min_z || z1 < min_z || z2 < min_z)
+    if (ps1_projection_vertex_needs_clip(sxy0, z0, min_z, s_far_z, s_geom_screen) ||
+        ps1_projection_vertex_needs_clip(sxy1, z1, min_z, s_far_z, s_geom_screen) ||
+        ps1_projection_vertex_needs_clip(sxy2, z2, min_z, s_far_z, s_geom_screen))
         return 1;
     if (x1 < min_x) min_x = x1;
     if (x1 > max_x) max_x = x1;
@@ -1448,7 +1790,22 @@ static int cached_triangle_needs_safe_clip(
     if (y1 > max_y) max_y = y1;
     if (y2 < min_y) min_y = y2;
     if (y2 > max_y) max_y = y2;
-    return max_x - min_x > 1020 || max_y - min_y > 508;
+    if (max_x - min_x > 1020 || max_y - min_y > 508) return 1;
+    /* Both triangles sharing an offscreen edge must clip it. Clipping only
+     * the one exceeding GPU limits rounds a new boundary endpoint while its
+     * neighbour retains the original long edge, opening a diagonal crack. */
+    if (min_x < -2 || max_x > s_screen_w + 1 ||
+        min_y < -2 || max_y > s_screen_h + 1) return 1;
+    /* Authored floor grids already carry their subdivision. Keep all real
+     * projection/near-plane clipping above, without routing them through the
+     * wall's extra affine-correction path. */
+    if (!affine_correction) return 0;
+    int min_depth = z0 < z1 ? z0 : z1;
+    int max_depth = z0 > z1 ? z0 : z1;
+    if (z2 < min_depth) min_depth = z2;
+    if (z2 > max_depth) max_depth = z2;
+    return (max_x - min_x > 64 || max_y - min_y > 64) &&
+           max_depth - min_depth > min_depth / 8;
 }
 
 static void project_clip_vert(const ps1_clip_vert* in, int16_t* x, int16_t* y, int min_z) {
@@ -1456,21 +1813,16 @@ static void project_clip_vert(const ps1_clip_vert* in, int16_t* x, int16_t* y, i
     int sx, sy;
     if (z < min_z)
         z = min_z;
-    sx = (s_screen_w / 2) + (int)(((int64_t)s_geom_screen * in->p.vx) / z);
-    sy = (s_screen_h / 2) + (int)(((int64_t)s_geom_screen * in->p.vy) / z);
+    const uint32_t factor = ps1_projection_factor(s_geom_screen, z);
+    sx = ps1_projection_axis(in->p.vx, factor, s_screen_w / 2);
+    sy = ps1_projection_axis(in->p.vy, factor, s_screen_h / 2);
     *x = (int16_t)clamp_i16(sx);
     *y = (int16_t)clamp_i16(sy);
 }
 
 static void project_vector_vert(const VECTOR* in, int16_t* x, int16_t* y, int min_z) {
-    int z = in->vz;
-    int sx, sy;
-    if (z < min_z)
-        z = min_z;
-    sx = (s_screen_w / 2) + (int)(((int64_t)s_geom_screen * in->vx) / z);
-    sy = (s_screen_h / 2) + (int)(((int64_t)s_geom_screen * in->vy) / z);
-    *x = (int16_t)clamp_i16(sx);
-    *y = (int16_t)clamp_i16(sy);
+    *x = ps1_viewmodel_project_axis(in->vx, in->vz, s_geom_screen, s_screen_w / 2, min_z);
+    *y = ps1_viewmodel_project_axis(in->vy, in->vz, s_geom_screen, s_screen_h / 2, min_z);
 }
 
 static int screen_front_facing(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
@@ -1693,7 +2045,7 @@ static void draw_debug_projected_point(char** pri, const char* packet_end, uint3
     setXY0(tile, x - 2, y - 2);
     setWH(tile, 5, 5);
     setRGB0(tile, r, g, b);
-    addPrim(ot + (OT_LEN - 2), tile);
+    add_world_primitive(ot + (OT_LEN - 2), tile);
     *pri = (char*)(tile + 1);
 }
 
@@ -1898,12 +2250,13 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
     if (discard_solid_fog_quad(z[0], z[1], z[2], z[3]))
         return 0;
 
-    if (ctx->fog_enabled && z[0] >= s_fog_solid_z && z[1] >= s_fog_solid_z &&
+    if (ctx->fog_enabled && !ps1_texture_has_cutout(ctx->mesh->tris[triangle_index].texture_index ? ctx->mesh->tris[triangle_index].texture_index : ctx->ent->texture_index) && z[0] >= s_fog_solid_z && z[1] >= s_fog_solid_z &&
         z[2] >= s_fog_solid_z && z[3] >= s_fog_solid_z) {
         opaque_fog_solid = 1;
     }
 
-    SEAM_FILL_EXPAND4(x[0], y[0], x[1], y[1], x[2], y[2], x[3], y[3]);
+    if (!authored_floor_face(ctx->ent, &ctx->mesh->tris[triangle_index]))
+        SEAM_FILL_EXPAND4(x[0], y[0], x[1], y[1], x[2], y[2], x[3], y[3]);
     avsz = (z[0] + z[1] + z[2] + z[3]) / 16;
     otz = mesh_triangle_otz_fine(avsz);
     otz = floor_surface_otz(ctx->ent,
@@ -1962,7 +2315,7 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
                    clamp_u8(ctx->uoff + ctx->mesh->uvs[q[1]].u), clamp_u8(ctx->voff + ctx->mesh->uvs[q[1]].v),
                    clamp_u8(ctx->uoff + ctx->mesh->uvs[q[2]].u), clamp_u8(ctx->voff + ctx->mesh->uvs[q[2]].v),
                    clamp_u8(ctx->uoff + ctx->mesh->uvs[q[3]].u), clamp_u8(ctx->voff + ctx->mesh->uvs[q[3]].v));
-            addPrim(ctx->ot + otz, poly);
+            add_world_primitive(ctx->ot + otz, poly);
             *ctx->pri = (char*)(poly + 1);
         } else {
             POLY_FT4* poly;
@@ -1979,7 +2332,7 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
                    clamp_u8(ctx->uoff + ctx->mesh->uvs[q[1]].u), clamp_u8(ctx->voff + ctx->mesh->uvs[q[1]].v),
                    clamp_u8(ctx->uoff + ctx->mesh->uvs[q[2]].u), clamp_u8(ctx->voff + ctx->mesh->uvs[q[2]].v),
                    clamp_u8(ctx->uoff + ctx->mesh->uvs[q[3]].u), clamp_u8(ctx->voff + ctx->mesh->uvs[q[3]].v));
-            addPrim(ctx->ot + otz, poly);
+            add_world_primitive(ctx->ot + otz, poly);
             *ctx->pri = (char*)(poly + 1);
         }
     } else if (gouraud_fog) {
@@ -1993,7 +2346,7 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
         poly->r1 = r[1]; poly->g1 = g[1]; poly->b1 = b[1];
         poly->r2 = r[2]; poly->g2 = g[2]; poly->b2 = b[2];
         poly->r3 = r[3]; poly->g3 = g[3]; poly->b3 = b[3];
-        addPrim(ctx->ot + otz, poly);
+        add_world_primitive(ctx->ot + otz, poly);
         *ctx->pri = (char*)(poly + 1);
     } else {
         POLY_F4* poly;
@@ -2003,7 +2356,7 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
         setPolyF4(poly);
         setXY4(poly, x[0], y[0], x[1], y[1], x[2], y[2], x[3], y[3]);
         setRGB0(poly, r[0], g[0], b[0]);
-        addPrim(ctx->ot + otz, poly);
+        add_world_primitive(ctx->ot + otz, poly);
         *ctx->pri = (char*)(poly + 1);
     }
     return 1;
@@ -2051,7 +2404,7 @@ static int __attribute__((noinline)) draw_cached_flat_fog_triangle(
                clamp_u8(ctx->voff + ctx->mesh->uvs[ctx->face->i1].v),
                clamp_u8(ctx->uoff + ctx->mesh->uvs[ctx->face->i2].u),
                clamp_u8(ctx->voff + ctx->mesh->uvs[ctx->face->i2].v));
-        addPrim(ctx->ot + ctx->otz, poly);
+        add_world_primitive(ctx->ot + ctx->otz, poly);
         *ctx->pri = (char*)(poly + 1);
     } else {
         POLY_G3* poly;
@@ -2064,7 +2417,7 @@ static int __attribute__((noinline)) draw_cached_flat_fog_triangle(
         poly->r0 = ctx->r[0]; poly->g0 = ctx->g[0]; poly->b0 = ctx->b[0];
         poly->r1 = ctx->r[1]; poly->g1 = ctx->g[1]; poly->b1 = ctx->b[1];
         poly->r2 = ctx->r[2]; poly->g2 = ctx->g[2]; poly->b2 = ctx->b[2];
-        addPrim(ctx->ot + ctx->otz, poly);
+        add_world_primitive(ctx->ot + ctx->otz, poly);
         *ctx->pri = (char*)(poly + 1);
     }
     return 1;
@@ -2080,7 +2433,8 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
                                  uint16_t vertex_offset, uint16_t triangle_offset,
                                  int32_t near_z, int shell_ot_bias,
                                  int default_use_tex, uint16_t default_tpage,
-                                 int default_uoff, int default_voff) {
+                                 int default_uoff, int default_voff, int skip_unsafe,
+                                 const uint16_t* visible_triangles, uint16_t visible_count) {
     unsigned int cached_texture_index = 0xffffffffu;
     int cached_use_tex = 0;
     uint16_t cached_tpage = 0;
@@ -2092,7 +2446,7 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
             ? static_topology_cache_for(mesh) : 0;
     ps1_cached_flat_quad_context quad_ctx;
     int added = 0;
-    uint16_t ti;
+    uint16_t ti, draw_index;
 
     quad_ctx.pri = pri;
     quad_ctx.packet_end = packet_end;
@@ -2105,7 +2459,8 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
     quad_ctx.shell_ot_bias = shell_ot_bias;
     quad_ctx.fog_enabled = fog_enabled;
 
-    for (ti = 0; ti < mesh->tri_count; ++ti) {
+    for (draw_index = 0; draw_index < (visible_triangles ? visible_count : mesh->tri_count); ++draw_index) {
+        ti = visible_triangles ? visible_triangles[draw_index] : draw_index;
         const ps1_mesh_tri* face = &mesh->tris[ti];
         int32_t sxy0, sxy1, sxy2;
         int32_t z0, z1, z2;
@@ -2123,6 +2478,10 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
         uint16_t p0, p1, p2;
 
         if (topology && ti + 1u < mesh->tri_count &&
+            (!skip_unsafe || (visible_triangles &&
+                !s_static_safe_clip_cache[triangle_offset + ti] &&
+                !s_static_safe_clip_cache[triangle_offset + ti + 1u])) &&
+            (!visible_triangles || (draw_index + 1u < visible_count && visible_triangles[draw_index + 1u] == ti + 1u)) &&
             s_static_quad_valid[topology->triangle_offset + ti]) {
             const uint16_t quad[4] = {
                 face->i0, face->i1, face->i2, mesh->tris[ti + 1u].i2
@@ -2156,7 +2515,7 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
                 quad_ctx.voff = voff;
                 pair_result = draw_cached_flat_quad(&quad_ctx, quad, ti);
                 if (pair_result != 2) {
-                    ++ti;
+                    ++draw_index;
                     if (pair_result < 0)
                         return added;
                     if (pair_result > 0)
@@ -2180,11 +2539,14 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
         z0 = s_static_depth_cache[vertex_offset + p0];
         z1 = s_static_depth_cache[vertex_offset + p1];
         z2 = s_static_depth_cache[vertex_offset + p2];
+        if (skip_unsafe && (visible_triangles ? s_static_safe_clip_cache[triangle_offset + ti] :
+            cached_triangle_needs_safe_clip(sxy0, sxy1, sxy2, z0, z1, z2, near_z, !authored_floor_face(ent, face))))
+            continue;
         if (z0 < near_z || z1 < near_z || z2 < near_z)
             continue;
         if (discard_solid_fog_triangle(z0, z1, z2))
             continue;
-        if (fog_enabled && z0 >= s_fog_solid_z && z1 >= s_fog_solid_z &&
+        if (fog_enabled && !ps1_texture_has_cutout(face->texture_index ? face->texture_index : ent->texture_index) && z0 >= s_fog_solid_z && z1 >= s_fog_solid_z &&
             z2 >= s_fog_solid_z) {
             opaque_fog_solid = 1;
         }
@@ -2198,7 +2560,7 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
             triangle_outside_screen(x0, y0, x1, y1, x2, y2))
             continue;
 
-        if (ent->vertex_anim_frame_count == 0)
+        if (ent->vertex_anim_frame_count == 0 && !authored_floor_face(ent, face))
             SEAM_FILL_EXPAND(x0, y0, x1, y1, x2, y2);
 
         avsz = (z0 + z1 + z2) / 12;
@@ -2302,7 +2664,7 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
                    clamp_u8(voff + mesh->uvs[face->i1].v),
                    clamp_u8(uoff + mesh->uvs[face->i2].u),
                    clamp_u8(voff + mesh->uvs[face->i2].v));
-            addPrim(ot + otz, poly);
+            add_world_primitive(ot + otz, poly);
             *pri = (char*)(poly + 1);
         } else {
             POLY_F3* poly;
@@ -2312,12 +2674,393 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
             setPolyF3(poly);
             setXY3(poly, x0, y0, x1, y1, x2, y2);
             setRGB0(poly, r, g, b);
-            addPrim(ot + otz, poly);
+            add_world_primitive(ot + otz, poly);
             *pri = (char*)(poly + 1);
         }
         ++added;
     }
     return added;
+}
+
+/* Keep the visible portion of a floor triangle when a corner crosses the
+ * near plane or its projected span exceeds the GPU's polygon limits. The
+ * ordinary plane path still uses RTPT; only boundary triangles pay for this. */
+static int draw_clipped_plane_triangle(char** pri, const char* packet_end, uint32_t* ot,
+        const ps1_entity* ent, const MATRIX* matrix, int near_z,
+        const SVECTOR* a, const SVECTOR* b, const SVECTOR* c,
+        const uint8_t ca[3], const uint8_t cb[3], const uint8_t cc[3],
+        int ua, int va, int ub, int vb, int uc, int vc,
+        int use_texture, uint16_t tpage) {
+    ps1_clip_vert source[3], clipped[6];
+    ps1_screen_clip_vert projected[6], screen[12];
+    const SVECTOR* points[3]={a,b,c};
+    const uint8_t* colors[3]={ca,cb,cc};
+    const int u[3]={ua,ub,uc}, v[3]={va,vb,vc};
+    int count, i, added=0;
+    ps1_mesh_tri floor_face={0};
+    floor_face.ny=ONE;
+    for (i=0;i<3;++i) {
+        make_clip_vert(matrix,points[i],0,&source[i]);
+        source[i].u=u[i]; source[i].v=v[i];
+        source[i].r=colors[i][0]; source[i].g=colors[i][1]; source[i].b=colors[i][2];
+    }
+    count=clip_world_depth(source,clipped,near_z,s_far_z);
+    if (count<3) return 0;
+    for (i=0;i<count;++i) project_clip_vert_wide(&clipped[i],&projected[i],near_z);
+    count=clip_polygon_to_safe_screen(projected,count,screen);
+    for (i=1;i<count-1;++i) {
+        const ps1_screen_clip_vert* p[3]={&screen[0],&screen[i],&screen[i+1]};
+        const int32_t depth=(p[0]->z+p[1]->z+p[2]->z)/3;
+        int bucket, j;
+        uint8_t color[3][3];
+        if (depth>s_far_z || discard_solid_fog_triangle(p[0]->z,p[1]->z,p[2]->z)) continue;
+        if ((int64_t)(p[1]->x-p[0]->x)*(p[2]->y-p[0]->y)==
+            (int64_t)(p[1]->y-p[0]->y)*(p[2]->x-p[0]->x)) continue;
+        bucket=mesh_triangle_otz_fine(depth>>2);
+        bucket=floor_surface_otz(ent,&floor_face,bucket,p[0]->z,p[1]->z,p[2]->z,p[2]->z);
+        for (j=0;j<3;++j) {
+            color[j][0]=clamp_u8(p[j]->r); color[j][1]=clamp_u8(p[j]->g); color[j][2]=clamp_u8(p[j]->b);
+            apply_scene_fog(p[j]->z,&color[j][0],&color[j][1],&color[j][2]);
+        }
+        if (is_triangle_fully_fogged(p[0]->z) && is_triangle_fully_fogged(p[1]->z) &&
+            is_triangle_fully_fogged(p[2]->z) && !ps1_texture_has_cutout(ent->texture_index)) {
+            POLY_F3* tri;
+            if ((const char*)(*pri+sizeof(POLY_F3))>packet_end) return added;
+            tri=(POLY_F3*)*pri; setPolyF3(tri);
+            setXY3(tri,p[0]->x,p[0]->y,p[1]->x,p[1]->y,p[2]->x,p[2]->y);
+            setRGB0(tri,g_ps1_scene.fog_r,g_ps1_scene.fog_g,g_ps1_scene.fog_b);
+            add_world_primitive(ot+bucket,tri); *pri=(char*)(tri+1);
+        } else if (use_texture) {
+            POLY_GT3* tri;
+            if ((const char*)(*pri+sizeof(POLY_GT3))>packet_end) return added;
+            tri=(POLY_GT3*)*pri; setPolyGT3(tri);
+            setXY3(tri,p[0]->x,p[0]->y,p[1]->x,p[1]->y,p[2]->x,p[2]->y);
+            setUV3(tri,p[0]->u,p[0]->v,p[1]->u,p[1]->v,p[2]->u,p[2]->v);
+            setRGB0(tri,color[0][0],color[0][1],color[0][2]);
+            setRGB1(tri,color[1][0],color[1][1],color[1][2]);
+            setRGB2(tri,color[2][0],color[2][1],color[2][2]);
+            tri->tpage=tpage; tri->clut=0;
+            add_world_primitive(ot+bucket,tri); *pri=(char*)(tri+1);
+        } else {
+            POLY_G3* tri;
+            if ((const char*)(*pri+sizeof(POLY_G3))>packet_end) return added;
+            tri=(POLY_G3*)*pri; setPolyG3(tri);
+            setXY3(tri,p[0]->x,p[0]->y,p[1]->x,p[1]->y,p[2]->x,p[2]->y);
+            setRGB0(tri,color[0][0],color[0][1],color[0][2]);
+            setRGB1(tri,color[1][0],color[1][1],color[1][2]);
+            setRGB2(tri,color[2][0],color[2][1],color[2][2]);
+            add_world_primitive(ot+bucket,tri); *pri=(char*)(tri+1);
+        }
+        ++added;
+    }
+    return added;
+}
+
+/* Preserve the authored camera-space vertices and unrestricted H/Z ratio
+ * for every Viewmodel path. RTPS/RTPT cannot project this close reliably. */
+static int cache_viewmodel_projection(const MATRIX* composed, const ps1_mesh* m,
+                                     int32_t entity_near_z) {
+    uint16_t vi;
+    int needs_clip = 0;
+    gte_SetRotMatrix(composed);
+    gte_SetTransMatrix(composed);
+    for (vi = 0; vi < m->vert_count; ++vi) {
+        uint16_t reference = m->position_refs ? m->position_refs[vi] : vi;
+        if (reference < vi) {
+            s_viewmodel_vertex_cache[vi] = s_viewmodel_vertex_cache[reference];
+            s_viewmodel_screen_cache[vi] = s_viewmodel_screen_cache[reference];
+            s_viewmodel_depth_cache[vi] = s_viewmodel_depth_cache[reference];
+            continue;
+        }
+        int16_t sx, sy;
+        VECTOR* vertex = &s_viewmodel_vertex_cache[vi];
+        gte_ldv0(&m->verts[vi]);
+        gte_rtv0tr();
+        gte_stlvnl(vertex);
+        project_vector_vert(vertex, &sx, &sy, entity_near_z);
+        s_viewmodel_screen_cache[vi] = (int32_t)(
+            (uint32_t)(uint16_t)sx | ((uint32_t)(uint16_t)sy << 16));
+        s_viewmodel_depth_cache[vi] = vertex->vz;
+        if (vertex->vz < entity_near_z)
+            needs_clip = 1;
+    }
+    return needs_clip;
+}
+
+/* Keep the Unlit packet loop separate from the large world renderer so it
+ * fits in the PS1 instruction cache. Projection is shared with Lit meshes. */
+static int __attribute__((noinline)) draw_unlit_viewmodel_fast(
+        char** pri, const char* packet_end, uint32_t* ot,
+        const ps1_entity* ent, const ps1_mesh* m, const MATRIX* composed,
+        int32_t entity_near_z,
+        int use_tex, uint16_t tpage, int tex_uoff, int tex_voff) {
+    uint16_t ti;
+    int added = 0;
+
+    if (!m || m->vert_count > PS1_VIEWMODEL_VERTEX_CACHE_MAX ||
+        m->tri_count > PS1_VIEWMODEL_TRI_CACHE_MAX)
+        return -1;
+    /* Per-face texture pages need the general descriptor cache. */
+    for (ti = 0; ti < m->tri_count; ++ti) {
+        if (m->tris[ti].texture_index != 0)
+            return -1;
+    }
+
+    if (cache_viewmodel_projection(composed, m, entity_near_z))
+        return -1;
+
+    if (use_tex && tpage &&
+        (const char*)(*pri + sizeof(DR_TPAGE)) <= packet_end) {
+        DR_TPAGE* dr = (DR_TPAGE*)*pri;
+        setDrawTPage(dr, 0, 0, tpage);
+        add_world_primitive(ot + (OT_LEN - 2), dr);
+        *pri = (char*)(dr + 1);
+    }
+
+    for (ti = 0; ti < m->tri_count; ++ti) {
+        const ps1_mesh_tri* t = &m->tris[ti];
+        if (t->i0 >= m->vert_count || t->i1 >= m->vert_count ||
+            t->i2 >= m->vert_count)
+            continue;
+        const int32_t sxy0 = s_viewmodel_screen_cache[t->i0];
+        const int32_t sxy1 = s_viewmodel_screen_cache[t->i1];
+        const int32_t sxy2 = s_viewmodel_screen_cache[t->i2];
+        const int16_t x0 = (int16_t)(sxy0 & 0xffff);
+        const int16_t y0 = (int16_t)(sxy0 >> 16);
+        const int16_t x1 = (int16_t)(sxy1 & 0xffff);
+        const int16_t y1 = (int16_t)(sxy1 >> 16);
+        const int16_t x2 = (int16_t)(sxy2 & 0xffff);
+        const int16_t y2 = (int16_t)(sxy2 >> 16);
+        const int32_t z0 = s_viewmodel_depth_cache[t->i0];
+        const int32_t z1 = s_viewmodel_depth_cache[t->i1];
+        const int32_t z2 = s_viewmodel_depth_cache[t->i2];
+        const int32_t depth = (z0 + z1 + z2) / 3;
+        const int otz = viewmodel_triangle_otz(depth);
+
+        if (depth <= 0 ||
+            triangle_outside_screen(x0, y0, x1, y1, x2, y2) ||
+            !screen_front_facing(x0, y0, x1, y1, x2, y2))
+            continue;
+
+        if (use_tex && tpage) {
+            POLY_FT3* tri;
+            if ((const char*)(*pri + sizeof(POLY_FT3)) > packet_end)
+                return added;
+            tri = (POLY_FT3*)*pri;
+            setPolyFT3(tri);
+            setXY3(tri, x0, y0, x1, y1, x2, y2);
+            setRGB0(tri, ent->color_r, ent->color_g, ent->color_b);
+            tri->tpage = tpage;
+            tri->clut = 0;
+            setUV3(tri,
+                   clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
+                   clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
+                   clamp_u8(tex_uoff + m->uvs[t->i2].u), clamp_u8(tex_voff + m->uvs[t->i2].v));
+            add_world_primitive(ot + otz, tri);
+            *pri = (char*)(tri + 1);
+        } else {
+            POLY_F3* tri;
+            if ((const char*)(*pri + sizeof(POLY_F3)) > packet_end)
+                return added;
+            tri = (POLY_F3*)*pri;
+            setPolyF3(tri);
+            setXY3(tri, x0, y0, x1, y1, x2, y2);
+            setRGB0(tri, ent->color_r, ent->color_g, ent->color_b);
+            add_world_primitive(ot + otz, tri);
+            *pri = (char*)(tri + 1);
+        }
+        ++added;
+    }
+    return added;
+}
+
+/* Find the camera's object-space Y once for an authored flat floor. Guard the
+ * wide products; singular/extreme transforms use the general winding test. */
+static int floor_camera_y(const MATRIX* matrix, int32_t* y, int* mirrored) {
+    for (int i = 0; i < 3; ++i)
+        if (matrix->t[i] < -65535 || matrix->t[i] > 65535) return 0;
+    const int64_t a = (int32_t)matrix->m[1][1]*matrix->m[2][2] - (int64_t)matrix->m[1][2]*matrix->m[2][1];
+    const int64_t b = (int32_t)matrix->m[1][2]*matrix->m[2][0] - (int64_t)matrix->m[1][0]*matrix->m[2][2];
+    const int64_t c = (int32_t)matrix->m[1][0]*matrix->m[2][1] - (int64_t)matrix->m[1][1]*matrix->m[2][0];
+    const int64_t det = matrix->m[0][0]*a + matrix->m[0][1]*b + matrix->m[0][2]*c;
+    if (!det) return 0;
+    const int64_t d = (int32_t)matrix->m[0][0]*matrix->m[2][2] - (int64_t)matrix->m[0][2]*matrix->m[2][0];
+    const int64_t e = (int32_t)matrix->m[0][2]*matrix->m[1][0] - (int64_t)matrix->m[0][0]*matrix->m[1][2];
+    const int64_t eye = -4096 * (b*matrix->t[0] + d*matrix->t[1] + e*matrix->t[2]) / det;
+    if (eye < -65535 || eye > 65535) return 0;
+    *y = (int32_t)eye; *mirrored = det < 0;
+    return 1;
+}
+
+static int visibility_batch_outside(const ps1_visibility_batch* batch,
+                                    const MATRIX* matrix, int near_z) {
+    VECTOR center;
+    int64_t radius[3];
+    if (!batch->vertex_count) return 1;
+    gte_ldv0(&batch->center); gte_rtv0tr(); gte_stlvnl(&center);
+    /* Bound the products before using native arithmetic. Most small world
+     * batches fit; unusual scales retain the original wide calculations. */
+    if ((unsigned)batch->extent[0] + batch->extent[1] + batch->extent[2] <= 65535u) {
+        int32_t r[3];
+        int fits = s_geom_screen >= 0 && s_geom_screen <= 1023 &&
+            s_screen_w > 0 && s_screen_w <= 1024 && s_screen_h > 0 && s_screen_h <= 1024;
+        const int32_t c[3] = {center.vx, center.vy, center.vz};
+        for (int row = 0; row < 3; ++row) {
+            uint32_t sum = 0;
+            for (int axis = 0; axis < 3; ++axis) {
+                int coefficient = matrix->m[row][axis];
+                if (coefficient < 0) coefficient = -coefficient;
+                sum += (uint32_t)coefficient * batch->extent[axis];
+            }
+            r[row] = (int32_t)((sum + 4095u) >> 12) + 2;
+            if (c[row] < -1048575 + r[row] || c[row] > 1048575 - r[row]) fits = 0;
+        }
+        if (fits) {
+            const int32_t farthest = center.vz + r[2];
+            if (farthest < near_z || center.vz - r[2] > s_far_z) return 1;
+            return (center.vx + r[0])*s_geom_screen < -(s_screen_w/2+2)*farthest ||
+                (center.vx - r[0])*s_geom_screen > (s_screen_w-s_screen_w/2+2)*farthest ||
+                (center.vy + r[1])*s_geom_screen < -(s_screen_h/2+2)*farthest ||
+                (center.vy - r[1])*s_geom_screen > (s_screen_h-s_screen_h/2+2)*farthest;
+        }
+    }
+    for (int row = 0; row < 3; ++row) {
+        int64_t r = 0;
+        for (int axis = 0; axis < 3; ++axis) {
+            int coefficient = matrix->m[row][axis];
+            if (coefficient < 0) coefficient = -coefficient;
+            r += (int64_t)coefficient * batch->extent[axis];
+        }
+        radius[row] = (r + 4095) / 4096 + 2;
+    }
+    const int64_t farthest = (int64_t)center.vz + radius[2];
+    if (farthest < near_z || (int64_t)center.vz - radius[2] > s_far_z) return 1;
+    return ((int64_t)center.vx + radius[0])*s_geom_screen < -(s_screen_w/2+2)*farthest ||
+        ((int64_t)center.vx - radius[0])*s_geom_screen > (s_screen_w-s_screen_w/2+2)*farthest ||
+        ((int64_t)center.vy + radius[1])*s_geom_screen < -(s_screen_h/2+2)*farthest ||
+        ((int64_t)center.vy - radius[1])*s_geom_screen > (s_screen_h-s_screen_h/2+2)*farthest;
+}
+
+static void __attribute__((noinline)) cache_world_visibility(
+        const ps1_entity* ent, const ps1_mesh* m,
+        ps1_static_entity_cache* static_cache, int entity_near_z, const MATRIX* composed) {
+    const uint16_t static_vertex_offset = static_cache->vertex_offset;
+    const uint16_t static_triangle_offset = static_cache->triangle_offset;
+    uint16_t vi;
+    static_cache->needs_safe_clip = 0;
+    const ps1_visibility_topology* visibility = visibility_topology_for(m);
+    const unsigned batch_count = visibility ? visibility->batch_count : 1;
+    int32_t eye_y = 0;
+    int mirrored = 0;
+    const int floor_eye_valid = (ent->render_preset == PS1_RENDER_PRESET_FLOOR ||
+        ent->render_preset == PS1_RENDER_PRESET_CORRIDOR) && floor_camera_y(composed,&eye_y,&mirrored);
+    if (visibility) {
+        memset(&s_static_active_vertex[static_vertex_offset],0,m->vert_count);
+        for (unsigned bi = 0; bi < batch_count; ++bi) {
+            const unsigned index = visibility->batch_offset+bi;
+            const ps1_visibility_batch* batch = &s_visibility_batches[index];
+            const int delta_y = eye_y-batch->center.vy;
+            const int backface = floor_eye_valid && batch->plane_winding &&
+                (delta_y < -2 || delta_y > 2) &&
+                (((batch->plane_winding < 0) != (delta_y < 0)) != mirrored);
+            const int outside = backface || visibility_batch_outside(batch,composed,entity_near_z);
+            s_visibility_batch_outside[index] = outside;
+            if (!outside) for (unsigned v = 0; v < batch->vertex_count; ++v)
+                s_static_active_vertex[static_vertex_offset+s_visibility_vertices[batch->vertex_offset+v]] = 1;
+        }
+    }
+                        for (vi = 0; vi < m->vert_count; ++vi) {
+                            uint16_t reference = m->position_refs ? m->position_refs[vi] : vi;
+                            if (reference != vi && reference < m->vert_count)
+                                continue;
+                            if (visibility && !s_static_active_vertex[static_vertex_offset+vi]) continue;
+                            gte_ldv0(&m->verts[vi]);
+                            gte_rtps();
+                            gte_stsxy(&s_static_screen_cache[static_vertex_offset+vi]);
+                            gte_stsz(&s_static_depth_cache[static_vertex_offset+vi]);
+                            gte_stlvnl(&s_static_camera_cache[static_vertex_offset + vi]);
+                            s_static_outcode_cache[static_vertex_offset + vi] = camera_outcode(
+                                &s_static_camera_cache[static_vertex_offset + vi], entity_near_z);
+                            s_static_fog_cache[static_vertex_offset+vi] = scene_fog_amount_q8(
+                                s_static_depth_cache[static_vertex_offset+vi]);
+                            const int32_t xy=s_static_screen_cache[static_vertex_offset+vi];
+                            const int32_t z=s_static_depth_cache[static_vertex_offset+vi];
+                            const int x=(int16_t)xy, y=(int16_t)(xy>>16);
+                            s_static_projection_flags[static_vertex_offset+vi] =
+                                (ps1_projection_vertex_needs_clip(xy,z,entity_near_z,INT32_MAX,s_geom_screen) ? 1 : 0) |
+                                (s_static_camera_cache[static_vertex_offset+vi].vz>s_far_z ? 2 : 0) |
+                                (x < -2 || x>s_screen_w+1 || y < -2 || y>s_screen_h+1 ? 4 : 0);
+                        }
+                        static_cache->visible_triangle_count = 0;
+                        for(unsigned bi=0;bi<batch_count;++bi) {
+                            const ps1_visibility_batch* batch = visibility
+                                ? &s_visibility_batches[visibility->batch_offset+bi] : 0;
+                            if(batch) {
+                                if (s_visibility_batch_outside[visibility->batch_offset+bi]) continue;
+                                uint8_t common=0xff;
+                                for(uint16_t vi=0;vi<batch->vertex_count && common;++vi)
+                                    common &= s_static_outcode_cache[static_vertex_offset+
+                                        s_visibility_vertices[batch->vertex_offset+vi]];
+                                if(common)continue;
+                            }
+                            const unsigned begin=batch ? batch->triangle_begin : 0;
+                            const unsigned end=batch ? batch->triangle_end : m->tri_count;
+                        for (uint16_t ti = begin; ti < end; ++ti) {
+                            const ps1_mesh_tri* face = &m->tris[ti];
+                            uint16_t p0, p1, p2;
+                            if (face->i0 >= m->vert_count || face->i1 >= m->vert_count || face->i2 >= m->vert_count)
+                                continue;
+                            p0 = m->position_refs ? m->position_refs[face->i0] : face->i0;
+                            p1 = m->position_refs ? m->position_refs[face->i1] : face->i1;
+                            p2 = m->position_refs ? m->position_refs[face->i2] : face->i2;
+                            if (p0 >= m->vert_count) p0 = face->i0;
+                            if (p1 >= m->vert_count) p1 = face->i1;
+                            if (p2 >= m->vert_count) p2 = face->i2;
+                            if (s_static_outcode_cache[static_vertex_offset + p0] &
+                                s_static_outcode_cache[static_vertex_offset + p1] &
+                                s_static_outcode_cache[static_vertex_offset + p2])
+                                continue;
+                            /* Clipped faces need camera-space winding. A
+                             * saturated GTE XY can reverse the projected area;
+                             * retaining every such backface until after all
+                             * clipping doubled the work on two-sided floors. */
+                            const int32_t xy0 = s_static_screen_cache[static_vertex_offset + p0];
+                            const int32_t xy1 = s_static_screen_cache[static_vertex_offset + p1];
+                            const int32_t xy2 = s_static_screen_cache[static_vertex_offset + p2];
+                            const unsigned projection_flags=s_static_projection_flags[static_vertex_offset+p0] |
+                                s_static_projection_flags[static_vertex_offset+p1] | s_static_projection_flags[static_vertex_offset+p2];
+                            const int valid_projection = !(projection_flags & 1);
+                            if (valid_projection) {
+                                if (!screen_front_facing_strict((int16_t)xy0, (int16_t)(xy0 >> 16),
+                                        (int16_t)xy1, (int16_t)(xy1 >> 16), (int16_t)xy2, (int16_t)(xy2 >> 16)))
+                                    continue;
+                            } else if (!camera_space_quad_front_facing(
+                                    &s_static_camera_cache[static_vertex_offset + p0],
+                                    &s_static_camera_cache[static_vertex_offset + p1],
+                                    &s_static_camera_cache[static_vertex_offset + p2]))
+                                continue;
+                            int needs_clip = projection_flags != 0;
+                            if (!needs_clip && (!authored_floor_face(ent,face) || s_screen_w>1020 || s_screen_h>508)) {
+                                int min_x=(int16_t)xy0,max_x=min_x,min_y=(int16_t)(xy0>>16),max_y=min_y;
+                                const int x1=(int16_t)xy1,x2=(int16_t)xy2,y1=(int16_t)(xy1>>16),y2=(int16_t)(xy2>>16);
+                                if(x1<min_x)min_x=x1;if(x2<min_x)min_x=x2;
+                                if(x1>max_x)max_x=x1;if(x2>max_x)max_x=x2;
+                                if(y1<min_y)min_y=y1;if(y2<min_y)min_y=y2;
+                                if(y1>max_y)max_y=y1;if(y2>max_y)max_y=y2;
+                                const int z0=s_static_depth_cache[static_vertex_offset+p0],z1=s_static_depth_cache[static_vertex_offset+p1],z2=s_static_depth_cache[static_vertex_offset+p2];
+                                int min_z=z0,max_z=z0;
+                                if(z1<min_z)min_z=z1;if(z2<min_z)min_z=z2;
+                                if(z1>max_z)max_z=z1;if(z2>max_z)max_z=z2;
+                                needs_clip=max_x-min_x>1020 || max_y-min_y>508 ||
+                                    (!authored_floor_face(ent,face) && (max_x-min_x>64 || max_y-min_y>64) && max_z-min_z>min_z/8);
+                            }
+                            s_static_safe_clip_cache[static_triangle_offset+ti] = needs_clip;
+                            if (needs_clip) static_cache->needs_safe_clip = 1;
+                            s_static_visible_triangles[static_triangle_offset + static_cache->visible_triangle_count++] = ti;
+                        }
+                        }
+                        static_cache->visible_list_valid = 1;
+
 }
 
 static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const ps1_entity* ent,
@@ -2333,6 +3076,8 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
     int     added = 0;
     int     shared_character_transform_hit = 0;
     const int is_viewmodel = entity_is_viewmodel(ent);
+    const ps1_entity* viewmodel_source = is_viewmodel && !entity_rigid_frame(ent)
+        ? source_entity_by_id(ent->id) : 0;
     const int entity_near_z = is_viewmodel
         ? viewmodel_near_z()
         : (ent->render_preset == PS1_RENDER_PRESET_CORRIDOR
@@ -2431,6 +3176,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
             RotMatrix(&rotvec, &rmtx);
             if (ent->rigid_root_entity_index >= 0) {
                 s_shared_character_transform.valid = 1;
+                s_shared_character_transform.light_matrix_valid = 0;
                 s_shared_character_transform.root_index =
                     ent->rigid_root_entity_index;
                 s_shared_character_transform.position[0] = ent->position[0];
@@ -2443,6 +3189,22 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                 s_shared_character_transform.rotation_matrix = rmtx;
             }
         }
+    }
+
+    /* A ViewModel is authored below the Camera and must remain in the same
+     * camera-local pose while the player looks around.  Runtime hierarchy
+     * entities currently carry flattened world Euler angles; adding parent
+     * Euler deltas is not a valid rotation composition when the model already
+     * has an FBX basis rotation (the arms use 90/180 degrees).  Rebuild its
+     * object basis from the immutable authored pose and later compose it with
+     * the authored camera view.  Vertex animation remains fully dynamic. */
+    if (viewmodel_source && s_render_camera_source) {
+        unity_euler_to_psx_object(
+            viewmodel_source->rotation[0], viewmodel_source->rotation[1],
+            viewmodel_source->rotation[2], &rotvec);
+        unity_pos_to_psx(viewmodel_source->position, &pos);
+        RotMatrix(&rotvec, &rmtx);
+        shared_character_transform_hit = 0;
     }
 
     if (ent->mesh == PS1_MESH_PLANE) {
@@ -2488,15 +3250,42 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
     if (ent->mesh != PS1_MESH_PLANE)
         ScaleMatrix(&omtx, &scale);
     TransMatrix(&omtx, &pos);
-    /* Lighting should NOT be affected by non-uniform scale. */
-    if (shared_character_transform_hit) {
+    if (!ent->render_unlit) {
+        int axis;
+        fix16_t minimum = 0x7fffffff;
+        for (axis = 0; axis < 3; ++axis) {
+            fix16_t magnitude = ent->scale[axis] < 0 ? -ent->scale[axis] : ent->scale[axis];
+            if (magnitude > 0 && magnitude < minimum)
+                minimum = magnitude;
+        }
+        for (axis = 0; axis < 3; ++axis)
+            s_normal_scale_q12[axis] = ent->scale[axis] != 0
+                ? (int32_t)(((int64_t)minimum * ONE) / ent->scale[axis]) : 0;
+    }
+    s_shading_unlit = ent->render_unlit != 0;
+    if (s_shading_unlit) {
+        memset(&lmtx, 0, sizeof(lmtx));
+    } else if (shared_character_transform_hit && s_shared_character_transform.light_matrix_valid) {
         lmtx = s_shared_character_transform.light_matrix;
     } else {
         MulMatrix0(&s_light_mtx, &rmtx, &lmtx);
-        if (!rigid_frame && ent->rigid_root_entity_index >= 0)
+        if (!rigid_frame && ent->rigid_root_entity_index >= 0) {
             s_shared_character_transform.light_matrix = lmtx;
+            s_shared_character_transform.light_matrix_valid = 1;
+        }
     }
-    CompMatrixLV(&s_cam_mtx, &omtx, &composed);
+    if (viewmodel_source && s_render_camera_source) {
+        MATRIX authored_camera;
+        VECTOR authored_eye;
+        unity_pos_to_psx(s_render_camera_source->position, &authored_eye);
+        build_unity_camera_matrix(
+            &authored_eye, s_render_camera_source->rotation[0],
+            s_render_camera_source->rotation[1],
+            s_render_camera_source->rotation[2], &authored_camera);
+        CompMatrixLV(&authored_camera, &omtx, &composed);
+    } else {
+        CompMatrixLV(&s_cam_mtx, &omtx, &composed);
+    }
 
     if (!is_viewmodel) {
         const int is_skinned_mesh =
@@ -2606,7 +3395,15 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
 
     gte_SetRotMatrix(&composed);
     gte_SetTransMatrix(&composed);
-    gte_SetLightMatrix(&lmtx);
+    s_shading_unlit = ent->render_unlit != 0;
+    if (!s_shading_unlit) gte_SetLightMatrix(&lmtx);
+    s_shading_world = omtx;
+    s_shading_rotation = rmtx;
+    s_shading_mesh = 0;
+    s_shading_next_mesh = 0;
+    s_shading_lerp_q8 = 0;
+    s_shading_use_probe = 0;
+    s_shading_probe_source = 0;
 
 #if PS1_PROJECTION_DEBUG
     if (ent->mesh == PS1_MESH_CUSTOM)
@@ -2622,6 +3419,32 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
             const ps1_mesh* m = &g_ps1_meshes[idx];
             const ps1_mesh* m_next = 0;
             const int use_vertex_lerp = entity_vertex_lerp_mesh(ent, m, &m_next);
+            s_shading_mesh = m;
+            s_shading_next_mesh = use_vertex_lerp ? m_next : 0;
+            s_shading_lerp_q8 = ent->vertex_anim_lerp_q8;
+            if (!s_shading_unlit && s_scene_light_count && (rigid_frame || ent->vertex_anim_frame_count > 0)) {
+                const ps1_mesh* source = m;
+                SVECTOR center;
+                VECTOR world_center;
+                int32_t point[3];
+                /* Small animated parts share one light sample, as rigid parts
+                 * already share normal bins. Anchor vertex-animation probes
+                 * to the clip's first frame so idle deformation does not force
+                 * all triangle lighting to be rebuilt every rendered frame. */
+                if (!rigid_frame && ent->vertex_anim_first_mesh_index > 0 &&
+                    ent->vertex_anim_first_mesh_index <= g_ps1_mesh_count)
+                    source = &g_ps1_meshes[ent->vertex_anim_first_mesh_index - 1u];
+                center.vx = clamp_svector_i16((int32_t)source->bounds_center_x * source->scale_q12 / (m->scale_q12 ? m->scale_q12 : 1));
+                center.vy = clamp_svector_i16((int32_t)source->bounds_center_y * source->scale_q12 / (m->scale_q12 ? m->scale_q12 : 1));
+                center.vz = clamp_svector_i16((int32_t)source->bounds_center_z * source->scale_q12 / (m->scale_q12 ? m->scale_q12 : 1));
+                center.pad = 0;
+                transform_point(&omtx, &center, &world_center);
+                point[0] = world_center.vx; point[1] = world_center.vy; point[2] = world_center.vz;
+                s_shading_probe_count = ps1_lighting_prepare(s_scene_lights, s_scene_light_count,
+                    point, s_shading_probe_lights);
+                s_shading_use_probe = 1;
+                s_shading_probe_source = source;
+            }
             const int use_tex =
                 ent->texture_index > 0 && m->uvs &&
                 ent->texture_index <= g_ps1_texture_count &&
@@ -2638,6 +3461,12 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                     light_mask = 1u << 13;
                 for (light_bin = 0; light_bin < 27; ++light_bin) {
                     if ((light_mask & (1u << light_bin)) != 0u) {
+                        if (s_shading_unlit) {
+                            rigid_light_colors[light_bin][0] = base_r;
+                            rigid_light_colors[light_bin][1] = base_g;
+                            rigid_light_colors[light_bin][2] = base_b;
+                            continue;
+                        }
                         SVECTOR normal;
                         rigid_light_bin_normal(light_bin, &normal);
                         gte_shade_normal_vec(
@@ -2667,6 +3496,9 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
             }
             const int viewmodel_cached =
                 is_viewmodel && m->vert_count <= PS1_VIEWMODEL_VERTEX_CACHE_MAX;
+            const int viewmodel_light_cached =
+                is_viewmodel && !s_shading_unlit &&
+                m->tri_count <= PS1_VIEWMODEL_TRI_CACHE_MAX;
             const int rigid_cached =
                 rigid_frame && m->position_refs &&
                 m->vert_count <= PS1_RIGID_VERTEX_CACHE_MAX;
@@ -2680,15 +3512,58 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                 ? static_cache->vertex_offset : 0u;
             const uint16_t static_triangle_offset = static_cached
                 ? static_cache->triangle_offset : 0u;
+            if (is_viewmodel && ent->render_unlit && viewmodel_cached) {
+                const int fast_added = draw_unlit_viewmodel_fast(
+                    pri, packet_end, ot, ent, m, &composed, entity_near_z,
+                    use_tex, tpage, tex_uoff, tex_voff);
+                if (fast_added >= 0)
+                    return fast_added;
+            }
             if (viewmodel_cached) {
-                uint16_t vi;
-                for (vi = 0; vi < m->vert_count; ++vi) {
-                    transform_point(&composed, &m->verts[vi], &s_viewmodel_vertex_cache[vi]);
-                    project_vector_vert(&s_viewmodel_vertex_cache[vi],
-                                        &s_viewmodel_screen_x[vi],
-                                        &s_viewmodel_screen_y[vi],
-                                        entity_near_z);
+                /* Lit and Unlit must use the same unrestricted close-range
+                 * projection, including camera-space vertices for clipping. */
+                cache_viewmodel_projection(&composed, m, entity_near_z);
+            }
+            if (viewmodel_light_cached &&
+                (!s_viewmodel_light_valid ||
+                 s_viewmodel_light_entity != ent ||
+                 s_viewmodel_light_tris != m->tris ||
+                 s_viewmodel_light_base_r != base_r ||
+                 s_viewmodel_light_base_g != base_g ||
+                 s_viewmodel_light_base_b != base_b ||
+                 s_viewmodel_normal_scale_q12[0] != s_normal_scale_q12[0] ||
+                 s_viewmodel_normal_scale_q12[1] != s_normal_scale_q12[1] ||
+                 s_viewmodel_normal_scale_q12[2] != s_normal_scale_q12[2] ||
+                 !matrix_equal(&s_viewmodel_light_matrix, &lmtx) ||
+                 (s_scene_light_count && (
+                    s_viewmodel_light_revision != s_scene_light_revision ||
+                    s_viewmodel_lighting_vertices != m->verts ||
+                    !matrix_equal(&s_viewmodel_lighting_world, &omtx))))) {
+                uint16_t ti;
+                for (ti = 0; ti < m->tri_count; ++ti) {
+                    const ps1_mesh_tri* face = &m->tris[ti];
+                    SVECTOR normal = { face->nx, face->ny, face->nz, 0 };
+                    SVECTOR center = mesh_face_center(m, face);
+                    if (normal.vx == 0 && normal.vy == 0 && normal.vz == 0)
+                        normal.vy = 3800;
+                    viewmodel_cpu_shade_normal(
+                        &lmtx, &normal, &center, base_r, base_g, base_b,
+                        &s_viewmodel_face_light_cache[ti][0],
+                        &s_viewmodel_face_light_cache[ti][1],
+                        &s_viewmodel_face_light_cache[ti][2]);
                 }
+                s_viewmodel_light_entity = ent;
+                s_viewmodel_light_tris = m->tris;
+                s_viewmodel_light_matrix = lmtx;
+                s_viewmodel_lighting_world = omtx;
+                s_viewmodel_light_revision = s_scene_light_revision;
+                s_viewmodel_lighting_vertices = m->verts;
+                for (int axis = 0; axis < 3; ++axis)
+                    s_viewmodel_normal_scale_q12[axis] = s_normal_scale_q12[axis];
+                s_viewmodel_light_base_r = base_r;
+                s_viewmodel_light_base_g = base_g;
+                s_viewmodel_light_base_b = base_b;
+                s_viewmodel_light_valid = 1;
             }
             if (rigid_cached) {
                 uint16_t vi;
@@ -2741,16 +3616,33 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                     static_cache->vertex_lerp_q8 != ent->vertex_anim_lerp_q8 ||
                     static_cache->geom_screen != s_geom_screen ||
                     static_cache->safe_clip_near_z != entity_near_z ||
+                    static_cache->safe_clip_far_z != s_far_z ||
                     !matrix_equal(&static_cache->projected_matrix, &composed);
                 const int lighting_dirty =
                     !static_cache->lighting_valid ||
-                    static_cache->lighting_norms != m->norms ||
+                    static_cache->lighting_unlit != s_shading_unlit ||
                     static_cache->lighting_tris != m->tris ||
                     static_cache->base_r != base_r ||
                     static_cache->base_g != base_g ||
                     static_cache->base_b != base_b ||
-                    !matrix_equal(&static_cache->light_matrix, &lmtx);
+                    (!s_shading_unlit && (
+                    static_cache->lighting_norms != m->norms ||
+                    static_cache->lighting_face_norms != m->face_norms ||
+                    static_cache->normal_scale_q12[0] != s_normal_scale_q12[0] ||
+                    static_cache->normal_scale_q12[1] != s_normal_scale_q12[1] ||
+                    static_cache->normal_scale_q12[2] != s_normal_scale_q12[2] ||
+                    !matrix_equal(&static_cache->light_matrix, &lmtx) ||
+                    (s_scene_light_count && (
+                        static_cache->light_revision != s_scene_light_revision ||
+                        !matrix_equal(&static_cache->lighting_world, &omtx) ||
+                        static_cache->lighting_probe_source != s_shading_probe_source ||
+                        (!s_shading_use_probe && (static_cache->lighting_vertices != m->verts ||
+                            static_cache->lighting_next_mesh != m_next ||
+                            static_cache->lighting_lerp_q8 != ent->vertex_anim_lerp_q8))))));
                 if (projection_dirty) {
+                    if (!is_viewmodel && !rigid_frame && ent->vertex_anim_frame_count == 0) {
+                        cache_world_visibility(ent,m,static_cache,entity_near_z,&composed);
+                    } else {
                     if (m->position_refs) {
                         uint16_t batch_indices[3];
                         SVECTOR batch_vertices[3];
@@ -2880,6 +3772,8 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             (uint16_t)scene_fog_amount_q8(
                                 s_static_depth_cache[static_vertex_offset + vi]);
                     }
+                    static_cache->visible_list_valid = 0;
+                    }
                     /* The compact flat-mesh path deliberately avoids the
                      * per-triangle camera-space clipping setup. Remember
                      * whether the current projection contains a triangle
@@ -2888,8 +3782,8 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                      * to the general clipping path below. This keeps the hot
                      * path for ordinary props while preventing large floors
                      * from losing whole triangles at the edge of the view. */
-                    static_cache->needs_safe_clip = 0;
-                    if (!is_terrain && !is_smooth) {
+                    if (!static_cache->visible_list_valid) static_cache->needs_safe_clip = 0;
+                    if (!is_terrain && !is_smooth && !static_cache->visible_list_valid) {
                         uint16_t ti;
                         for (ti = 0; ti < m->tri_count; ++ti) {
                             const ps1_mesh_tri* face = &m->tris[ti];
@@ -2914,7 +3808,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                     s_static_depth_cache[static_vertex_offset + p0],
                                     s_static_depth_cache[static_vertex_offset + p1],
                                     s_static_depth_cache[static_vertex_offset + p2],
-                                    entity_near_z)) {
+                                    entity_near_z, !authored_floor_face(ent, face))) {
                                 static_cache->needs_safe_clip = 1;
                                 break;
                             }
@@ -2923,47 +3817,61 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                     static_cache->projected_matrix = composed;
                     static_cache->geom_screen = s_geom_screen;
                     static_cache->safe_clip_near_z = entity_near_z;
+                    static_cache->safe_clip_far_z = s_far_z;
                     static_cache->next_mesh = m_next;
                     static_cache->vertex_lerp_q8 = ent->vertex_anim_lerp_q8;
                     static_cache->projection_valid = 1;
                 }
                 if (lighting_dirty && is_smooth && !is_terrain && m->norms) {
                     for (vi = 0; vi < m->vert_count; ++vi) {
+                        if (s_shading_unlit) {
+                            s_static_light_cache[static_vertex_offset + vi][0] = base_r;
+                            s_static_light_cache[static_vertex_offset + vi][1] = base_g;
+                            s_static_light_cache[static_vertex_offset + vi][2] = base_b;
+                            continue;
+                        }
                         if (use_tex) {
                             gte_shade_textured_smooth_normal(
-                                &m->norms[vi], base_r, base_g, base_b,
+                                &m->norms[vi], &m->verts[vi], base_r, base_g, base_b,
                                 &s_static_light_cache[static_vertex_offset + vi][0],
                                 &s_static_light_cache[static_vertex_offset + vi][1],
                                 &s_static_light_cache[static_vertex_offset + vi][2]);
                         } else {
                             gte_shade_normal(
-                                &m->norms[vi], base_r, base_g, base_b,
+                                &m->norms[vi], &m->verts[vi], base_r, base_g, base_b,
                                 &s_static_light_cache[static_vertex_offset + vi][0],
                                 &s_static_light_cache[static_vertex_offset + vi][1],
                                 &s_static_light_cache[static_vertex_offset + vi][2]);
                         }
                     }
                 }
-                /* Vertex animation frames share their normals and triangle
-                 * topology. Cache lighting against those actual inputs rather
-                 * than the per-frame vertex mesh pointer. */
+                /* Topology and UVs can be shared between poses; character
+                 * face normals change with deformation and invalidate lighting.
+                 * Unlit meshes still avoid unnecessary lighting invalidation. */
                 if (lighting_dirty && !is_smooth && !is_terrain) {
                     uint16_t ti;
                     for (ti = 0; ti < m->tri_count; ++ti) {
                         const ps1_mesh_tri* source = &m->tris[ti];
-                        SVECTOR normal = { source->nx, source->ny, source->nz, 0 };
+                        if (s_shading_unlit) {
+                            /* Preserve the existing fixed-point material and
+                             * face-colour modulation, without preparing a
+                             * normal, centre or lighting command. */
+                            s_static_face_light_cache[static_triangle_offset + ti][0] =
+                                (uint8_t)((((uint32_t)255 * base_r) >> 8) * source->color_r >> 8);
+                            s_static_face_light_cache[static_triangle_offset + ti][1] =
+                                (uint8_t)((((uint32_t)255 * base_g) >> 8) * source->color_g >> 8);
+                            s_static_face_light_cache[static_triangle_offset + ti][2] =
+                                (uint8_t)((((uint32_t)255 * base_b) >> 8) * source->color_b >> 8);
+                            continue;
+                        }
+                        SVECTOR normal = ps1_mesh_face_normal(m, source, ti);
+                        SVECTOR center = mesh_face_center(m, source);
                         uint8_t cd[4] = { 128, 128, 128, 0 };
                         uint8_t r, g, b;
                         if (normal.vx == 0 && normal.vy == 0 && normal.vz == 0)
                             normal.vy = 3800;
-                        gte_ldrgb(cd);
-                        gte_ldv0(&normal);
-                        gte_ncs();
-                        gte_strgb(cd);
+                        gte_shade_normal(&normal, &center, 255, 255, 255, &cd[0], &cd[1], &cd[2]);
                         r = cd[0]; g = cd[1]; b = cd[2];
-                        if (r < 64) r = 64; else r = (uint8_t)(((uint16_t)r * 3 + 80) >> 2);
-                        if (g < 64) g = 64; else g = (uint8_t)(((uint16_t)g * 3 + 80) >> 2);
-                        if (b < 64) b = 64; else b = (uint8_t)(((uint16_t)b * 3 + 80) >> 2);
                         s_static_face_light_cache[static_triangle_offset + ti][0] =
                             (uint8_t)((((uint32_t)r * base_r) >> 8) * source->color_r >> 8);
                         s_static_face_light_cache[static_triangle_offset + ti][1] =
@@ -2974,12 +3882,22 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                 }
                 if (lighting_dirty) {
                     static_cache->light_matrix = lmtx;
+                    static_cache->lighting_world = omtx;
+                    static_cache->light_revision = s_scene_light_revision;
+                    static_cache->lighting_vertices = m->verts;
+                    static_cache->lighting_next_mesh = m_next;
+                    static_cache->lighting_lerp_q8 = ent->vertex_anim_lerp_q8;
+                    static_cache->lighting_probe_source = s_shading_probe_source;
+                    for (vi = 0; vi < 3; ++vi)
+                        static_cache->normal_scale_q12[vi] = s_normal_scale_q12[vi];
                     static_cache->lighting_norms = m->norms;
+                    static_cache->lighting_face_norms = m->face_norms;
                     static_cache->lighting_tris = m->tris;
                     static_cache->base_r = base_r;
                     static_cache->base_g = base_g;
                     static_cache->base_b = base_b;
                     static_cache->lighting_valid = 1;
+                    static_cache->lighting_unlit = s_shading_unlit;
                 }
                 static_cache->mesh = m;
             }
@@ -2987,17 +3905,24 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
             if (use_tex && tpage && (const char*)(*pri + sizeof(DR_TPAGE)) <= packet_end) {
                 DR_TPAGE* dr = (DR_TPAGE*)*pri;
                 setDrawTPage(dr, 0, 0, tpage);
-                addPrim(ot + (OT_LEN - 2), dr);
+                add_world_primitive(ot + (OT_LEN - 2), dr);
                 *pri = (char*)(dr + 1);
             }
 
-            if (static_cached && !is_terrain && !is_smooth &&
-                !static_cache->needs_safe_clip) {
-                return draw_cached_flat_mesh(
+            int split_cached_flat = 0;
+            if (static_cached && !is_terrain && !is_smooth) {
+                const int fast_added = draw_cached_flat_mesh(
                     pri, packet_end, ot, ent, m,
                     static_vertex_offset, static_triangle_offset,
                     entity_near_z, shell_ot_bias,
-                    use_tex, tpage, tex_uoff, tex_voff);
+                    use_tex, tpage, tex_uoff, tex_voff,
+                    static_cache->needs_safe_clip,
+                    static_cache->visible_list_valid ? &s_static_visible_triangles[static_triangle_offset] : 0,
+                    static_cache->visible_triangle_count);
+                if (!static_cache->needs_safe_clip)
+                    return fast_added;
+                added += fast_added;
+                split_cached_flat = 1;
             }
 
             if (rigid_cached) {
@@ -3006,6 +3931,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                 uint16_t ti;
                 for (ti = 0; ti < m->tri_count; ++ti) {
                     const ps1_mesh_tri* t = &m->tris[ti];
+                    const SVECTOR face_center = mesh_face_center(m, t);
                     const uint16_t p0 = m->position_refs[t->i0];
                     const uint16_t p1 = m->position_refs[t->i1];
                     const uint16_t p2 = m->position_refs[t->i2];
@@ -3073,7 +3999,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
                                clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
                                clamp_u8(tex_uoff + m->uvs[t->i2].u), clamp_u8(tex_voff + m->uvs[t->i2].v));
-                        addPrim(ot + rigid_otz, tri);
+                        add_world_primitive(ot + rigid_otz, tri);
                         *pri = (char*)(tri + 1);
                     } else {
                         uint8_t fog_r = rigid_light_colors[light_bin][0];
@@ -3087,7 +4013,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                         setXY3(tri, x0, y0, x1, y1, x2, y2);
                         apply_scene_fog(skinned_tri_depth, &fog_r, &fog_g, &fog_b);
                         setRGB0(tri, fog_r, fog_g, fog_b);
-                        addPrim(ot + rigid_otz, tri);
+                        add_world_primitive(ot + rigid_otz, tri);
                         *pri = (char*)(tri + 1);
                     }
                     ++added;
@@ -3110,8 +4036,58 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
             int cached_face_tex_uoff = 0;
             int cached_face_tex_voff = 0;
 
-            for (uint16_t ti = 0; ti < m->tri_count; ++ti) {
+            const uint16_t visible_count = static_cached && static_cache->visible_list_valid
+                ? static_cache->visible_triangle_count : m->tri_count;
+            for (uint16_t draw_index = 0; draw_index < visible_count; ++draw_index) {
+                const uint16_t ti = static_cached && static_cache->visible_list_valid
+                    ? s_static_visible_triangles[static_triangle_offset + draw_index] : draw_index;
                 const ps1_mesh_tri* t = &m->tris[ti];
+                if (t->i0 >= m->vert_count || t->i1 >= m->vert_count || t->i2 >= m->vert_count)
+                    continue;
+                if (static_cached && !is_viewmodel) {
+                    uint16_t p0 = m->position_refs ? m->position_refs[t->i0] : t->i0;
+                    uint16_t p1 = m->position_refs ? m->position_refs[t->i1] : t->i1;
+                    uint16_t p2 = m->position_refs ? m->position_refs[t->i2] : t->i2;
+                    int32_t z0, z1, z2;
+                    if (p0 >= m->vert_count) p0 = t->i0;
+                    if (p1 >= m->vert_count) p1 = t->i1;
+                    if (p2 >= m->vert_count) p2 = t->i2;
+                    z0 = s_static_depth_cache[static_vertex_offset + p0];
+                    z1 = s_static_depth_cache[static_vertex_offset + p1];
+                    z2 = s_static_depth_cache[static_vertex_offset + p2];
+                    if (!rigid_frame && ent->vertex_anim_frame_count == 0 &&
+                        (s_static_outcode_cache[static_vertex_offset + p0] &
+                         s_static_outcode_cache[static_vertex_offset + p1] &
+                         s_static_outcode_cache[static_vertex_offset + p2]))
+                        continue;
+                    if (split_cached_flat && !(static_cache->visible_list_valid
+                        ? s_static_safe_clip_cache[static_triangle_offset+ti] : cached_triangle_needs_safe_clip(
+                            s_static_screen_cache[static_vertex_offset + p0],
+                            s_static_screen_cache[static_vertex_offset + p1],
+                            s_static_screen_cache[static_vertex_offset + p2],
+                            z0, z1, z2, entity_near_z, !authored_floor_face(ent, t))))
+                        continue;
+                    /* Reject only wholly invisible faces. A near-plane
+                     * crossing must reach the clipper even when its GTE XY
+                     * appears offscreen. Large subdivided floors otherwise
+                     * transform and clip hundreds of faces behind the camera. */
+                    if ((z0 < entity_near_z && z1 < entity_near_z && z2 < entity_near_z) ||
+                        (z0 > s_far_z && z1 > s_far_z && z2 > s_far_z) ||
+                        discard_solid_fog_triangle(z0, z1, z2))
+                        continue;
+                    if (z0 >= entity_near_z && z1 >= entity_near_z && z2 >= entity_near_z) {
+                        const int32_t xy0 = s_static_screen_cache[static_vertex_offset + p0];
+                        const int32_t xy1 = s_static_screen_cache[static_vertex_offset + p1];
+                        const int32_t xy2 = s_static_screen_cache[static_vertex_offset + p2];
+                        if (!(static_cache->visible_list_valid ? s_static_safe_clip_cache[static_triangle_offset+ti] :
+                            cached_triangle_needs_safe_clip(xy0, xy1, xy2, z0, z1, z2, entity_near_z, !authored_floor_face(ent, t))) &&
+                            triangle_outside_screen((int16_t)xy0, (int16_t)(xy0 >> 16),
+                                (int16_t)xy1, (int16_t)(xy1 >> 16),
+                                (int16_t)xy2, (int16_t)(xy2 >> 16)))
+                            continue;
+                    }
+                }
+                const SVECTOR face_center = static_cached ? (SVECTOR){0,0,0,0} : mesh_face_center(m, t);
                 const unsigned int texture_index = t->texture_index != 0
                     ? (unsigned int)t->texture_index
                     : (unsigned int)ent->texture_index;
@@ -3156,11 +4132,12 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                     const SVECTOR* v0 = &m->verts[t->i0];
                     const SVECTOR* v1 = &m->verts[t->i1];
                     const SVECTOR* v2 = &m->verts[t->i2];
-                    /* static_cached already interpolated every vertex once in
-                     * the projection-cache pass above.  Repeating the same
-                     * three lerps here discarded their results and doubled
-                     * animated-character interpolation cost. */
-                    if (use_vertex_lerp && !static_cached) {
+                    /* Cached world meshes already interpolate in their cache
+                     * pass. Viewmodels intentionally use the current baked
+                     * frame here: that is the camera-relative correction path
+                     * used before projection was optimized. In either case,
+                     * per-triangle lerps would only discard their results. */
+                    if (use_vertex_lerp && !static_cached && !viewmodel_cached) {
                         lerp0 = lerp_mesh_svector_q8(
                             v0, m, &m_next->verts[t->i0], m_next,
                             ent->vertex_anim_lerp_q8);
@@ -3175,27 +4152,112 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                         v2 = &lerp2;
                     }
 
+                /* Unlit hands are the common close-camera case.  When the
+                 * cached vertices are all in front of the near plane there is
+                 * no reason to build clip vertices, evaluate normals, or run
+                 * the general polygon clipper.  Keep the exact same screen
+                 * winding/visibility tests and packet format as the full path,
+                 * then fall through only for the rare near-plane crossing. */
+                if (is_viewmodel && view_model_soft && s_shading_unlit &&
+                    viewmodel_cached) {
+                    const int32_t z0 = s_viewmodel_depth_cache[t->i0];
+                    const int32_t z1 = s_viewmodel_depth_cache[t->i1];
+                    const int32_t z2 = s_viewmodel_depth_cache[t->i2];
+                    if (z0 >= entity_near_z && z1 >= entity_near_z &&
+                        z2 >= entity_near_z) {
+                        const int32_t sxy0 = s_viewmodel_screen_cache[t->i0];
+                        const int32_t sxy1 = s_viewmodel_screen_cache[t->i1];
+                        const int32_t sxy2 = s_viewmodel_screen_cache[t->i2];
+                        const int16_t x0 = (int16_t)(sxy0 & 0xffff);
+                        const int16_t y0 = (int16_t)(sxy0 >> 16);
+                        const int16_t x1 = (int16_t)(sxy1 & 0xffff);
+                        const int16_t y1 = (int16_t)(sxy1 >> 16);
+                        const int16_t x2 = (int16_t)(sxy2 & 0xffff);
+                        const int16_t y2 = (int16_t)(sxy2 >> 16);
+                        const int32_t depth = (z0 + z1 + z2) / 3;
+                        if (depth > 0 &&
+                            !triangle_outside_screen(x0, y0, x1, y1, x2, y2) &&
+                            screen_front_facing(x0, y0, x1, y1, x2, y2)) {
+                            const int fast_otz = viewmodel_triangle_otz(depth);
+                            if (use_tex && tpage) {
+                                POLY_FT3* tri;
+                                if ((const char*)(*pri + sizeof(POLY_FT3)) > packet_end)
+                                    return added;
+                                tri = (POLY_FT3*)*pri;
+                                setPolyFT3(tri);
+                                setXY3(tri, x0, y0, x1, y1, x2, y2);
+                                setRGB0(tri, base_r, base_g, base_b);
+                                tri->tpage = tpage;
+                                tri->clut = 0;
+                                setUV3(tri,
+                                       clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
+                                       clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
+                                       clamp_u8(tex_uoff + m->uvs[t->i2].u), clamp_u8(tex_voff + m->uvs[t->i2].v));
+                                add_world_primitive(ot + fast_otz, tri);
+                                *pri = (char*)(tri + 1);
+                                ++added;
+                            } else {
+                                POLY_F3* tri;
+                                if ((const char*)(*pri + sizeof(POLY_F3)) > packet_end)
+                                    return added;
+                                tri = (POLY_F3*)*pri;
+                                setPolyF3(tri);
+                                setXY3(tri, x0, y0, x1, y1, x2, y2);
+                                setRGB0(tri, base_r, base_g, base_b);
+                                add_world_primitive(ot + fast_otz, tri);
+                                *pri = (char*)(tri + 1);
+                                ++added;
+                            }
+                        }
+                        continue;
+                    }
+                }
+
                 if (is_viewmodel && view_model_soft) {
                     ps1_clip_vert src[3];
                     if (viewmodel_cached) {
-                        make_cached_clip_vert(&s_viewmodel_vertex_cache[t->i0],
+                        VECTOR cached_p[3];
+                        const int all_front =
+                            s_viewmodel_depth_cache[t->i0] >= entity_near_z &&
+                            s_viewmodel_depth_cache[t->i1] >= entity_near_z &&
+                            s_viewmodel_depth_cache[t->i2] >= entity_near_z;
+                        if (all_front) {
+                            /* The hot path only needs projected XY and depth.
+                             * Camera-space XY is intentionally left at zero;
+                             * screen-space winding below performs backface
+                             * rejection without 64-bit perspective products. */
+                            cached_p[0].vx = cached_p[0].vy = 0;
+                            cached_p[1].vx = cached_p[1].vy = 0;
+                            cached_p[2].vx = cached_p[2].vy = 0;
+                            cached_p[0].vz = s_viewmodel_depth_cache[t->i0];
+                            cached_p[1].vz = s_viewmodel_depth_cache[t->i1];
+                            cached_p[2].vz = s_viewmodel_depth_cache[t->i2];
+                        } else {
+                            /* Only the rare near-plane crossing needs full
+                             * camera-space coordinates for software clipping. */
+                            cached_p[0] = s_viewmodel_vertex_cache[t->i0];
+                            cached_p[1] = s_viewmodel_vertex_cache[t->i1];
+                            cached_p[2] = s_viewmodel_vertex_cache[t->i2];
+                        }
+                        make_cached_clip_vert(&cached_p[0],
                                               (use_tex && m->uvs) ? &m->uvs[t->i0] : 0, &src[0]);
-                        make_cached_clip_vert(&s_viewmodel_vertex_cache[t->i1],
+                        make_cached_clip_vert(&cached_p[1],
                                               (use_tex && m->uvs) ? &m->uvs[t->i1] : 0, &src[1]);
-                        make_cached_clip_vert(&s_viewmodel_vertex_cache[t->i2],
+                        make_cached_clip_vert(&cached_p[2],
                                               (use_tex && m->uvs) ? &m->uvs[t->i2] : 0, &src[2]);
                     } else {
-                        make_clip_vert(&composed, &m->verts[t->i0],
+                        make_clip_vert(&composed, v0,
                                        (use_tex && m->uvs) ? &m->uvs[t->i0] : 0, &src[0]);
-                        make_clip_vert(&composed, &m->verts[t->i1],
+                        make_clip_vert(&composed, v1,
                                        (use_tex && m->uvs) ? &m->uvs[t->i1] : 0, &src[1]);
-                        make_clip_vert(&composed, &m->verts[t->i2],
+                        make_clip_vert(&composed, v2,
                                        (use_tex && m->uvs) ? &m->uvs[t->i2] : 0, &src[2]);
                     }
 
                     if (src[0].p.vz >= entity_near_z &&
                         src[1].p.vz >= entity_near_z &&
                         src[2].p.vz >= entity_near_z &&
+                        !viewmodel_cached &&
                         !camera_space_front_facing(src))
                         continue;
 
@@ -3204,12 +4266,15 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                         src[2].p.vz >= entity_near_z) {
                         int16_t x0, y0, x1, y1, x2, y2;
                         if (viewmodel_cached) {
-                            x0 = s_viewmodel_screen_x[t->i0];
-                            y0 = s_viewmodel_screen_y[t->i0];
-                            x1 = s_viewmodel_screen_x[t->i1];
-                            y1 = s_viewmodel_screen_y[t->i1];
-                            x2 = s_viewmodel_screen_x[t->i2];
-                            y2 = s_viewmodel_screen_y[t->i2];
+                            const int32_t sxy0 = s_viewmodel_screen_cache[t->i0];
+                            const int32_t sxy1 = s_viewmodel_screen_cache[t->i1];
+                            const int32_t sxy2 = s_viewmodel_screen_cache[t->i2];
+                            x0 = (int16_t)(sxy0 & 0xffff);
+                            y0 = (int16_t)(sxy0 >> 16);
+                            x1 = (int16_t)(sxy1 & 0xffff);
+                            y1 = (int16_t)(sxy1 >> 16);
+                            x2 = (int16_t)(sxy2 & 0xffff);
+                            y2 = (int16_t)(sxy2 >> 16);
                         } else {
                             project_clip_vert(&src[0], &x0, &y0, entity_near_z);
                             project_clip_vert(&src[1], &x1, &y1, entity_near_z);
@@ -3225,14 +4290,18 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             continue;
                         otz = viewmodel_triangle_otz(p);
 
-                        faceN.vx = t->nx;
-                        faceN.vy = t->ny;
-                        faceN.vz = t->nz;
-                        faceN.pad = 0;
+                        faceN = ps1_mesh_face_normal(m, t, ti);
                         if (faceN.vx == 0 && faceN.vy == 0 && faceN.vz == 0)
                             faceN.vy = 3800;
 
-                        viewmodel_cpu_shade_normal(&lmtx, &faceN, base_r, base_g, base_b, &r, &g, &b);
+                        if (viewmodel_light_cached) {
+                            r = s_viewmodel_face_light_cache[ti][0];
+                            g = s_viewmodel_face_light_cache[ti][1];
+                            b = s_viewmodel_face_light_cache[ti][2];
+                        } else {
+                            viewmodel_cpu_shade_normal(
+                                &lmtx, &faceN, &face_center, base_r, base_g, base_b, &r, &g, &b);
+                        }
 
                         if (use_tex && tpage) {
                             if ((const char*)(*pri + sizeof(POLY_FT3)) > packet_end)
@@ -3248,7 +4317,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                        clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
                                        clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
                                        clamp_u8(tex_uoff + m->uvs[t->i2].u), clamp_u8(tex_voff + m->uvs[t->i2].v));
-                                addPrim(ot + otz, tri);
+                                add_world_primitive(ot + otz, tri);
                                 *pri = (char*)(tri + 1);
                                 ++added;
                             }
@@ -3260,7 +4329,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                 setPolyF3(tri);
                                 setXY3(tri, x0, y0, x1, y1, x2, y2);
                                 setRGB0(tri, r, g, b);
-                                addPrim(ot + otz, tri);
+                                add_world_primitive(ot + otz, tri);
                                 *pri = (char*)(tri + 1);
                                 ++added;
                             }
@@ -3269,19 +4338,23 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                     }
 
                     {
-                        ps1_clip_vert clipped[4];
+                        ps1_clip_vert clipped[6];
                         int clipped_count = clip_triangle_near(src, clipped, entity_near_z);
                         int qi;
                         if (clipped_count < 3)
                             continue;
 
-                        faceN.vx = t->nx;
-                        faceN.vy = t->ny;
-                        faceN.vz = t->nz;
-                        faceN.pad = 0;
+                        faceN = ps1_mesh_face_normal(m, t, ti);
                         if (faceN.vx == 0 && faceN.vy == 0 && faceN.vz == 0)
                             faceN.vy = 3800;
-                        viewmodel_cpu_shade_normal(&lmtx, &faceN, base_r, base_g, base_b, &r, &g, &b);
+                        if (viewmodel_light_cached) {
+                            r = s_viewmodel_face_light_cache[ti][0];
+                            g = s_viewmodel_face_light_cache[ti][1];
+                            b = s_viewmodel_face_light_cache[ti][2];
+                        } else {
+                            viewmodel_cpu_shade_normal(
+                                &lmtx, &faceN, &face_center, base_r, base_g, base_b, &r, &g, &b);
+                        }
 
                         for (qi = 0; qi < clipped_count - 2; ++qi) {
                             const ps1_clip_vert* c0 = &clipped[0];
@@ -3315,7 +4388,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                            clamp_u8(tex_uoff + c0->u), clamp_u8(tex_voff + c0->v),
                                            clamp_u8(tex_uoff + c1->u), clamp_u8(tex_voff + c1->v),
                                            clamp_u8(tex_uoff + c2->u), clamp_u8(tex_voff + c2->v));
-                                    addPrim(ot + otz, tri);
+                                    add_world_primitive(ot + otz, tri);
                                     *pri = (char*)(tri + 1);
                                     ++added;
                                 }
@@ -3327,7 +4400,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                     setPolyF3(tri);
                                     setXY3(tri, x0, y0, x1, y1, x2, y2);
                                     setRGB0(tri, r, g, b);
-                                    addPrim(ot + otz, tri);
+                                    add_world_primitive(ot + otz, tri);
                                     *pri = (char*)(tri + 1);
                                     ++added;
                                 }
@@ -3360,12 +4433,13 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                         csxy0 = s_static_screen_cache[static_vertex_offset + p0];
                         csxy1 = s_static_screen_cache[static_vertex_offset + p1];
                         csxy2 = s_static_screen_cache[static_vertex_offset + p2];
-                        needs_cpu_clip = cached_triangle_needs_safe_clip(
+                        needs_cpu_clip = static_cache->visible_list_valid ?
+                            s_static_safe_clip_cache[static_triangle_offset+ti] : cached_triangle_needs_safe_clip(
                             csxy0, csxy1, csxy2,
                             s_static_depth_cache[static_vertex_offset + p0],
                             s_static_depth_cache[static_vertex_offset + p1],
                             s_static_depth_cache[static_vertex_offset + p2],
-                            entity_near_z);
+                            entity_near_z, !authored_floor_face(ent, t));
                     } else {
                         make_clip_vert(&composed, v0,
                                        (use_tex && m->uvs) ? &m->uvs[t->i0] : 0, &src[0]);
@@ -3374,29 +4448,32 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                         make_clip_vert(&composed, v2,
                                        (use_tex && m->uvs) ? &m->uvs[t->i2] : 0, &src[2]);
                         needs_cpu_clip =
-                            camera_triangle_needs_safe_clip(src, entity_near_z);
+                            camera_triangle_needs_safe_clip(src, entity_near_z, !authored_floor_face(ent, t));
                     }
 
                     if (needs_cpu_clip) {
-                        ps1_clip_vert clipped[4];
+                        ps1_clip_vert clipped[6];
                         const int clipped_smooth =
                             is_smooth && !is_terrain && m->norms;
                         int clipped_count;
                         int qi;
 
                         if (static_cached) {
-                            make_clip_vert(&composed, v0,
+                            uint16_t p0 = m->position_refs ? m->position_refs[t->i0] : t->i0;
+                            uint16_t p1 = m->position_refs ? m->position_refs[t->i1] : t->i1;
+                            uint16_t p2 = m->position_refs ? m->position_refs[t->i2] : t->i2;
+                            if (p0 >= m->vert_count) p0 = t->i0;
+                            if (p1 >= m->vert_count) p1 = t->i1;
+                            if (p2 >= m->vert_count) p2 = t->i2;
+                            make_cached_clip_vert(&s_static_camera_cache[static_vertex_offset + p0],
                                            (use_tex && m->uvs) ? &m->uvs[t->i0] : 0, &src[0]);
-                            make_clip_vert(&composed, v1,
+                            make_cached_clip_vert(&s_static_camera_cache[static_vertex_offset + p1],
                                            (use_tex && m->uvs) ? &m->uvs[t->i1] : 0, &src[1]);
-                            make_clip_vert(&composed, v2,
+                            make_cached_clip_vert(&s_static_camera_cache[static_vertex_offset + p2],
                                            (use_tex && m->uvs) ? &m->uvs[t->i2] : 0, &src[2]);
                         }
 
-                        faceN.vx = t->nx;
-                        faceN.vy = t->ny;
-                        faceN.vz = t->nz;
-                        faceN.pad = 0;
+                        faceN = ps1_mesh_face_normal(m, t, ti);
                         if (faceN.vx == 0 && faceN.vy == 0 && faceN.vz == 0)
                             faceN.vy = 3800;
 
@@ -3415,28 +4492,28 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             } else {
                                 if (use_tex) {
                                     gte_shade_textured_smooth_normal(
-                                        &m->norms[t->i0], base_r, base_g, base_b,
+                                        &m->norms[t->i0], &m->verts[t->i0], base_r, base_g, base_b,
                                         &sr, &sg, &sb);
                                 } else {
-                                    gte_shade_normal(&m->norms[t->i0], base_r, base_g, base_b,
+                                    gte_shade_normal(&m->norms[t->i0], &m->verts[t->i0], base_r, base_g, base_b,
                                                      &sr, &sg, &sb);
                                 }
                                 src[0].r = sr; src[0].g = sg; src[0].b = sb;
                                 if (use_tex) {
                                     gte_shade_textured_smooth_normal(
-                                        &m->norms[t->i1], base_r, base_g, base_b,
+                                        &m->norms[t->i1], &m->verts[t->i1], base_r, base_g, base_b,
                                         &sr, &sg, &sb);
                                 } else {
-                                    gte_shade_normal(&m->norms[t->i1], base_r, base_g, base_b,
+                                    gte_shade_normal(&m->norms[t->i1], &m->verts[t->i1], base_r, base_g, base_b,
                                                      &sr, &sg, &sb);
                                 }
                                 src[1].r = sr; src[1].g = sg; src[1].b = sb;
                                 if (use_tex) {
                                     gte_shade_textured_smooth_normal(
-                                        &m->norms[t->i2], base_r, base_g, base_b,
+                                        &m->norms[t->i2], &m->verts[t->i2], base_r, base_g, base_b,
                                         &sr, &sg, &sb);
                                 } else {
-                                    gte_shade_normal(&m->norms[t->i2], base_r, base_g, base_b,
+                                    gte_shade_normal(&m->norms[t->i2], &m->verts[t->i2], base_r, base_g, base_b,
                                                      &sr, &sg, &sb);
                                 }
                                 src[2].r = sr; src[2].g = sg; src[2].b = sb;
@@ -3453,14 +4530,8 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             } else {
                                 uint8_t cd[4];
                                 cd[0] = 128; cd[1] = 128; cd[2] = 128; cd[3] = 0;
-                                gte_ldrgb(cd);
-                                gte_ldv0(&faceN);
-                                gte_ncs();
-                                gte_strgb(cd);
+                                gte_shade_normal(&faceN, &face_center, 255, 255, 255, &cd[0], &cd[1], &cd[2]);
                                 r = cd[0]; g = cd[1]; b = cd[2];
-                                if (r < 64) r = 64; else r = (uint8_t)(((uint16_t)r * 3 + 80) >> 2);
-                                if (g < 64) g = 64; else g = (uint8_t)(((uint16_t)g * 3 + 80) >> 2);
-                                if (b < 64) b = 64; else b = (uint8_t)(((uint16_t)b * 3 + 80) >> 2);
                                 r = (uint8_t)(((uint16_t)r * base_r) >> 8);
                                 g = (uint8_t)(((uint16_t)g * base_g) >> 8);
                                 b = (uint8_t)(((uint16_t)b * base_b) >> 8);
@@ -3470,24 +4541,63 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             }
                         }
 
-                        clipped_count = clip_triangle_near(src, clipped, entity_near_z);
+                        clipped_count = clip_world_depth(src, clipped, entity_near_z, s_far_z);
                         if (clipped_count < 3)
                             continue;
 
                         {
-                            ps1_screen_clip_vert projected[4];
+                            ps1_screen_clip_vert projected[6];
                             ps1_screen_clip_vert screen_clipped[12];
                             int screen_count;
-                            for (qi = 0; qi < clipped_count; ++qi)
-                                project_clip_vert_wide(
+                            int reuse_projection = static_cached && clipped_count == 3;
+                            uint16_t cached_positions[3] = {t->i2, t->i0, t->i1};
+                            for (qi = 0; reuse_projection && qi < 3; ++qi) {
+                                uint16_t reference = m->position_refs
+                                    ? m->position_refs[cached_positions[qi]] : cached_positions[qi];
+                                if (reference >= m->vert_count) reference = cached_positions[qi];
+                                cached_positions[qi] = reference;
+                                const int z = src[qi].p.vz;
+                                if (z < entity_near_z || z > s_far_z || z > 65535 ||
+                                    src[qi].p.vx < -32768 || src[qi].p.vx > 32767 ||
+                                    src[qi].p.vy < -32768 || src[qi].p.vy > 32767 ||
+                                    ps1_projection_vertex_needs_clip(
+                                        s_static_screen_cache[static_vertex_offset + reference],
+                                        s_static_depth_cache[static_vertex_offset + reference],
+                                        entity_near_z, s_far_z, s_geom_screen))
+                                    reuse_projection = 0;
+                            }
+                            for (qi = 0; qi < clipped_count; ++qi) {
+                                if (reuse_projection) {
+                                    const int32_t xy = s_static_screen_cache[
+                                        static_vertex_offset + cached_positions[qi]];
+                                    projected[qi].x = (int16_t)xy;
+                                    projected[qi].y = (int16_t)(xy >> 16);
+                                    projected[qi].z = clipped[qi].p.vz;
+                                    projected[qi].u = clipped[qi].u;
+                                    projected[qi].v = clipped[qi].v;
+                                    projected[qi].r = clipped[qi].r;
+                                    projected[qi].g = clipped[qi].g;
+                                    projected[qi].b = clipped[qi].b;
+                                } else project_clip_vert_wide(
                                     &clipped[qi], &projected[qi], entity_near_z);
+                            }
                             screen_count = clip_polygon_to_safe_screen(
                                 projected, clipped_count, screen_clipped);
 
                         for (qi = 0; qi < screen_count - 2; ++qi) {
-                            const ps1_screen_clip_vert* c0 = &screen_clipped[0];
-                            const ps1_screen_clip_vert* c1 = &screen_clipped[qi + 1];
-                            const ps1_screen_clip_vert* c2 = &screen_clipped[qi + 2];
+                            ps1_screen_clip_vert fragments[PS1_AFFINE_FRAGMENTS][3];
+                            const int authored_floor = authored_floor_face(ent, t);
+                            const int subdivide = use_tex && !authored_floor;
+                            int fragment_count = 1;
+                            if (subdivide) {
+                                const ps1_screen_clip_vert face[3] = {
+                                    screen_clipped[0], screen_clipped[qi + 1], screen_clipped[qi + 2] };
+                                fragment_count = ps1_affine_subdivide(face, fragments);
+                            }
+                            for (int fi = 0; fi < fragment_count; ++fi) {
+                            const ps1_screen_clip_vert* c0 = subdivide ? &fragments[fi][0] : &screen_clipped[0];
+                            const ps1_screen_clip_vert* c1 = subdivide ? &fragments[fi][1] : &screen_clipped[qi+1];
+                            const ps1_screen_clip_vert* c2 = subdivide ? &fragments[fi][2] : &screen_clipped[qi+2];
                             int16_t x0, y0, x1, y1, x2, y2;
                             uint8_t cr0, cg0, cb0, cr1, cg1, cb1, cr2, cg2, cb2;
 
@@ -3496,13 +4606,18 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             x2 = (int16_t)c2->x; y2 = (int16_t)c2->y;
                             if (!screen_front_facing_strict(x0, y0, x1, y1, x2, y2))
                                 continue;
-                            /* CPU projection rounds differently from adjacent
-                             * cached GTE triangles. Expand only clipped output
-                             * by one pixel so that mismatch cannot expose the
-                             * background as dotted/diagonal cracks. */
-                            SEAM_FILL_EXPAND(x0, y0, x1, y1, x2, y2);
+                            /* Floor boundaries use shared projection and
+                             * clipping, not per-triangle geometry inflation. */
+                            if (!authored_floor)
+                                SEAM_FILL_EXPAND(x0, y0, x1, y1, x2, y2);
 
-                            p = (c0->z + c1->z + c2->z) / 12;
+                            /* Large front AND rear surfaces use the same
+                             * bounded subdivision. Their local fragment depth
+                             * can now order a nearby wall in front of stairs,
+                             * instead of sorting a whole oblique wall by its
+                             * distant centroid. */
+                            p = ps1_clipped_face_sort_depth(c0->z, c1->z, c2->z,
+                                                           entity_near_z, s_far_z);
                             if (p <= 0 || (!is_viewmodel && (p > (s_far_z >> 2))))
                                 continue;
                             if (!is_viewmodel &&
@@ -3510,7 +4625,11 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                 continue;
                             otz = mesh_triangle_otz_fine(p);
                             otz = floor_surface_otz(
-                                ent, t, otz, c0->z, c1->z, c2->z, c2->z);
+                                ent, t, otz,
+                                authored_floor ? src[0].p.vz : c0->z,
+                                authored_floor ? src[1].p.vz : c1->z,
+                                authored_floor ? src[2].p.vz : c2->z,
+                                authored_floor ? src[2].p.vz : c2->z);
                             if (smooth_object_otz_floor > 0 && otz < smooth_object_otz_floor)
                                 otz = smooth_object_otz_floor;
                             if (shell_ot_bias > 0) {
@@ -3529,8 +4648,8 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                     &cr1, &cg1, &cb1,
                                     &cr2, &cg2, &cb2);
                                 if (use_tex && tpage &&
-                                    !is_triangle_fully_fogged(p << 2) &&
-                                    scene_fog_amount_q8(p << 2) <= 0) {
+                                    (!is_triangle_fully_fogged(c0->z) || !is_triangle_fully_fogged(c1->z) ||
+                                     !is_triangle_fully_fogged(c2->z) || ps1_texture_has_cutout(texture_index))) {
                                     POLY_GT3* tri;
                                     if ((const char*)(*pri + sizeof(POLY_GT3)) > packet_end)
                                         return added;
@@ -3546,7 +4665,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                            clamp_u8(tex_uoff + c0->u), clamp_u8(tex_voff + c0->v),
                                            clamp_u8(tex_uoff + c1->u), clamp_u8(tex_voff + c1->v),
                                            clamp_u8(tex_uoff + c2->u), clamp_u8(tex_voff + c2->v));
-                                    addPrim(ot + otz, tri);
+                                    add_world_primitive(ot + otz, tri);
                                     *pri = (char*)(tri + 1);
                                 } else {
                                     POLY_G3* tri;
@@ -3558,29 +4677,35 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                     tri->r0 = cr0; tri->g0 = cg0; tri->b0 = cb0;
                                     tri->r1 = cr1; tri->g1 = cg1; tri->b1 = cb1;
                                     tri->r2 = cr2; tri->g2 = cg2; tri->b2 = cb2;
-                                    addPrim(ot + otz, tri);
+                                    add_world_primitive(ot + otz, tri);
                                     *pri = (char*)(tri + 1);
                                 }
                             } else {
                                 cr0 = r; cg0 = g; cb0 = b;
-                                apply_scene_fog(p << 2, &cr0, &cg0, &cb0);
+                                cr1 = r; cg1 = g; cb1 = b;
+                                cr2 = r; cg2 = g; cb2 = b;
+                                apply_scene_fog(c0->z, &cr0, &cg0, &cb0);
+                                apply_scene_fog(c1->z, &cr1, &cg1, &cb1);
+                                apply_scene_fog(c2->z, &cr2, &cg2, &cb2);
                                 if (use_tex && tpage &&
-                                    !is_triangle_fully_fogged(p << 2) &&
-                                    scene_fog_amount_q8(p << 2) <= 0) {
-                                    POLY_FT3* tri;
-                                    if ((const char*)(*pri + sizeof(POLY_FT3)) > packet_end)
+                                    (!is_triangle_fully_fogged(c0->z) || !is_triangle_fully_fogged(c1->z) ||
+                                     !is_triangle_fully_fogged(c2->z) || ps1_texture_has_cutout(texture_index))) {
+                                    POLY_GT3* tri;
+                                    if ((const char*)(*pri + sizeof(POLY_GT3)) > packet_end)
                                         return added;
-                                    tri = (POLY_FT3*)*pri;
-                                    setPolyFT3(tri);
+                                    tri = (POLY_GT3*)*pri;
+                                    setPolyGT3(tri);
                                     setXY3(tri, x0, y0, x1, y1, x2, y2);
                                     setRGB0(tri, cr0, cg0, cb0);
+                                    setRGB1(tri, cr1, cg1, cb1);
+                                    setRGB2(tri, cr2, cg2, cb2);
                                     tri->tpage = tpage;
                                     tri->clut = 0;
                                     setUV3(tri,
                                            clamp_u8(tex_uoff + c0->u), clamp_u8(tex_voff + c0->v),
                                            clamp_u8(tex_uoff + c1->u), clamp_u8(tex_voff + c1->v),
                                            clamp_u8(tex_uoff + c2->u), clamp_u8(tex_voff + c2->v));
-                                    addPrim(ot + otz, tri);
+                                    add_world_primitive(ot + otz, tri);
                                     *pri = (char*)(tri + 1);
                                 } else {
                                     POLY_F3* tri;
@@ -3590,11 +4715,12 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                     setPolyF3(tri);
                                     setXY3(tri, x0, y0, x1, y1, x2, y2);
                                     setRGB0(tri, cr0, cg0, cb0);
-                                    addPrim(ot + otz, tri);
+                                    add_world_primitive(ot + otz, tri);
                                     *pri = (char*)(tri + 1);
                                 }
                             }
                             ++added;
+                        }
                         }
                         }
                         continue;
@@ -3702,7 +4828,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                         continue;
                 }
                 if (!is_viewmodel && !rigid_frame &&
-                    ent->vertex_anim_frame_count == 0) {
+                    ent->vertex_anim_frame_count == 0 && !authored_floor_face(ent, t)) {
                     /* UV-repeat subdivision can leave adjacent exported
                      * vertices one fixed-point unit apart. At PS1 projection
                      * precision that becomes a dotted one-pixel background
@@ -3734,16 +4860,13 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                  * For reversed-winding copies (back faces), the cross product
                  * in the exporter produces an inward-pointing normal. GTE
                  * will light it correctly facing the interior light source. */
-                faceN.vx = t->nx;
-                faceN.vy = t->ny;
-                faceN.vz = t->nz;
-                faceN.pad = 0;
+                faceN = ps1_mesh_face_normal(m, t, ti);
                 if (faceN.vx == 0 && faceN.vy == 0 && faceN.vz == 0)
                     faceN.vy = 3800;
 
 
                 if (use_tex && tpage) {
-                    if (is_triangle_fully_fogged(tri_depth)) {
+                    if (is_triangle_fully_fogged(tri_depth) && !ps1_texture_has_cutout(texture_index)) {
                         POLY_F3* tri;
                         if ((const char*)(*pri + sizeof(POLY_F3)) > packet_end)
                             return added;
@@ -3751,7 +4874,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                         setPolyF3(tri);
                         setXY3(tri, tri_x0, tri_y0, tri_x1, tri_y1, tri_x2, tri_y2);
                         setRGB0(tri, g_ps1_scene.fog_r, g_ps1_scene.fog_g, g_ps1_scene.fog_b);
-                        addPrim(ot + otz, tri);
+                        add_world_primitive(ot + otz, tri);
                         *pri = (char*)(tri + 1);
                         ++added;
                         continue;
@@ -3769,32 +4892,37 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             g2 = s_static_light_cache[static_vertex_offset + t->i2][1];
                             b2 = s_static_light_cache[static_vertex_offset + t->i2][2];
                         } else {
-                            gte_shade_textured_smooth_normal(&m->norms[t->i0], base_r, base_g, base_b, &r0, &g0, &b0);
-                            gte_shade_textured_smooth_normal(&m->norms[t->i1], base_r, base_g, base_b, &r1, &g1, &b1);
-                            gte_shade_textured_smooth_normal(&m->norms[t->i2], base_r, base_g, base_b, &r2, &g2, &b2);
+                            gte_shade_textured_smooth_normal(&m->norms[t->i0], &m->verts[t->i0], base_r, base_g, base_b, &r0, &g0, &b0);
+                            gte_shade_textured_smooth_normal(&m->norms[t->i1], &m->verts[t->i1], base_r, base_g, base_b, &r1, &g1, &b1);
+                            gte_shade_textured_smooth_normal(&m->norms[t->i2], &m->verts[t->i2], base_r, base_g, base_b, &r2, &g2, &b2);
                         }
-                        /* Check per-vertex fog. If ANY vertex has fog, we MUST use
-                         * an untextured POLY_G3 because PS1 GPU does texel*vertex/128
-                         * (multiplicative) — texture colors bleed through fog color.
-                         * Untextured polygons use vertex color directly = opaque fog. */
+                        /* Preserve texture detail throughout the fade. Fully
+                         * fogged faces use the opaque branch above; partial fog
+                         * modulates per-vertex colour on a textured primitive. */
                         if (g_ps1_scene.fog_enabled) {
                             int f0 = scene_fog_amount_q8(z0);
                             int f1 = scene_fog_amount_q8(z1);
                             int f2 = scene_fog_amount_q8(z2);
                             if (f0 > 0 || f1 > 0 || f2 > 0) {
-                                POLY_G3* gtri;
-                                if ((const char*)(*pri + sizeof(POLY_G3)) > packet_end)
+                                POLY_GT3* gtri;
+                                if ((const char*)(*pri + sizeof(POLY_GT3)) > packet_end)
                                     return added;
-                                gtri = (POLY_G3*)*pri;
-                                setPolyG3(gtri);
+                                gtri = (POLY_GT3*)*pri;
+                                setPolyGT3(gtri);
                                 setXY3(gtri, tri_x0, tri_y0, tri_x1, tri_y1, tri_x2, tri_y2);
+                                gtri->tpage = tpage;
+                                gtri->clut = 0;
+                                setUV3(gtri,
+                                    clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
+                                    clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
+                                    clamp_u8(tex_uoff + m->uvs[t->i2].u), clamp_u8(tex_voff + m->uvs[t->i2].v));
                                 apply_scene_fog_amount(f0, &r0, &g0, &b0);
                                 apply_scene_fog_amount(f1, &r1, &g1, &b1);
                                 apply_scene_fog_amount(f2, &r2, &g2, &b2);
                                 gtri->r0 = r0; gtri->g0 = g0; gtri->b0 = b0;
                                 gtri->r1 = r1; gtri->g1 = g1; gtri->b1 = b1;
                                 gtri->r2 = r2; gtri->g2 = g2; gtri->b2 = b2;
-                                addPrim(ot + otz, gtri);
+                                add_world_primitive(ot + otz, gtri);
                                 *pri = (char*)(gtri + 1);
                                 ++added;
                                 continue;
@@ -3816,7 +4944,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                    clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
                                    clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
                                    clamp_u8(tex_uoff + m->uvs[t->i2].u), clamp_u8(tex_voff + m->uvs[t->i2].v));
-                            addPrim(ot + otz, tri);
+                            add_world_primitive(ot + otz, tri);
                             *pri = (char*)(tri + 1);
                             ++added;
                         }
@@ -3837,21 +4965,13 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                 /* Inline NCS: load face normal, compute lighting via GTE. */
                                 uint8_t cd[4];
                                 cd[0] = 128; cd[1] = 128; cd[2] = 128; cd[3] = 0;
-                                gte_ldrgb(cd);
-                                gte_ldv0(&faceN);
-                                gte_ncs();
-                                gte_strgb(cd);
+                                gte_shade_normal(&faceN, &face_center, 255, 255, 255, &cd[0], &cd[1], &cd[2]);
                                 r = cd[0]; g = cd[1]; b = cd[2];
                             }
                             if (is_terrain) {
                                 r = (uint8_t)(((uint16_t)t->shade * t->color_r) / 255u);
                                 g = (uint8_t)(((uint16_t)t->shade * t->color_g) / 255u);
                                 b = (uint8_t)(((uint16_t)t->shade * t->color_b) / 255u);
-                            } else if (!rigid_frame) {
-                                /* Lift shadows (half-Lambert) and modulate with base color. */
-                                if (r < 64) r = 64; else r = (uint8_t)(((uint16_t)r * 3 + 80) >> 2);
-                                if (g < 64) g = 64; else g = (uint8_t)(((uint16_t)g * 3 + 80) >> 2);
-                                if (b < 64) b = 64; else b = (uint8_t)(((uint16_t)b * 3 + 80) >> 2);
                             }
                             if (!rigid_frame) {
                                 r = (uint8_t)(((uint16_t)r * base_r) >> 8);
@@ -3864,21 +4984,24 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                 }
                             }
                         }
-                        /* When fog is active and any vertex is in the fog zone,
-                         * use untextured POLY_G3 with per-vertex fog colors.
-                         * PS1 GPU does texel*vertex/128 (multiplicative) so textured
-                         * polygons can never produce opaque fog — texture bleeds through. */
+                        /* Partial fog must not erase the material's texture. */
                         if (g_ps1_scene.fog_enabled) {
                             int f0 = scene_fog_amount_q8(z0);
                             int f1 = scene_fog_amount_q8(z1);
                             int f2 = scene_fog_amount_q8(z2);
                             if (f0 > 0 || f1 > 0 || f2 > 0) {
-                                POLY_G3* gtri;
-                                if ((const char*)(*pri + sizeof(POLY_G3)) > packet_end)
+                                POLY_GT3* gtri;
+                                if ((const char*)(*pri + sizeof(POLY_GT3)) > packet_end)
                                     return added;
-                                gtri = (POLY_G3*)*pri;
-                                setPolyG3(gtri);
+                                gtri = (POLY_GT3*)*pri;
+                                setPolyGT3(gtri);
                                 setXY3(gtri, tri_x0, tri_y0, tri_x1, tri_y1, tri_x2, tri_y2);
+                                gtri->tpage = tpage;
+                                gtri->clut = 0;
+                                setUV3(gtri,
+                                    clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
+                                    clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
+                                    clamp_u8(tex_uoff + m->uvs[t->i2].u), clamp_u8(tex_voff + m->uvs[t->i2].v));
                                 uint8_t r0 = r, g0 = g, b0 = b;
                                 uint8_t r1 = r, g1 = g, b1 = b;
                                 uint8_t r2 = r, g2 = g, b2 = b;
@@ -3888,7 +5011,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                 gtri->r0 = r0; gtri->g0 = g0; gtri->b0 = b0;
                                 gtri->r1 = r1; gtri->g1 = g1; gtri->b1 = b1;
                                 gtri->r2 = r2; gtri->g2 = g2; gtri->b2 = b2;
-                                addPrim(ot + otz, gtri);
+                                add_world_primitive(ot + otz, gtri);
                                 *pri = (char*)(gtri + 1);
                                 ++added;
                                 continue;
@@ -3908,7 +5031,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                    clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
                                    clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
                                    clamp_u8(tex_uoff + m->uvs[t->i2].u), clamp_u8(tex_voff + m->uvs[t->i2].v));
-                            addPrim(ot + otz, tri);
+                            add_world_primitive(ot + otz, tri);
                             *pri = (char*)(tri + 1);
                             ++added;
                         }
@@ -3933,9 +5056,9 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             g2 = s_static_light_cache[static_vertex_offset + t->i2][1];
                             b2 = s_static_light_cache[static_vertex_offset + t->i2][2];
                         } else {
-                            gte_shade_normal(&m->norms[t->i0], base_r, base_g, base_b, &r0, &g0, &b0);
-                            gte_shade_normal(&m->norms[t->i1], base_r, base_g, base_b, &r1, &g1, &b1);
-                            gte_shade_normal(&m->norms[t->i2], base_r, base_g, base_b, &r2, &g2, &b2);
+                            gte_shade_normal(&m->norms[t->i0], &m->verts[t->i0], base_r, base_g, base_b, &r0, &g0, &b0);
+                            gte_shade_normal(&m->norms[t->i1], &m->verts[t->i1], base_r, base_g, base_b, &r1, &g1, &b1);
+                            gte_shade_normal(&m->norms[t->i2], &m->verts[t->i2], base_r, base_g, base_b, &r2, &g2, &b2);
                         }
                         apply_scene_fog_vertex3(
                             z0, z1, z2,
@@ -3945,7 +5068,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                         tri->r0 = r0; tri->g0 = g0; tri->b0 = b0;
                         tri->r1 = r1; tri->g1 = g1; tri->b1 = b1;
                         tri->r2 = r2; tri->g2 = g2; tri->b2 = b2;
-                        addPrim(ot + otz, tri);
+                        add_world_primitive(ot + otz, tri);
                         *pri = (char*)(tri + 1);
                         ++added;
                         continue;
@@ -3971,20 +5094,13 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                 /* Flat-shaded: inline NCS + modulate with entity base color. */
                                 uint8_t cd[4];
                                 cd[0] = 128; cd[1] = 128; cd[2] = 128; cd[3] = 0;
-                                gte_ldrgb(cd);
-                                gte_ldv0(&faceN);
-                                gte_ncs();
-                                gte_strgb(cd);
+                                gte_shade_normal(&faceN, &face_center, 255, 255, 255, &cd[0], &cd[1], &cd[2]);
                                 r = cd[0]; g = cd[1]; b = cd[2];
                             }
                             if (is_terrain) {
                                 r = (uint8_t)(((uint16_t)t->shade * t->color_r) / 255u);
                                 g = (uint8_t)(((uint16_t)t->shade * t->color_g) / 255u);
                                 b = (uint8_t)(((uint16_t)t->shade * t->color_b) / 255u);
-                            } else if (!rigid_frame) {
-                                if (r < 64) r = 64; else r = (uint8_t)(((uint16_t)r * 3 + 80) >> 2);
-                                if (g < 64) g = 64; else g = (uint8_t)(((uint16_t)g * 3 + 80) >> 2);
-                                if (b < 64) b = 64; else b = (uint8_t)(((uint16_t)b * 3 + 80) >> 2);
                             }
                             if (!rigid_frame) {
                                 r = (uint8_t)(((uint16_t)r * base_r) >> 8);
@@ -4012,14 +5128,14 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             gtri->r0 = r0; gtri->g0 = g0; gtri->b0 = b0;
                             gtri->r1 = r1; gtri->g1 = g1; gtri->b1 = b1;
                             gtri->r2 = r2; gtri->g2 = g2; gtri->b2 = b2;
-                            addPrim(ot + otz, gtri);
+                            add_world_primitive(ot + otz, gtri);
                             *pri = (char*)(gtri + 1);
                             ++added;
                             continue;
                         }
                         apply_scene_fog(tri_depth, &r, &g, &b);
                         setRGB0(tri, r, g, b);
-                        addPrim(ot + otz, tri);
+                        add_world_primitive(ot + otz, tri);
                         *pri = (char*)(tri + 1);
                         ++added;
                     }
@@ -4032,7 +5148,6 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
 
     if (ent->mesh == PS1_MESH_PLANE) {
         int32_t p;
-        uint8_t r, g, b;
         const int use_texture =
             ent->texture_index > 0 && ent->texture_index <= g_ps1_texture_count &&
             ps1_texture_width((unsigned int)ent->texture_index) > 0 &&
@@ -4056,50 +5171,42 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
         if (hx > 32000) hx = 32000;
         if (hz > 32000) hz = 32000;
 
-        if (use_texture)
-            gte_shade_textured_smooth_normal(
-                &s_plane_norm_up, base_r, base_g, base_b, &r, &g, &b);
-        else
-            gte_shade_normal(&s_plane_norm_up, base_r, base_g, base_b, &r, &g, &b);
-
-        /* Besides keeping screen coordinates stable, subdivision provides the
-         * repeat boundaries required by the PS1's 8-bit, non-wrapping polygon
-         * UVs. Use independent axis counts so 10x2 does not become a wasteful
-         * 10x10 grid. */
-        const int tiles_x = primitive_plane_axis_tiles(
-            ent->texture_tiling_u_q8, ent->mesh_subdivision_levels);
-        const int tiles_z = primitive_plane_axis_tiles(
-            ent->texture_tiling_v_q8, ent->mesh_subdivision_levels);
+        /* Keep each material repeat in one UV cell, including fractional
+         * tiling, offsets and mirroring. Refine long spans for GTE precision. */
+        ps1_plane_span spans_x[PS1_PLANE_AXIS_CAP], spans_z[PS1_PLANE_AXIS_CAP];
+        const int tiles_x = ps1_plane_axis(use_texture ? ent->texture_tiling_u_q8 : 0,
+            ent->texture_offset_u_q8, ent->mesh_subdivision_levels, spans_x);
+        const int tiles_z = ps1_plane_axis(use_texture ? ent->texture_tiling_v_q8 : 0,
+            ent->texture_offset_v_q8, ent->mesh_subdivision_levels, spans_z);
 
         for (int tz = 0; tz < tiles_z; ++tz) {
             for (int tx = 0; tx < tiles_x; ++tx) {
                 SVECTOR pv0, pv1, pv2, pv3;
-                const int x0 = -hx + (2 * hx * tx) / tiles_x;
-                const int x1 = -hx + (2 * hx * (tx + 1)) / tiles_x;
-                const int z0 = -hz + (2 * hz * tz) / tiles_z;
-                const int z1 = -hz + (2 * hz * (tz + 1)) / tiles_z;
+                uint8_t colors[4][3];
+                const int x0 = -hx + (int)((int64_t)2*hx*spans_x[tx].start_q16/65536);
+                const int x1 = -hx + (int)((int64_t)2*hx*spans_x[tx].end_q16/65536);
+                const int z0 = -hz + (int)((int64_t)2*hz*spans_z[tz].start_q16/65536);
+                const int z1 = -hz + (int)((int64_t)2*hz*spans_z[tz].end_q16/65536);
                 const int tile_u0 = use_texture
-                    ? primitive_material_uv(texture_u0, texture_u1 - texture_u0,
-                        ent->texture_tiling_u_q8, ent->texture_offset_u_q8,
-                        tx, tiles_x, 0) : 0;
+                    ? texture_u0 + ((texture_u1-texture_u0)*spans_x[tx].uv_start_q8+128)/256 : 0;
                 const int tile_u1 = use_texture
-                    ? primitive_material_uv(texture_u0, texture_u1 - texture_u0,
-                        ent->texture_tiling_u_q8, ent->texture_offset_u_q8,
-                        tx + 1, tiles_x, 1) : 0;
+                    ? texture_u0 + ((texture_u1-texture_u0)*spans_x[tx].uv_end_q8+128)/256 : 0;
                 const int tile_v0 = use_texture
-                    ? primitive_material_uv(texture_v0, texture_v1 - texture_v0,
-                        ent->texture_tiling_v_q8, ent->texture_offset_v_q8,
-                        tz, tiles_z, 0) : 0;
+                    ? texture_v0 + ((texture_v1-texture_v0)*spans_z[tz].uv_start_q8+128)/256 : 0;
                 const int tile_v1 = use_texture
-                    ? primitive_material_uv(texture_v0, texture_v1 - texture_v0,
-                        ent->texture_tiling_v_q8, ent->texture_offset_v_q8,
-                        tz + 1, tiles_z, 1) : 0;
+                    ? texture_v0 + ((texture_v1-texture_v0)*spans_z[tz].uv_end_q8+128)/256 : 0;
 
                 pv0.vx = (short)x0; pv0.vy = 0; pv0.vz = (short)z0; pv0.pad = 0;
                 pv1.vx = (short)x1; pv1.vy = 0; pv1.vz = (short)z0; pv1.pad = 0;
                 pv2.vx = (short)x1; pv2.vy = 0; pv2.vz = (short)z1; pv2.pad = 0;
                 pv3.vx = (short)x0; pv3.vy = 0; pv3.vz = (short)z1; pv3.pad = 0;
 
+                /* Match the editor's Gouraud lighting. Sampling only the tile
+                 * centre made point lights appear as large square patches. */
+                gte_shade_normal(&s_plane_norm_up, &pv0, base_r, base_g, base_b, &colors[0][0], &colors[0][1], &colors[0][2]);
+                gte_shade_normal(&s_plane_norm_up, &pv1, base_r, base_g, base_b, &colors[1][0], &colors[1][1], &colors[1][2]);
+                gte_shade_normal(&s_plane_norm_up, &pv2, base_r, base_g, base_b, &colors[2][0], &colors[2][1], &colors[2][2]);
+                gte_shade_normal(&s_plane_norm_up, &pv3, base_r, base_g, base_b, &colors[3][0], &colors[3][1], &colors[3][2]);
                 /* Tri 1: 0-1-2 */
                 {
                     int32_t sxy0, sxy1, sxy2;
@@ -4118,10 +5225,20 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                      * The previous p>>2 put Plane in buckets half as deep,
                      * causing it to paint over geometry physically above it. */
                     otz = mesh_triangle_otz_fine(p);
-                    if (otz < OT_LEN && (p << 2) <= s_far_z &&
+                    {
+                        ps1_mesh_tri floor_face = { 0 };
+                        floor_face.ny = ONE;
+                        otz = floor_surface_otz(ent, &floor_face, otz, cz0, cz1, cz2, cz2);
+                    }
+                    if (cached_triangle_needs_safe_clip(sxy0,sxy1,sxy2,cz0,cz1,cz2,entity_near_z,0)) {
+                        added += draw_clipped_plane_triangle(pri,packet_end,ot,ent,&composed,entity_near_z,
+                            &pv0,&pv1,&pv2,colors[0],colors[1],colors[2],
+                            tile_u0,tile_v0,tile_u1,tile_v0,tile_u1,tile_v1,use_texture,texture_tpage);
+                    } else if (
+                        otz < OT_LEN && (p << 2) <= s_far_z &&
                         (is_viewmodel ||
                          !discard_solid_fog_triangle(cz0, cz1, cz2))) {
-                        if (is_triangle_fully_fogged(tri_depth1)) {
+                        if (is_triangle_fully_fogged(cz0) && is_triangle_fully_fogged(cz1) && is_triangle_fully_fogged(cz2) && !ps1_texture_has_cutout(ent->texture_index)) {
                             POLY_F3* tri;
                             if ((const char*)(*pri + sizeof(POLY_F3)) > packet_end)
                                 return added;
@@ -4132,10 +5249,32 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                    (int16_t)(sxy1 & 0xffff), (int16_t)(sxy1 >> 16),
                                    (int16_t)(sxy2 & 0xffff), (int16_t)(sxy2 >> 16));
                             setRGB0(tri, g_ps1_scene.fog_r, g_ps1_scene.fog_g, g_ps1_scene.fog_b);
-                            addPrim(ot + otz, tri);
+                            add_world_primitive(ot + otz, tri);
                             *pri = (char*)(tri + 1);
-                        } else if (g_ps1_scene.fog_enabled && (scene_fog_amount_q8(cz0) > 0 || scene_fog_amount_q8(cz1) > 0 || scene_fog_amount_q8(cz2) > 0)) {
-                            /* Any vertex in fog zone: untextured POLY_G3 for opaque fog */
+                        } else if (use_texture) {
+                            POLY_GT3* tri;
+                            if ((const char*)(*pri + sizeof(POLY_GT3)) > packet_end)
+                                return added;
+                            tri = (POLY_GT3*)*pri;
+                            setPolyGT3(tri);
+                            setXY3(tri,
+                                   (int16_t)(sxy0 & 0xffff), (int16_t)(sxy0 >> 16),
+                                   (int16_t)(sxy1 & 0xffff), (int16_t)(sxy1 >> 16),
+                                   (int16_t)(sxy2 & 0xffff), (int16_t)(sxy2 >> 16));
+                            setUV3(tri, tile_u0, tile_v0,
+                                   tile_u1, tile_v0,
+                                   tile_u1, tile_v1);
+                            setRGB0(tri, colors[0][0], colors[0][1], colors[0][2]);
+                            setRGB1(tri, colors[1][0], colors[1][1], colors[1][2]);
+                            setRGB2(tri, colors[2][0], colors[2][1], colors[2][2]);
+                            apply_scene_fog(cz0, &tri->r0, &tri->g0, &tri->b0);
+                            apply_scene_fog(cz1, &tri->r1, &tri->g1, &tri->b1);
+                            apply_scene_fog(cz2, &tri->r2, &tri->g2, &tri->b2);
+                            tri->tpage = texture_tpage;
+                            tri->clut = 0;
+                            add_world_primitive(ot + otz, tri);
+                            *pri = (char*)(tri + 1);
+                        } else {
                             POLY_G3* tri;
                             if ((const char*)(*pri + sizeof(POLY_G3)) > packet_end)
                                 return added;
@@ -4145,47 +5284,10 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                    (int16_t)(sxy0 & 0xffff), (int16_t)(sxy0 >> 16),
                                    (int16_t)(sxy1 & 0xffff), (int16_t)(sxy1 >> 16),
                                    (int16_t)(sxy2 & 0xffff), (int16_t)(sxy2 >> 16));
-                            uint8_t r0 = r, g0 = g, b0 = b;
-                            uint8_t r1 = r, g1 = g, b1 = b;
-                            uint8_t r2 = r, g2 = g, b2 = b;
-                            apply_scene_fog(cz0, &r0, &g0, &b0);
-                            apply_scene_fog(cz1, &r1, &g1, &b1);
-                            apply_scene_fog(cz2, &r2, &g2, &b2);
-                            tri->r0 = r0; tri->g0 = g0; tri->b0 = b0;
-                            tri->r1 = r1; tri->g1 = g1; tri->b1 = b1;
-                            tri->r2 = r2; tri->g2 = g2; tri->b2 = b2;
-                            addPrim(ot + otz, tri);
-                            *pri = (char*)(tri + 1);
-                        } else if (use_texture) {
-                            POLY_FT3* tri;
-                            if ((const char*)(*pri + sizeof(POLY_FT3)) > packet_end)
-                                return added;
-                            tri = (POLY_FT3*)*pri;
-                            setPolyFT3(tri);
-                            setXY3(tri,
-                                   (int16_t)(sxy0 & 0xffff), (int16_t)(sxy0 >> 16),
-                                   (int16_t)(sxy1 & 0xffff), (int16_t)(sxy1 >> 16),
-                                   (int16_t)(sxy2 & 0xffff), (int16_t)(sxy2 >> 16));
-                            setUV3(tri, tile_u0, tile_v0,
-                                   tile_u1, tile_v0,
-                                   tile_u1, tile_v1);
-                            setRGB0(tri, r, g, b);
-                            tri->tpage = texture_tpage;
-                            tri->clut = 0;
-                            addPrim(ot + otz, tri);
-                            *pri = (char*)(tri + 1);
-                        } else {
-                            POLY_F3* tri;
-                            if ((const char*)(*pri + sizeof(POLY_F3)) > packet_end)
-                                return added;
-                            tri = (POLY_F3*)*pri;
-                            setPolyF3(tri);
-                            setXY3(tri,
-                                   (int16_t)(sxy0 & 0xffff), (int16_t)(sxy0 >> 16),
-                                   (int16_t)(sxy1 & 0xffff), (int16_t)(sxy1 >> 16),
-                                   (int16_t)(sxy2 & 0xffff), (int16_t)(sxy2 >> 16));
-                            setRGB0(tri, r, g, b);
-                            addPrim(ot + otz, tri);
+                            setRGB0(tri, colors[0][0], colors[0][1], colors[0][2]);
+                            setRGB1(tri, colors[1][0], colors[1][1], colors[1][2]);
+                            setRGB2(tri, colors[2][0], colors[2][1], colors[2][2]);
+                            add_world_primitive(ot + otz, tri);
                             *pri = (char*)(tri + 1);
                         }
                         ++added;
@@ -4206,10 +5308,20 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                     int32_t cz3 = (int32_t)(((int64_t)composed.m[2][0]*pv3.vx + (int64_t)composed.m[2][1]*pv3.vy + (int64_t)composed.m[2][2]*pv3.vz) >> 12) + composed.t[2];
                     int32_t tri_depth2 = (cz0 + cz2 + cz3) / 3;
                     otz = mesh_triangle_otz_fine(p);
-                    if (otz < OT_LEN && (p << 2) <= s_far_z &&
+                    {
+                        ps1_mesh_tri floor_face = { 0 };
+                        floor_face.ny = ONE;
+                        otz = floor_surface_otz(ent, &floor_face, otz, cz0, cz2, cz3, cz3);
+                    }
+                    if (cached_triangle_needs_safe_clip(sxy0,sxy1,sxy2,cz0,cz2,cz3,entity_near_z,0)) {
+                        added += draw_clipped_plane_triangle(pri,packet_end,ot,ent,&composed,entity_near_z,
+                            &pv0,&pv2,&pv3,colors[0],colors[2],colors[3],
+                            tile_u0,tile_v0,tile_u1,tile_v1,tile_u0,tile_v1,use_texture,texture_tpage);
+                    } else if (
+                        otz < OT_LEN && (p << 2) <= s_far_z &&
                         (is_viewmodel ||
                          !discard_solid_fog_triangle(cz0, cz2, cz3))) {
-                        if (is_triangle_fully_fogged(tri_depth2)) {
+                        if (is_triangle_fully_fogged(cz0) && is_triangle_fully_fogged(cz2) && is_triangle_fully_fogged(cz3) && !ps1_texture_has_cutout(ent->texture_index)) {
                             POLY_F3* tri;
                             if ((const char*)(*pri + sizeof(POLY_F3)) > packet_end)
                                 return added;
@@ -4220,9 +5332,32 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                    (int16_t)(sxy1 & 0xffff), (int16_t)(sxy1 >> 16),
                                    (int16_t)(sxy2 & 0xffff), (int16_t)(sxy2 >> 16));
                             setRGB0(tri, g_ps1_scene.fog_r, g_ps1_scene.fog_g, g_ps1_scene.fog_b);
-                            addPrim(ot + otz, tri);
+                            add_world_primitive(ot + otz, tri);
                             *pri = (char*)(tri + 1);
-                        } else if (g_ps1_scene.fog_enabled && (scene_fog_amount_q8(cz0) > 0 || scene_fog_amount_q8(cz2) > 0 || scene_fog_amount_q8(cz3) > 0)) {
+                        } else if (use_texture) {
+                            POLY_GT3* tri;
+                            if ((const char*)(*pri + sizeof(POLY_GT3)) > packet_end)
+                                return added;
+                            tri = (POLY_GT3*)*pri;
+                            setPolyGT3(tri);
+                            setXY3(tri,
+                                   (int16_t)(sxy0 & 0xffff), (int16_t)(sxy0 >> 16),
+                                   (int16_t)(sxy1 & 0xffff), (int16_t)(sxy1 >> 16),
+                                   (int16_t)(sxy2 & 0xffff), (int16_t)(sxy2 >> 16));
+                            setUV3(tri, tile_u0, tile_v0,
+                                   tile_u1, tile_v1,
+                                   tile_u0, tile_v1);
+                            setRGB0(tri, colors[0][0], colors[0][1], colors[0][2]);
+                            setRGB1(tri, colors[2][0], colors[2][1], colors[2][2]);
+                            setRGB2(tri, colors[3][0], colors[3][1], colors[3][2]);
+                            apply_scene_fog(cz0, &tri->r0, &tri->g0, &tri->b0);
+                            apply_scene_fog(cz2, &tri->r1, &tri->g1, &tri->b1);
+                            apply_scene_fog(cz3, &tri->r2, &tri->g2, &tri->b2);
+                            tri->tpage = texture_tpage;
+                            tri->clut = 0;
+                            add_world_primitive(ot + otz, tri);
+                            *pri = (char*)(tri + 1);
+                        } else {
                             POLY_G3* tri;
                             if ((const char*)(*pri + sizeof(POLY_G3)) > packet_end)
                                 return added;
@@ -4232,47 +5367,10 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                    (int16_t)(sxy0 & 0xffff), (int16_t)(sxy0 >> 16),
                                    (int16_t)(sxy1 & 0xffff), (int16_t)(sxy1 >> 16),
                                    (int16_t)(sxy2 & 0xffff), (int16_t)(sxy2 >> 16));
-                            uint8_t r0 = r, g0 = g, b0 = b;
-                            uint8_t r2 = r, g2 = g, b2 = b;
-                            uint8_t r3 = r, g3 = g, b3 = b;
-                            apply_scene_fog(cz0, &r0, &g0, &b0);
-                            apply_scene_fog(cz2, &r2, &g2, &b2);
-                            apply_scene_fog(cz3, &r3, &g3, &b3);
-                            tri->r0 = r0; tri->g0 = g0; tri->b0 = b0;
-                            tri->r1 = r2; tri->g1 = g2; tri->b1 = b2;
-                            tri->r2 = r3; tri->g2 = g3; tri->b2 = b3;
-                            addPrim(ot + otz, tri);
-                            *pri = (char*)(tri + 1);
-                        } else if (use_texture) {
-                            POLY_FT3* tri;
-                            if ((const char*)(*pri + sizeof(POLY_FT3)) > packet_end)
-                                return added;
-                            tri = (POLY_FT3*)*pri;
-                            setPolyFT3(tri);
-                            setXY3(tri,
-                                   (int16_t)(sxy0 & 0xffff), (int16_t)(sxy0 >> 16),
-                                   (int16_t)(sxy1 & 0xffff), (int16_t)(sxy1 >> 16),
-                                   (int16_t)(sxy2 & 0xffff), (int16_t)(sxy2 >> 16));
-                            setUV3(tri, tile_u0, tile_v0,
-                                   tile_u1, tile_v1,
-                                   tile_u0, tile_v1);
-                            setRGB0(tri, r, g, b);
-                            tri->tpage = texture_tpage;
-                            tri->clut = 0;
-                            addPrim(ot + otz, tri);
-                            *pri = (char*)(tri + 1);
-                        } else {
-                            POLY_F3* tri;
-                            if ((const char*)(*pri + sizeof(POLY_F3)) > packet_end)
-                                return added;
-                            tri = (POLY_F3*)*pri;
-                            setPolyF3(tri);
-                            setXY3(tri,
-                                   (int16_t)(sxy0 & 0xffff), (int16_t)(sxy0 >> 16),
-                                   (int16_t)(sxy1 & 0xffff), (int16_t)(sxy1 >> 16),
-                                   (int16_t)(sxy2 & 0xffff), (int16_t)(sxy2 >> 16));
-                            setRGB0(tri, r, g, b);
-                            addPrim(ot + otz, tri);
+                            setRGB0(tri, colors[0][0], colors[0][1], colors[0][2]);
+                            setRGB1(tri, colors[2][0], colors[2][1], colors[2][2]);
+                            setRGB2(tri, colors[3][0], colors[3][1], colors[3][2]);
+                            add_world_primitive(ot + otz, tri);
                             *pri = (char*)(tri + 1);
                         }
                         ++added;
@@ -4345,7 +5443,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                 b = (uint8_t)(((uint16_t)shade * base_b) >> 8);
                 apply_scene_fog((cv0.vz + cv1.vz + cv2.vz) / 3, &r, &g, &b);
                 setRGB0(poly, r, g, b);
-                addPrim(ot + otz, poly);
+                add_world_primitive(ot + otz, poly);
                 *pri = (char*)(poly + 1);
                 ++added;
             }
@@ -4354,24 +5452,8 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
     }
 
     {
-        int vi;
-        int32_t cube_max_z = -0x3fffffff;
-        int cube_object_otz_floor;
-        for (vi = 0; vi < (int)(sizeof(s_cube_verts) / sizeof(s_cube_verts[0])); ++vi) {
-            VECTOR camera_vertex;
-            transform_point(&composed, &s_cube_verts[vi], &camera_vertex);
-            if (camera_vertex.vz > cube_max_z)
-                cube_max_z = camera_vertex.vz;
-        }
-        cube_object_otz_floor = (int)(cube_max_z >> 3);
-        if (cube_object_otz_floor < PS1_WORLD_OT_MIN)
-            cube_object_otz_floor = PS1_WORLD_OT_MIN;
-        else if (cube_object_otz_floor >= OT_LEN)
-            cube_object_otz_floor = OT_LEN - 1;
-
         for (fi = 0; fi < 6; ++fi) {
             int32_t p;
-            uint8_t r, g, b;
             VECTOR cv0, cv1, cv2, cv3;
 
         transform_point(&composed, &s_cube_verts[s_cube_faces[fi].v0], &cv0);
@@ -4404,12 +5486,10 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
         if (otz >= OT_LEN || (p << 2) > s_far_z)
             continue;
 
-        if ((const char*)(*pri + sizeof(POLY_F4)) > packet_end)
+        if ((const char*)(*pri + sizeof(POLY_G4)) > packet_end)
             return added;
-        POLY_F4* poly = (POLY_F4*)*pri;
-        setPolyF4(poly);
-        /* Ensure gte_ldrgb reads a stable primitive color. */
-        setRGB0(poly, 128, 128, 128);
+        POLY_G4* poly = (POLY_G4*)*pri;
+        setPolyG4(poly);
 
         gte_stsxy0(&poly->x0);
         gte_stsxy1(&poly->x1);
@@ -4419,31 +5499,26 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
         gte_rtps();
         gte_stsxy(&poly->x3);
 
-        gte_ldrgb(&poly->r0);
-        gte_ldv0(&s_cube_norms[fi]);
-        gte_ncs();
-        gte_strgb(&poly->r0);
-
-        r = (uint8_t)(((uint16_t)poly->r0 * base_r) >> 8);
-        g = (uint8_t)(((uint16_t)poly->g0 * base_g) >> 8);
-        b = (uint8_t)(((uint16_t)poly->b0 * base_b) >> 8);
-        apply_scene_fog(p << 2, &r, &g, &b);
-        setRGB0(poly, r, g, b);
+        /* Each face keeps its hard normal, while positional light falloff
+         * varies continuously across its vertices as in the editor. */
+        gte_shade_normal(&s_cube_norms[fi], &s_cube_verts[s_cube_faces[fi].v0], base_r, base_g, base_b, &poly->r0, &poly->g0, &poly->b0);
+        gte_shade_normal(&s_cube_norms[fi], &s_cube_verts[s_cube_faces[fi].v1], base_r, base_g, base_b, &poly->r1, &poly->g1, &poly->b1);
+        gte_shade_normal(&s_cube_norms[fi], &s_cube_verts[s_cube_faces[fi].v2], base_r, base_g, base_b, &poly->r2, &poly->g2, &poly->b2);
+        gte_shade_normal(&s_cube_norms[fi], &s_cube_verts[s_cube_faces[fi].v3], base_r, base_g, base_b, &poly->r3, &poly->g3, &poly->b3);
+        apply_scene_fog(cv0.vz, &poly->r0, &poly->g0, &poly->b0);
+        apply_scene_fog(cv1.vz, &poly->r1, &poly->g1, &poly->b1);
+        apply_scene_fog(cv2.vz, &poly->r2, &poly->g2, &poly->b2);
+        apply_scene_fog(cv3.vz, &poly->r3, &poly->g3, &poly->b3);
 
         gte_avsz4();
         gte_stotz(&p);
         otz = mesh_triangle_otz_fine(p);
         if (otz >= OT_LEN || (p << 2) > s_far_z)
             continue;
-        /* Cubes are often used as large, simple child/background blocks.
-         * With no Z-buffer, sorting each face purely by its near/front side can
-         * let a cube behind another mesh punch through it. Clamp cube faces to
-         * at least the object's farthest-vertex bucket so background/child
-         * cubes cannot leak in front of smooth geometry that should hide them. */
-            if (otz < cube_object_otz_floor)
-                otz = cube_object_otz_floor;
+        /* Preserve this face's depth. Moving every face to the whole cube's
+         * farthest corner let nearer floor tiles paint over its front face. */
 
-            addPrim(ot + otz, poly);
+            add_world_primitive(ot + otz, poly);
             *pri = (char*)(poly + 1);
             ++added;
         }
@@ -4882,7 +5957,7 @@ static int draw_prerender_occluder(char** pri, const char* packet_end, uint32_t*
                 setPolyF3(triangle);
                 setXY3(triangle, a->x, a->y, b->x, b->y, c->x, c->y);
                 setRGB0(triangle, 255, 0, 255);
-                addPrim(ot + otz, triangle);
+                add_world_primitive(ot + otz, triangle);
                 *pri = (char*)(triangle + 1);
 #else
 #if PS1_OCCLUDER_DEBUG_FORCE_FRONT
@@ -4910,7 +5985,7 @@ static int draw_prerender_occluder(char** pri, const char* packet_end, uint32_t*
                        clamp_u8(background_voff + b->y),
                        clamp_u8(background_uoff + c->x - strip_left),
                        clamp_u8(background_voff + c->y));
-                addPrim(ot + otz, triangle);
+                add_world_primitive(ot + otz, triangle);
                 *pri = (char*)(triangle + 1);
 #endif
                 ++added;
@@ -4958,6 +6033,8 @@ void ps1_render_frame(uint32_t* ot, char** nextpri, const char* packet_end) {
     cam_idx = ps1_scene_camera_index();
     if (cam_idx >= 0)
         cam_ent = ps1_scene_entity((unsigned int)cam_idx);
+    s_render_camera_source = cam_idx >= 0
+        ? ps1_scene_source_entity((unsigned int)cam_idx) : 0;
     set_camera(cam_ent);
     if (s_occluder_projection_camera_index != (int16_t)cam_idx) {
         unsigned int cache_index;
@@ -5066,9 +6143,10 @@ void ps1_render_frame(uint32_t* ot, char** nextpri, const char* packet_end) {
             else
                 setUV4(bg, u0, v1, u1, v1, u0, v0, u1, v0);
             setRGB0(bg, 128, 128, 128);
+            setShadeTex(bg, 1);
             bg->tpage = tpage;
             bg->clut = 0;
-            addPrim(ot + (OT_LEN - 1), bg);
+            add_world_primitive(ot + (OT_LEN - 1), bg);
             pri = (char*)(bg + 1);
             source_x = (uint16_t)(source_x + strip_width);
         }

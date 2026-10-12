@@ -1,3 +1,4 @@
+#include "../core/PreparationCancellation.h"
 #include "VM.h"
 #include "../core/Engine.h"
 #include "../core/Log.h"
@@ -5,6 +6,7 @@
 #include "../game/GameSave.h"
 #include "../assets/AssetManager.h"
 #include "../audio/AudioSystem.h"
+#include "../animation/AnimatorRuntime.h"
 #include "../scene/Scene.h"
 #include "../editor/Raycast.h"
 #include "../physics/ColliderUtils.h"
@@ -285,6 +287,8 @@ int MapKeyName(const std::string& name) {
 double NumberValue(const Value& v) {
     if (v.tag == Value::Tag::Bool)
         return v.boolValue ? 1.0 : 0.0;
+    if (v.tag == Value::Tag::Host && v.host.kind == HostKind::AudioSource)
+        return v.host.entity ? static_cast<double>(v.host.entity->GetID()) : 0.0;
     return v.tag == Value::Tag::Number ? v.number : 0.0;
 }
 
@@ -322,7 +326,9 @@ bool VM::IsTruthy(const Value& value) const {
         case Value::Tag::Bool: return value.boolValue;
         case Value::Tag::Number: return value.number != 0.0;
         case Value::Tag::String: return true;
-        case Value::Tag::Host: return value.host.kind != HostKind::None;
+        case Value::Tag::Host:
+            if (value.host.kind == HostKind::AudioSource) return value.host.entity != nullptr;
+            return value.host.kind != HostKind::None;
         case Value::Tag::Array: return value.array != nullptr;
         default: return false;
     }
@@ -365,8 +371,10 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
     const auto& code = method.code;
     size_t ip = coroutine ? coroutine->instruction : 0;
     size_t executedInstructions = 0;
+    struct InvocationCount { size_t& target;size_t& count;~InvocationCount(){target=count;} } invocationCount{m_LastInvocationInstructions,executedInstructions};
 
     while (ip < code.size()) {
+        if ((executedInstructions & 255u) == 0) CheckPreparationCancelled();
         if (++executedInstructions > m_Limits.maxInstructionsPerInvocation) {
             outErrors.push_back("instruction budget exceeded in " + method.name);
             if (coroutine)
@@ -386,6 +394,7 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
             return false;
         }
         const OpCode op = static_cast<OpCode>(code[ip++]);
+        if (m_PerformanceCounting) ++m_OpcodeCounts[static_cast<uint8_t>(op)];
 
         switch (op) {
         case OpCode::PushConst: {
@@ -414,6 +423,16 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
         }
         case OpCode::PushField: {
             const uint16_t idx = ReadU16(code, ip);
+            if (idx < m_Module->fields.size() && m_Module->fields[idx].typeName == "AudioSource") {
+                Value v;
+                if (idx < instance.runtimeFields.size() && instance.runtimeFields[idx].tag == Value::Tag::Host) v = instance.runtimeFields[idx];
+                else {
+                    v.tag = Value::Tag::Host; v.host.kind = HostKind::AudioSource;
+                    const double id = idx < instance.fields.size() ? instance.fields[idx] : 0.0;
+                    v.host.entity = m_Scene && id > 0 && id <= UINT32_MAX ? m_Scene->FindEntity(static_cast<uint32_t>(id)) : nullptr;
+                }
+                Push(v); break;
+            }
             if (idx < m_Module->fields.size() &&
                 m_Module->fields[idx].valueKind == FieldValueKind::AudioClip) {
                 Push(MakeRuntimeString(idx < instance.assetFields.size()
@@ -806,6 +825,7 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
             const uint16_t hostId = ReadU16(code, ip);
             const uint8_t argc = ReadU8(code, ip);
             const HostFunc func = static_cast<HostFunc>(hostId);
+            if (m_PerformanceCounting && hostId < m_HostCounts.size()) ++m_HostCounts[hostId];
 
             std::vector<Value> args(argc);
             for (int i = static_cast<int>(argc) - 1; i >= 0; --i)
@@ -868,12 +888,29 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
             case HostFunc::Time_DeltaTime:
                 pushNumber(static_cast<double>(m_DeltaTime));
                 break;
+            case HostFunc::Input_GetButton:
+            case HostFunc::Input_GetButtonDown:
+            case HostFunc::Input_GetButtonUp: {
+                bool pressed = false;
+                if (argc >= 1 && args[0].tag == Value::Tag::String) {
+                    const auto name = ResolveString(args[0]);
+                    pressed = func == HostFunc::Input_GetButtonDown ? Input::GetPS1ButtonDown(name) :
+                        func == HostFunc::Input_GetButtonUp ? Input::GetPS1ButtonUp(name) : Input::GetPS1Button(name);
+                }
+                pushNumber(pressed ? 1.0 : 0.0); break;
+            }
             case HostFunc::Input_GetKey:
             case HostFunc::Input_GetKeyDown:
             case HostFunc::Input_GetKeyUp: {
                 bool pressed = false;
                 if (argc >= 1 && args[0].tag == Value::Tag::String) {
-                    const int code = MapKeyName(ResolveString(args[0]));
+                    const auto name = ResolveString(args[0]);
+                    if (Input::IsPS1Button(name)) {
+                        pressed = func == HostFunc::Input_GetKeyDown ? Input::GetPS1ButtonDown(name) :
+                            func == HostFunc::Input_GetKeyUp ? Input::GetPS1ButtonUp(name) : Input::GetPS1Button(name);
+                        pushNumber(pressed ? 1.0 : 0.0); break;
+                    }
+                    const int code = MapKeyName(name);
                     if (code >= 0) {
                         if (func == HostFunc::Input_GetKeyDown)
                             pressed = Input::IsKeyDown(code);
@@ -890,13 +927,7 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                 double axis = 0.0;
                 if (argc >= 1 && args[0].tag == Value::Tag::String) {
                     const std::string name = ResolveString(args[0]);
-                    if (name == "Horizontal") {
-                        if (Input::IsKeyPressed(GLFW_KEY_A) || Input::IsKeyPressed(GLFW_KEY_LEFT)) axis -= 1.0;
-                        if (Input::IsKeyPressed(GLFW_KEY_D) || Input::IsKeyPressed(GLFW_KEY_RIGHT)) axis += 1.0;
-                    } else if (name == "Vertical") {
-                        if (Input::IsKeyPressed(GLFW_KEY_S) || Input::IsKeyPressed(GLFW_KEY_DOWN)) axis -= 1.0;
-                        if (Input::IsKeyPressed(GLFW_KEY_W) || Input::IsKeyPressed(GLFW_KEY_UP)) axis += 1.0;
-                    }
+                    axis = Input::GetPS1Axis(name);
                 }
                 pushNumber(axis);
                 break;
@@ -1045,6 +1076,24 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                 const glm::vec3 forward = axes.second;
                 pushNumber(static_cast<double>(
                     glm::degrees(std::atan2(-forward.x, -forward.z))));
+                break;
+            }
+            case HostFunc::Camera_RotatePitch: {
+                if (argc < 4 || !m_Scene || !m_Instance) { pushNumber(0); break; }
+                const double id = NumberValue(args[0]);
+                Entity* target = id == 0 ? m_Instance->entity :
+                    std::isfinite(id) && id > 0 && id <= UINT32_MAX ?
+                    m_Scene->FindEntity(static_cast<uint32_t>(id)) : nullptr;
+                auto* transform = GetTransform(target);
+                auto* camera = target ? target->GetComponent<CameraComponent>() : nullptr;
+                if (!transform || !camera) { pushNumber(0); break; }
+                const float minimum = static_cast<float>(NumberValue(args[2]));
+                const float maximum = static_cast<float>(NumberValue(args[3]));
+                transform->rotation.x = std::clamp(transform->rotation.x +
+                    static_cast<float>(NumberValue(args[1])), std::min(minimum, maximum), std::max(minimum, maximum));
+                const glm::mat4 world = m_Scene->GetWorldMatrix(*target);
+                camera->camera.SyncFromWorldMatrix(glm::vec3(world[3]), world);
+                pushNumber(transform->rotation.x);
                 break;
             }
             case HostFunc::Camera_Follow: {
@@ -1221,6 +1270,16 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                     Push(MakeRuntimeString(entityName));
                 }
                 break;
+            case HostFunc::Animator_GetNormalizedTime: {
+                Entity* entity = m_Instance ? m_Instance->entity : nullptr;
+                const bool target = argc >= 1 && args[0].tag == Value::Tag::Host;
+                if (target) entity = EntityFromHost(args[0], nullptr);
+                const size_t nameIndex = target ? 1 : 0;
+                const std::string name = argc > nameIndex ? ResolveString(args[nameIndex]) : std::string{};
+                const auto* animator = entity ? entity->GetComponent<AnimatorComponent>() : nullptr;
+                pushNumber(animator ? GetAnimatorNormalizedTime(*animator, name) : -1.0);
+                break;
+            }
             case HostFunc::Animator_SetFloat:
             case HostFunc::Animator_SetBool:
             case HostFunc::Animator_SetInt:
@@ -1336,6 +1395,41 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
             case HostFunc::Scene_Load: {
                 if (argc >= 1 && args[0].tag == Value::Tag::String)
                     Engine::Get().RequestSceneLoad(ResolveString(args[0]));
+                break;
+            }
+            case HostFunc::UI_SetTextVisible: {
+                Entity* target = argc >= 2 && m_Scene
+                    ? m_Scene->FindEntity(static_cast<uint32_t>(NumberValue(args[0]))) : nullptr;
+                auto* text = target ? target->GetComponent<UITextComponent>() : nullptr;
+                if (text) text->enabled = IsTruthy(args[1]);
+                pushNumber(text ? 1.0 : 0.0);
+                break;
+            }
+            case HostFunc::UI_SetText:
+            case HostFunc::UI_SetTextNumber: {
+                Entity* target=argc>=2&&m_Scene?m_Scene->FindEntity(static_cast<uint32_t>(NumberValue(args[0]))):nullptr;
+                auto* text=target?target->GetComponent<UITextComponent>():nullptr;
+                std::string value;
+                if(func==HostFunc::UI_SetTextNumber&&argc>=2)value=std::to_string(static_cast<int>(std::clamp(NumberValue(args[1]),-32768.,32767.)));
+                else if(argc>=2&&args[1].tag==Value::Tag::String)value=ResolveString(args[1]);
+                else text=nullptr;
+                if(value.size()>=MIPSYNC_UI_TEXT_BYTES)text=nullptr;
+                if(text)text->text=value;
+                pushNumber(text?1:0);break;
+            }
+            case HostFunc::UI_SetColor: {
+                Entity* target=argc>=5&&m_Scene?m_Scene->FindEntity(static_cast<uint32_t>(NumberValue(args[0]))):nullptr;
+                auto* text=target?target->GetComponent<UITextComponent>():nullptr;
+                auto* image=target?target->GetComponent<UIImageComponent>():nullptr;
+                if(text||image){glm::vec4 color;for(int i=0;i<4;++i)color[i]=static_cast<float>(std::clamp(NumberValue(args[i+1]),0.,1.));if(text)text->color=color;if(image)image->color=color;}
+                pushNumber(text||image?1:0);break;
+            }
+            case HostFunc::UI_SetImageVisible: {
+                Entity* target = argc >= 2 && m_Scene
+                    ? m_Scene->FindEntity(static_cast<uint32_t>(NumberValue(args[0]))) : nullptr;
+                auto* image = target ? target->GetComponent<UIImageComponent>() : nullptr;
+                if (image) image->enabled = IsTruthy(args[1]);
+                pushNumber(image ? 1.0 : 0.0);
                 break;
             }
             case HostFunc::Scene_LoadBuildIndex: {

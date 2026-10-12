@@ -4,7 +4,8 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const childProcess = require("child_process");
-const { KEYWORDS, TYPES, GLOBALS, INSTANCE_MEMBERS, SNIPPETS } = require("./api");
+const { KEYWORDS, TYPES, GLOBALS, INSTANCE_MEMBERS, SNIPPETS, ATTRIBUTES } = require("./api");
+const { analyze, codeOnly } = require("./language");
 
 function uriToPath(uri) {
   if (!uri || !uri.startsWith("file://")) return uri || "";
@@ -20,10 +21,15 @@ function pathToUri(filePath) {
 }
 
 function offsetAt(text, position) {
-  const lines = text.split(/\r?\n/);
-  let offset = 0;
-  for (let i = 0; i < position.line && i < lines.length; i++) offset += lines[i].length + 1;
-  return offset + Math.min(position.character, lines[position.line]?.length ?? 0);
+  let offset = 0, line = 0;
+  while (line < position.line && offset < text.length) {
+    const next = text.indexOf("\n", offset);
+    if (next < 0) return text.length;
+    offset = next + 1; ++line;
+  }
+  const end = text.indexOf("\n", offset);
+  const length = (end < 0 ? text.length : end) - offset;
+  return offset + Math.min(position.character, length);
 }
 
 function positionAt(text, offset) {
@@ -162,39 +168,23 @@ function validateWithEngine(text, uri, settings = {}) {
 }
 
 function parseSymbols(text) {
-  const symbols = [];
-  const patterns = [
-    { kind: "class", re: /\bclass\s+([A-Za-z_][A-Za-z0-9_]*)/g },
-    { kind: "enum", re: /\benum\s+([A-Za-z_][A-Za-z0-9_]*)/g },
-    { kind: "field", re: /\bpublic\s+([A-Za-z_][A-Za-z0-9_]*(?:\[\])?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|;|\{)/g },
-    { kind: "method", re: /\b(?:public\s+)?([A-Za-z_][A-Za-z0-9_]*(?:\[\])?|void)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g },
-    { kind: "local", re: /\b(?:var|bool|int|float|string|Vector3|Animator|AudioSource|Transform|Entity|AudioClip)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|;|\))/g },
-  ];
-  for (const pattern of patterns) {
-    for (const match of text.matchAll(pattern.re)) {
-      const name = match[pattern.kind === "field" || pattern.kind === "method" ? 2 : 1];
-      const type = pattern.kind === "field" || pattern.kind === "method" ? match[1] : "";
-      const start = match.index + match[0].indexOf(name);
-      symbols.push({ name, type, kind: pattern.kind, start, range: { start: positionAt(text, start), end: positionAt(text, start + name.length) } });
-    }
-  }
-  return symbols;
+  return analyze(text).declarations.map(symbol => ({ ...symbol, range: {
+    start: positionAt(text, symbol.start), end: positionAt(text, symbol.start + symbol.length),
+  }}));
 }
 
 function inferLocalTypes(text) {
   const types = {};
-  for (const match of text.matchAll(/\b(Transform|Vector3|Animator|AudioSource|Entity|AudioClip|bool|int|float|string|[A-Za-z_][A-Za-z0-9_]*\[\])\s+([A-Za-z_][A-Za-z0-9_]*)/g)) {
-    types[match[2]] = match[1].endsWith("[]") ? "Array" : match[1];
-  }
-  for (const match of text.matchAll(/\bvar\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*GetComponent\s*<\s*([A-Za-z_][A-Za-z0-9_]*)\s*>/g)) {
+  for (const symbol of analyze(text).declarations)
+    if (symbol.type && symbol.kind !== "method" && symbol.kind !== "class" && symbol.kind !== "enum")
+      types[symbol.name] = symbol.type.endsWith("[]") ? "Array" : symbol.type;
+  const source = codeOnly(text);
+  for (const match of source.matchAll(/\bvar\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*GetComponent\s*<\s*([A-Za-z_][A-Za-z0-9_]*)\s*>/g))
     types[match[1]] = match[2];
-  }
-  for (const match of text.matchAll(/\bvar\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*Vector3\s*\(/g)) {
-    types[match[1]] = "Vector3";
-  }
-  for (const match of text.matchAll(/\bvar\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\[/g)) {
-    types[match[1]] = "Array";
-  }
+  for (const match of source.matchAll(/\bvar\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:new\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(\(|\[)/g))
+    if (match[3] === "[") types[match[1]] = "Array";
+    else if (TYPES.includes(match[2])) types[match[1]] = match[2];
+  for (const match of source.matchAll(/\bvar\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\[/g)) types[match[1]] = "Array";
   return types;
 }
 
@@ -209,6 +199,11 @@ function memberCompletions(members) {
 function getCompletions(text, position) {
   const offset = offsetAt(text, position);
   const before = text.slice(0, offset);
+  if (/(?:^|\n)\s*(?:\[[^\]\r\n]*\]\s*)*\[\s*(?:[A-Za-z]+(?:\([^\r\n]*?\))?\s*,\s*)*[A-Za-z]*$/.test(before)) {
+    return Object.entries(ATTRIBUTES).map(([name, info]) => ({
+      ...completionItem(name, info.signature, info.documentation, 7, info.snippet), insertTextFormat: 2,
+    }));
+  }
   const dot = /([A-Za-z_][A-Za-z0-9_]*)\.\s*[A-Za-z0-9_]*$/.exec(before);
   if (dot) {
     const owner = dot[1];
@@ -240,7 +235,11 @@ function getHover(text, position) {
   const { word, range } = wordRangeAt(text, position);
   if (!word) return null;
   const offset = offsetAt(text, position);
-  const prefix = text.slice(Math.max(0, offset - word.length - 64), offset - word.length);
+  const start = wordRangeAt(text, position).start;
+  const prefix = text.slice(Math.max(0, start - 64), start);
+  const attribute = ATTRIBUTES[word.replace(/Attribute$/, "")];
+  if (attribute && analyze(text).tokens.some(t => t.start === start && t.type === "decorator"))
+    return { range, contents: { kind: "markdown", value: `\`\`\`mips\n[${attribute.signature}]\n\`\`\`\n${attribute.documentation}` } };
   const dot = /([A-Za-z_][A-Za-z0-9_]*)\.\s*$/.exec(prefix);
   if (dot) {
     const owner = dot[1];
@@ -293,4 +292,6 @@ module.exports = {
   getCompletions,
   getHover,
   getDefinition,
+  parseSymbols,
+  inferLocalTypes,
 };

@@ -1,4 +1,7 @@
 #include "PS1SceneExport.h"
+#include "SkinnedSurfaceReduction.h"
+#include "../scene/SceneChildOrder.h"
+#include "../core/AssetFiles.h"
 #include "../audio/Ps1VagEncoder.h"
 #include "PS1TextureExport.h"
 #include "MipsRuntime.h"
@@ -191,7 +194,10 @@ static bool IsBakedRepeatMesh(const Ps1SceneExportResult& data,
         std::abs(entity.textureTiling[0]) > 1.0001f ||
         std::abs(entity.textureTiling[1]) > 1.0001f;
     if (entity.meshKind == 2)
-        return authoredRepeats;
+        // Ordinary floor repeats use full-resolution textures and runtime UV
+        // boundary splits. Only very dense tiling needs the compact atlas.
+        return std::abs(entity.textureTiling[0])>8.f ||
+               std::abs(entity.textureTiling[1])>8.f;
     if (entity.meshKind != 4)
         return false;
     const bool supportsBakedRepeats =
@@ -371,6 +377,12 @@ void ResolveEntityAppearances(const std::string& projectRoot, const fs::path& sc
     std::unordered_map<std::string, uint8_t> texIndexByPath;
     const std::string requestedSceneBackground = data.backgroundImagePath;
     data.texturePaths.clear();
+    data.textureMaxSizes.clear();
+    auto requestTextureSize = [&](uint8_t index, int size) {
+        data.textureMaxSizes.resize(data.texturePaths.size(), 64);
+        if (index > 0 && index <= data.textureMaxSizes.size())
+            data.textureMaxSizes[index - 1u] = std::max(data.textureMaxSizes[index - 1u], size);
+    };
     data.backgroundImagePath.clear();
     data.backgroundImagePaths.clear();
 
@@ -407,6 +419,7 @@ void ResolveEntityAppearances(const std::string& projectRoot, const fs::path& sc
 
         e.textureIndex = 0;
         e.textureIndex = RegisterTexturePath(data.texturePaths, texIndexByPath, texPath);
+        requestTextureSize(e.textureIndex, mat.ps1TextureMaxSize);
     }
 
     // ProModeler supports material overrides per logical face. Register those
@@ -437,15 +450,18 @@ void ResolveEntityAppearances(const std::string& projectRoot, const fs::path& sc
                 texturePath = std::string(kPs1BakedTexturePrefix) + texturePath;
             mesh.faceMaterialTextureIndices.push_back(
                 RegisterTexturePath(data.texturePaths, texIndexByPath, texturePath));
+            requestTextureSize(mesh.faceMaterialTextureIndices.back(), material.ps1TextureMaxSize);
         }
     }
 
     for (auto& ui : data.uiElements) {
-        ui.textureIndex = RegisterTexturePath(data.texturePaths, texIndexByPath, ui.texturePath);
+        ui.textureIndex = RegisterTexturePath(data.texturePaths, texIndexByPath,
+            ui.texturePath.empty() ? std::string{} : "mipsyncui://" + ui.texturePath);
     }
     for (auto& group : data.uiButtonGroups) {
         group.cursorTextureIndex =
-            RegisterTexturePath(data.texturePaths, texIndexByPath, group.cursorTexturePath);
+            RegisterTexturePath(data.texturePaths, texIndexByPath,
+                group.cursorTexturePath.empty() ? std::string{} : "mipsyncui://" + group.cursorTexturePath);
     }
 
     data.backgroundTextureIndex = 0;
@@ -729,9 +745,13 @@ static bool IsPrerenderOccluderEntity(const json& ent, const std::string& name) 
     return name.find(kMarker) != std::string::npos;
 }
 
-static uint8_t RenderPresetFromJson(const json& meshRenderer) {
+static std::string LowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+static uint8_t RenderPresetFromJson(const json& meshRenderer, uint8_t defaultPreset = 0u) {
     if (!meshRenderer.contains("typePreset"))
-        return meshRenderer.value("viewModel", false) ? 3u : 0u;
+        return meshRenderer.value("viewModel", false) ? 3u : defaultPreset;
     if (meshRenderer["typePreset"].is_number_integer())
         return static_cast<uint8_t>(std::clamp(meshRenderer["typePreset"].get<int>(), 0, 4));
     std::string preset = meshRenderer.value("typePreset", std::string{"Prop"});
@@ -741,7 +761,7 @@ static uint8_t RenderPresetFromJson(const json& meshRenderer) {
     if (preset == "character") return 2u;
     if (preset == "viewmodel" || preset == "view-model") return 3u;
     if (preset == "floor") return 4u;
-    return 0u;
+    return defaultPreset;
 }
 
 static std::string RegisterProModelerMeshFromJson(const json& proModeler, Ps1SceneExportResult& result) {
@@ -1003,7 +1023,9 @@ static std::string RegisterSubdividablePrimitiveMesh(
     }
 
     const Mesh source = primitive == "Plane"
-        ? Mesh::CreatePlane(size, 1, true)
+        // Match MeshRendererComponent::RebuildMesh(). Starting from two faces
+        // discarded the editor's base grid before applying Mesh Subdivider.
+        ? Mesh::CreatePlane(size, 10, true)
         : Mesh::CreateCube(size, true);
     Ps1ProModelerMeshData data;
     data.key = key;
@@ -1030,6 +1052,29 @@ static std::string RegisterSubdividablePrimitiveMesh(
     data.indices = source.GetIndices();
     result.proModelerMeshes.push_back(std::move(data));
     return result.proModelerMeshes.back().key;
+}
+
+static std::string RegisterImportedMeshPart(const std::string& path, int partIndex,
+                                           const std::string& materialVariant,
+                                           Ps1SceneExportResult& result) {
+    const std::string key = "primitivemesh://ModelPart/" + std::to_string(partIndex) + "/" +
+                            std::to_string(StableVariantHash(path + "\n" + materialVariant));
+    for (const auto& existing : result.proModelerMeshes)
+        if (existing.key == key) return key;
+    const Mesh whole = Mesh::LoadFromFileCpu(AssetManager::Get().ToAbsolute(path));
+    const Mesh part = Mesh::ExtractPart(whole, partIndex, true);
+    if (!part.GetVertexCount()) throw std::runtime_error("Invalid imported mesh part: " + path);
+    Ps1ProModelerMeshData data;
+    data.key = key;
+    for (const auto& vertex : part.GetVertices()) {
+        data.positions.insert(data.positions.end(), {vertex.position.x, vertex.position.y, vertex.position.z});
+        data.normals.insert(data.normals.end(), {vertex.normal.x, vertex.normal.y, vertex.normal.z});
+        data.uvs.insert(data.uvs.end(), {vertex.uv.x, vertex.uv.y});
+        data.colors.push_back(0xffffffffu);
+    }
+    data.indices = part.GetIndices();
+    result.proModelerMeshes.push_back(std::move(data));
+    return key;
 }
 
 static uint32_t ColorToPackedFromVec4(const glm::vec4& c) {
@@ -1097,12 +1142,15 @@ static Vertex BakeSkinnedVertexForPs1(const SkeletalModelAsset& model, uint32_t 
     return Vertex{ displayPos, worldNormal, sv.uv, sv.color };
 }
 
+static int DominantBoneIndex(const SkinnedVertex& sv, int maxBoneIndex);
+
 static void ReduceSkinnedTopologyForPs1(const std::vector<Vertex>& sampleVerts,
                                         std::vector<uint32_t>& usedVertices,
                                         std::vector<uint32_t>& compactIndices,
                                         size_t maxTris,
                                         size_t maxVerts,
-                                        std::vector<std::vector<uint32_t>>* outClusterSourceVertices = nullptr) {
+                                        std::vector<std::vector<uint32_t>>* outClusterSourceVertices = nullptr,
+                                        const SkeletalModelAsset* skinModel = nullptr) {
     if (outClusterSourceVertices)
         outClusterSourceVertices->clear();
     const size_t triCount = compactIndices.size() / 3;
@@ -1120,6 +1168,19 @@ static void ReduceSkinnedTopologyForPs1(const std::vector<Vertex>& sampleVerts,
         bmax = glm::max(bmax, sampleVerts[idx].position);
     }
     const glm::vec3 ext = glm::max(bmax - bmin, glm::vec3(1e-6f));
+    std::vector<uint64_t> vertexRegions(usedVertices.size(), 0u);
+    std::vector<glm::vec3> regionMin, regionMax;
+    if (skinModel && !skinModel->bones.empty()) {
+        regionMin.assign(skinModel->bones.size() + 1, glm::vec3(std::numeric_limits<float>::max()));
+        regionMax.assign(regionMin.size(), glm::vec3(std::numeric_limits<float>::lowest()));
+        for (size_t vi = 0; vi < usedVertices.size(); ++vi) {
+            const auto region = static_cast<uint64_t>(1 + DominantBoneIndex(
+                skinModel->sourceVertices[usedVertices[vi]], static_cast<int>(skinModel->bones.size()) - 1));
+            vertexRegions[vi] = region;
+            regionMin[region] = glm::min(regionMin[region], sampleVerts[vi].position);
+            regionMax[region] = glm::max(regionMax[region], sampleVerts[vi].position);
+        }
+    }
     const int grid = 18;
     auto packCell = [](int x, int y, int z) -> uint64_t {
         return (static_cast<uint64_t>(x & 0x3ff) << 20u) |
@@ -1130,7 +1191,8 @@ static void ReduceSkinnedTopologyForPs1(const std::vector<Vertex>& sampleVerts,
     auto buildClusteredTopology = [&](int grid,
                                       std::vector<uint32_t>& outUsedVertices,
                                       std::vector<uint32_t>& outIndices,
-                                      std::vector<std::vector<uint32_t>>& outSourceVerticesByCluster) -> bool {
+                                      std::vector<std::vector<uint32_t>>& outSourceVerticesByCluster,
+                                      const std::vector<int>* regionGrids = nullptr) -> bool {
         struct SkinnedCluster {
             glm::vec3 posSum{ 0.0f };
             glm::vec3 centroid{ 0.0f };
@@ -1147,10 +1209,28 @@ static void ReduceSkinnedTopologyForPs1(const std::vector<Vertex>& sampleVerts,
 
         for (size_t vi = 0; vi < usedVertices.size(); ++vi) {
             const glm::vec3& p = sampleVerts[vi].position;
-            const int ix = std::clamp(static_cast<int>((p.x - bmin.x) / ext.x * grid), 0, grid - 1);
-            const int iy = std::clamp(static_cast<int>((p.y - bmin.y) / ext.y * grid), 0, grid - 1);
-            const int iz = std::clamp(static_cast<int>((p.z - bmin.z) / ext.z * grid), 0, grid - 1);
-            const uint64_t key = packCell(ix, iy, iz);
+            // Nearby surfaces in one pose may belong to independent limbs.
+            // Do not weld a hand to the head or the two legs together merely
+            // because they happen to occupy the same spatial cell.
+            const uint64_t region = vertexRegions[vi];
+            // A cell sized to the entire body's span erases limb thickness.
+            // Fit each bone region separately, so a thin calf keeps distinct
+            // front/back and left/right surface samples at a small budget.
+            const glm::vec3 origin = region ? regionMin[region] : bmin;
+            const glm::vec3 cellExtent = region
+                ? glm::max(regionMax[region] - origin, glm::vec3(1e-6f)) : ext;
+            const int resolution = regionGrids && region ? (*regionGrids)[region] : grid;
+            glm::ivec3 dimensions(resolution);
+            if (region) {
+                const int longAxis = cellExtent.x >= cellExtent.y && cellExtent.x >= cellExtent.z
+                    ? 0 : (cellExtent.y >= cellExtent.z ? 1 : 2);
+                for (int axis = 0; axis < 3; ++axis)
+                    if (axis != longAxis) dimensions[axis] = std::max(resolution, 2);
+            }
+            const int ix = std::clamp(static_cast<int>((p.x - origin.x) / cellExtent.x * dimensions.x), 0, dimensions.x - 1);
+            const int iy = std::clamp(static_cast<int>((p.y - origin.y) / cellExtent.y * dimensions.y), 0, dimensions.y - 1);
+            const int iz = std::clamp(static_cast<int>((p.z - origin.z) / cellExtent.z * dimensions.z), 0, dimensions.z - 1);
+            const uint64_t key = packCell(ix, iy, iz) | (region << 30u);
             auto it = cellToCluster.find(key);
             if (it == cellToCluster.end()) {
                 const uint32_t clusterIndex = static_cast<uint32_t>(clusters.size());
@@ -1240,7 +1320,8 @@ static void ReduceSkinnedTopologyForPs1(const std::vector<Vertex>& sampleVerts,
     std::vector<uint32_t> bestClusteredUsedVertices;
     std::vector<uint32_t> bestClusteredIndices;
     std::vector<std::vector<uint32_t>> bestClusteredSourceVertices;
-    for (int gridCandidate = 3; gridCandidate <= 32; ++gridCandidate) {
+    int bestGrid = 0;
+    for (int gridCandidate = skinModel ? 1 : 3; gridCandidate <= 32; ++gridCandidate) {
         std::vector<uint32_t> candidateUsedVertices;
         std::vector<uint32_t> candidateIndices;
         std::vector<std::vector<uint32_t>> candidateSourceVertices;
@@ -1253,6 +1334,43 @@ static void ReduceSkinnedTopologyForPs1(const std::vector<Vertex>& sampleVerts,
             bestClusteredUsedVertices = std::move(candidateUsedVertices);
             bestClusteredIndices = std::move(candidateIndices);
             bestClusteredSourceVertices = std::move(candidateSourceVertices);
+            bestGrid = gridCandidate;
+        }
+    }
+    if (skinModel && bestGrid > 0 && !regionMin.empty()) {
+        // Spend the remaining faces on the largest body regions instead of
+        // dropping to an entire coarser grid when one fine grid exceeds budget.
+        // The minimum grid retains two samples across a limb's thickness.
+        std::vector<size_t> regions;
+        for (size_t region = 1; region < regionMin.size(); ++region)
+            if (regionMin[region].x != std::numeric_limits<float>::max()) regions.push_back(region);
+        auto area = [&](size_t region) {
+            const glm::vec3 e = regionMax[region] - regionMin[region];
+            return e.x * e.y + e.y * e.z + e.z * e.x;
+        };
+        std::sort(regions.begin(), regions.end(), [&](size_t a, size_t b) {
+            return area(a) != area(b) ? area(a) > area(b) : a < b;
+        });
+        std::vector<int> regionGrids(regionMin.size(), bestGrid);
+        for (int resolution = bestGrid + 1; resolution <= 32; ++resolution) {
+            bool improved = false;
+            for (size_t region : regions) {
+                const int previous = regionGrids[region];
+                regionGrids[region] = resolution;
+                std::vector<uint32_t> candidateUsedVertices, candidateIndices;
+                std::vector<std::vector<uint32_t>> candidateSourceVertices;
+                if (buildClusteredTopology(bestGrid, candidateUsedVertices, candidateIndices,
+                                           candidateSourceVertices, &regionGrids) &&
+                    candidateIndices.size() > bestClusteredIndices.size()) {
+                    bestClusteredUsedVertices = std::move(candidateUsedVertices);
+                    bestClusteredIndices = std::move(candidateIndices);
+                    bestClusteredSourceVertices = std::move(candidateSourceVertices);
+                    improved = true;
+                } else {
+                    regionGrids[region] = previous;
+                }
+            }
+            if (!improved) break;
         }
     }
     if (!bestClusteredUsedVertices.empty() && bestClusteredIndices.size() >= 3) {
@@ -1377,6 +1495,49 @@ struct Ps1AnimatorClipSelection {
     std::string clipModelPath;
 };
 
+static void ReduceCharacterSurfaceForPs1(
+    const SkeletalModelAsset& model, const SkeletalModelAsset* clipModel,
+    int stackIndex, double duration, const std::vector<Vertex>& bindVertices,
+    std::vector<uint32_t>& usedVertices, std::vector<uint32_t>& indices, size_t targetTris) {
+    if (bindVertices.empty()) return;
+    glm::vec3 minimum = bindVertices.front().position, maximum = minimum;
+    for (const Vertex& vertex : bindVertices) {
+        minimum = glm::min(minimum, vertex.position);
+        maximum = glm::max(maximum, vertex.position);
+    }
+    const glm::vec3 extent = maximum - minimum;
+    const float scale = std::max({extent.x, extent.y, extent.z, 1e-6f});
+    std::vector<SkinnedSurfaceVertex> surface(bindVertices.size());
+    for (size_t i = 0; i < surface.size(); ++i) {
+        const Vertex& vertex = bindVertices[i];
+        surface[i].position = {vertex.position.x, vertex.position.y, vertex.position.z};
+        surface[i].attributes[0] = vertex.uv.x;
+        surface[i].attributes[1] = vertex.uv.y;
+    }
+    // Motion attributes prevent an edge that looks harmless in bind pose from
+    // collapsing an elbow/knee or joining surfaces with different skinning.
+    glm::mat4 bones[kMaxBones];
+    for (size_t pose = 0; pose < 8; ++pose) {
+        if (clipModel && stackIndex >= 0 && duration > 0.0)
+            EvaluateRetargetedBoneMatrices(model, *clipModel, stackIndex,
+                duration * static_cast<double>(pose) / 8.0, bones);
+        else model.EvaluateBoneMatrices({}, 0.0, bones);
+        for (size_t i = 0; i < surface.size(); ++i) {
+            const glm::vec3 offset = (BakeSkinnedVertexForPs1(model, usedVertices[i], bones).position
+                - bindVertices[i].position) / scale;
+            for (size_t axis = 0; axis < 3; ++axis)
+                surface[i].attributes[2 + pose * 3 + axis] = offset[axis];
+        }
+    }
+    auto reduced = ReduceSkinnedSurface(surface, indices, targetTris);
+    if (reduced.indices.empty()) return;
+    std::vector<uint32_t> retained;
+    retained.reserve(reduced.sourceVertices.size());
+    for (uint32_t source : reduced.sourceVertices) retained.push_back(usedVertices[source]);
+    usedVertices = std::move(retained);
+    indices = std::move(reduced.indices);
+}
+
 static std::string RegisterSkinnedAnimMeshesFromJson(
     const json& skinned, Ps1SceneExportResult& result,
     uint16_t& outFrameCount, uint8_t& outFps,
@@ -1420,15 +1581,16 @@ static std::string RegisterSkinnedAnimMeshesFromJson(
             modelPath, model->sourceVertices.size(), model->sourceIndices.size() / 3);
     }
 
-    // Baked skinned vertices preserve the source surface exactly, but every
-    // sample consumes PS1 main RAM. The runtime interpolates between samples,
-    // so 10 samples/sec (at most 15 per clip) remains visually smooth while
-    // leaving room for the renderer, VM and stack in the console's 2 MiB.
+    // The small view-model budget is for short first-person arm clips. Applying
+    // it to a long character clip leaves seconds between poses and collapses
+    // articulated limbs during linear interpolation. Honour the character
+    // settings while retaining the established arm memory budget.
+    const bool viewModel = RenderPresetFromJson(skinned, 2u) == 3u;
     const int ps1Fps = ps1Mode == 2
-        ? std::clamp(skinned.value("ps1VertexAnimFps", 10), 1, 10)
+        ? std::clamp(skinned.value("ps1VertexAnimFps", 30), 1, viewModel ? 10 : 30)
         : 1;
     const int ps1MaxFrames = ps1Mode == 2
-        ? std::clamp(skinned.value("ps1VertexAnimMaxFrames", 15), 1, 15)
+        ? std::clamp(skinned.value("ps1VertexAnimMaxFrames", 96), 1, viewModel ? 15 : 120)
         : 1;
     const std::shared_ptr<SkeletalModelAsset> clipModel =
         selectedClip && selectedClip->clipModel ? selectedClip->clipModel : model;
@@ -1490,7 +1652,7 @@ static std::string RegisterSkinnedAnimMeshesFromJson(
     std::vector<std::vector<uint32_t>> clusteredSourceVertices;
     {
         glm::mat4 sampleBones[kMaxBones];
-        if (stackIndex >= 0 && duration > 0.0 && clipModel)
+        if (viewModel && stackIndex >= 0 && duration > 0.0 && clipModel)
             EvaluateRetargetedBoneMatrices(*model, *clipModel, stackIndex, 0.0, sampleBones);
         else
             model->EvaluateBoneMatrices({}, 0.0, sampleBones);
@@ -1501,9 +1663,9 @@ static std::string RegisterSkinnedAnimMeshesFromJson(
             sampleVerts.push_back(BakeSkinnedVertexForPs1(*model, oldIndex, sampleBones));
 
         const size_t configuredTargetTris =
-            static_cast<size_t>(std::clamp(skinned.value("ps1VertexAnimTargetTris", 640), 32, 4000));
+            static_cast<size_t>(std::clamp(skinned.value("ps1VertexAnimTargetTris", 320), 32, 4000));
         const size_t configuredTargetVerts =
-            static_cast<size_t>(std::clamp(skinned.value("ps1VertexAnimTargetVerts", 2000), 64, 5000));
+            static_cast<size_t>(std::clamp(skinned.value("ps1VertexAnimTargetVerts", 1000), 64, 5000));
         size_t targetTris = configuredTargetTris;
         size_t targetVerts = configuredTargetVerts;
         if (meshPartIndex >= 0 && model->meshParts.size() > 1) {
@@ -1519,7 +1681,12 @@ static std::string RegisterSkinnedAnimMeshesFromJson(
         }
         const size_t beforeVerts = usedVertices.size();
         const size_t beforeTris = compactIndices.size() / 3;
-        ReduceSkinnedTopologyForPs1(sampleVerts, usedVertices, compactIndices, targetTris, targetVerts, &clusteredSourceVertices);
+        if (viewModel)
+            ReduceSkinnedTopologyForPs1(sampleVerts, usedVertices, compactIndices, targetTris, targetVerts,
+                                       &clusteredSourceVertices);
+        else
+            ReduceCharacterSurfaceForPs1(*model, clipModel.get(), stackIndex, duration,
+                sampleVerts, usedVertices, compactIndices, targetTris);
         MIPSYNC_INFO("PS1 vertex animation topology: {}v/{}t -> {}v/{}t (stable across frames, budget {}v/{}t)",
                      beforeVerts, beforeTris, usedVertices.size(), compactIndices.size() / 3,
                      targetVerts, targetTris);
@@ -2062,6 +2229,8 @@ struct Ps1AnimatorClipSet {
     Ps1AnimatorClipSelection aim;
     Ps1AnimatorClipSelection trigger;
     uint16_t triggerParameterHash = 0;
+    uint8_t actionCondition = 0;
+    float actionThreshold = 0.0f;
     uint16_t triggerExitDurationQ8 = 0;
     uint16_t triggerTransitionDurationQ8 = 0;
 };
@@ -2124,16 +2293,24 @@ static Ps1AnimatorClipSet ResolvePs1AnimatorClips(
             } else if (positiveCondition && !aimState &&
                        (condition.parameter == "Aim" || condition.parameter == "Aiming")) {
                 aimState = FindAnimatorStateForPs1(*controller, transition.toState);
-            } else if (positiveCondition && !triggerState) {
+            } else if (!triggerState && (positiveCondition ||
+                        transition.fromState == controller->defaultState ||
+                        transition.fromState == kAnimatorAnyStateName)) {
                 const auto parameter = std::find_if(
                     controller->parameters.begin(), controller->parameters.end(),
                     [&](const AnimatorParameterDef& value) {
                         return value.name == condition.parameter &&
-                               value.type == AnimatorParamType::Trigger;
+                               (value.type == AnimatorParamType::Trigger ||
+                                transition.fromState == controller->defaultState ||
+                                transition.fromState == kAnimatorAnyStateName);
                     });
                 if (parameter != controller->parameters.end()) {
                     triggerState = FindAnimatorStateForPs1(*controller, transition.toState);
                     triggerParameter = condition.parameter;
+                    if (parameter->type != AnimatorParamType::Trigger) {
+                        clips.actionCondition = static_cast<uint8_t>(condition.mode) + 1u;
+                        clips.actionThreshold = condition.threshold;
+                    }
                 }
             }
         }
@@ -2386,7 +2563,7 @@ static bool RegisterRigidBonePartsFromJson(const json& skinned, Ps1SceneExportRe
         return false;
 
     const size_t configuredTargetTris =
-        static_cast<size_t>(std::clamp(skinned.value("ps1VertexAnimTargetTris", 800), 32, 2000));
+        static_cast<size_t>(std::clamp(skinned.value("ps1VertexAnimTargetTris", 320), 32, 2000));
     const size_t totalSourceTris = std::accumulate(
         ordered.begin(), ordered.end(), size_t{0},
         [](size_t sum, const BoneGroup& group) { return sum + static_cast<size_t>(group.triCount); });
@@ -2603,7 +2780,13 @@ static bool RegisterRigidBonePartsFromJson(const json& skinned, Ps1SceneExportRe
             part.rigidTriggerFirstFrame,
             part.rigidTriggerFrameCount,
             part.rigidTriggerFps);
+        part.animatorStateHashes[0] = AnimatorParameterHash(clips.idle.stateName);
+        part.animatorStateHashes[1] = AnimatorParameterHash(clips.walk.stateName);
+        part.animatorStateHashes[2] = AnimatorParameterHash(clips.aim.stateName);
+        part.animatorStateHashes[3] = AnimatorParameterHash(clips.trigger.stateName);
         part.animatorTriggerParameterHash = clips.triggerParameterHash;
+        part.animatorActionCondition = clips.actionCondition;
+        part.animatorActionThreshold = clips.actionThreshold;
         part.animatorTriggerExitDurationQ8 = clips.triggerExitDurationQ8;
         part.animatorTriggerTransitionDurationQ8 = clips.triggerTransitionDurationQ8;
 
@@ -3484,6 +3667,7 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
             e.materialPath = mr.value("material", std::string{});
             e.texturePath = mr.value("texture", std::string{});
             e.renderPreset = RenderPresetFromJson(mr);
+            e.renderUnlit = LowerAscii(mr.value("renderType", std::string{"Lit"})) == "unlit";
             e.seamFill = mr.value("ps1SeamFill", false);
             if (ent.contains("meshSubdivider") && ent["meshSubdivider"].is_object()) {
                 e.meshSubdivisionExplicit = true;
@@ -3517,9 +3701,12 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
             } else if (e.meshKind == 3) {
                 e.meshKind = 4;
                 e.meshPath = RegisterPrimitiveSphereMesh(e.meshSize, result);
-            } else if (e.meshKind == 4 && mr.contains("mesh") && mr["mesh"].is_string())
+            } else if (e.meshKind == 4 && mr.contains("mesh") && mr["mesh"].is_string()) {
                 e.meshPath = mr["mesh"].get<std::string>();
-            else if (e.meshKind == 4 && ent.contains("terrain"))
+                if (mr.value("meshPart", -1) >= 0)
+                    e.meshPath = RegisterImportedMeshPart(e.meshPath, mr["meshPart"].get<int>(),
+                        e.materialPath + "|" + e.texturePath, result);
+            } else if (e.meshKind == 4 && ent.contains("terrain"))
                 e.meshPath = RegisterTerrainMeshFromJson(ent["terrain"], result);
             else if (e.meshKind == 4 && (ent.contains("proModeler") || ent.contains("proBuilder"))) {
                 const std::string pmKey = ent.contains("proModeler") ? "proModeler" : "proBuilder";
@@ -3547,6 +3734,11 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
             ExtractColor(sm, e.color);
             e.materialPath = sm.value("material", std::string{});
             e.texturePath = sm.value("texture", std::string{});
+            // Legacy skinned renderers had no authored preset and are dynamic
+            // characters by definition. Preserve that default in direct PS1
+            // exports while still honoring legacy viewModel scenes.
+            e.renderPreset = RenderPresetFromJson(sm, 2u);
+            e.renderUnlit = LowerAscii(sm.value("renderType", std::string{"Lit"})) == "unlit";
             if (sm.contains("tiling"))
                 ReadVec2(sm["tiling"], e.textureTiling);
             if (sm.contains("offset"))
@@ -3554,9 +3746,9 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
             ApplySkinnedPartMaterialFromModel(sm, e);
             e.seamFill = sm.value("ps1SeamFill", false);
             e.vertexAnimTargetTris =
-                static_cast<uint16_t>(std::clamp(sm.value("ps1VertexAnimTargetTris", 640), 32, 4000));
+                static_cast<uint16_t>(std::clamp(sm.value("ps1VertexAnimTargetTris", 320), 32, 4000));
             e.vertexAnimTargetVerts =
-                static_cast<uint16_t>(std::clamp(sm.value("ps1VertexAnimTargetVerts", 2000), 64, 5000));
+                static_cast<uint16_t>(std::clamp(sm.value("ps1VertexAnimTargetVerts", 1000), 64, 5000));
 
             bool vertexOk = false;
             if (ps1ExportMode == 2) {
@@ -3582,7 +3774,13 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
                              e.vertexAimFrameCount, e.vertexAimFps);
                     bakeClip(clips.trigger, e.vertexTriggerMeshPath,
                              e.vertexTriggerFrameCount, e.vertexTriggerFps);
+                    e.animatorStateHashes[0] = AnimatorParameterHash(clips.idle.stateName);
+                    e.animatorStateHashes[1] = AnimatorParameterHash(clips.walk.stateName);
+                    e.animatorStateHashes[2] = AnimatorParameterHash(clips.aim.stateName);
+                    e.animatorStateHashes[3] = AnimatorParameterHash(clips.trigger.stateName);
                     e.animatorTriggerParameterHash = clips.triggerParameterHash;
+                    e.animatorActionCondition = clips.actionCondition;
+                    e.animatorActionThreshold = clips.actionThreshold;
                     e.animatorTriggerExitDurationQ8 = clips.triggerExitDurationQ8;
                     e.animatorTriggerTransitionDurationQ8 =
                         clips.triggerTransitionDurationQ8;
@@ -3682,6 +3880,8 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
         const json& audio = ent["audioSource"];
         e.audioEnabled = audio.value("enabled", true);
         e.audioClipPath = audio.value("clip", std::string{});
+        e.audioSfx = audio.value("type", 0) != 0;
+        e.audioSample = audio.value("type", 0) == 2;
         e.audioPlayOnAwake = audio.value("playOnAwake", true);
         e.audioLoop = audio.value("loop", false);
         e.audioMute = audio.value("mute", false);
@@ -3736,6 +3936,8 @@ struct Ps1RectTransformJson {
 };
 
 struct Ps1UiNode {
+    bool textEnabled = true;
+    bool imageEnabled = true;
     uint32_t id = 0;
     uint32_t parent = 0;
     int sortOrder = 0;
@@ -3756,6 +3958,7 @@ struct Ps1UiNode {
     bool buttonPreserveAspect = false;
     std::vector<Ps1ExportedUiButtonAction> buttonActions;
     bool hasButtonGroup = false;
+    uint32_t navigationAudioSourceId = 0, confirmAudioSourceId = 0;
     int buttonGroupSelectedIndex = 0;
     bool buttonGroupWrapNavigation = true;
     bool buttonGroupGamepadNavigation = true;
@@ -3776,6 +3979,7 @@ struct Ps1UiNode {
     float spectrumGap = 4.0f;
     float spectrumSensitivity = 1.4f;
     std::vector<uint32_t> children;
+    json childOrder;
 };
 
 static bool ReadVec2Json(const json& j, glm::vec2& out) {
@@ -3821,6 +4025,7 @@ static void AddUiNodeFromJson(const json& ent, uint32_t inheritedParent,
     if (node.id == 0)
         return;
     node.parent = ent.value("parent", inheritedParent);
+    node.childOrder = ent.value("childOrder", json{});
 
     if (ent.contains("canvas") && ent["canvas"].is_object()) {
         const json& c = ent["canvas"];
@@ -3849,7 +4054,8 @@ static void AddUiNodeFromJson(const json& ent, uint32_t inheritedParent,
 
     if (ent.contains("uiImage") && ent["uiImage"].is_object()) {
         const json& im = ent["uiImage"];
-        node.hasImage = im.value("enabled", true);
+        node.hasImage = true;
+        node.imageEnabled = im.value("enabled", true);
         ReadVec4Json(im.value("color", json::array({ 1.0f, 1.0f, 1.0f, 1.0f })), node.imageColor);
         node.imageTexturePath = im.value("texture", std::string{});
         node.imagePreserveAspect = im.value("preserveAspect", false);
@@ -3881,6 +4087,8 @@ static void AddUiNodeFromJson(const json& ent, uint32_t inheritedParent,
         const json& bg = ent["uiButtonGroup"];
         node.hasButtonGroup = true;
         node.buttonGroupSelectedIndex = bg.value("selectedIndex", 0);
+        node.navigationAudioSourceId = bg.value("navigationAudioSource", 0u);
+        node.confirmAudioSourceId = bg.value("confirmAudioSource", 0u);
         node.buttonGroupWrapNavigation = bg.value("wrapNavigation", true);
         node.buttonGroupGamepadNavigation = bg.value("gamepadNavigation", true);
         node.buttonGroupGamepadConfirm = bg.value("gamepadConfirm", true);
@@ -3893,7 +4101,8 @@ static void AddUiNodeFromJson(const json& ent, uint32_t inheritedParent,
 
     if (ent.contains("uiText") && ent["uiText"].is_object()) {
         const json& tx = ent["uiText"];
-        node.hasText = tx.value("enabled", true);
+        node.hasText = true;
+        node.textEnabled = tx.value("enabled", true);
         node.text = tx.value("text", std::string{});
         ReadVec4Json(tx.value("color", json::array({ 1.0f, 1.0f, 1.0f, 1.0f })), node.textColor);
         node.fontSize = tx.value("fontSize", 18.0f);
@@ -3948,6 +4157,8 @@ static void AppendPs1UiElement(Ps1SceneExportResult& outResult, const Ps1UiNode&
     if (!ConvertPs1UiRect(rect, layoutW, layoutH, elem.x, elem.y, elem.w, elem.h))
         return;
     elem.kind = kind;
+    elem.entityId = node.id;
+    elem.visible = kind == 2 ? node.textEnabled : (kind != 1 || node.imageEnabled);
     elem.rotationDegrees = ClampI16(static_cast<int>(std::round(node.rotationZDegrees)));
 
     const glm::vec4& c = (kind == 1) ? node.imageColor :
@@ -4000,6 +4211,9 @@ static void ExtractUiElements(const json& root, Ps1SceneExportResult& outResult)
         }
     }
 
+    for (auto& [id, node] : nodes)
+        ApplySceneChildOrder(node.children, node.childOrder);
+
     std::vector<uint32_t> canvases;
     for (uint32_t id : order) {
         auto it = nodes.find(id);
@@ -4019,6 +4233,8 @@ static void ExtractUiElements(const json& root, Ps1SceneExportResult& outResult)
             rootRect = CalcUiRectInParent(rootRect, canvas.rect);
 
         std::function<void(uint32_t, Ps1UiRect)> visit = [&](uint32_t id, Ps1UiRect parentRect) {
+            size_t buttonGroupIndex = outResult.uiButtonGroups.size();
+            bool appendedButtonGroup = false;
             const Ps1UiNode& node = nodes[id];
             Ps1UiRect rect = parentRect;
             if (node.hasRect)
@@ -4043,6 +4259,8 @@ static void ExtractUiElements(const json& root, Ps1SceneExportResult& outResult)
                     group.gamepadNavigation = node.buttonGroupGamepadNavigation ? 1 : 0;
                     group.gamepadConfirm = node.buttonGroupGamepadConfirm ? 1 : 0;
                     group.confirmButton = node.buttonGroupConfirmButton;
+                    group.navigationAudioSourceId = node.navigationAudioSourceId;
+                    group.confirmAudioSourceId = node.confirmAudioSourceId;
                     group.buttonRectOffset = static_cast<uint16_t>(
                         std::min<size_t>(outResult.uiButtonRects.size(), 65535));
                     group.buttonCount = static_cast<uint8_t>(
@@ -4073,8 +4291,10 @@ static void ExtractUiElements(const json& root, Ps1SceneExportResult& outResult)
                             --group.buttonCount;
                         }
                     }
-                    if (group.buttonCount > 0)
+                    if (group.buttonCount > 0) {
                         outResult.uiButtonGroups.push_back(std::move(group));
+                        appendedButtonGroup = true;
+                    }
                 }
             }
             if (node.hasImage)
@@ -4092,6 +4312,9 @@ static void ExtractUiElements(const json& root, Ps1SceneExportResult& outResult)
                 AppendPs1UiElement(outResult, node, rect, layoutW, layoutH, 3);
             for (uint32_t child : node.children)
                 visit(child, rect);
+            if (appendedButtonGroup)
+                outResult.uiButtonGroups[buttonGroupIndex].cursorUiOffset =
+                    static_cast<uint16_t>(std::min<size_t>(outResult.uiElements.size(), 65535));
         };
 
         if (canvas.hasImage)
@@ -4154,12 +4377,18 @@ static void ExtractPostProcessFog(const json& root, Ps1SceneExportResult& outRes
         if (ent.is_object() && ent.contains("postProcessVolume") &&
             ent["postProcessVolume"].is_object()) {
             const json& pp = ent["postProcessVolume"];
-            const bool componentEnabled = pp.value("enabled", true);
+            const bool componentEnabled = pp.value("enabled", true) && ent.value("active", true);
             const int priority = pp.value("priority", 0);
             if (componentEnabled && priority >= bestPriority) {
                 bestPriority = priority;
                 found = true;
                 outResult.fogEnabled = pp.value("fogEnabled", true);
+                outResult.colorGrading.enabled = pp.value("colorGradingEnabled", false);
+                outResult.colorGrading.exposure = pp.value("exposure", 0.f);
+                outResult.colorGrading.contrast = pp.value("contrast", 1.f);
+                outResult.colorGrading.saturation = pp.value("saturation", 1.f);
+                if (pp.contains("colorFilter") && pp["colorFilter"].is_array() && pp["colorFilter"].size() >= 3)
+                    for (int c = 0; c < 3; ++c) outResult.colorGrading.filter[c] = pp["colorFilter"][c].get<float>();
                 outResult.fogStart = std::max(0.0f, pp.value("fogStart", 10.0f));
                 outResult.fogEnd = std::max(outResult.fogStart + 0.1f,
                                             pp.value("fogEnd", 40.0f));
@@ -4179,8 +4408,8 @@ static void ExtractPostProcessFog(const json& root, Ps1SceneExportResult& outRes
 
     for (const json& ent : root["entities"])
         scan(scan, ent);
-    if (!found)
-        outResult.fogEnabled = false;
+    // With no authored volume, retain the same defaults as PS1Settings in
+    // the editor instead of silently disabling the game's distance fog.
 }
 
 static bool ResolveTexturePathForBake(const fs::path& projectRoot, const fs::path& scenePath,
@@ -4269,7 +4498,8 @@ static void BakeSkyboxBackgroundForPs1(const json& root, const std::string& proj
     }
 
     int srcW = 0, srcH = 0, srcC = 0;
-    uint8_t* src = stbi_load(PathUtf8::ToString(srcAbs).c_str(), &srcW, &srcH, &srcC, 4);
+    const auto sourceBytes = AssetFiles::Read(srcAbs);
+    uint8_t* src = stbi_load_from_memory(sourceBytes.data(), static_cast<int>(sourceBytes.size()), &srcW, &srcH, &srcC, 4);
     if (!src || srcW <= 0 || srcH <= 0) {
         if (src) stbi_image_free(src);
         outResult.backgroundImagePath = bestTexture;
@@ -4566,6 +4796,10 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                 << ToFixed16(e.cameraFrustumCullMargin) << ", "
                 << (e.cameraFrustumCullMeshes ? 1 : 0) << ", "
                 << (e.cameraFrustumCullSkinned ? 1 : 0)
+                << ", {" << e.animatorStateHashes[0] << "," << e.animatorStateHashes[1]
+                << "," << e.animatorStateHashes[2] << "," << e.animatorStateHashes[3] << "}"
+                << ", " << unsigned(e.animatorActionCondition) << ", " << ToFixed16(e.animatorActionThreshold)
+                << ", " << (e.renderUnlit ? 1 : 0)
                 << " },\n";
         }
         out << "};\n\n";
@@ -4645,7 +4879,8 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                 << static_cast<int>(ui.spectrumBars) << ", "
                 << static_cast<int>(ui.spectrumGap) << ", "
                 << ui.spectrumSensitivityQ8 << "u, "
-                << ui.rotationDegrees << " },\n";
+                << ui.rotationDegrees << ", " << ui.entityId << "u, "
+                << (ui.visible ? 1 : 0) << " },\n";
         }
         out << "};\n\n";
 
@@ -4702,10 +4937,34 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                 << group.cursorOffsetY << ", "
                 << group.cursorW << ", "
                 << group.cursorH << ", "
-                << static_cast<int>(group.cursorTextureIndex) << " },\n";
+                << static_cast<int>(group.cursorTextureIndex) << ", "
+                << group.cursorUiOffset << "u, " << group.navigationAudioSourceIndex << "u, "
+                << group.confirmAudioSourceIndex << "u },\n";
         }
         out << "};\n\n";
 
+        out << "static const ps1_scene_light k_ps1_scene_lights[] = {\n";
+        for (const auto& light : data.lights) {
+            out << "    { " << light.entityIndex << ", " << static_cast<int>(light.type) << ", { "
+                << ToFixed16(light.position[0]) << ", " << ToFixed16(light.position[1]) << ", "
+                << ToFixed16(light.position[2]) << " }, { " << light.direction[0] << ", "
+                << light.direction[1] << ", " << light.direction[2] << " }, { "
+                << light.colorQ12[0] << ", " << light.colorQ12[1] << ", " << light.colorQ12[2]
+                << " }, " << ToFixed16(light.range) << ", " << light.cosOuter << ", "
+                << light.cosInner << " },\n";
+        }
+        out << "};\n\n";
+
+        if (Ps1::NeedsColorGrading(data.colorGrading)) {
+            out << "/* Final-frame exposure, contrast, saturation and filter. */\n"
+                   "static const uint16_t k_ps1_color_grading_lut[32768] = {\n";
+            for (uint32_t color = 0; color < 32768; ++color) {
+                if (color % 16 == 0) out << "    ";
+                out << Ps1::GradeRgb555(static_cast<uint16_t>(color), data.colorGrading) << "u,";
+                out << (color % 16 == 15 ? "\n" : " ");
+            }
+            out << "};\n\n";
+        }
         out << "const ps1_scene g_ps1_scene = {\n"
                "    k_ps1_entities,\n"
                "    " << data.entities.size() << "u,\n"
@@ -4748,7 +5007,10 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                "    " << data.uiButtonRects.size() << "u,\n"
                "    k_ps1_ui_button_actions,\n"
                "    " << data.uiButtonActions.size() << "u,\n"
-               "    " << static_cast<int>(data.backgroundTextureIndex) << "u\n"
+               "    " << static_cast<int>(data.backgroundTextureIndex) << "u,\n"
+               "    k_ps1_scene_lights,\n"
+               "    " << data.lights.size() << "u,\n"
+               "    " << (Ps1::NeedsColorGrading(data.colorGrading) ? "k_ps1_color_grading_lut" : "0") << "\n"
                "};\n";
         return out.good();
     } catch (const std::exception& ex) {
@@ -4757,8 +5019,8 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
     }
 }
 
-// Slightly below ONE (4096) to reduce GTE lighting MAC overflow (black sparkles).
-static constexpr int kNorm12_4One = 3800;
+// Unit normals must keep the same length as the editor's normalized normals.
+static constexpr int kNorm12_4One = 4096;
 
 static int16_t float_to_norm12_4(float v) {
     const float c = std::clamp(v, -1.0f, 1.0f);
@@ -5531,10 +5793,11 @@ bool EmitAudioDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
     std::unordered_map<std::string, uint8_t> clipIndex;
     size_t totalSpuBytes = 0;
 
-    auto ensureClip = [&](const std::string& path, uint8_t& outIndex) -> bool {
+    auto ensureClip = [&](const std::string& path, bool sfx, bool sample, uint8_t& outIndex) -> bool {
         outIndex = 0;
         if (path.empty()) return true;
-        auto found = clipIndex.find(path);
+        const std::string key = (sample ? "SAMPLE:" : sfx ? "SFX:" : "BGM:") + path;
+        auto found = clipIndex.find(key);
         if (found != clipIndex.end()) { outIndex = found->second; return true; }
         if (data.audioClips.size() >= 63) {
             outError = "PS1 audio supports at most 63 unique clips";
@@ -5544,32 +5807,51 @@ bool EmitAudioDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                                   PathUtf8::FromString(path);
         Ps1VagData encoded;
         std::string encodeError;
+        if ((sfx && !sample) != IsMidiPath(path)) {
+            outError = "AudioSource '" + path + "': SFX requires .mid / .midi; BGM requires WAV / MP3 / VAG";
+            return false;
+        }
+        if (sfx && !sample) {
+            Ps1ExportedAudioClip clip; clip.path = path; clip.sfx = true;
+            if (!ReadMidi(PathUtf8::ToString(absolute), clip.midi, encodeError)) {
+                outError = "MIDI SFX '" + path + "': " + encodeError; return false;
+            }
+            data.audioClips.push_back(std::move(clip));
+            outIndex = static_cast<uint8_t>(data.audioClips.size()); clipIndex[key] = outIndex; return true;
+        }
         if (!EncodeAudioForPs1(PathUtf8::ToString(absolute), false,
                                encoded, encodeError)) {
             outError = "PS1 audio encode failed for '" + path + "': " + encodeError;
             return false;
         }
+        if (sample) {
+            if (encoded.frames.size() > 65536u) { outError = "Sample SFX '" + path + "' exceeds 64 KiB SPU ADPCM; shorten it or use BGM streaming"; return false; }
+            // Loop to the voice's explicit loop address. One-shots point at
+            // the silent SPU block; looping sources point at the sample start.
+            if (!encoded.frames.empty()) encoded.frames[encoded.frames.size() - 15u] = 3u;
+        }
         encoded.frames.resize((encoded.frames.size() + 63u) & ~size_t(63u), 0);
         totalSpuBytes += encoded.frames.size();
         Ps1ExportedAudioClip clip;
         clip.path = path;
+        clip.sfx = sfx; clip.sample = sample;
         clip.loop = false;
         clip.sampleRate = encoded.sampleRate;
         clip.data = std::move(encoded.frames);
         data.audioClips.push_back(std::move(clip));
         const uint8_t index = static_cast<uint8_t>(data.audioClips.size());
-        clipIndex[path] = index;
+        clipIndex[key] = index;
         outIndex = index;
         return true;
     };
 
     for (auto& entity : data.entities) {
-        if (entity.audioEnabled && !ensureClip(entity.audioClipPath, entity.audioClipIndex))
+        if (entity.audioEnabled && !ensureClip(entity.audioClipPath, entity.audioSfx, entity.audioSample, entity.audioClipIndex))
             return false;
       for (auto& script : entity.scripts) {
         for (size_t i = 0; i < script.assetFieldPaths.size(); ++i) {
             uint8_t index = 0;
-            if (!ensureClip(script.assetFieldPaths[i], index))
+            if (!ensureClip(script.assetFieldPaths[i], IsMidiPath(script.assetFieldPaths[i]), false, index))
                 return false;
             if (index != 0 && i < script.fieldValuesQ16.size())
                 script.fieldValuesQ16[i] = ToFixed16(static_cast<double>(index));
@@ -5590,8 +5872,10 @@ bool EmitAudioDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
     cdFileNames.reserve(data.audioClips.size());
     for (size_t i = 0; i < data.audioClips.size(); ++i) {
         std::ostringstream name;
-        name << "AUD" << std::setfill('0') << std::setw(2) << i << ".VAG";
+        name << "S" << std::setfill('0') << std::setw(3) << data.buildSceneIndex
+             << "A" << std::setw(2) << i << ".VAG";
         cdFileNames.push_back(name.str());
+        if (data.audioClips[i].sfx) { cdFileNames.back().clear(); continue; }
         const fs::path audioPath = audioDir / name.str();
         std::ofstream audioOut(audioPath, std::ios::binary | std::ios::trunc);
         if (!audioOut.is_open()) {
@@ -5624,6 +5908,7 @@ bool EmitAudioDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
         }
         std::ostringstream audioEntries;
         for (const std::string& name : cdFileNames) {
+            if (name.empty()) continue;
             audioEntries << "            <file name=\"" << name
                          << "\" type=\"data\" source=\"${PROJECT_SOURCE_DIR}/audio/"
                          << name << "\" />\n";
@@ -5644,14 +5929,53 @@ bool EmitAudioDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
     std::ofstream out(cPath, std::ios::trunc);
     if (!out.is_open()) { outError = "cannot open audio_data.c: " + outCFile; return false; }
     out << "/* Auto-generated PS1 CD audio metadata. */\n#include \"../runtime/audio.h\"\n\n";
+    const bool hasMidi = std::any_of(data.audioClips.begin(), data.audioClips.end(), [](const auto& c) { return c.sfx && !c.sample; });
+    for (size_t i = 0; i < data.audioClips.size(); ++i) {
+        const auto& clip = data.audioClips[i]; if (!clip.sfx || clip.sample) continue;
+        out << "static const ps1_midi_event midi_events_" << i << "[] = {\n";
+        for (const auto& e : clip.midi.events)
+            out << "{" << e.timeUs << "u," << unsigned(e.status) << "," << unsigned(e.data1) << "," << unsigned(e.data2) << "},\n";
+        out << "};\nstatic const ps1_midi_sequence midi_" << i << " = {midi_events_" << i << ","
+            << clip.midi.events.size() << "u," << clip.midi.durationUs << "u};\n";
+    }
+    std::vector<uint8_t> bank;
+    if (hasMidi) for (unsigned tone = 0; tone < 8; ++tone) {
+        std::vector<int16_t> pcm(448);
+        for (size_t sample = 0; sample < pcm.size(); ++sample)
+            pcm[sample] = static_cast<int16_t>(MidiTone(tone, double(sample) / 112.0) * 24000.0f);
+        auto adpcm = EncodePcmForPs1(pcm, true); bank.insert(bank.end(), adpcm.begin(), adpcm.end());
+    }
+    size_t residentBytes = bank.size();
+    for (const auto& clip : data.audioClips) if (clip.sample) residentBytes += clip.data.size();
+    if (residentBytes > 440u * 1024u) { outError = "Resident SFX exceeds the shared 440 KiB SPU budget; shorten clips or use BGM streaming"; return false; }
+    for (size_t i = 0; i < data.audioClips.size(); ++i) {
+        const auto& clip = data.audioClips[i]; if (!clip.sample) continue;
+        out << "static const uint8_t sample_" << i << "[] __attribute__((aligned(64))) = {";
+        for (size_t b = 0; b < clip.data.size(); ++b) { if (b % 32 == 0) out << "\n"; out << unsigned(clip.data[b]) << ","; }
+        out << "};\n";
+    }
+    out << "const uint8_t g_ps1_midi_bank[] __attribute__((aligned(64))) = {";
+    if (bank.empty()) out << "0";
+    for (size_t i = 0; i < bank.size(); ++i) { if (i % 32 == 0) out << "\n"; out << unsigned(bank[i]) << ","; }
+    out << "};\nconst uint32_t g_ps1_midi_bank_size = " << bank.size() << "u;\n";
+    out << "const uint16_t g_ps1_midi_pitch[128] = {";
+    for (int note = 0; note < 128; ++note)
+        out << std::clamp(static_cast<int>(std::lround(440.0 * std::pow(2.0, (note - 69) / 12.0) * 112.0 * 4096.0 / 44100.0)), 1, 16383) << ",";
+    out << "};\n";
     out << "const ps1_audio_clip g_ps1_audio_clips[] = {\n";
     if (data.audioClips.empty()) {
         out << "    { 0, 0u, 0u },\n";
     } else {
         for (size_t i = 0; i < data.audioClips.size(); ++i) {
+            if (data.audioClips[i].sample) {
+                out << "    {0," << data.audioClips[i].data.size() << "u," << data.audioClips[i].sampleRate << "u,0,sample_" << i << "},\n"; continue;
+            }
+            if (data.audioClips[i].sfx) {
+                out << "    {0, 0u, 0u, &midi_" << i << "},\n"; continue;
+            }
             out << "    { \"\\\\" << cdFileNames[i] << "\", "
                 << data.audioClips[i].data.size()
-                << "u, " << data.audioClips[i].sampleRate << "u },\n";
+                << "u, " << data.audioClips[i].sampleRate << "u, 0 },\n";
         }
     }
     out << "};\nconst unsigned int g_ps1_audio_clip_count = "
@@ -6043,7 +6367,7 @@ static bool IsOpenShellMesh(const std::vector<Vertex>& verts, const std::vector<
 
     const float ratio = static_cast<float>(boundaryCount) / static_cast<float>(edgeShareCount.size());
     MIPSYNC_INFO("Topological analysis (position-welded): boundary edges = {} / {}, ratio = {:.3f}", boundaryCount, edgeShareCount.size(), ratio);
-    return boundaryCount >= 16 && ratio > 0.002f;
+    return boundaryCount > 0 && ratio > 0.002f;
 }
 
 static bool IsHighQualityPs1Prop(const std::string& relPath) {
@@ -6081,7 +6405,7 @@ std::shared_ptr<Mesh> BuildPs1PreviewMeshInternal(const Mesh& sourceMesh, bool p
 
     std::vector<Vertex> workVerts = verts;
     std::vector<uint32_t> workIndices = indices;
-    AlignMeshBottom(workVerts);
+    if (!sourceMesh.IsModelPart()) AlignMeshBottom(workVerts);
     WeldMeshVerts(workVerts, workIndices, 1e-5f, true);
     NormalizeNormals(workVerts);
 
@@ -6282,6 +6606,8 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
         // entity pivot, which may be far outside long or asymmetrical meshes.
         std::vector<uint16_t> meshBoundsRadii(data.meshPaths.size(), 1024u);
         std::vector<uint32_t> meshRigidLightBinMasks(data.meshPaths.size(), 0u);
+        std::vector<size_t> meshVertexCounts(data.meshPaths.size(), 0u);
+        std::vector<size_t> meshTriangleCounts(data.meshPaths.size(), 0u);
         std::vector<size_t> skinnedTopologyBase(data.meshPaths.size(), SIZE_MAX);
         std::unordered_map<std::string, size_t> firstSkinnedMeshBySequence;
         std::unordered_map<std::string, float> skinnedSequenceHalf;
@@ -6442,6 +6768,12 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
 
             const bool overBudget =
                 (workVerts.size() > meshMaxVerts) || ((workIndices.size() / 3) > simpMaxTris);
+            if (isSkinnedAnimMesh && overBudget) {
+                outError = "animated mesh exceeded stable sequence topology budget: " + rel;
+                MIPSYNC_ERROR("PS1 animated mesh '{}' exceeded its sequence topology budget; "
+                              "per-pose simplification would invalidate shared indices", rel);
+                return false;
+            }
             SimplifiedMesh simp;
             if (!overBudget) {
                 simp = SimplifiedMesh{ workVerts, workIndices };
@@ -6471,17 +6803,16 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 continue;
             }
 
-            /* A baked texture carries eight authored repeats in one PS1 UV
-             * cell, keeping broad ProModeler faces compact.  Ordinary
-             * full-resolution textures are only selected when their complete
-             * transformed UV range fits inside one repeat cell, so they need
-             * no geometry expansion here. */
-            if (exportUvs && bakedUvRepeats) {
+            /* Preserve repeat boundaries before 8-bit UV quantization. A 1.0
+             * endpoint must stay on the last texel instead of wrapping to 0;
+             * cards otherwise collapse to a one-texel strip. Baked materials
+             * carry eight repeats per cell; ordinary materials carry one. */
+            if (exportUvs && (bakedUvRepeats || (!isSkinnedAnimMesh && !isRigidBoneMesh))) {
                 const size_t sourceTriangles = simp.indices.size() / 3u;
                 const size_t repeatTriangleBudget = meshMaxTris;
                 const size_t repeatVertexBudget = meshMaxVerts;
                 const SimplifiedMesh unsplit = simp;
-                const float repeatSpan = kPs1BakedTextureRepeats;
+                const float repeatSpan = bakedUvRepeats ? kPs1BakedTextureRepeats : 1.f;
                 float packedOffset[2] = { meshOffset[0], meshOffset[1] };
                 /* ProModeler planar UVs are commonly centred around zero.
                  * After packing eight identical repeats into one texture,
@@ -6521,7 +6852,7 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 if (repeatSplit) {
                     WeldMeshVerts(simp.verts, simp.indices, 1e-5f, true);
                     MIPSYNC_INFO(
-                        "PS1 mesh UV repeats '{}': {} triangles -> {} tiled triangles (authored density, 8x baked texture)",
+                        "PS1 mesh UV repeats '{}': {} triangles -> {} tiled triangles (authored density)",
                         rel, sourceTriangles, simp.indices.size() / 3u);
                     meshTiling[0] = meshTiling[1] = 1.0f;
                     meshOffset[0] = meshOffset[1] = 0.0f;
@@ -6544,7 +6875,14 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
             }
 
             RefitMeshHalfExtent(simp.verts, sourceHalf);
-            FinalizeExportedMesh(simp);
+            if (isSkinnedAnimMesh) {
+                // Animation samples share triangle indices, UVs and position
+                // references. Even a temporarily zero-area face must retain
+                // its vertices: compacting a pose renumbers later samples.
+                NormalizeNormals(simp.verts);
+            } else {
+                FinalizeExportedMesh(simp);
+            }
             bool forceFlip = false;
             bool useForceFlip = false;
             if (isSkinnedAnimMesh) {
@@ -6560,7 +6898,11 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
             if (isSkinnedAnimMesh && !useForceFlip) {
                 skinnedAnimFlippedCache[animBaseKey] = globallyInverted;
             }
-            if (isSkinnedAnimMesh && !shareSkinnedTopology)
+            // Spatially reduced viewmodels retain their shell workaround.
+            // Characters retain authored surface endpoints and winding; adding
+            // opposed faces only to the first pose would change shared topology
+            // and misalign all later pose normals (or silently truncate faces).
+            if (isSkinnedAnimMesh && usedAsViewModel && !shareSkinnedTopology)
                 DuplicateOpposedTriangles(simp.verts, simp.indices);
             if (needsDoubleSided || skinnedAnimDoubleSided || rigidBoneDoubleSided) {
                 DuplicateTrianglesDoubleSided(simp.indices);
@@ -6592,6 +6934,9 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 MIPSYNC_ERROR("PS1 mesh '{}' has no triangles after decimation; skipped", rel);
                 continue;
             }
+            meshVertexCounts[mi] = vcount;
+            meshTriangleCounts[mi] = shareSkinnedTopology
+                ? meshTriangleCounts[topologyBase] : tcount;
 
             glm::vec3 templateMin = simp.verts[0].position * toTemplate;
             glm::vec3 templateMax = templateMin;
@@ -6646,7 +6991,7 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
              * in every compatible animation frame. This also makes sharing
              * safe while the runtime interpolates between animation meshes. */
             if (isRigidBoneMesh ||
-                (isAuthoredProModelerMesh && !isCollisionMesh) ||
+                (!isSkinnedAnimMesh && !isCollisionMesh) ||
                 (isSkinnedAnimMesh && !shareSkinnedTopology)) {
                 struct TrajectoryFrame {
                     const Ps1SkinnedAnimMeshData* mesh = nullptr;
@@ -6730,6 +7075,19 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 }
             }
 
+            if (isSkinnedAnimMesh && !usedAsViewModel) {
+                out << "static const SVECTOR k_ps1_mesh_" << mi << "_face_norms[] = {\n";
+                for (size_t ti = 0; ti < tcount; ++ti) {
+                    glm::vec3 normal;
+                    ComputeTriNormal(simp.verts[simp.indices[ti * 3]].position,
+                        simp.verts[simp.indices[ti * 3 + 1]].position,
+                        simp.verts[simp.indices[ti * 3 + 2]].position, normal);
+                    out << "    { " << float_to_norm12_4(normal.x) << ", "
+                        << float_to_norm12_4(normal.y) << ", "
+                        << float_to_norm12_4(normal.z) << ", 0 },\n";
+                }
+                out << "};\n\n";
+            }
             if (!shareSkinnedTopology) {
             // Vertex normals (12.4 fixed; ONE=4096). Keep in mesh local space.
             out << "static const SVECTOR k_ps1_mesh_" << mi << "_norms[] = {\n";
@@ -6750,6 +7108,7 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 int texHeight = 64;
 
                 std::string texPath;
+                int maxTexSize = 64;
                 for (const auto& e : data.entities) {
                     if (e.meshKind == 4 && e.textureIndex > 0 &&
                         (e.meshPath == rel || SameSkinnedAnimSequence(e.meshPath, rel) ||
@@ -6759,46 +7118,50 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                          SameSkinnedAnimSequence(e.vertexTriggerMeshPath, rel))) {
                         if (e.textureIndex <= data.texturePaths.size()) {
                             texPath = data.texturePaths[e.textureIndex - 1];
+                            if (e.textureIndex <= data.textureMaxSizes.size())
+                                maxTexSize = data.textureMaxSizes[e.textureIndex - 1];
                         }
                         break;
                     }
                 }
 
                 if (!texPath.empty()) {
-                    if (texPath.rfind(kPs1BakedTexturePrefix, 0) == 0)
+                    const bool bakedTexture = texPath.rfind(kPs1BakedTexturePrefix, 0) == 0;
+                    const int repeats = bakedTexture ? 8 : 1;
+                    maxTexSize /= repeats;
+                    if (bakedTexture)
                         texPath.erase(0, std::char_traits<char>::length(kPs1BakedTexturePrefix));
                     std::string absPath = AssetManager::Get().ToAbsolute(texPath);
                     int w = 0, h = 0, comp = 0;
-                    if (stbi_info(absPath.c_str(), &w, &h, &comp)) {
-                        // TIM rectangles are measured in 16-bit VRAM words and
-                        // getTPage selects X bases in 64-word increments. Keep
-                        // ordinary materials in one 64x64 packing cell so their
-                        // explicit UV range cannot reach a neighbouring cell.
-                        if (w > 64 || h > 64) {
-                            float scale = 64.0f / static_cast<float>(std::max(w, h));
+                    const auto textureBytes = AssetFiles::Exists(PathUtf8::FromString(absPath))
+                        ? AssetFiles::Read(PathUtf8::FromString(absPath)) : AssetFiles::Bytes{};
+                    if (stbi_info_from_memory(textureBytes.data(), static_cast<int>(textureBytes.size()), &w, &h, &comp)) {
+                        // Match the actual resized TIM, including baked repeats.
+                        if (w > maxTexSize || h > maxTexSize) {
+                            float scale = static_cast<float>(maxTexSize) / static_cast<float>(std::max(w, h));
                             w = std::max(1, static_cast<int>(std::lround(static_cast<float>(w) * scale)));
                             h = std::max(1, static_cast<int>(std::lround(static_cast<float>(h) * scale)));
                         }
                         // Round even up
                         w = (w < 2) ? 2 : ((w + 1) & ~1);
                         h = (h < 2) ? 2 : ((h + 1) & ~1);
-                        texWidth = w;
-                        texHeight = h;
+                        texWidth = w * repeats;
+                        texHeight = h * repeats;
                     } else {
                         // Fallback if stbi_info fails
                         auto texPtr = AssetManager::Get().GetTexture(texPath);
                         if (texPtr) {
                             int w2 = texPtr->GetWidth();
                             int h2 = texPtr->GetHeight();
-                            if (w2 > 64 || h2 > 64) {
-                                float scale = 64.0f / static_cast<float>(std::max(w2, h2));
+                            if (w2 > maxTexSize || h2 > maxTexSize) {
+                                float scale = static_cast<float>(maxTexSize) / static_cast<float>(std::max(w2, h2));
                                 w2 = std::max(1, static_cast<int>(std::lround(static_cast<float>(w2) * scale)));
                                 h2 = std::max(1, static_cast<int>(std::lround(static_cast<float>(h2) * scale)));
                             }
                             w2 = (w2 < 2) ? 2 : ((w2 + 1) & ~1);
                             h2 = (h2 < 2) ? 2 : ((h2 + 1) & ~1);
-                            texWidth = w2;
-                            texHeight = h2;
+                            texWidth = w2 * repeats;
+                            texHeight = h2 * repeats;
                         }
                     }
                 }
@@ -6877,10 +7240,9 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
             FindMeshUvTransform(data, rel, tiling, offset, exportUvs);
             const bool isTerrainMesh = IsTerrainMeshKey(rel);
             const bool isSmoothMesh = rel.rfind("primitivesphere://", 0) == 0;
-            const bool hasProModelerPositionRefs =
+            const bool hasStaticPositionRefs =
                 !IsCollisionMeshKey(rel) &&
-                (sourceRel.rfind("promodelerdata://", 0) == 0 ||
-                 sourceRel.rfind("probuilderdata://", 0) == 0);
+                !IsSkinnedAnimMeshKey(rel);
             const size_t topologyMi = IsSkinnedAnimMeshKey(rel) &&
                                       mi < skinnedTopologyBase.size() &&
                                       skinnedTopologyBase[mi] != SIZE_MAX
@@ -6898,7 +7260,7 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 << ", "
                 << (IsRigidBoneMeshKey(rel)
                         ? ("k_ps1_mesh_" + std::to_string(mi) + "_position_refs")
-                        : (hasProModelerPositionRefs
+                        : (hasStaticPositionRefs
                             ? ("k_ps1_mesh_" + std::to_string(mi) + "_position_refs")
                             : (IsSkinnedAnimMeshKey(rel)
                             ? ("k_ps1_mesh_" + std::to_string(topologyMi) + "_position_refs")
@@ -6912,10 +7274,61 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 << meshBoundsCenters[mi][2] << ", "
                 << meshBoundsRadii[mi] << ", "
                 << meshFlags << ", "
-                << meshRigidLightBinMasks[mi] << "u },\n";
+                << meshRigidLightBinMasks[mi] << "u, "
+                << (IsSkinnedAnimMeshKey(rel) &&
+                    !(mi < data.meshViewModelVariants.size() && data.meshViewModelVariants[mi])
+                    ? "k_ps1_mesh_" + std::to_string(mi) + "_face_norms" : "0")
+                << " },\n";
         }
         out << "};\n";
         out << "const unsigned int g_ps1_mesh_count = " << data.meshPaths.size() << "u;\n";
+
+        // Reserve cache space per entity instance, taking the largest frame
+        // across all its clips. Summing every baked frame overallocates RAM;
+        // counting unique meshes alone underallocates for repeated props.
+        size_t cachedVertices = 0;
+        size_t cachedTriangles = 0;
+        for (const auto& entity : data.entities) {
+            if (entity.meshKind != 4 || entity.meshIndex == 0 ||
+                entity.renderPreset == 3 || entity.rigidAnimFrameCount != 0)
+                continue;
+            size_t vertices = 0;
+            size_t triangles = 0;
+            auto includeRange = [&](uint16_t first, uint16_t count) {
+                if (first == 0) return;
+                for (size_t frame = 0; frame < count; ++frame) {
+                    const size_t index = static_cast<size_t>(first) - 1u + frame;
+                    if (index >= meshVertexCounts.size()) break;
+                    vertices = std::max(vertices, meshVertexCounts[index]);
+                    triangles = std::max(triangles, meshTriangleCounts[index]);
+                }
+            };
+            includeRange(entity.meshIndex, 1);
+            includeRange(entity.vertexAnimFirstMeshIndex, entity.vertexAnimFrameCount);
+            includeRange(entity.vertexIdleFirstMeshIndex, entity.vertexIdleFrameCount);
+            includeRange(entity.vertexWalkFirstMeshIndex, entity.vertexWalkFrameCount);
+            includeRange(entity.vertexAimFirstMeshIndex, entity.vertexAimFrameCount);
+            includeRange(entity.vertexTriggerFirstMeshIndex, entity.vertexTriggerFrameCount);
+            cachedVertices += vertices;
+            cachedTriangles += triangles;
+        }
+        const size_t vertexCacheCap = std::clamp<size_t>(cachedVertices, 1, 16384);
+        const size_t triangleCacheCap = std::clamp<size_t>(cachedTriangles, 1, 16384);
+        const fs::path limitsPath = cPath.parent_path() / "render_limits.h";
+        std::ofstream limits(limitsPath, std::ios::trunc);
+        limits << "/* Auto-generated by Mipsync PS1SceneExport. */\n"
+                  "#ifndef MIPSYNC_GENERATED_RENDER_LIMITS_H\n"
+                  "#define MIPSYNC_GENERATED_RENDER_LIMITS_H\n"
+                  "#define PS1_STATIC_VERTEX_CACHE_TOTAL " << vertexCacheCap << "\n"
+                  "#define PS1_STATIC_TRI_CACHE_TOTAL " << triangleCacheCap << "\n"
+                  "#endif\n";
+        if (!limits.good()) {
+            outError = "failed to write render_limits.h: " + PathUtf8::ToString(limitsPath);
+            return false;
+        }
+        MIPSYNC_INFO("PS1 render vertex/triangle pools: {} vertices, {} triangles ({} bytes)",
+                     vertexCacheCap, triangleCacheCap,
+                     vertexCacheCap * 30u + triangleCacheCap * 12u);
         return out.good();
     } catch (const std::exception& ex) {
         outError = ex.what();
@@ -6927,6 +7340,104 @@ bool EmitMeshDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
 
 std::shared_ptr<Mesh> BuildPs1PreviewMesh(const Mesh& sourceMesh, bool preserveUvSeams) {
     return BuildPs1PreviewMeshInternal(sourceMesh, preserveUvSeams);
+}
+
+std::shared_ptr<Ps1SkinnedPreview> BuildPs1SkinnedPreview(
+    const std::shared_ptr<SkeletalModelAsset>& sourceModel, int meshPartIndex, int targetTris, int targetVerts,
+    const std::string& controllerPath, const std::string& state, bool viewModel) {
+    if (!sourceModel) return nullptr;
+    const auto& model = *sourceModel;
+    auto preview = std::make_shared<Ps1SkinnedPreview>();
+    preview->sourceModel = sourceModel;
+    preview->meshPart = meshPartIndex;
+    preview->targetTris = targetTris;
+    preview->targetVerts = targetVerts;
+    preview->controllerPath = controllerPath;
+    preview->state = state;
+    uint32_t offset = 0, count = static_cast<uint32_t>(model.sourceIndices.size());
+    if (meshPartIndex >= 0 && static_cast<size_t>(meshPartIndex) < model.meshParts.size()) {
+        const auto& part = model.meshParts[meshPartIndex];
+        offset = part.indexOffset;
+        count = part.indexCount;
+    }
+    if (offset >= model.sourceIndices.size()) return nullptr;
+    count = std::min<uint32_t>(count, static_cast<uint32_t>(model.sourceIndices.size() - offset));
+    std::vector<uint32_t> used, remap(model.sourceVertices.size(), UINT32_MAX);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t source = model.sourceIndices[offset + i];
+        if (source >= remap.size()) return nullptr;
+        if (remap[source] == UINT32_MAX) {
+            remap[source] = static_cast<uint32_t>(used.size());
+            used.push_back(source);
+        }
+        preview->indices.push_back(remap[source]);
+    }
+    if (used.empty() || preview->indices.size() < 3) return nullptr;
+    glm::mat4 sampleBones[kMaxBones];
+    json animator = {{"controller", controllerPath}, {"state", state}};
+    // Resolve the same initial controller clip used by the PS1 vertex bake.
+    const auto clips = ResolvePs1AnimatorClips(model.sourcePath, sourceModel, &animator);
+    if (viewModel && clips.idle.stackIndex >= 0 && clips.idle.duration > 0.0 && clips.idle.clipModel)
+        EvaluateRetargetedBoneMatrices(model, *clips.idle.clipModel, clips.idle.stackIndex, 0.0, sampleBones);
+    else model.EvaluateBoneMatrices({}, 0.0, sampleBones);
+    std::vector<Vertex> samples;
+    samples.reserve(used.size());
+    for (uint32_t source : used) samples.push_back(BakeSkinnedVertexForPs1(model, source, sampleBones));
+    size_t tris = static_cast<size_t>(std::clamp(targetTris, 32, 4000));
+    size_t verts = static_cast<size_t>(std::clamp(targetVerts, 64, 5000));
+    if (meshPartIndex >= 0 && model.meshParts.size() > 1) {
+        const size_t parts = model.meshParts.size();
+        tris = std::clamp<size_t>((tris * 4 + parts - 1) / parts, 96, tris);
+        verts = std::clamp<size_t>(tris * 3, 64, verts);
+    }
+    if (viewModel)
+        ReduceSkinnedTopologyForPs1(samples, used, preview->indices, tris, verts,
+                                   &preview->sourceClusters);
+    else
+        ReduceCharacterSurfaceForPs1(model, clips.idle.clipModel.get(), clips.idle.stackIndex,
+            clips.idle.duration, samples, used, preview->indices, tris);
+    if (preview->sourceClusters.empty())
+        for (uint32_t source : used) preview->sourceClusters.push_back({source});
+    UpdatePs1SkinnedPreview(*preview, model, sampleBones);
+    return preview;
+}
+
+void UpdatePs1SkinnedPreview(Ps1SkinnedPreview& preview, const SkeletalModelAsset& model,
+                            const glm::mat4* bones) {
+    uint64_t hash = 14695981039346656037ULL;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(bones);
+    for (size_t i = 0; i < std::min<size_t>(model.bones.size(), kMaxBones) * sizeof(glm::mat4); ++i)
+        hash = (hash ^ bytes[i]) * 1099511628211ULL;
+    if (preview.poseValid && hash == preview.poseHash) return;
+    std::vector<SkinnedVertex> vertices;
+    vertices.reserve(preview.sourceClusters.size());
+    for (const auto& cluster : preview.sourceClusters) {
+        SkinnedVertex vertex{};
+        vertex.position = vertex.normal = glm::vec3(0.0f);
+        vertex.uv = glm::vec2(0.0f);
+        vertex.color = glm::vec4(0.0f);
+        for (uint32_t source : cluster) {
+            const Vertex baked = BakeSkinnedVertexForPs1(model, source, bones);
+            vertex.position += baked.position;
+            vertex.normal += baked.normal;
+            vertex.uv += baked.uv;
+            vertex.color += baked.color;
+        }
+        const float count = static_cast<float>(cluster.size());
+        vertex.position = vertex.position / count / model.displayScale + model.displayCenter;
+        vertex.uv /= count;
+        vertex.color /= count;
+        const float length = glm::length(vertex.normal);
+        vertex.normal = length > 1e-4f ? vertex.normal / length : glm::vec3(0, 1, 0);
+        // Already posed in model world space: identity skin/part transforms
+        // avoid assigning a whole triangle to a different moving bone.
+        vertex.boneWeights = glm::vec4(0.0f);
+        vertices.push_back(vertex);
+    }
+    if (!preview.mesh) preview.mesh = std::make_shared<SkinnedMesh>(vertices, preview.indices);
+    else preview.mesh->UpdateVertexData(vertices);
+    preview.poseHash = hash;
+    preview.poseValid = true;
 }
 
 std::shared_ptr<MipsyncEngine::SkinnedMesh> BuildPs1RigidBonePreview(
@@ -7235,6 +7746,7 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
                               Ps1SceneExportResult& outResult,
                               std::string& outError) {
     outResult = {};
+    outResult.buildSceneIndex = static_cast<unsigned int>(std::max(0, bootManifest.startupSceneIndex));
     outError.clear();
 
     if (AssetManager::Get().GetProjectRoot() != projectRoot)
@@ -7251,6 +7763,8 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
         outError = "Startup scene not found: " + PathUtf8::ToString(scenePath);
         return false;
     }
+    MIPSYNC_INFO("PS1 startup scene: {} (build index {})", sceneRel,
+                 bootManifest.startupSceneIndex);
 
     try {
         std::ifstream in(scenePath);
@@ -7260,6 +7774,34 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
         }
         json root;
         in >> root;
+        // Each scene runs in a separate executable, keeping all scene assets
+        // out of RAM until requested. The catalog is identical in every image.
+        const fs::path catalogPath = PathUtf8::FromString(generatedDir) / "scene_catalog.h";
+        fs::create_directories(catalogPath.parent_path());
+        std::ofstream catalog(catalogPath, std::ios::trunc);
+        catalog << "#ifndef MIPSYNC_GENERATED_SCENE_CATALOG_H\n"
+                   "#define MIPSYNC_GENERATED_SCENE_CATALOG_H\n"
+                   "#define MIPSYNC_BUILD_SCENE_COUNT " << bootManifest.scenesInBuild.size() << "\n"
+                   "#define MIPSYNC_CURRENT_SCENE_INDEX " << outResult.buildSceneIndex << "\n"
+                   "static const char* const k_mipsync_scene_paths[] = {\n";
+        for (std::string path : bootManifest.scenesInBuild) {
+            std::replace(path.begin(), path.end(), '\\', '/');
+            catalog << "    " << json(path).dump() << ",\n";
+        }
+        catalog << "};\nstatic const char* const k_mipsync_scene_executables[] = {\n";
+        for (size_t index = 0; index < bootManifest.scenesInBuild.size(); ++index) {
+            std::ostringstream executable;
+            executable << "cdrom:\\";
+            if (index == 0) executable << "PSX";
+            else executable << "SCN" << std::setfill('0') << std::setw(5) << index;
+            executable << ".EXE;1";
+            catalog << "    " << json(executable.str()).dump() << ",\n";
+        }
+        catalog << "};\n#endif\n";
+        if (!catalog.good()) {
+            outError = "Cannot write scene catalog: " + PathUtf8::ToString(catalogPath);
+            return false;
+        }
         if (!root.contains("entities") || !root["entities"].is_array()) {
             outError = "Invalid scene file (missing entities array).";
             return false;
@@ -7286,69 +7828,58 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
         ExtractPostProcessFog(root, outResult);
         BuildUiGlyphs(outResult);
 
-        // Pick first enabled directional light (fallback to first enabled light).
-        bool foundAny = false;
-        bool foundDir = false;
-        float chosenRot[3] = { 0, 0, 0 };
-        float chosenColor[3] = { 1, 1, 1 };
-        float chosenIntensity = 1.0f;
-        auto scanLights = [&](auto&& self, const json& e) -> void {
-            if (e.contains("light") && e["light"].is_object()) {
+        // Preserve scene order and the editor's eight enabled-light limit.
+        auto scanLights = [&](auto&& self, const json& e, const glm::mat4& parent) -> void {
+            glm::mat4 world = parent * Ps1TransformMatrix(ReadEntityLocalTransform(e));
+            const uint32_t sourceId = e.value("id", 0u);
+            if (const auto it = flatWorldTransforms.find(sourceId); it != flatWorldTransforms.end())
+                world = it->second.matrix;
+            if (e.contains("light") && e["light"].is_object() &&
+                e["light"].value("enabled", true) && outResult.lights.size() < 8) {
                 const json& lj = e["light"];
-                const bool enabled = lj.value("enabled", true);
-                if (enabled) {
-                    const int type = lj.value("type", 1); // 0=Directional, 1=Point, 2=Spot
-                    float rot[3] = { 0, 0, 0 };
-                    if (e.contains("transform")) {
-                        ReadVec3(e["transform"].value("rotation", json::array({ 0, 0, 0 })), rot);
+                Ps1ExportedLight light;
+                light.type = static_cast<uint8_t>(std::clamp(lj.value("type", 1), 0, 2));
+                for (size_t i = 0; i < outResult.entities.size(); ++i)
+                    if (sourceId != 0 && outResult.entities[i].sourceEntityId == sourceId) {
+                        light.entityIndex = static_cast<int>(i);
+                        break;
                     }
-                    float col[3] = { 1, 1, 1 };
-                    if (lj.contains("color") && lj["color"].is_array() && lj["color"].size() >= 3) {
-                        col[0] = lj["color"][0].get<float>();
-                        col[1] = lj["color"][1].get<float>();
-                        col[2] = lj["color"][2].get<float>();
-                    }
-                    float intensity = lj.value("intensity", 1.0f);
-
-                    if (!foundAny || (!foundDir && type == 0)) {
-                        foundAny = true;
-                        foundDir = (type == 0);
-                        chosenRot[0] = rot[0]; chosenRot[1] = rot[1]; chosenRot[2] = rot[2];
-                        chosenColor[0] = col[0]; chosenColor[1] = col[1]; chosenColor[2] = col[2];
-                        chosenIntensity = intensity;
-                    }
+                glm::vec3 direction = glm::vec3(world[2]); // -forward, toward the source
+                if (glm::length(direction) > 0.00001f) direction = glm::normalize(direction);
+                else direction = glm::vec3(0, 0, 1);
+                float color[3] = { 1, 1, 1 };
+                ReadVec3(lj.value("color", json::array({ 1, 1, 1 })), color);
+                const float intensity = std::max(lj.value("intensity", 1.0f), 0.0f);
+                for (int axis = 0; axis < 3; ++axis) {
+                    light.position[axis] = world[3][axis];
+                    light.direction[axis] = static_cast<int16_t>(std::round(direction[axis] * 4096));
+                    light.colorQ12[axis] = static_cast<int32_t>(std::round(
+                        std::clamp(color[axis] * intensity, 0.0f, 64.0f) * 4096));
                 }
+                light.range = light.type == 0 ? 0 : std::max(lj.value("range", 10.0f), 0.0f);
+                const float outer = lj.value("spotAngle", 45.0f);
+                const float inner = lj.value("spotInnerAngle", 30.0f);
+                light.cosOuter = static_cast<int16_t>(std::round(std::cos(glm::radians(
+                    std::clamp(outer, 1.0f, 89.0f))) * 4096));
+                light.cosInner = static_cast<int16_t>(std::round(std::cos(glm::radians(
+                    std::clamp(inner, 0.5f, std::max(outer, 0.5f)))) * 4096));
+                outResult.lights.push_back(light);
             }
-            if (e.contains("children") && e["children"].is_array()) {
-                for (const json& c : e["children"])
-                    self(self, c);
-            }
+            if (e.contains("children") && e["children"].is_array())
+                for (const json& child : e["children"]) self(self, child, world);
         };
         for (const json& ent : root["entities"])
-            scanLights(scanLights, ent);
-
-        if (foundAny) {
+            scanLights(scanLights, ent, glm::mat4(1.0f));
+        if (!outResult.lights.empty()) {
             outResult.hasLight = true;
-            float fwd[3];
-            EulerToForwardUnity(chosenRot, fwd);
-            // Directional light points along -forward (light shining "forward").
-            float dir[3] = { -fwd[0], -fwd[1], -fwd[2] };
-            Normalize3(dir);
-            outResult.lightDirXYZ12_4[0] = static_cast<int16_t>(dir[0] * 4096.0f);
-            outResult.lightDirXYZ12_4[1] = static_cast<int16_t>(dir[1] * 4096.0f);
-            outResult.lightDirXYZ12_4[2] = static_cast<int16_t>(dir[2] * 4096.0f);
-
-            const float ir = Clamp01(chosenColor[0] * chosenIntensity);
-            const float ig = Clamp01(chosenColor[1] * chosenIntensity);
-            const float ib = Clamp01(chosenColor[2] * chosenIntensity);
-            outResult.lightColor[0] = ToByte01(ir);
-            outResult.lightColor[1] = ToByte01(ig);
-            outResult.lightColor[2] = ToByte01(ib);
-
-            // Minimal ambient: 12% of directional color, clamped.
-            outResult.ambientColor[0] = std::max<uint8_t>(16, static_cast<uint8_t>(outResult.lightColor[0] / 8));
-            outResult.ambientColor[1] = std::max<uint8_t>(16, static_cast<uint8_t>(outResult.lightColor[1] / 8));
-            outResult.ambientColor[2] = std::max<uint8_t>(16, static_cast<uint8_t>(outResult.lightColor[2] / 8));
+            const auto it = std::find_if(outResult.lights.begin(), outResult.lights.end(),
+                [](const auto& light) { return light.type == 0; });
+            const auto& legacy = it == outResult.lights.end() ? outResult.lights.front() : *it;
+            for (int axis = 0; axis < 3; ++axis) {
+                outResult.lightDirXYZ12_4[axis] = legacy.direction[axis];
+                outResult.lightColor[axis] = ToByte01(legacy.colorQ12[axis] / 4096.0f);
+                outResult.ambientColor[axis] = ToByte01(0.15f * 0.12f);
+            }
         }
 
         // Compile scripts referenced by entities.
@@ -7368,7 +7899,7 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
                     PathUtf8::FromString(projectRoot) / PathUtf8::FromString(script.path);
                 std::vector<std::string> compileErrors;
                 mod = MipsRuntime::CompileScriptFile(PathUtf8::ToString(absScript), compileErrors);
-                if (!mod) {
+                if (!mod || !compileErrors.empty()) {
                     std::ostringstream message;
                     message << "PS1 script compilation failed for " << script.path;
                     for (const auto& err : compileErrors)
@@ -7418,6 +7949,19 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
                 entityIndexBySourceId[outResult.entities[i].sourceEntityId] = static_cast<int>(i);
         }
 
+        for (auto& group : outResult.uiButtonGroups) {
+            auto resolveSound = [&](uint32_t id, uint16_t& index) {
+                if (!id) return;
+                auto found = entityIndexBySourceId.find(id);
+                if (found == entityIndexBySourceId.end()) return;
+                const auto& source = outResult.entities[found->second];
+                if (source.audioEnabled && source.audioSfx)
+                    index = static_cast<uint16_t>(found->second + 1);
+            };
+            resolveSound(group.navigationAudioSourceId, group.navigationAudioSourceIndex);
+            resolveSound(group.confirmAudioSourceId, group.confirmAudioSourceIndex);
+        }
+
         // Scene object references are authored as stable source entity IDs.
         // The PS1 runtime addresses the flattened entity table, so rewrite
         // references to one-based runtime handles (zero remains None).
@@ -7455,6 +7999,10 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
                         outError = "PS1 script field '" + field.name +
                                    "' requires an object with a Camera component";
                         return false;
+                    }
+                    if (field.typeName == "AudioSource" && !outResult.entities[referencedIndex].audioEnabled) {
+                        // A disabled source is a valid optional reference, but does not play.
+                        script.fieldValuesQ16[fi] = 0; continue;
                     }
                     script.fieldValuesQ16[fi] = ToFixed16(
                         static_cast<double>(referencedIndex + 1));
@@ -7590,7 +8138,19 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
             return false;
 
         const fs::path texC = PathUtf8::FromString(generatedDir) / "textures_data.c";
-        if (!EmitTexturesDataC(outResult.texturePaths, projectRoot, PathUtf8::ToString(texC), outError, outResult.backgroundImagePaths))
+        std::vector<int> textureMaxSizes = outResult.textureMaxSizes;
+        textureMaxSizes.resize(outResult.texturePaths.size(), 64);
+        auto requestUiTexture = [&](uint8_t index, int width, int height) {
+            if (index > 0 && index <= textureMaxSizes.size())
+                textureMaxSizes[index - 1u] = std::max(textureMaxSizes[index - 1u],
+                    std::clamp(std::max(width, height), 64, 256));
+        };
+        for (const auto& ui : outResult.uiElements)
+            requestUiTexture(ui.textureIndex, ui.w, ui.h);
+        for (const auto& group : outResult.uiButtonGroups)
+            requestUiTexture(group.cursorTextureIndex, group.cursorW, group.cursorH);
+        if (!EmitTexturesDataC(outResult.texturePaths, projectRoot, PathUtf8::ToString(texC), outError,
+                              outResult.backgroundImagePaths, textureMaxSizes))
             return false;
 
         const fs::path audioC = PathUtf8::FromString(generatedDir) / "audio_data.c";

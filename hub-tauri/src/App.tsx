@@ -420,12 +420,14 @@ export default function App() {
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return projects;
-    return projects.filter(
-      (p) =>
-        p.name.toLowerCase().includes(q) ||
-        p.path.toLowerCase().includes(q)
-    );
+    return projects
+      .filter(
+        (p) =>
+          !q ||
+          p.name.toLowerCase().includes(q) ||
+          p.path.toLowerCase().includes(q)
+      )
+      .sort((a, b) => b.lastOpened - a.lastOpened);
   }, [projects, search]);
 
   const ensureLatestEditorRelease = async (): Promise<EditorRelease | null> => {
@@ -437,6 +439,7 @@ export default function App() {
 
   const openProjectNow = async (p: ProjectEntry) => {
     await openProject(p.path);
+    await refresh();
   };
 
   const handleOpen = async (p: ProjectEntry, bypassUpdatePrompt = false) => {
@@ -508,7 +511,7 @@ export default function App() {
       writeLastNewProjectLocation(newLocation);
       setModal(null);
       await refresh();
-      await openProject(created.path);
+      await openProjectNow(created);
     } catch (e) {
       setError(String(e));
     }

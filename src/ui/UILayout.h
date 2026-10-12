@@ -23,7 +23,8 @@ struct UILayoutContext {
 /// Depth-first UI layout under a canvas (includes components on the canvas entity).
 void VisitCanvasUI(Scene& scene, Entity& canvasEntity, const CanvasComponent& canvas,
                    const UILayoutContext& ctx,
-                   const std::function<void(Entity&, const UIRect&)>& visitor);
+                   const std::function<void(Entity&, const UIRect&)>& visitor,
+                   const std::function<void(Entity&, const UIRect&)>& afterSubtree = {});
 
 /// Map a UI rect (bottom-left pixel origin) to ImGui screen coordinates over a scene/game view image.
 void UIRectToScreenOverlay(const UIRect& rect, float layoutW, float layoutH, const ImVec2& imageMin,

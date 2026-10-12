@@ -14,5 +14,6 @@ struct Ps1VagData {
 /// Converts a desktop audio asset to mono PS1 SPU ADPCM (max 22050 Hz).
 bool EncodeAudioForPs1(const std::string& absolutePath, bool loop, Ps1VagData& outData,
                        std::string& outError, uint32_t maxSampleRate = 22050);
+std::vector<uint8_t> EncodePcmForPs1(const std::vector<int16_t>& pcm, bool loop);
 
 } // namespace MipsyncEngine

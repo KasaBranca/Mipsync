@@ -31,7 +31,7 @@ public:
     void RefreshBodies(Scene& scene);
 
     /// Step physics: characters move + slide, dynamic bodies simulate, transforms write back.
-    void Simulate(Scene& scene, float deltaTime);
+    void Simulate(Scene& scene, float deltaTime, float maxFrameDeltaTime = 1.0f / 20.0f);
 
     /// Push one entity's transform into its Jolt body / character (e.g. after a gizmo edit).
     void SyncEntityFromScene(Scene& scene, Entity& entity);

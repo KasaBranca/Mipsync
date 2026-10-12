@@ -97,7 +97,8 @@ void DrawCanvasAlignedText(ImDrawList* drawList, ImFont* font, const char* text,
 namespace {
 
 void VisitEntityRecursive(Scene& scene, Entity& entity, const UIRect& parentRect, float scaleFactor,
-                          const std::function<void(Entity&, const UIRect&)>& visitor) {
+                          const std::function<void(Entity&, const UIRect&)>& visitor,
+                          const std::function<void(Entity&, const UIRect&)>& afterSubtree) {
     UIRect nodeRect = parentRect;
     if (auto* rect = entity.GetComponent<RectTransformComponent>()) {
         nodeRect = CalcRectInParent(parentRect, *rect, scaleFactor);
@@ -106,15 +107,17 @@ void VisitEntityRecursive(Scene& scene, Entity& entity, const UIRect& parentRect
 
     for (uint32_t childId : entity.GetChildIDs()) {
         if (Entity* child = scene.FindEntity(childId))
-            VisitEntityRecursive(scene, *child, nodeRect, scaleFactor, visitor);
+            VisitEntityRecursive(scene, *child, nodeRect, scaleFactor, visitor, afterSubtree);
     }
+    if (afterSubtree) afterSubtree(entity, nodeRect);
 }
 
 } // namespace
 
 void VisitCanvasUI(Scene& scene, Entity& canvasEntity, const CanvasComponent& canvas,
                    const UILayoutContext& ctx,
-                   const std::function<void(Entity&, const UIRect&)>& visitor) {
+                   const std::function<void(Entity&, const UIRect&)>& visitor,
+                   const std::function<void(Entity&, const UIRect&)>& afterSubtree) {
     UIRect layoutParent = ctx.pixelSpace
                               ? UIRect{ 0.0f, 0.0f, ctx.viewportWidth, ctx.viewportHeight }
                               : GetCanvasReferenceRect(canvas, ctx.scaleFactor);
@@ -122,7 +125,7 @@ void VisitCanvasUI(Scene& scene, Entity& canvasEntity, const CanvasComponent& ca
     if (auto* rootRt = canvasEntity.GetComponent<RectTransformComponent>())
         layoutParent = CalcRectInParent(layoutParent, *rootRt, ctx.scaleFactor);
 
-    VisitEntityRecursive(scene, canvasEntity, layoutParent, ctx.scaleFactor, visitor);
+    VisitEntityRecursive(scene, canvasEntity, layoutParent, ctx.scaleFactor, visitor, afterSubtree);
 }
 
 float MeasureUITextWidth(ImFont* font, float fontSize, const char* text) {

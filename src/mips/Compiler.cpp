@@ -65,6 +65,15 @@ bool ContainsStringLiteral(const Ast::Expr& expr) {
         return expr.unary && expr.unary->operand && ContainsStringLiteral(*expr.unary->operand);
     case Ast::Expr::Kind::Call:
         if (!expr.call) return false;
+        if (expr.call->callee && expr.call->callee->kind == Ast::Expr::Kind::Member) {
+            const auto& member = *expr.call->callee->member;
+            if (member.object && member.object->kind == Ast::Expr::Kind::Identifier &&
+                member.object->identifier->name == "Input" &&
+                (member.member == "GetAxis" || member.member == "GetButton" ||
+                 member.member == "GetButtonDown" || member.member == "GetButtonUp" ||
+                 member.member == "GetKey" || member.member == "GetKeyDown" || member.member == "GetKeyUp"))
+                return false; // String arguments name controls; the returned value is numeric/bool.
+        }
         if (expr.call->callee && ContainsStringLiteral(*expr.call->callee)) return true;
         for (const auto& arg : expr.call->arguments)
             if (arg && ContainsStringLiteral(*arg)) return true;
@@ -215,7 +224,7 @@ int Compiler::FindLocal(const std::string& name) const {
 
 int Compiler::AllocateLocal(const std::string& name) {
     if (FindLocal(name) >= 0) {
-        m_Errors.push_back(m_FileName + ": local '" + name + "' shadows existing variable");
+        AddLocatedError("local '" + name + "' shadows existing variable");
         return FindLocal(name);
     }
     m_Locals.push_back(name);
@@ -239,6 +248,10 @@ void Compiler::AddError(const Ast::Stmt& stmt, const std::string& message) {
     m_Errors.push_back(m_FileName + "(" + std::to_string(stmt.location.line) + "," +
                        std::to_string(stmt.location.column) + "): " + message);
 }
+void Compiler::AddLocatedError(const std::string& message) {
+    m_Errors.push_back(m_FileName+"("+std::to_string(std::max(1,m_CurrentLocation.line))+","+
+        std::to_string(std::max(1,m_CurrentLocation.column))+"): "+message);
+}
 
 std::unique_ptr<CompiledModule> Compiler::Compile() {
     m_Module = std::make_unique<CompiledModule>();
@@ -252,6 +265,8 @@ std::unique_ptr<CompiledModule> Compiler::Compile() {
             static constexpr const char* kAxes[3] = { "x", "y", "z" };
             for (size_t axis = 0; axis < 3; ++axis) {
                 CompiledField component;
+                component.inspector = field->inspector;
+                if (axis != 0) { component.inspector.header.clear(); component.inspector.space = 0; }
                 component.name = field->name + "." + kAxes[axis];
                 component.typeName = std::string("Vector3.") + kAxes[axis];
                 component.valueKind = FieldValueKind::Number;
@@ -263,6 +278,7 @@ std::unique_ptr<CompiledModule> Compiler::Compile() {
             continue;
         }
         CompiledField cf;
+        cf.inspector = field->inspector;
         cf.name = field->name;
         cf.typeName = field->typeName;
         cf.hasGetter = field->hasGetter;
@@ -271,7 +287,7 @@ std::unique_ptr<CompiledModule> Compiler::Compile() {
             cf.valueKind = FieldValueKind::Bool;
         else if (field->typeName == "AudioClip")
             cf.valueKind = FieldValueKind::AudioClip;
-        else if (field->typeName == "Entity" || field->typeName == "Camera")
+        else if (field->typeName == "Entity" || field->typeName == "Camera" || field->typeName == "AudioSource")
             cf.valueKind = FieldValueKind::EntityReference;
         else if (field->typeName.size() >= 2 &&
                  field->typeName.compare(field->typeName.size() - 2, 2, "[]") == 0)
@@ -324,6 +340,7 @@ void Compiler::CompileBlock(const Ast::BlockStmt& block) {
 }
 
 void Compiler::CompileStatement(const Ast::Stmt& stmt) {
+    m_CurrentLocation=stmt.location;
     switch (stmt.kind) {
     case Ast::Stmt::Kind::Block:
         if (stmt.block) CompileBlock(*stmt.block);
@@ -544,7 +561,7 @@ void Compiler::CompileLValueStore(const Ast::Expr& lhs) {
         const int fieldIdx = m_Module->FindFieldIndex(name);
         if (fieldIdx >= 0) {
             if (!m_Module->fields[static_cast<size_t>(fieldIdx)].hasSetter) {
-                m_Errors.push_back(m_FileName + ": field '" + name + "' is read-only");
+                m_CurrentLocation=lhs.location;AddLocatedError("field '" + name + "' is read-only");
                 m_Writer.EmitOp(OpCode::Pop);
                 return;
             }
@@ -554,11 +571,12 @@ void Compiler::CompileLValueStore(const Ast::Expr& lhs) {
         }
     }
 
-    m_Errors.push_back(m_FileName + ": unsupported assignment target");
+    m_CurrentLocation=lhs.location;AddLocatedError("unsupported assignment target; assign local/own fields, array elements or transform axes. Direct writes to another script's fields are not supported.");
     m_Writer.EmitOp(OpCode::Pop);
 }
 
 void Compiler::CompileExpression(const Ast::Expr& expr) {
+    m_CurrentLocation=expr.location;
     switch (expr.kind) {
     case Ast::Expr::Kind::Literal:
         if (expr.literal->kind == Ast::LiteralExpr::Kind::Int ||
@@ -590,7 +608,7 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
         const int fieldIdx = m_Module->FindFieldIndex(name);
         if (fieldIdx >= 0) {
             if (!m_Module->fields[static_cast<size_t>(fieldIdx)].hasGetter) {
-                m_Errors.push_back(m_FileName + ": field '" + name + "' has no getter");
+                AddLocatedError("field '" + name + "' has no getter");
                 m_Writer.EmitOp(OpCode::PushConst);
                 m_Writer.EmitU16(AddNumberConstant(0));
                 break;
@@ -768,7 +786,7 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
             m_Writer.EmitU16(AddNameConstant(expr.genericCall->typeArgument));
             break;
         }
-        m_Errors.push_back(m_FileName + ": unsupported generic call: " + expr.genericCall->calleeName);
+        AddLocatedError("unsupported generic call: " + expr.genericCall->calleeName);
         m_Writer.EmitOp(OpCode::PushConst);
         m_Writer.EmitU16(AddNumberConstant(0));
         break;
@@ -777,7 +795,7 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
     case Ast::Expr::Kind::Call: {
         if (TryCompileBuiltinCall(*expr.call))
             break;
-        m_Errors.push_back(m_FileName + ": unsupported call expression");
+        m_CurrentLocation=expr.location;AddLocatedError("unsupported call expression; user-defined method calls are not supported by this VM yet. Use lifecycle callbacks or supported built-in APIs; see language.reference.");
         break;
     }
 
@@ -800,14 +818,14 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
             CompileExpression(*expr.newExpr->arraySize);
             m_Writer.EmitOp(OpCode::NewArraySized);
         } else {
-            m_Errors.push_back(m_FileName + ": unsupported constructor: " + expr.newExpr->typeName);
+            AddLocatedError("unsupported constructor: " + expr.newExpr->typeName);
             m_Writer.EmitOp(OpCode::PushConst);
             m_Writer.EmitU16(AddNumberConstant(0));
         }
         break;
 
     default:
-        m_Errors.push_back(m_FileName + ": unsupported expression");
+        AddLocatedError("unsupported expression");
         m_Writer.EmitOp(OpCode::PushConst);
         m_Writer.EmitU16(AddNumberConstant(0));
         break;
@@ -835,6 +853,10 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
         if (hasTarget)
             CompileExpression(objectExpr);
         const uint8_t hostArgc = static_cast<uint8_t>(argc + (hasTarget ? 1 : 0));
+        if (methodName == "GetNormalizedTime" && (argc == 0 || argc == 1)) {
+            emit(HostFunc::Animator_GetNormalizedTime, hostArgc);
+            return true;
+        }
         if (methodName == "SetFloat" && argc == 2) {
             emit(HostFunc::Animator_SetFloat, hostArgc);
             return true;
@@ -889,7 +911,7 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
             call.arguments[0]->call->callee &&
             call.arguments[0]->call->callee->kind == Ast::Expr::Kind::Identifier) {
             if (!call.arguments[0]->call->arguments.empty()) {
-                m_Errors.push_back(m_FileName + ": coroutine arguments are not supported yet");
+                AddLocatedError("coroutine arguments are not supported yet");
                 m_Writer.EmitOp(OpCode::PushConst);
                 m_Writer.EmitU16(AddNumberConstant(0));
                 return true;
@@ -953,16 +975,16 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
         emit(HostFunc::Log_Info, static_cast<uint8_t>(argc));
         return true;
     }
-    if (targetName == "Input" && methodName == "GetKey" && argc == 1) {
-        emit(HostFunc::Input_GetKey, 1);
+    if (targetName == "Input" && (methodName == "GetKey" || methodName == "GetButton") && argc == 1) {
+        emit(methodName == "GetButton" ? HostFunc::Input_GetButton : HostFunc::Input_GetKey, 1);
         return true;
     }
-    if (targetName == "Input" && methodName == "GetKeyDown" && argc == 1) {
-        emit(HostFunc::Input_GetKeyDown, 1);
+    if (targetName == "Input" && (methodName == "GetKeyDown" || methodName == "GetButtonDown") && argc == 1) {
+        emit(methodName == "GetButtonDown" ? HostFunc::Input_GetButtonDown : HostFunc::Input_GetKeyDown, 1);
         return true;
     }
-    if (targetName == "Input" && methodName == "GetKeyUp" && argc == 1) {
-        emit(HostFunc::Input_GetKeyUp, 1);
+    if (targetName == "Input" && (methodName == "GetKeyUp" || methodName == "GetButtonUp") && argc == 1) {
+        emit(methodName == "GetButtonUp" ? HostFunc::Input_GetButtonUp : HostFunc::Input_GetKeyUp, 1);
         return true;
     }
     if (targetName == "Input" && methodName == "GetAxis" && argc == 1) {
@@ -1005,6 +1027,10 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
         emit(HostFunc::Camera_Follow, static_cast<uint8_t>(argc));
         return true;
     }
+    if (targetName == "Camera" && methodName == "RotatePitch" && argc == 4) {
+        emit(HostFunc::Camera_RotatePitch, 4);
+        return true;
+    }
     if (targetName == "Vector3") {
         if (methodName == "Add" && argc == 2)    { emit(HostFunc::Vector3_Add, 2); return true; }
         if (methodName == "Sub" && argc == 2)    { emit(HostFunc::Vector3_Sub, 2); return true; }
@@ -1031,6 +1057,17 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
         return tryAnimatorMethods(*member.object, methodName);
     if (targetName == "Scene" && methodName == "Load" && argc == 1) {
         emit(HostFunc::Scene_Load, 1);
+        return true;
+    }
+    if (targetName == "UI" && methodName == "SetTextVisible" && argc == 2) {
+        emit(HostFunc::UI_SetTextVisible, 2);
+        return true;
+    }
+    if(targetName=="UI"&&methodName=="SetText"&&argc==2){emit(HostFunc::UI_SetText,2);return true;}
+    if(targetName=="UI"&&methodName=="SetTextNumber"&&argc==2){emit(HostFunc::UI_SetTextNumber,2);return true;}
+    if(targetName=="UI"&&methodName=="SetColor"&&argc==5){emit(HostFunc::UI_SetColor,5);return true;}
+    if (targetName == "UI" && methodName == "SetImageVisible" && argc == 2) {
+        emit(HostFunc::UI_SetImageVisible, 2);
         return true;
     }
     if (targetName == "Scene" && methodName == "LoadBuildIndex" && argc == 1) {

@@ -2,6 +2,8 @@
 #include "MipsEditorIntegration.h"
 #include "EditorApp.h"
 #include "EditorTheme.h"
+#include "EditorMenu.h"
+#include "EditorToolbar.h"
 #include "EditorAssetIcons.h"
 #include "../assets/AssetThumbnail.h"
 #include "../core/Engine.h"
@@ -19,6 +21,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <cctype>
+#include <sstream>
 #include <fstream>
 #include <filesystem>
 
@@ -36,6 +40,10 @@ namespace MipsyncEngine {
 namespace fs = std::filesystem;
 
 namespace {
+
+bool TrackAssetUndo(EditorApp* editor, const fs::path& path, bool recursive = false) {
+    return !editor || editor->RecordAssetUndoSnapshot(PathUtf8::ToString(path), recursive);
+}
 
 // Asset thumbnails often use the editor's blue accent themselves. Keep file
 // selection neutral so the artwork remains readable instead of merging into
@@ -301,14 +309,15 @@ AssetKind AssetBrowserPanel::ClassifyByExtension(const std::string& filename) {
     if (StrEndsWithCI(filename, ".nanim"))    return AssetKind::AnimationClip;
     if (StrEndsWithCI(filename, ".nprefab"))  return AssetKind::Prefab;
     if (StrEndsWithCI(filename, ".fbx") || StrEndsWithCI(filename, ".obj") ||
-        StrEndsWithCI(filename, ".glb"))
+        StrEndsWithCI(filename, ".glb") || StrEndsWithCI(filename, ".nmodel"))
         return AssetKind::Model;
     if (StrEndsWithCI(filename, ".png") || StrEndsWithCI(filename, ".jpg") ||
         StrEndsWithCI(filename, ".jpeg") || StrEndsWithCI(filename, ".tga") ||
         StrEndsWithCI(filename, ".bmp") || StrEndsWithCI(filename, ".hdr"))
         return AssetKind::Texture;
     if (StrEndsWithCI(filename, ".wav") || StrEndsWithCI(filename, ".mp3") ||
-        StrEndsWithCI(filename, ".vag"))      return AssetKind::Audio;
+        StrEndsWithCI(filename, ".vag") || StrEndsWithCI(filename, ".mid") ||
+        StrEndsWithCI(filename, ".midi"))      return AssetKind::Audio;
     return AssetKind::Other;
 }
 
@@ -385,33 +394,102 @@ const char* AssetBrowserPanel::DragDropTypeFor(AssetKind kind) {
 
 void AssetBrowserPanel::Refresh() {
     m_ScanRequested = true;
+    m_ProjectScanRequested = true;
+}
+
+void AssetBrowserPanel::SetSearchQuery(const std::string& query) {
+    // An external reveal/clear must also update ImGui's cached edit buffer.
+    // Edits made by InputText itself already agree with m_SearchQuery.
+    if (query != m_SearchQuery && ImGui::GetCurrentContext()) {
+        if (auto* project = ImGui::FindWindowByName("Project")) {
+            const ImGuiID id = project->GetID("##ProjectSearch");
+            if (auto* state = ImGui::GetInputTextState(id); state && ImGui::GetActiveID() == id)
+                state->ReloadUserBufAndMoveToEnd();
+            auto& g = *ImGui::GetCurrentContext();
+            if (g.InputTextDeactivatedState.ID == id)
+                g.InputTextDeactivatedState.ID = 0;
+        }
+    }
+    const size_t size = std::min(query.size(), sizeof(m_SearchQuery) - 1);
+    std::memcpy(m_SearchQuery, query.data(), size);
+    m_SearchQuery[size] = '\0';
+    m_SearchTerms.clear();
+    std::istringstream words(m_SearchQuery);
+    for (std::string term; words >> term;) {
+        std::transform(term.begin(), term.end(), term.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        m_SearchTerms.push_back(std::move(term));
+    }
+    m_SelectionAnchorIndex = SIZE_MAX;
+    // Reuse the project index while typing; filesystem changes invalidate it
+    // through Refresh(), including the existing automatic refresh interval.
+    m_ScanRequested = true;
+}
+
+void AssetBrowserPanel::DrawSearchBar() {
+    const float height = ImGui::GetFrameHeight();
+    const float width = ImGui::GetContentRegionAvail().x;
+    const bool showClear = m_SearchQuery[0] != '\0' && width > height * 2.0f;
+    ImGui::SetNextItemWidth(std::max(1.0f, width - (showClear ? height + ImGui::GetStyle().ItemSpacing.x : 0.0f)));
+    if (ImGui::InputTextWithHint("##ProjectSearch", "Search project...", m_SearchQuery,
+                                sizeof(m_SearchQuery), ImGuiInputTextFlags_EscapeClearsAll))
+        SetSearchQuery(m_SearchQuery);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Search asset names across Assets and Scenes.");
+    if (showClear) {
+        ImGui::SameLine();
+        if (EditorSurface::ClearButton("##ProjectSearchClear", height))
+            SetSearchQuery("");
+    }
 }
 
 void AssetBrowserPanel::SetCurrentFolder(const std::string& projectRelPath) {
+    SetSearchQuery("");
     m_CurrentFolder = NormalizeContentFolder(projectRelPath);
     ExpandTreeToFolder(m_CurrentFolder);
-    ClearAssetSelection();
+    // Selection belongs to the project, while the range anchor belongs to the
+    // current folder's grid. Keep the former and discard the latter.
+    m_SelectionAnchorIndex = SIZE_MAX;
+    m_PendingRevealPath.clear();
     Refresh();
 }
 
 bool AssetBrowserPanel::RevealAndSelectAsset(const std::string& projectOrAbsolutePath) {
+    if (projectOrAbsolutePath.empty()) return false;
     const std::string rel = NormalizeProjectRel(
         AssetManager::Get().ToProjectRelative(projectOrAbsolutePath));
     if (rel.empty())
         return false;
-    const std::string abs = AssetManager::Get().ToAbsolute(rel);
+    std::string modelPath, clipName;
+    int clipStackIndex = -1;
+    const bool isClip = TryParseAnimationClipVirtualPath(rel, modelPath, clipName, &clipStackIndex);
+    const std::string filePath = isClip ? modelPath : rel;
+    const auto relativeFile = PathUtf8::FromString(filePath).lexically_normal();
+    // An external absolute path cannot be shown in this project's folder tree.
+    // Reject it before expanding ancestors (filesystem roots are not tree roots).
+    if (AssetManager::Get().GetProjectRoot().empty() || relativeFile.empty() ||
+        relativeFile.is_absolute() || *relativeFile.begin() == "..")
+        return false;
+    const std::string abs = AssetManager::Get().ToAbsolute(filePath);
     std::error_code ec;
     if (!fs::is_regular_file(PathUtf8::FromString(abs), ec))
         return false;
 
-    m_CurrentFolder = NormalizeContentFolder(ParentProjectRel(rel));
+    SetSearchQuery("");
+    m_CurrentFolder = NormalizeContentFolder(ParentProjectRel(filePath));
     ExpandTreeToFolder(m_CurrentFolder);
     m_SelectedAssets.clear();
     SelectedAsset selected{};
     selected.projectRelPath = rel;
     selected.kind = ClassifyAssetByPath(rel);
+    if (isClip) {
+        selected.parentModelPath = modelPath;
+        selected.clipName = clipName;
+        m_ExpandedModels.insert(modelPath);
+    }
     m_SelectedAssets.push_back(std::move(selected));
     m_SelectionAnchorIndex = SIZE_MAX;
+    m_PendingRevealPath = rel;
     Refresh();
     return true;
 }
@@ -481,9 +559,24 @@ bool AssetBrowserPanel::GetSelectedAnimationClip(std::string& outModelPath,
     return TryParseAnimationClipVirtualPath(sel.projectRelPath, outModelPath, outClipName);
 }
 
+void AssetBrowserPanel::OnHistoryRestored() {
+    std::erase_if(m_SelectedAssets, [](const SelectedAsset& entry) {
+        const auto& rel = entry.parentModelPath.empty() ? entry.projectRelPath : entry.parentModelPath;
+        return !std::filesystem::exists(PathUtf8::FromString(AssetManager::Get().ToAbsolute(rel)));
+    });
+    m_SelectionAnchorIndex = SIZE_MAX;
+    m_RenameTargetPath.clear();
+    while (m_CurrentFolder != kAssetsRoot && m_CurrentFolder != kScenesRoot &&
+           !std::filesystem::exists(PathUtf8::FromString(AssetManager::Get().ToAbsolute(m_CurrentFolder))))
+        m_CurrentFolder = NormalizeContentFolder(ParentProjectRel(m_CurrentFolder));
+    RescanFolderTree();
+    Refresh();
+}
+
 void AssetBrowserPanel::ClearAssetSelection() {
     m_SelectedAssets.clear();
     m_SelectionAnchorIndex = SIZE_MAX;
+    m_PendingRevealPath.clear();
 }
 
 bool AssetBrowserPanel::IsAssetSelected(const std::string& projectRelPath) const {
@@ -582,6 +675,7 @@ bool AssetBrowserPanel::DeleteAssetAt(const std::string& projectRelPath, AssetKi
         return false;
     }
 
+    if (!TrackAssetUndo(m_Editor, path, true)) { outError = "Cannot record asset deletion"; return false; }
     if (fs::is_directory(path, ec)) {
         const auto removed = fs::remove_all(path, ec);
         if (ec || removed == 0) {
@@ -649,6 +743,9 @@ bool AssetBrowserPanel::RenameAssetAt(const std::string& projectRelPath, const s
         return false;
     }
 
+    if (!TrackAssetUndo(m_Editor, oldAbs, true) || !TrackAssetUndo(m_Editor, newAbs, true)) {
+        outError = "Cannot record asset rename"; return false;
+    }
     fs::rename(oldAbs, newAbs, ec);
     if (ec) {
         outError = ec.message();
@@ -687,6 +784,7 @@ bool AssetBrowserPanel::CreateScriptAsset(const std::string& requestedName,
     const std::string folder = "assets/scripts";
     const fs::path folderAbs = PathUtf8::FromString(AssetManager::Get().ToAbsolute(folder));
     std::error_code ec;
+    if (!TrackAssetUndo(m_Editor, folderAbs, true)) { outError = "Cannot record script creation"; return false; }
     fs::create_directories(folderAbs, ec);
     if (ec) {
         outError = ec.message();
@@ -696,6 +794,7 @@ bool AssetBrowserPanel::CreateScriptAsset(const std::string& requestedName,
     outProjectRelPath = MakeUniqueAssetPath(folder, stem, ".mips");
     const fs::path absolute =
         PathUtf8::FromString(AssetManager::Get().ToAbsolute(outProjectRelPath));
+    if (!TrackAssetUndo(m_Editor, absolute)) { outError = "Cannot record script creation"; return false; }
     std::ofstream file(absolute, std::ios::binary | std::ios::trunc);
     if (!file.is_open()) {
         outError = "failed to create script";
@@ -814,6 +913,7 @@ void AssetBrowserPanel::CreateAssetAndBeginRename(AssetKind kind) {
     const std::string rel = MakeUniqueAssetPath(folder, stem, extension);
     const fs::path absolute = PathUtf8::FromString(AssetManager::Get().ToAbsolute(rel));
     std::error_code ec;
+    if (!TrackAssetUndo(m_Editor, absolute, true)) { m_LastError = "Cannot record asset creation"; return; }
     fs::create_directories(absolute.parent_path(), ec);
     if (ec) {
         m_LastError = ec.message();
@@ -878,7 +978,7 @@ void AssetBrowserPanel::OpenRenameDialogForSelection() {
 }
 
 void AssetBrowserPanel::DrawAssetContextMenu(const AssetEntry& entry, size_t entryIndex) {
-    if (!ImGui::BeginPopupContextItem("##ctx"))
+    if (!EditorMenu::BeginPopupContextItem("##ctx"))
         return;
 
     if (!IsAssetSelected(entry.projectRelPath))
@@ -886,20 +986,20 @@ void AssetBrowserPanel::DrawAssetContextMenu(const AssetEntry& entry, size_t ent
 
     const size_t selCount = m_SelectedAssets.size();
 
-    if (selCount == 1 && !entry.isSubAsset && ImGui::MenuItem("Rename"))
+    if (selCount == 1 && !entry.isSubAsset && EditorMenu::MenuItem("Rename"))
         OpenRenameDialogForSelection();
 
-    if (selCount == 1 && entry.kind == AssetKind::Scene && ImGui::MenuItem("Open Scene")) {
+    if (selCount == 1 && entry.kind == AssetKind::Scene && EditorMenu::MenuItem("Open Scene")) {
         if (m_Editor)
             m_Editor->LoadSceneFromPath(entry.absolutePath);
     }
 
     if (selCount == 1 && entry.kind == AssetKind::Script) {
-        if (ImGui::MenuItem("Open in IDE")) {
+        if (EditorMenu::MenuItem("Open in IDE")) {
             if (!MipsEditorIntegration::OpenScriptInIde(entry.projectRelPath))
                 m_LastError = "Failed to open script in IDE";
         }
-        if (ImGui::MenuItem("Validate Mips#")) {
+        if (EditorMenu::MenuItem("Validate Mips#")) {
             const auto result = MipsEditorIntegration::ValidateScript(entry.projectRelPath);
             MipsEditorIntegration::LogValidationResult(entry.projectRelPath, result);
             if (result.success) {
@@ -917,10 +1017,10 @@ void AssetBrowserPanel::DrawAssetContextMenu(const AssetEntry& entry, size_t ent
     }
 
     if (!entry.isSubAsset &&
-        ImGui::MenuItem(selCount > 1 ? "Delete Selected" : "Delete"))
+        EditorMenu::MenuItem(selCount > 1 ? "Delete Selected" : "Delete"))
         DeleteSelectedAssets();
 
-    if (ImGui::MenuItem("Reveal in Explorer")) {
+    if (EditorMenu::MenuItem("Reveal in Explorer")) {
         if (entry.isSubAsset && !entry.parentModelPath.empty()) {
             const std::string abs = AssetManager::Get().ToAbsolute(entry.parentModelPath);
             fs::path target = PathUtf8::FromString(abs);
@@ -934,13 +1034,15 @@ void AssetBrowserPanel::DrawAssetContextMenu(const AssetEntry& entry, size_t ent
         }
     }
 
-    ImGui::EndPopup();
+    EditorMenu::EndPopup();
 }
 
 void AssetBrowserPanel::HandleGridKeyboardShortcuts() {
     if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows))
         return;
     if (!m_RenameTargetPath.empty())
+        return;
+    if (ImGui::GetIO().WantTextInput)
         return;
 
     if (ImGui::IsKeyPressed(ImGuiKey_Delete))
@@ -965,11 +1067,57 @@ void AssetBrowserPanel::RescanFolderTree() {
     m_FolderTreeRoots.push_back(kScenesRoot);
 }
 
+void AssetBrowserPanel::RescanProjectAssets() {
+    m_ProjectEntries.clear();
+    const auto root = PathUtf8::FromString(AssetManager::Get().GetProjectRoot());
+    for (const char* contentRoot : {kAssetsRoot, kScenesRoot}) {
+        std::error_code ec;
+        const auto options = fs::directory_options::skip_permission_denied;
+        for (fs::recursive_directory_iterator it(root / contentRoot, options, ec), end;
+             it != end && !ec; it.increment(ec)) {
+            const auto& entry = *it;
+            const std::string name = PathUtf8::ToString(entry.path().filename());
+            if (name.empty() || name[0] == '.' || entry.is_symlink(ec)) {
+                it.disable_recursion_pending();
+                continue;
+            }
+            AssetEntry asset;
+            asset.name = name;
+            asset.absolutePath = PathUtf8::ToString(entry.path());
+            asset.projectRelPath = PathUtf8::ToString(entry.path().lexically_relative(root));
+            std::replace(asset.projectRelPath.begin(), asset.projectRelPath.end(), '\\', '/');
+            asset.isDirectory = entry.is_directory(ec);
+            if (ec || (!asset.isDirectory && !entry.is_regular_file(ec))) continue;
+            asset.kind = asset.isDirectory ? AssetKind::Folder : ClassifyByExtension(name);
+            m_ProjectEntries.push_back(std::move(asset));
+        }
+    }
+    std::sort(m_ProjectEntries.begin(), m_ProjectEntries.end(), [](const AssetEntry& a, const AssetEntry& b) {
+        if (a.isDirectory != b.isDirectory) return a.isDirectory;
+        if (a.name != b.name) return a.name < b.name;
+        return a.projectRelPath < b.projectRelPath;
+    });
+    m_ProjectScanRequested = false;
+}
+
 void AssetBrowserPanel::RescanFolder() {
     m_Entries.clear();
     AssetManager& assets = AssetManager::Get();
     const std::string& root = assets.GetProjectRoot();
     if (root.empty()) return;
+
+    if (!m_SearchTerms.empty()) {
+        if (m_ProjectScanRequested) RescanProjectAssets();
+        for (const auto& entry : m_ProjectEntries) {
+            std::string name = entry.name;
+            std::transform(name.begin(), name.end(), name.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (std::all_of(m_SearchTerms.begin(), m_SearchTerms.end(),
+                [&](const std::string& term) { return name.find(term) != std::string::npos; }))
+                m_Entries.push_back(entry);
+        }
+        return;
+    }
 
     fs::path rootPath = PathUtf8::FromString(root);
     const std::string folder = NormalizeContentFolder(m_CurrentFolder);
@@ -1071,7 +1219,8 @@ void AssetBrowserPanel::HandleEntityDropOnFolder(const std::string& projectRelFo
         }
 
         std::string err;
-        if (!SceneIO::SaveEntityToFile(*target, scene, absTarget, err)) {
+        if (!TrackAssetUndo(m_Editor, PathUtf8::FromString(absTarget)) ||
+            !SceneIO::SaveEntityToFile(*target, scene, absTarget, err)) {
             m_LastError = "prefab save failed: " + err;
             continue;
         }
@@ -1166,6 +1315,9 @@ bool AssetBrowserPanel::MoveAssetToFolder(const std::string& srcProjectRel,
         return false;
     }
 
+    if (!TrackAssetUndo(m_Editor, srcAbs, true) || !TrackAssetUndo(m_Editor, destAbs, true)) {
+        outError = "Cannot record asset move"; return false;
+    }
     fs::create_directories(destDir, ec);
     fs::rename(srcAbs, destAbs, ec);
     if (ec) {
@@ -1291,27 +1443,27 @@ void AssetBrowserPanel::BeginAssetDragSource(const AssetEntry& entry) {
 }
 
 void AssetBrowserPanel::DrawPanelContextMenu() {
-    if (!ImGui::BeginPopupContextWindow(nullptr, ImGuiPopupFlags_MouseButtonRight))
+    if (!EditorMenu::BeginPopupContextWindow(nullptr, ImGuiPopupFlags_MouseButtonRight))
         return;
 
-    if (ImGui::MenuItem("Refresh"))
+    if (EditorMenu::MenuItem("Refresh"))
         Refresh();
-    if (ImGui::MenuItem("New Folder"))
+    if (EditorMenu::MenuItem("New Folder"))
         CreateAssetAndBeginRename(AssetKind::Folder);
-    if (ImGui::MenuItem("New Scene"))
+    if (EditorMenu::MenuItem("New Scene"))
         CreateAssetAndBeginRename(AssetKind::Scene);
-    if (ImGui::MenuItem("New Material"))
+    if (EditorMenu::MenuItem("New Material"))
         CreateAssetAndBeginRename(AssetKind::Material);
-    if (ImGui::MenuItem("New Animator Controller"))
+    if (EditorMenu::MenuItem("New Animator Controller"))
         CreateAssetAndBeginRename(AssetKind::AnimatorController);
-    if (ImGui::MenuItem("New Script"))
+    if (EditorMenu::MenuItem("New Script"))
         CreateAssetAndBeginRename(AssetKind::Script);
 #ifdef _WIN32
-    if (ImGui::MenuItem("Import..."))
+    if (EditorMenu::MenuItem("Import..."))
         m_OpenImportDialog = true;
 #endif
     ImGui::Separator();
-    if (ImGui::MenuItem("Reveal in Explorer")) {
+    if (EditorMenu::MenuItem("Reveal in Explorer")) {
         const std::string abs =
             AssetManager::Get().ToAbsolute(NormalizeContentFolder(m_CurrentFolder));
         RevealFolderInOS(abs);
@@ -1319,13 +1471,13 @@ void AssetBrowserPanel::DrawPanelContextMenu() {
 
     if (!m_SelectedAssets.empty()) {
         ImGui::Separator();
-        if (m_SelectedAssets.size() == 1 && ImGui::MenuItem("Rename Selected"))
+        if (m_SelectedAssets.size() == 1 && EditorMenu::MenuItem("Rename Selected"))
             OpenRenameDialogForSelection();
-        if (ImGui::MenuItem("Delete Selected"))
+        if (EditorMenu::MenuItem("Delete Selected"))
             DeleteSelectedAssets();
     }
 
-    ImGui::EndPopup();
+    EditorMenu::EndPopup();
 }
 
 void AssetBrowserPanel::DrawFolderTreeNode(const std::string& projectRelPath, const std::string& displayName) {
@@ -1333,7 +1485,8 @@ void AssetBrowserPanel::DrawFolderTreeNode(const std::string& projectRelPath, co
     fs::path rootPath = PathUtf8::FromString(root);
     fs::path abs = projectRelPath.empty() ? rootPath : rootPath / PathUtf8::FromString(projectRelPath);
 
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
+                               ImGuiTreeNodeFlags_DrawLinesNone;
     if (m_CurrentFolder == projectRelPath)
         flags |= ImGuiTreeNodeFlags_Selected;
 
@@ -1349,9 +1502,6 @@ void AssetBrowserPanel::DrawFolderTreeNode(const std::string& projectRelPath, co
     }
     if (!hasChildren) {
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-        // A leaf has no branch to communicate. Suppress ImGui's tiny terminal
-        // connector while keeping relationship lines on actual folder forks.
-        flags |= ImGuiTreeNodeFlags_DrawLinesNone;
     }
 
     ImGui::PushStyleColor(ImGuiCol_Header, kProjectSelectionBg);
@@ -1366,6 +1516,12 @@ void AssetBrowserPanel::DrawFolderTreeNode(const std::string& projectRelPath, co
 
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
         SetCurrentFolder(projectRelPath);
+
+    // Native OS file drops do not produce an ImGui payload. Remember the
+    // concrete tree row under the cursor so ProcessOsFileDrop imports into
+    // that folder instead of falling back to the folder open in the grid.
+    if (!OsFileDrop::Peek().empty() && ImGui::IsItemHovered())
+        m_OsDropTargetFolder = projectRelPath;
 
     if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
         std::vector<std::string> paths;
@@ -1595,6 +1751,10 @@ void AssetBrowserPanel::DrawFileGridCell(const AssetEntry& entry, size_t display
     ImGui::Selectable("##cell", isSelected, ImGuiSelectableFlags_AllowDoubleClick,
                       ImVec2(cellThumb, cellThumb));
     ImGui::PopStyleColor();
+    if (m_PendingRevealPath == entry.projectRelPath) {
+        ImGui::SetScrollHereY(0.5f);
+        m_PendingRevealPath.clear();
+    }
     const bool cellHovered = ImGui::IsItemHovered();
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1648,7 +1808,7 @@ void AssetBrowserPanel::DrawFileGridCell(const AssetEntry& entry, size_t display
                io.MouseReleased[ImGuiMouseButton_Left] &&
                !ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
         const ImVec2 drag = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
-        constexpr float kSelectDragThreshold = 6.0f;
+        const float kSelectDragThreshold = ImGui::GetIO().MouseDragThreshold;
         if (drag.x * drag.x + drag.y * drag.y < kSelectDragThreshold * kSelectDragThreshold)
             HandleAssetClickSelection(entry, displayIndex);
     }
@@ -1659,6 +1819,8 @@ void AssetBrowserPanel::DrawFileGridCell(const AssetEntry& entry, size_t display
         HandleFolderDropTargets(entry.projectRelPath);
         ImGui::EndDragDropTarget();
     }
+    if (entry.isDirectory && !OsFileDrop::Peek().empty() && cellHovered)
+        m_OsDropTargetFolder = entry.projectRelPath;
 
     DrawAssetContextMenu(entry, displayIndex);
 
@@ -1688,6 +1850,9 @@ void AssetBrowserPanel::DrawFileGridCell(const AssetEntry& entry, size_t display
     }
 
     ImGui::EndGroup();
+    if (m_Editor && m_Editor->GetPreferences().Enabled("projectTooltips") &&
+        ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("%s", entry.projectRelPath.c_str());
     ImGui::PopID();
 
     if (++col < columns)
@@ -1697,7 +1862,7 @@ void AssetBrowserPanel::DrawFileGridCell(const AssetEntry& entry, size_t display
 }
 
 void AssetBrowserPanel::DrawFileGrid() {
-    const float thumb = 96.0f;
+    const float thumb = m_Editor ? static_cast<float>(m_Editor->GetPreferences().Get("projectThumbnailSize")) : 96.0f;
     const float cellW = thumb + 8.0f;
     const float available = ImGui::GetContentRegionAvail().x;
     const int columns = std::max(1, static_cast<int>(available / cellW));
@@ -1706,27 +1871,26 @@ void AssetBrowserPanel::DrawFileGrid() {
     const std::string display = DisplayFolderPath(folder);
     const std::string root = ContentRootFor(folder);
     const char* rootLabel = (root == kScenesRoot) ? "Scenes" : "Assets";
-    ImGui::TextColored(EditorTheme::TextSecondary, "%s/%s", rootLabel, display.c_str());
+    EditorToolbar toolbar;
+    toolbar.Text(m_SearchTerms.empty() ? (std::string(rootLabel) + "/" + display).c_str() :
+                 "Search results", EditorTheme::TextSecondary);
     if (!m_LastError.empty()) {
-        ImGui::SameLine();
-        ImGui::TextColored(EditorTheme::Error, "— %s", m_LastError.c_str());
+        toolbar.Text(m_LastError.c_str(), EditorTheme::Error);
     } else if (!m_LastInfo.empty()) {
-        ImGui::SameLine();
-        ImGui::TextColored(EditorTheme::SuccessLabel, "— %s", m_LastInfo.c_str());
+        toolbar.Text(m_LastInfo.c_str(), EditorTheme::SuccessLabel);
     }
 
-    if (!IsContentRoot(folder)) {
-        ImGui::SameLine();
-        if (ImGui::SmallButton("..")) {
+    if (m_SearchTerms.empty() && !IsContentRoot(folder)) {
+        if (toolbar.Button("..", 32.0f)) {
             SetCurrentFolder(ParentProjectRel(folder));
         }
     }
 
-    ImGui::Separator();
+    toolbar.End();
 
     if (m_Entries.empty()) {
         ImGui::Spacing();
-        ImGui::TextColored(EditorTheme::TextMuted, "Empty folder.");
+        ImGui::TextColored(EditorTheme::TextMuted, m_SearchTerms.empty() ? "Empty folder." : "No matching assets.");
         HandleGridKeyboardShortcuts();
         DrawPanelContextMenu();
         return;
@@ -1841,7 +2005,9 @@ void AssetBrowserPanel::DrawNewScriptDialog() {
                 "    }\n"
                 "}\n";
 
-            std::ofstream file(abs);
+            const bool recorded = TrackAssetUndo(m_Editor, PathUtf8::FromString(abs));
+            std::ofstream file;
+            if (recorded) file.open(PathUtf8::FromString(abs));
             if (file.is_open()) {
                 file << body;
                 m_LastInfo = "Created: " + rel;
@@ -1851,7 +2017,7 @@ void AssetBrowserPanel::DrawNewScriptDialog() {
                 m_LastError = "Failed to write: " + abs;
             }
         }
-        ImGui::EndPopup();
+        EditorMenu::EndPopup();
     }
 }
 
@@ -1904,7 +2070,7 @@ void AssetBrowserPanel::DrawNewAnimatorControllerDialog() {
                 asset = CreateEmptyController();
 
             std::string err;
-            if (SaveAnimatorController(abs, *asset, err)) {
+            if (TrackAssetUndo(m_Editor, PathUtf8::FromString(abs)) && SaveAnimatorController(abs, *asset, err)) {
                 m_LastInfo = "Created: " + rel;
                 Refresh();
                 AssetEntry created{};
@@ -1918,7 +2084,7 @@ void AssetBrowserPanel::DrawNewAnimatorControllerDialog() {
                 m_LastError = err;
             }
         }
-        ImGui::EndPopup();
+        EditorMenu::EndPopup();
     }
 }
 
@@ -1952,7 +2118,7 @@ void AssetBrowserPanel::DrawNewMaterialDialog() {
             std::string abs = AssetManager::Get().ToAbsolute(rel);
             Material mat;
             std::string err;
-            if (Material::Save(abs, mat, err)) {
+            if (TrackAssetUndo(m_Editor, PathUtf8::FromString(abs)) && Material::Save(abs, mat, err)) {
                 m_LastInfo = "Created: " + rel;
                 Refresh();
                 ImGui::CloseCurrentPopup();
@@ -1960,7 +2126,7 @@ void AssetBrowserPanel::DrawNewMaterialDialog() {
                 m_LastError = err;
             }
         }
-        ImGui::EndPopup();
+        EditorMenu::EndPopup();
     }
 }
 
@@ -1989,7 +2155,9 @@ void AssetBrowserPanel::DrawNewFolderDialog() {
             std::string rel = JoinProjectRel(parentRel, m_NewFolderName);
             std::string abs = AssetManager::Get().ToAbsolute(rel);
             std::error_code ec;
-            fs::create_directories(PathUtf8::FromString(abs), ec);
+            if (TrackAssetUndo(m_Editor, PathUtf8::FromString(abs), true))
+                fs::create_directories(PathUtf8::FromString(abs), ec);
+            else ec = std::make_error_code(std::errc::operation_canceled);
             if (ec)
                 m_LastError = "mkdir failed: " + ec.message();
             else {
@@ -1999,7 +2167,7 @@ void AssetBrowserPanel::DrawNewFolderDialog() {
                 ImGui::CloseCurrentPopup();
             }
         }
-        ImGui::EndPopup();
+        EditorMenu::EndPopup();
     }
 }
 
@@ -2042,7 +2210,7 @@ void AssetBrowserPanel::DrawNewSceneDialog() {
             cam->GetComponent<TransformComponent>()->position = { 0.0f, 2.0f, 6.0f };
 
             std::string err;
-            if (SceneIO::SaveToFile(sc, abs, err)) {
+            if (TrackAssetUndo(m_Editor, PathUtf8::FromString(abs)) && SceneIO::SaveToFile(sc, abs, err)) {
                 m_LastInfo = "Created: " + rel;
                 Refresh();
                 ImGui::CloseCurrentPopup();
@@ -2050,20 +2218,28 @@ void AssetBrowserPanel::DrawNewSceneDialog() {
                 m_LastError = err;
             }
         }
-        ImGui::EndPopup();
+        EditorMenu::EndPopup();
     }
 }
 
 void AssetBrowserPanel::OnImGuiRender() {
+    m_OsDropTargetFolder.clear();
+    if (m_Editor && m_Editor->GetPreferences().Enabled("projectAutoRefresh") &&
+        ImGui::GetTime() - m_LastAutomaticRefresh >= m_Editor->GetPreferences().Get("projectRefreshInterval")) {
+        m_LastAutomaticRefresh = ImGui::GetTime();
+        // Avoid interrupting an asset rename or a drag operation.
+        if (m_RenameTargetPath.empty() && !ImGui::GetDragDropPayload()) Refresh();
+    }
     if (m_FolderTreeRoots.empty())
         RescanFolderTree();
+
+    ImGui::Begin("Project");
+    DrawSearchBar();
 
     if (m_ScanRequested) {
         RescanFolder();
         m_ScanRequested = false;
     }
-
-    ImGui::Begin("Project");
 
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     constexpr float kMinGridW = 96.0f;
@@ -2140,10 +2316,8 @@ bool ShouldSkipImportPath(const fs::path& path) {
 }
 
 bool ImportExternalFileImpl(const fs::path& srcFile, const fs::path& destDir,
-                            std::string& outError, fs::path* outImportedPath = nullptr) {
+                            std::string& outError, fs::path* outImportedPath, EditorApp* editor) {
     std::error_code ec;
-    fs::create_directories(destDir, ec);
-
     fs::path dest = destDir / srcFile.filename();
     int counter = 1;
     const std::string stem = PathUtf8::ToString(srcFile.stem());
@@ -2153,6 +2327,8 @@ bool ImportExternalFileImpl(const fs::path& srcFile, const fs::path& destDir,
         ++counter;
     }
 
+    if (!TrackAssetUndo(editor, dest)) { outError = "Cannot record asset import"; return false; }
+    fs::create_directories(destDir, ec);
     fs::copy_file(srcFile, dest, fs::copy_options::none, ec);
     if (ec) {
         outError = ec.message();
@@ -2199,7 +2375,7 @@ bool IsFbxPath(const fs::path& path) {
     return ext == ".fbx";
 }
 
-void ImportModelSidecarAssets(const std::vector<fs::path>& importedPaths) {
+void ImportModelSidecarAssets(const std::vector<fs::path>& importedPaths, EditorApp* editor) {
     AssetManager& assets = AssetManager::Get();
     for (const fs::path& importedPath : importedPaths) {
         if (!IsFbxPath(importedPath))
@@ -2213,6 +2389,9 @@ void ImportModelSidecarAssets(const std::vector<fs::path>& importedPaths) {
         // writes them beside the model as <model>_textures/*.  Do this before
         // the Project panel rescans so those generated assets are visible in
         // the same frame instead of only after the next editor launch.
+        const auto textures = importedPath.parent_path() /
+            PathUtf8::FromString(PathUtf8::ToString(importedPath.stem()) + "_textures");
+        if (!TrackAssetUndo(editor, textures, true)) continue;
         assets.DropSkeletalModel(rel);
         assets.DropMesh(rel);
         if (!assets.GetSkeletalModel(rel))
@@ -2237,7 +2416,7 @@ fs::path UniqueDestDirectory(const fs::path& parentDir, const fs::path& folderNa
 
 int ImportExternalDirectory(const fs::path& srcDir, const fs::path& destParentDir,
                             fs::path& outDestRoot, std::string& outError,
-                            std::vector<fs::path>* outImportedPaths = nullptr) {
+                            std::vector<fs::path>* outImportedPaths, EditorApp* editor) {
     std::error_code ec;
     if (!fs::is_directory(srcDir, ec)) {
         outError = "not a directory";
@@ -2245,6 +2424,7 @@ int ImportExternalDirectory(const fs::path& srcDir, const fs::path& destParentDi
     }
 
     outDestRoot = UniqueDestDirectory(destParentDir, srcDir.filename());
+    if (!TrackAssetUndo(editor, outDestRoot, true)) { outError = "Cannot record folder import"; return 0; }
     int imported = 0;
 
     for (const auto& entry : fs::recursive_directory_iterator(srcDir, ec)) {
@@ -2262,7 +2442,7 @@ int ImportExternalDirectory(const fs::path& srcDir, const fs::path& destParentDi
         const fs::path targetDir = outDestRoot / rel.parent_path();
         std::string fileErr;
         fs::path importedPath;
-        if (ImportExternalFileImpl(entry.path(), targetDir, fileErr, &importedPath)) {
+        if (ImportExternalFileImpl(entry.path(), targetDir, fileErr, &importedPath, editor)) {
             ++imported;
             if (outImportedPaths)
                 outImportedPaths->push_back(std::move(importedPath));
@@ -2280,6 +2460,11 @@ int ImportExternalDirectory(const fs::path& srcDir, const fs::path& destParentDi
 } // namespace
 
 int AssetBrowserPanel::ImportExternalPath(const std::string& absSourcePath) {
+    return ImportExternalPathToFolder(absSourcePath, m_CurrentFolder);
+}
+
+int AssetBrowserPanel::ImportExternalPathToFolder(
+    const std::string& absSourcePath, const std::string& projectRelFolder) {
     m_LastError.clear();
     std::error_code ec;
     fs::path src = PathUtf8::FromString(absSourcePath);
@@ -2288,7 +2473,7 @@ int AssetBrowserPanel::ImportExternalPath(const std::string& absSourcePath) {
         return 0;
     }
 
-    std::string targetSubdir = NormalizeContentFolder(m_CurrentFolder);
+    std::string targetSubdir = NormalizeContentFolder(projectRelFolder);
     fs::path destDir = PathUtf8::FromString(AssetManager::Get().GetProjectRoot()) /
                        PathUtf8::FromString(targetSubdir);
 
@@ -2298,7 +2483,7 @@ int AssetBrowserPanel::ImportExternalPath(const std::string& absSourcePath) {
         if (fs::is_directory(src, ec)) {
             std::string err;
             fs::path destRoot;
-            imported = ImportExternalDirectory(src, destDir, destRoot, err, &importedPaths);
+            imported = ImportExternalDirectory(src, destDir, destRoot, err, &importedPaths, m_Editor);
             if (imported > 0) {
                 m_LastInfo = "Imported folder: " + PathUtf8::ToString(src.filename()) +
                              " (" + std::to_string(imported) + " files)";
@@ -2310,7 +2495,7 @@ int AssetBrowserPanel::ImportExternalPath(const std::string& absSourcePath) {
         } else if (fs::is_regular_file(src, ec)) {
             std::string err;
             fs::path importedPath;
-            if (ImportExternalFileImpl(src, destDir, err, &importedPath)) {
+            if (ImportExternalFileImpl(src, destDir, err, &importedPath, m_Editor)) {
                 imported = 1;
                 importedPaths.push_back(std::move(importedPath));
                 m_LastInfo = "Imported: " + PathUtf8::ToString(src.filename());
@@ -2325,7 +2510,7 @@ int AssetBrowserPanel::ImportExternalPath(const std::string& absSourcePath) {
     }
 
     if (imported > 0) {
-        ImportModelSidecarAssets(importedPaths);
+        ImportModelSidecarAssets(importedPaths, m_Editor);
         if (imported > 1 && m_LastInfo.empty())
             m_LastInfo = "Imported " + std::to_string(imported) + " file(s)";
         RescanFolderTree();
@@ -2344,9 +2529,11 @@ void AssetBrowserPanel::ProcessOsFileDrop() {
     }
 
     const std::vector<std::string> paths = OsFileDrop::Consume();
+    const std::string targetFolder = m_OsDropTargetFolder.empty()
+        ? m_CurrentFolder : m_OsDropTargetFolder;
     int total = 0;
     for (const std::string& path : paths)
-        total += ImportExternalPath(path);
+        total += ImportExternalPathToFolder(path, targetFolder);
 
     if (total > 0 && m_LastInfo.empty())
         m_LastInfo = "Imported " + std::to_string(total) + " file(s)";

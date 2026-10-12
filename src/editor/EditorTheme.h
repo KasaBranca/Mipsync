@@ -50,14 +50,13 @@ constexpr ImVec4 WithAlpha(ImVec4 c, float a) {
     return { c.x, c.y, c.z, a };
 }
 
-// ── Figma UI3 dark semantics ─────────────────────
-// Canvas-first hierarchy: near-black work area, neutral docked panels, visible
-// input fills, and one blue interaction accent. Decorative chrome is avoided.
-static constexpr ImVec4 Bg                = Hex(0x1E1E1E);
-static constexpr ImVec4 BgSecondary       = Hex(0x2C2C2C);
-static constexpr ImVec4 BgTertiary        = Hex(0x383838);
-static constexpr ImVec4 BgHover           = Hex(0x444444);
-static constexpr ImVec4 BgPressed         = Hex(0x242424);
+// Neutral editor chrome: quiet canvas, readable gray panels, darker tab rails,
+// and the Mipsync blue reserved for selection and interactive feedback.
+static constexpr ImVec4 Bg                = Hex(0x242628);
+static constexpr ImVec4 BgSecondary       = Hex(0x36383B);
+static constexpr ImVec4 BgTertiary        = Hex(0x44474B);
+static constexpr ImVec4 BgHover           = Hex(0x50545A);
+static constexpr ImVec4 BgPressed         = Hex(0x2A2D30);
 static constexpr ImVec4 BgSelected        = Hex(0x0D99FF);
 static constexpr ImVec4 BgSelectedStrong  = Hex(0x0D99FF);
 
@@ -73,17 +72,17 @@ static constexpr ImVec4 Component         = Hex(0x9747FF);
 static constexpr ImVec4 ComponentHover    = Hex(0x8638E5);
 
 // text
-static constexpr ImVec4 Text              = Hex(0xFFFFFF);
-static constexpr ImVec4 TextSecondary     = Hex(0xB3B3B3);
-static constexpr ImVec4 TextTertiary      = Hex(0x8C8C8C);
-static constexpr ImVec4 TextDisabled      = Hex(0x666666);
+static constexpr ImVec4 Text              = Hex(0xECEEF1);
+static constexpr ImVec4 TextSecondary     = Hex(0xC3C7CD);
+static constexpr ImVec4 TextTertiary      = Hex(0xA0A6AE);
+static constexpr ImVec4 TextDisabled      = Hex(0x777D85);
 static constexpr ImVec4 TextOnBrand       = Hex(0xFFFFFF);
 static constexpr ImVec4 TextBrand         = Hex(0x0D99FF);
 
 // borders
-static constexpr ImVec4 Border            = Hex(0x444444);
-static constexpr ImVec4 BorderHighlight   = Hex(0x5C5C5C);
-static constexpr ImVec4 BorderStrong      = Hex(0x707070);
+static constexpr ImVec4 Border            = Hex(0x27292C);
+static constexpr ImVec4 BorderHighlight   = Hex(0x60656D);
+static constexpr ImVec4 BorderStrong      = Hex(0x757C86);
 static constexpr ImVec4 BorderSelected    = Hex(0x0D99FF);
 
 // feedback
@@ -134,6 +133,11 @@ public:
                               float rounding = ShapeCornerSmall);
     static bool StyledButton(const char* label, const ImVec2& size, AeroButtonKind kind = AeroButtonKind::Primary);
     static bool Checkbox(const char* label, bool* value);
+    /// Thin track, circular handle and a separate editable numeric field.
+    static bool SliderFloat(const char* label, float* value, float min, float max,
+                            const char* format = "%.3f", ImGuiSliderFlags flags = 0);
+    static bool SliderInt(const char* label, int* value, int min, int max,
+                          const char* format = "%d", ImGuiSliderFlags flags = 0);
 
     static ImVec4 GetClearColor();
 
@@ -216,8 +220,6 @@ public:
         return StyledButton(label, size, kind);
     }
 
-private:
-    static void DrawButtonBevel(ImDrawList* drawList, ImVec2 min, ImVec2 max, bool pressed);
 };
 
 } // namespace MipsyncEngine

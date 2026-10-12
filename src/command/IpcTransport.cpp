@@ -1,4 +1,5 @@
 #include "IpcTransport.h"
+#include "../assets/AssetManager.h"
 
 #include <algorithm>
 #include <atomic>
@@ -26,19 +27,19 @@ namespace {
 std::string NormalizePath(const std::string& input) {
     if (input.empty()) return {};
     std::error_code ec;
-    fs::path path = fs::weakly_canonical(fs::path(input), ec);
-    if (ec) path = fs::absolute(fs::path(input), ec);
-    std::string value = ec ? input : path.string();
+    fs::path path = fs::weakly_canonical(PathUtf8::FromString(input), ec);
+    if (ec) path = fs::absolute(PathUtf8::FromString(input), ec);
+    std::string value = ec ? input : PathUtf8::ToString(path);
 #ifdef _WIN32
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
+        return c<128 ? static_cast<char>(std::tolower(c)) : static_cast<char>(c);
     });
 #endif
     return value;
 }
 
 fs::path RegistryFile(const std::string& instanceId) {
-    return fs::path(InstanceRegistry::RegistryDirectory()) / (instanceId + ".json");
+    return PathUtf8::FromString(InstanceRegistry::RegistryDirectory()) / (instanceId + ".json");
 }
 
 CommandResult ParseResponse(const std::string& payload, const std::string& requestId) {
@@ -93,14 +94,15 @@ EditorInstanceInfo EditorInstanceInfo::FromJson(const Json& value) {
 }
 
 std::string InstanceRegistry::RegistryDirectory() {
-    return (fs::temp_directory_path() / "mipsync" / "instances").string();
+    return PathUtf8::ToString(fs::temp_directory_path() / "mipsync" / "instances");
 }
 
 bool InstanceRegistry::Register(const EditorInstanceInfo& instance, std::string& outError) {
     try {
-        fs::create_directories(RegistryDirectory());
+        fs::create_directories(PathUtf8::FromString(RegistryDirectory()));
         const fs::path target = RegistryFile(instance.instanceId);
-        const fs::path temporary = target.string() + ".tmp";
+        fs::path temporary=target;
+        temporary += ".tmp";
         std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
         if (!out.is_open()) { outError = "failed to write instance registry"; return false; }
         out << instance.ToJson().dump(2);
@@ -124,8 +126,8 @@ void InstanceRegistry::Unregister(const std::string& instanceId) {
 std::vector<EditorInstanceInfo> InstanceRegistry::List() {
     std::vector<EditorInstanceInfo> result;
     std::error_code ec;
-    fs::create_directories(RegistryDirectory(), ec);
-    for (const auto& entry : fs::directory_iterator(RegistryDirectory(), ec)) {
+    fs::create_directories(PathUtf8::FromString(RegistryDirectory()), ec);
+    for (const auto& entry : fs::directory_iterator(PathUtf8::FromString(RegistryDirectory()), ec)) {
         if (ec || !entry.is_regular_file(ec) || entry.path().extension() != ".json") continue;
         try {
             std::ifstream input(entry.path(), std::ios::binary);
@@ -285,7 +287,10 @@ bool IpcClient::IsAvailable(const EditorInstanceInfo& instance, int timeoutMilli
 #ifdef _WIN32
     if (WaitNamedPipeA(instance.endpoint.c_str(), static_cast<DWORD>(timeoutMilliseconds)))
         return true;
-    return GetLastError() == ERROR_PIPE_BUSY;
+    const auto error = GetLastError();
+    // Keep inaccessible live endpoints discoverable so Execute can report
+    // sandbox/elevation denial instead of claiming that no editor is open.
+    return error == ERROR_PIPE_BUSY || error == ERROR_ACCESS_DENIED;
 #else
     std::error_code ec;
     return fs::is_socket(fs::path(instance.endpoint), ec);
@@ -300,14 +305,21 @@ CommandResult IpcClient::Execute(const EditorInstanceInfo& instance,
     std::string response;
 #ifdef _WIN32
     if (!WaitNamedPipeA(instance.endpoint.c_str(), static_cast<DWORD>(timeoutMilliseconds))) {
-        outError = "Editor IPC endpoint did not become available";
-        return CommandResult::Fail("MIPSYNC_IPC_CONNECT", outError);
+        const auto error = GetLastError();
+        outError = "Editor IPC endpoint unavailable (Win32 error " + std::to_string(error) + ").";
+        if(error == ERROR_ACCESS_DENIED) {
+            outError += " Access denied by the process sandbox or elevation boundary; run the CLI with matching permissions.";
+            return CommandResult::Fail("MIPSYNC_IPC_ACCESS_DENIED", outError);
+        }
+        return CommandResult::Fail(error == ERROR_SEM_TIMEOUT ? "MIPSYNC_IPC_BUSY" : "MIPSYNC_IPC_CONNECT", outError);
     }
     HANDLE pipe = CreateFileA(instance.endpoint.c_str(), GENERIC_READ | GENERIC_WRITE,
         0, nullptr, OPEN_EXISTING, 0, nullptr);
     if (pipe == INVALID_HANDLE_VALUE) {
-        outError = "Unable to connect to Editor named pipe";
-        return CommandResult::Fail("MIPSYNC_IPC_CONNECT", outError);
+        const auto error = GetLastError();
+        outError = "Unable to connect to Editor named pipe (Win32 error " + std::to_string(error) + ").";
+        if(error == ERROR_ACCESS_DENIED) outError += " Check process sandbox/elevation permissions.";
+        return CommandResult::Fail(error == ERROR_ACCESS_DENIED ? "MIPSYNC_IPC_ACCESS_DENIED" : "MIPSYNC_IPC_CONNECT", outError);
     }
     DWORD mode = PIPE_READMODE_MESSAGE;
     SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr);

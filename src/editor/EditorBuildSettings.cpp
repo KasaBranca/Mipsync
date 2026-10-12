@@ -183,9 +183,11 @@ bool EditorBuildSettings::SaveProject(std::string& outError) {
         m_Project.player.productName = m_Project.name;
     if (m_Project.player.scenesInBuild.empty())
         m_Project.player.scenesInBuild.push_back(m_Project.defaultScene);
-    m_Project.player.startupSceneIndex = std::clamp(
-        m_Project.player.startupSceneIndex, 0,
-        std::max(0, static_cast<int>(m_Project.player.scenesInBuild.size()) - 1));
+    m_Project.player.startupSceneIndex = 0;
+    if (m_Engine && !m_Engine->GetEditor().RecordAssetUndoSnapshot(
+        PathUtf8::ToString(PathUtf8::FromString(m_Project.path) / Project::kProjectFile))) {
+        outError = "Cannot record build settings edit"; return false;
+    }
     return Project::SaveToDir(m_Project, outError);
 }
 
@@ -281,6 +283,7 @@ void EditorBuildSettings::DrawScenesInBuild() {
     ImGui::Spacing();
     ImGui::TextUnformatted("Scenes In Build");
     ImGui::Separator();
+    ImGui::TextDisabled("The first scene is the startup scene. Use Up/Down to change it.");
 
     if (ImGui::Button("Add Open Scene")) {
         const std::string openScene = m_Engine->GetEditor().GetSceneFilePath();
@@ -305,14 +308,9 @@ void EditorBuildSettings::DrawScenesInBuild() {
             // Column 0: Scene Name (Selectable)
             ImGui::TableNextColumn();
             ImGui::PushID(i);
-            const bool isStartup = (i == m_Project.player.startupSceneIndex);
-            if (ImGui::Selectable(m_Project.player.scenesInBuild[static_cast<size_t>(i)].c_str(),
-                                  isStartup)) {
-                if (m_Project.player.startupSceneIndex != i) {
-                    m_Project.player.startupSceneIndex = i;
-                    AutoSaveProject();
-                }
-            }
+            const bool isStartup = (i == 0);
+            ImGui::Selectable(m_Project.player.scenesInBuild[static_cast<size_t>(i)].c_str(),
+                              isStartup);
             
             // Column 1: Buttons
             ImGui::TableNextColumn();
@@ -322,10 +320,6 @@ void EditorBuildSettings::DrawScenesInBuild() {
                 if (ImGui::SmallButton("Up")) {
                     std::swap(m_Project.player.scenesInBuild[static_cast<size_t>(i)],
                               m_Project.player.scenesInBuild[static_cast<size_t>(i - 1)]);
-                    if (m_Project.player.startupSceneIndex == i)
-                        --m_Project.player.startupSceneIndex;
-                    else if (m_Project.player.startupSceneIndex == i - 1)
-                        ++m_Project.player.startupSceneIndex;
                     AutoSaveProject();
                 }
             } else {
@@ -340,10 +334,6 @@ void EditorBuildSettings::DrawScenesInBuild() {
                 if (ImGui::SmallButton("Down")) {
                     std::swap(m_Project.player.scenesInBuild[static_cast<size_t>(i)],
                               m_Project.player.scenesInBuild[static_cast<size_t>(i + 1)]);
-                    if (m_Project.player.startupSceneIndex == i)
-                        ++m_Project.player.startupSceneIndex;
-                    else if (m_Project.player.startupSceneIndex == i + 1)
-                        --m_Project.player.startupSceneIndex;
                     AutoSaveProject();
                 }
             } else {
@@ -365,33 +355,30 @@ void EditorBuildSettings::DrawScenesInBuild() {
     if (removeIndex >= 0) {
         m_Project.player.scenesInBuild.erase(
             m_Project.player.scenesInBuild.begin() + removeIndex);
-        m_Project.player.startupSceneIndex = std::clamp(
-            m_Project.player.startupSceneIndex, 0,
-            std::max(0, static_cast<int>(m_Project.player.scenesInBuild.size()) - 1));
         AutoSaveProject();
     }
 }
 
-bool EditorBuildSettings::RunBuild(std::string& outMessage) {
-    return StartBuildProcess(BuildJobKind::Ps1, "--build-ps1", outMessage);
+bool EditorBuildSettings::RunBuild(std::string& outMessage, bool revealOutput, bool showDialog) {
+    return StartBuildProcess(BuildJobKind::Ps1, "--build-ps1", outMessage, revealOutput, showDialog);
 }
 
-bool EditorBuildSettings::RunPcNativeBuild(std::string& outMessage) {
-    return StartBuildProcess(BuildJobKind::PcNative, "--build-pc", outMessage);
+bool EditorBuildSettings::RunPcNativeBuild(std::string& outMessage, bool revealOutput, bool showDialog) {
+    return StartBuildProcess(BuildJobKind::PcNative, "--build-pc", outMessage, revealOutput, showDialog);
 }
 
 bool EditorBuildSettings::RunBuildAndRun(std::string& outMessage) {
     return StartBuildProcess(BuildJobKind::Ps1AndRun, "--build-ps1", outMessage);
 }
 
-bool EditorBuildSettings::RunBuildDiscFolder(std::string& outMessage) {
-    return StartBuildProcess(BuildJobKind::DiscFolder, "--build-disc", outMessage);
+bool EditorBuildSettings::RunBuildDiscFolder(std::string& outMessage, bool revealOutput, bool showDialog) {
+    return StartBuildProcess(BuildJobKind::DiscFolder, "--build-disc", outMessage, revealOutput, showDialog);
 }
 
 bool EditorBuildSettings::StartBuildProcess(BuildJobKind kind, const char* cliFlag,
-                                            std::string& outMessage) {
+                                            std::string& outMessage, bool revealOutput, bool showDialog) {
     if (m_BuildInProgress) {
-        m_BuildDialogRequested = true;
+        if (showDialog) m_BuildDialogRequested = true;
         outMessage = "A build is already running.";
         return false;
     }
@@ -468,10 +455,12 @@ bool EditorBuildSettings::StartBuildProcess(BuildJobKind kind, const char* cliFl
     m_BuildJobHandle = job;
     m_BuildKind = kind;
     m_BuildInProgress = true;
+    m_RevealOutput = revealOutput;
     m_BuildFinished = false;
     m_BuildCancelled = false;
-    m_BuildDialogRequested = true;
-    m_BuildDialogCloseRequested = false;
+    m_BuildDialogRequested = showDialog;
+    m_BuildDialogCloseRequested = !showDialog && m_BuildDialogVisible;
+    m_BuildExitCode = 0;
     m_BuildProgress = 0.01f;
     m_BuildStartedAt = ImGui::GetTime();
     m_BuildStage = "Starting isolated build process";
@@ -613,6 +602,7 @@ void EditorBuildSettings::FinishBuildProcess(unsigned long exitCode) {
     m_BuildInProgress = false;
     m_BuildFinished = true;
     m_BuildProgress = 1.0f;
+    m_BuildExitCode = exitCode;
     m_LastBuildOk = exitCode == 0 && !m_BuildCancelled;
     m_LastPs1Build.success = m_LastBuildOk;
     m_LastPcBuild.success = m_LastBuildOk;
@@ -644,7 +634,7 @@ void EditorBuildSettings::FinishBuildProcess(unsigned long exitCode) {
     }
 
     if (m_LastBuildOk && m_BuildKind != BuildJobKind::Ps1AndRun)
-        OpenSuccessfulBuildOutput();
+        if (m_RevealOutput) OpenSuccessfulBuildOutput();
 
     // Successful builds need no acknowledgement; errors and cancellations
     // keep the dialog open so their output remains visible.
@@ -674,6 +664,8 @@ void EditorBuildSettings::OpenSuccessfulBuildOutput() {
         output = PathUtf8::FromString(m_LastPcBuild.outputDirectory);
     else if (m_BuildKind == BuildJobKind::DiscFolder && !m_LastPs1Build.discFolderPath.empty())
         output = PathUtf8::FromString(m_LastPs1Build.discFolderPath);
+    else if (!m_LastPs1Build.psxExePath.empty())
+        output = PathUtf8::FromString(m_LastPs1Build.psxExePath).parent_path();
     else if (!m_LastPs1Build.outputDirectory.empty())
         output = PathUtf8::FromString(m_LastPs1Build.outputDirectory) / "out";
     std::error_code ec;
@@ -690,13 +682,17 @@ void EditorBuildSettings::DrawBuildProgressDialog() {
     }
 
     ImGui::SetNextWindowSize(ImVec2(560.0f, 330.0f), ImGuiCond_Appearing);
-    if (!ImGui::BeginPopupModal("Build Progress", nullptr,
-                                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse))
+    m_BuildDialogVisible = ImGui::BeginPopupModal("Build Progress", nullptr,
+                                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+    if (!m_BuildDialogVisible) {
+        m_BuildDialogCloseRequested = false;
         return;
+    }
 
     if (m_BuildDialogCloseRequested) {
         m_BuildDialogCloseRequested = false;
         ImGui::CloseCurrentPopup();
+        m_BuildDialogVisible = false;
         ImGui::EndPopup();
         return;
     }
@@ -742,10 +738,22 @@ void EditorBuildSettings::DrawBuildProgressDialog() {
             ImGui::SetTooltip("%s", m_LastBuildMessage.c_str());
         ImGui::SameLine();
         if (EditorTheme::AeroButton("Close", ImVec2(100.0f, EditorTheme::ButtonHeight),
-                                    AeroButtonKind::Secondary))
+                                    AeroButtonKind::Secondary)) {
             ImGui::CloseCurrentPopup();
+            m_BuildDialogVisible = false;
+        }
     }
     ImGui::EndPopup();
+}
+
+bool EditorBuildSettings::CommandCloseBuildDialog(std::string& outError) {
+    if (m_BuildInProgress) {
+        outError = "The build is running. Use build cancel to stop it.";
+        return false;
+    }
+    m_BuildDialogRequested = false;
+    m_BuildDialogCloseRequested = m_BuildDialogVisible;
+    return true;
 }
 
 void EditorBuildSettings::Draw() {

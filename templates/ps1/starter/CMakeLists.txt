@@ -49,31 +49,60 @@ function(mipsync_add_ps1_executable name)
     )
 endfunction()
 
-mipsync_add_ps1_executable(mipsync
+function(mipsync_add_scene_executable name source_dir)
+    set(scene_sources
     main.c
     runtime/fixedp.c
+    runtime/boot_brand.c
     runtime/mipsync_gte.c
     runtime/host.c
     runtime/vm.c
     runtime/scene.c
+    runtime/scene_loader.c
     runtime/lookat.c
+    runtime/lighting.c
+    runtime/color_grading.c
+    runtime/gpu_transfer.c
+    runtime/gpu_readback.c
     runtime/render.c
     runtime/ui.c
     runtime/textures.c
     runtime/input.c
     runtime/physics.c
     runtime/audio.c
+    runtime/midi.c
     generated/scripts_data.c
     generated/scene_data.c
     generated/mesh_data.c
     generated/textures_data.c
     generated/audio_data.c
-)
-target_include_directories(mipsync PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    )
+    list(TRANSFORM scene_sources PREPEND "${source_dir}/")
+    mipsync_add_ps1_executable(${name} ${scene_sources})
+    # Optimize the generated scene and runtime together; visibility and fixed
+    # point helpers otherwise spend a substantial part of each PS1 frame in
+    # cross-file calls. Keep compiler and linker options paired for LTO.
+    target_compile_options(${name} PRIVATE -O3 -flto)
+    target_link_options(${name} PRIVATE -O3 -flto)
+    target_include_directories(${name} PRIVATE "${source_dir}")
+endfunction()
+
+mipsync_add_scene_executable(mipsync "${CMAKE_CURRENT_SOURCE_DIR}")
+set(MIPSYNC_SCENE_TARGETS mipsync)
+include("${CMAKE_CURRENT_SOURCE_DIR}/generated/scene_targets.cmake" OPTIONAL)
+
+# PSn00bSDK relocates iso.xml into the binary directory without rewriting
+# <license file>. Keep unmodified regional system-area data beside that XML.
+foreach(license IN ITEMS licensej.dat licensea.dat licensee.dat)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${license}")
+        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/${license}"
+                       "${CMAKE_CURRENT_BINARY_DIR}/${license}" COPYONLY)
+    endif()
+endforeach()
 
 psn00bsdk_add_cd_image(
     iso             # CMake target name
     mipsync         # Output basename (= mipsync.bin + mipsync.cue)
     iso.xml
-    DEPENDS mipsync system.cnf
+    DEPENDS ${MIPSYNC_SCENE_TARGETS} system.cnf
 )

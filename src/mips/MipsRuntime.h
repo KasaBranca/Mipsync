@@ -11,6 +11,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 namespace MipsyncEngine {
 
@@ -31,6 +32,12 @@ public:
     bool IsPlaying() const { return m_Playing; }
     bool IsPaused() const { return m_Paused; }
     void SetPaused(bool paused) { m_Paused = paused; }
+    void BeginPerformanceFrame(bool enabled) {
+        m_VM.SetPerformanceCounting(enabled);
+        m_VM.ResetPerformanceCounts();
+    }
+    const auto& GetOpcodeCounts() const { return m_VM.GetOpcodeCounts(); }
+    const auto& GetHostCounts() const { return m_VM.GetHostCounts(); }
 
     /// Captures current scene transforms as the edit-mode baseline (call after scene load or inspector edits).
     void SyncEditSnapshot(MipsyncEngine::Scene& scene);
@@ -43,11 +50,16 @@ public:
 
     /// Compile if needed and resize fieldValues to match module defaults.
     static bool EnsureScriptReady(MipsScriptComponent& script, std::vector<std::string>& errors);
+    bool ReloadScripts(Scene& scene, const std::string& path, std::vector<std::string>& errors);
+    nlohmann::json InspectFields(const MipsScriptComponent& script) const;
+    nlohmann::json InspectExecution() const;
 
-    /// Recompile a script asset and reset inspector field values from module defaults.
+    /// Recompile, preserve compatible named overrides, and default new/renamed fields.
     void ResetScriptsByFileName(MipsyncEngine::Scene& scene, const std::string& fileName);
 
     void ApplyFieldOverrides(Entity* entity, const MipsScriptComponent& script);
+    /// Reconcile live script components after editing the running scene.
+    void RefreshPlayInstances(MipsyncEngine::Scene& scene, bool addNew = true);
 
     MipsPhysicsEventQueue& PhysicsEvents() { return m_PhysicsEvents; }
     void DispatchPhysicsEvents(MipsyncEngine::Scene& scene);
@@ -60,6 +72,7 @@ public:
 
 private:
     void CollectInstances(MipsyncEngine::Scene& scene);
+    bool AddInstance(Entity* entity, MipsScriptComponent& script);
     void InvokeLifecycleAll(const char* method, MipsyncEngine::Scene& scene, float deltaTime);
 
     VM m_VM;
@@ -70,6 +83,7 @@ private:
     MipsyncEngine::PhysicsWorld* m_PhysicsWorld = nullptr;
     bool m_Playing = false;
     bool m_Paused = false;
+    std::vector<std::string> m_ExecutionErrors;
 };
 
 } // namespace Mips

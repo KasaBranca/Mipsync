@@ -1,3 +1,4 @@
+#include "../assets/AssetManager.h"
 /*
  * Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md).
  * Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.
@@ -45,7 +46,7 @@ ImVec4 EditorTheme::PanelFace = UiTokens::BgSecondary;
 ImVec4 EditorTheme::PanelAlt = UiTokens::Bg;
 ImVec4 EditorTheme::WorkArea = UiTokens::Bg;
 ImVec4 EditorTheme::Desktop = UiTokens::Bg;
-ImVec4 EditorTheme::InputBg = UiTokens::Bg;
+ImVec4 EditorTheme::InputBg = UiTokens::BgPressed;
 ImVec4 EditorTheme::TitleBarTop = UiTokens::Bg;
 ImVec4 EditorTheme::TitleBarBottom = UiTokens::Bg;
 ImVec4 EditorTheme::TitleBarText = UiTokens::Text;
@@ -117,18 +118,18 @@ bool EditorTheme::IsDarkMode() {
 void EditorTheme::SetDarkMode(bool dark) {
     gDarkMode = dark;
 
-    const ImVec4 bg = dark ? UiTokens::Hex(0x1E1E1E) : UiTokens::Hex(0xECECEC);
-    const ImVec4 panel = dark ? UiTokens::Hex(0x2C2C2C) : UiTokens::Hex(0xFAFAFA);
-    const ImVec4 panelAlt = dark ? UiTokens::Hex(0x1E1E1E) : UiTokens::Hex(0xF4F4F4);
-    const ImVec4 control = dark ? UiTokens::Hex(0x383838) : UiTokens::Hex(0xF0F0F0);
-    const ImVec4 hover = dark ? UiTokens::Hex(0x444444) : UiTokens::Hex(0xE2E2E2);
-    const ImVec4 pressed = dark ? UiTokens::Hex(0x242424) : UiTokens::Hex(0xD8D8D8);
-    const ImVec4 text = dark ? UiTokens::Hex(0xFFFFFF) : UiTokens::Hex(0x242424);
-    const ImVec4 textSecondary = dark ? UiTokens::Hex(0xB3B3B3) : UiTokens::Hex(0x5F6368);
-    const ImVec4 textMuted = dark ? UiTokens::Hex(0x8C8C8C) : UiTokens::Hex(0x858585);
-    const ImVec4 textDisabled = dark ? UiTokens::Hex(0x666666) : UiTokens::Hex(0xADADAD);
-    const ImVec4 border = dark ? UiTokens::Hex(0x444444) : UiTokens::Hex(0xD2D2D2);
-    const ImVec4 borderStrong = dark ? UiTokens::Hex(0x707070) : UiTokens::Hex(0xA9A9A9);
+    const ImVec4 bg = dark ? UiTokens::Bg : UiTokens::Hex(0xECECEC);
+    const ImVec4 panel = dark ? UiTokens::BgSecondary : UiTokens::Hex(0xFAFAFA);
+    const ImVec4 panelAlt = dark ? UiTokens::Bg : UiTokens::Hex(0xF4F4F4);
+    const ImVec4 control = dark ? UiTokens::BgTertiary : UiTokens::Hex(0xF0F0F0);
+    const ImVec4 hover = dark ? UiTokens::BgHover : UiTokens::Hex(0xE2E2E2);
+    const ImVec4 pressed = dark ? UiTokens::BgPressed : UiTokens::Hex(0xD8D8D8);
+    const ImVec4 text = dark ? UiTokens::Text : UiTokens::Hex(0x242424);
+    const ImVec4 textSecondary = dark ? UiTokens::TextSecondary : UiTokens::Hex(0x5F6368);
+    const ImVec4 textMuted = dark ? UiTokens::TextTertiary : UiTokens::Hex(0x858585);
+    const ImVec4 textDisabled = dark ? UiTokens::TextDisabled : UiTokens::Hex(0xADADAD);
+    const ImVec4 border = dark ? UiTokens::Border : UiTokens::Hex(0xD2D2D2);
+    const ImVec4 borderStrong = dark ? UiTokens::BorderStrong : UiTokens::Hex(0xA9A9A9);
 
     BtnFace = control;
     BtnFaceLight = hover;
@@ -139,7 +140,7 @@ void EditorTheme::SetDarkMode(bool dark) {
     PanelAlt = panelAlt;
     WorkArea = bg;
     Desktop = bg;
-    InputBg = dark ? UiTokens::Hex(0x1E1E1E) : UiTokens::Hex(0xF3F3F3);
+    InputBg = dark ? UiTokens::BgPressed : UiTokens::Hex(0xF3F3F3);
     TitleBarTop = panel;
     TitleBarBottom = panel;
     TitleBarText = text;
@@ -184,15 +185,6 @@ void EditorTheme::SetDarkMode(bool dark) {
     SuccessHover = UiTokens::SuccessHover;
     Danger = DangerFace;
     DangerHover = UiTokens::DangerHover;
-}
-
-void EditorTheme::DrawButtonBevel(ImDrawList* drawList, ImVec2 min, ImVec2 max, bool pressed) {
-    // Godot StyleBoxFlat button border & focus ring rendering:
-    // Crisp 1px border around rounded box (4px radius).
-    const ImU32 borderCol = U32(pressed ? BorderStrong : BorderLight);
-    drawList->AddRect({min.x + 0.5f, min.y + 0.5f},
-                      {max.x - 0.5f, max.y - 0.5f},
-                      borderCol, ShapeCornerSmall, 0, 1.0f);
 }
 
 void EditorTheme::DrawTitleBar(ImDrawList* drawList, ImVec2 min, ImVec2 max, const char* title) {
@@ -281,8 +273,6 @@ bool EditorTheme::StyledButton(const char* label, const ImVec2& size, AeroButton
     ImGui::PushStyleColor(ImGuiCol_Text, text);
 
     const bool pressed = ImGui::Button(label, ImVec2(size.x, h));
-    DrawButtonBevel(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(),
-                    ImGui::GetItemRectMax(), ImGui::IsItemActive());
     if (ImGui::IsItemFocused()) {
         DrawFocusRing(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(),
                       ImGui::GetItemRectMax(), rounding);
@@ -385,8 +375,7 @@ void EditorTheme::Apply() {
     s.FrameBorderSize = 1.0f;
     s.TabBorderSize = 1.0f;
     s.TabBarBorderSize = 1.0f;
-    // Dock tabs get a custom straight, inset overline in EditorApp. ImGui's
-    // built-in overline follows TabRounding and produces an unwanted blue arc.
+    // Selection is indicated by the tab face; no top accent line.
     s.TabBarOverlineSize = 0.0f;
     // Godot's editor exposes parent/child relationships instead of relying on
     // indentation alone. Dear ImGui's native tree-line renderer gives us the
@@ -413,9 +402,9 @@ void EditorTheme::Apply() {
     c[ImGuiCol_ChildBg] = PanelFace;
     c[ImGuiCol_PopupBg] = PanelFace;
     c[ImGuiCol_Border] = BorderLight;
-    c[ImGuiCol_BorderShadow] = BtnHighlight;
+    c[ImGuiCol_BorderShadow] = ImVec4(0, 0, 0, 0);
 
-    c[ImGuiCol_FrameBg] = SurfaceContainerHigh;
+    c[ImGuiCol_FrameBg] = InputBg;
     c[ImGuiCol_FrameBgHovered] = SurfaceHover;
     c[ImGuiCol_FrameBgActive] = SurfaceContainerHigh;
 
@@ -452,15 +441,15 @@ void EditorTheme::Apply() {
 
     c[ImGuiCol_Tab] = PanelAlt;
     c[ImGuiCol_TabHovered] = SurfaceHover;
-    c[ImGuiCol_TabSelected] = SurfaceContainerHigh;
-    c[ImGuiCol_TabSelectedOverline] = Brand;
+    c[ImGuiCol_TabSelected] = PanelFace;
+    c[ImGuiCol_TabSelectedOverline] = ImVec4(0, 0, 0, 0);
     c[ImGuiCol_TabDimmed] = PanelAlt;
-    c[ImGuiCol_TabDimmedSelected] = SurfaceContainerHigh;
-    c[ImGuiCol_TabDimmedSelectedOverline] = UiTokens::WithAlpha(Brand, 0.6f);
+    c[ImGuiCol_TabDimmedSelected] = PanelFace;
+    c[ImGuiCol_TabDimmedSelectedOverline] = ImVec4(0, 0, 0, 0);
 
-    c[ImGuiCol_TabActive] = SurfaceContainerHigh;
+    c[ImGuiCol_TabActive] = PanelFace;
     c[ImGuiCol_TabUnfocused] = PanelAlt;
-    c[ImGuiCol_TabUnfocusedActive] = SurfaceContainerHigh;
+    c[ImGuiCol_TabUnfocusedActive] = PanelFace;
 
     c[ImGuiCol_DockingPreview] = UiTokens::WithAlpha(Accent, 0.35f);
     c[ImGuiCol_DockingEmptyBg] = WorkArea;
@@ -520,7 +509,7 @@ static void LoadFontsInternal(float fontSize) {
 
     ImFont* font = nullptr;
     if (!regular.empty())
-        font = io.Fonts->AddFontFromFileTTF(regular.string().c_str(), fontSize, &cfg);
+        font = io.Fonts->AddFontFromFileTTF(PathUtf8::ToString(regular).c_str(), fontSize, &cfg);
 
     if (!font) {
         const char* fallbacks[] = {

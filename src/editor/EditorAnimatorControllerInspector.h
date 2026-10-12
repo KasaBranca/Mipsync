@@ -15,7 +15,7 @@ inline constexpr const char* kAnimatorControllerWindowTitle = "Animator Controll
 std::string MakeUniqueAnimatorStateName(const AnimatorControllerAsset& asset,
                                         const std::string& preferred = {});
 
-/// Unity-style left column (name, type, default value).
+/// Parameter rail (name, type, default value).
 void DrawAnimatorParametersSidebar(AnimatorControllerAsset& asset, bool& changed);
 
 std::vector<std::string> LoadAnimationClipNames(const std::string& modelProjectPath);

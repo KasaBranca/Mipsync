@@ -22,6 +22,11 @@ void DrawFrustum(const Camera& camera, const TransformComponent& transform, floa
                  const ImVec2& rectMin, const ImVec2& rectSize, ImDrawList* drawList,
                  bool isSelected = true);
 
+void DrawFrustum(const Camera& camera, const glm::mat4& cameraWorld, float aspect,
+                 const glm::mat4& view, const glm::mat4& proj,
+                 const ImVec2& rectMin, const ImVec2& rectSize, ImDrawList* drawList,
+                 bool isSelected = true);
+
 void DrawDistanceCullGizmo(const glm::vec3& center, float radius,
                            const glm::mat4& view, const glm::mat4& proj,
                            const ImVec2& rectMin, const ImVec2& rectSize, ImDrawList* drawList,

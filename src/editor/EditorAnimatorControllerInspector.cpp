@@ -3,6 +3,8 @@
 #include "EditorApp.h"
 #include "../core/Engine.h"
 #include "EditorTheme.h"
+#include "EditorMenu.h"
+#include "EditorToolbar.h"
 #include "AssetBrowserPanel.h"
 #include "../animation/AnimatorControllerIO.h"
 #include "../animation/AnimatorRuntime.h"
@@ -14,6 +16,7 @@
 #include <imgui.h>
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -187,13 +190,13 @@ bool DrawAnimatorClipField(const char* label, std::string& clipName, int& clipSt
         std::string preview = clipName.empty() ? "<select clip>" : clipName;
         if (clipStackIndex >= 0)
             preview += " [stack " + std::to_string(clipStackIndex) + "]";
-        if (ImGui::BeginCombo(label, preview.c_str())) {
+        if (EditorDropdown::BeginCombo(label, preview.c_str())) {
             for (size_t i = 0; i < model->animationNames.size(); ++i) {
                 const std::string& clip = model->animationNames[i];
                 const int stack = static_cast<int>(model->animationStackIndices[i]);
                 const bool selected = clip == clipName && clipStackIndex == stack;
                 const std::string row = clip + "  [stack " + std::to_string(stack) + "]";
-                if (ImGui::Selectable(row.c_str(), selected)) {
+                if (EditorDropdown::Selectable(row.c_str(), selected)) {
                     clipName = clip;
                     clipStackIndex = stack;
                     if (clipSourceModelPath && !modelProjectPath.empty())
@@ -201,7 +204,7 @@ bool DrawAnimatorClipField(const char* label, std::string& clipName, int& clipSt
                     changed = true;
                 }
             }
-            ImGui::EndCombo();
+            EditorDropdown::EndCombo();
         }
     } else if (clips.empty()) {
         char clipBuf[256] = {};
@@ -217,9 +220,9 @@ bool DrawAnimatorClipField(const char* label, std::string& clipName, int& clipSt
         return false;
     } else {
         const char* preview = clipName.empty() ? "<select clip>" : clipName.c_str();
-        if (ImGui::BeginCombo(label, preview)) {
+        if (EditorDropdown::BeginCombo(label, preview)) {
             for (const std::string& clip : clips) {
-                if (ImGui::Selectable(clip.c_str(), clip == clipName)) {
+                if (EditorDropdown::Selectable(clip.c_str(), clip == clipName)) {
                     clipName = clip;
                     clipStackIndex = -1;
                     if (clipSourceModelPath)
@@ -227,13 +230,14 @@ bool DrawAnimatorClipField(const char* label, std::string& clipName, int& clipSt
                     changed = true;
                 }
             }
-            ImGui::EndCombo();
+            EditorDropdown::EndCombo();
         }
     }
 
     char clipBuf[256] = {};
     std::strncpy(clipBuf, clipName.c_str(), sizeof(clipBuf) - 1);
-    if (ImGui::InputText("Custom Clip Name", clipBuf, sizeof(clipBuf))) {
+    ImGui::TextColored(EditorTheme::TextSecondary, "Custom Clip Name");
+    if (ImGui::InputText("##CustomClipName", clipBuf, sizeof(clipBuf))) {
         clipName = clipBuf;
         changed = true;
     }
@@ -242,14 +246,26 @@ bool DrawAnimatorClipField(const char* label, std::string& clipName, int& clipSt
 
 void DrawAnimatorParametersSidebar(AnimatorControllerAsset& asset, bool& changed) {
     static int selectedParameter = -1;
+    static ImGuiTextFilter nameFilter;
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 7.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 5.0f));
     selectedParameter = std::clamp(selectedParameter, -1,
                                    static_cast<int>(asset.parameters.size()) - 1);
 
-    ImGui::TextColored(EditorTheme::TextSecondary, "Parameters");
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetWindowContentRegionMax().x - 24.0f);
-    if (ImGui::SmallButton("+##add_parameter"))
+    EditorToolbar parameterBar;
+    parameterBar.Text("Parameters", EditorTheme::TextSecondary);
+    parameterBar.SetX(parameterBar.Width() - 32.0f);
+    if (parameterBar.Button("+##add_parameter", 32.0f))
         ImGui::OpenPopup("Add Animator Parameter");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add a Float, Int, Bool or Trigger parameter");
+    parameterBar.End();
+    ImGui::Dummy(ImVec2(0.0f, 3.0f));
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputTextWithHint("##ParameterSearch", "Search parameters", nameFilter.InputBuf,
+                                sizeof(nameFilter.InputBuf)))
+        nameFilter.Build();
+    ImGui::TextColored(EditorTheme::TextMuted, "Default values");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Initial values saved in this controller.");
 
     auto uniqueParameterName = [&](const char* preferred) {
         auto used = [&](const std::string& candidate) {
@@ -267,13 +283,13 @@ void DrawAnimatorParametersSidebar(AnimatorControllerAsset& asset, bool& changed
         return base + " New";
     };
 
-    if (ImGui::BeginPopup("Add Animator Parameter")) {
+    if (EditorMenu::BeginPopup("Add Animator Parameter")) {
         const struct { const char* label; AnimatorParamType type; } types[] = {
             { "Float", AnimatorParamType::Float }, { "Int", AnimatorParamType::Int },
             { "Bool", AnimatorParamType::Bool }, { "Trigger", AnimatorParamType::Trigger },
         };
         for (const auto& entry : types) {
-            if (ImGui::MenuItem(entry.label)) {
+            if (EditorMenu::MenuItem(entry.label)) {
                 AnimatorParameterDef parameter{};
                 parameter.name = uniqueParameterName(entry.label);
                 parameter.type = entry.type;
@@ -282,10 +298,8 @@ void DrawAnimatorParametersSidebar(AnimatorControllerAsset& asset, bool& changed
                 changed = true;
             }
         }
-        ImGui::EndPopup();
+        EditorMenu::EndPopup();
     }
-
-    ImGui::Separator();
 
     auto typeGlyph = [](AnimatorParamType t) -> const char* {
         switch (t) {
@@ -300,19 +314,63 @@ void DrawAnimatorParametersSidebar(AnimatorControllerAsset& asset, bool& changed
     int paramRemove = -1;
     for (size_t i = 0; i < asset.parameters.size(); ++i) {
         auto& p = asset.parameters[i];
+        if (!nameFilter.PassFilter(p.name.c_str())) continue;
         ImGui::PushID(static_cast<int>(i));
         const bool selected = selectedParameter == static_cast<int>(i);
-        if (ImGui::Selectable("##parameter_row", selected, ImGuiSelectableFlags_AllowDoubleClick,
-                              ImVec2(0.0f, 24.0f)))
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+        const ImVec2 rowMin = ImGui::GetCursorScreenPos();
+        const float rowWidth = ImGui::GetContentRegionAvail().x;
+        const ImVec2 rowMax(rowMin.x + rowWidth, rowMin.y + 34.0f);
+        const float valueWidth = std::min(72.0f, rowWidth * 0.38f);
+        const float nameWidth = rowWidth - valueWidth - 8.0f;
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(rowMin, rowMax, ImGui::ColorConvertFloat4ToU32(
+            selected ? UiTokens::WithAlpha(EditorTheme::Accent, 0.18f)
+                     : UiTokens::WithAlpha(EditorTheme::InputBg, 0.35f)), 3.0f);
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, UiTokens::WithAlpha(EditorTheme::Accent, 0.24f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, UiTokens::WithAlpha(EditorTheme::Accent, 0.30f));
+        if (EditorDropdown::Selectable("##parameter_row", selected, ImGuiSelectableFlags_AllowDoubleClick,
+                              ImVec2(nameWidth, 34.0f)))
             selectedParameter = static_cast<int>(i);
-        const ImVec2 rowMin = ImGui::GetItemRectMin();
-        ImGui::GetWindowDrawList()->AddText(
-            ImVec2(rowMin.x + 5.0f, rowMin.y + 4.0f),
+        ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\nClick to rename or change its type.", p.name.c_str());
+        if (EditorMenu::BeginPopupContextItem("ParameterActions")) {
+            if (EditorMenu::MenuItem("Edit Parameter")) selectedParameter = static_cast<int>(i);
+            if (EditorMenu::MenuItem("Delete Parameter")) paramRemove = static_cast<int>(i);
+            EditorMenu::EndPopup();
+        }
+        draw->AddRectFilled(ImVec2(rowMin.x + 6.0f, rowMin.y + 6.0f),
+                            ImVec2(rowMin.x + 24.0f, rowMin.y + 24.0f),
+                            ImGui::ColorConvertFloat4ToU32(EditorTheme::InputBg), 3.0f);
+        draw->AddText(
+            ImVec2(rowMin.x + 10.0f, rowMin.y + 8.0f),
             ImGui::ColorConvertFloat4ToU32(EditorTheme::PsAccent),
             typeGlyph(p.type));
-        ImGui::GetWindowDrawList()->AddText(
-            ImVec2(rowMin.x + 25.0f, rowMin.y + 4.0f),
+        draw->PushClipRect(ImVec2(rowMin.x + 30.0f, rowMin.y),
+                           ImVec2(rowMin.x + nameWidth - 2.0f, rowMax.y), true);
+        draw->AddText(
+            ImVec2(rowMin.x + 30.0f, rowMin.y + 8.0f),
             ImGui::ColorConvertFloat4ToU32(EditorTheme::TextPrimary), p.name.c_str());
+        draw->PopClipRect();
+        ImGui::SetCursorScreenPos(ImVec2(rowMax.x - valueWidth, rowMin.y + 5.0f));
+        ImGui::SetNextItemWidth(valueWidth);
+        bool valueChanged = false;
+        if (p.type == AnimatorParamType::Float)
+            valueChanged = ImGui::DragFloat("##DefaultValue", &p.defaultFloat, 0.01f, 0, 0, "%.3g");
+        else if (p.type == AnimatorParamType::Int)
+            valueChanged = ImGui::DragInt("##DefaultValue", &p.defaultInt);
+        else if (p.type == AnimatorParamType::Bool)
+            valueChanged = EditorTheme::Checkbox("##DefaultValue", &p.defaultBool);
+        else {
+            ImGui::TextColored(EditorTheme::TextMuted, "Pulse");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Trigger resets after it is consumed at runtime.");
+        }
+        changed |= valueChanged;
+        if (valueChanged || ImGui::IsItemActivated()) selectedParameter = static_cast<int>(i);
+        ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + 4.0f));
+        ImGui::Dummy(ImVec2(0.0f, 0.0f));
+        ImGui::PopStyleVar();
         ImGui::PopID();
     }
 
@@ -320,13 +378,18 @@ void DrawAnimatorParametersSidebar(AnimatorControllerAsset& asset, bool& changed
         ImGui::TextColored(EditorTheme::TextMuted, "Use + to add a parameter.");
 
     if (selectedParameter >= 0 && selectedParameter < static_cast<int>(asset.parameters.size())) {
-        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+        ImGui::SeparatorText("Parameter");
+        ImGui::PushItemWidth(-1.0f);
         auto& p = asset.parameters[static_cast<size_t>(selectedParameter)];
         char nameBuf[96] = {};
         std::strncpy(nameBuf, p.name.c_str(), sizeof(nameBuf) - 1);
-        if (ImGui::InputText("Name", nameBuf, sizeof(nameBuf))) {
+        ImGui::TextColored(EditorTheme::TextSecondary, "Name");
+        if (ImGui::InputText("##ParameterName", nameBuf, sizeof(nameBuf))) {
             const std::string next = nameBuf;
-            if (!next.empty() && next != p.name) {
+            const bool duplicate = std::any_of(asset.parameters.begin(), asset.parameters.end(),
+                [&](const AnimatorParameterDef& other) { return &other != &p && other.name == next; });
+            if (!next.empty() && next != p.name && !duplicate) {
                 const std::string old = p.name;
                 p.name = next;
                 for (auto& transition : asset.transitions)
@@ -336,22 +399,24 @@ void DrawAnimatorParametersSidebar(AnimatorControllerAsset& asset, bool& changed
                 changed = true;
             }
         }
+        ImGui::TextColored(EditorTheme::TextSecondary, "Type");
         int typeIdx = static_cast<int>(p.type);
-        if (ImGui::Combo("Type", &typeIdx, "Float\0Bool\0Int\0Trigger\0")) {
+        if (EditorDropdown::Combo("##ParameterType", &typeIdx, "Float\0Bool\0Int\0Trigger\0")) {
             p.type = static_cast<AnimatorParamType>(typeIdx);
+            for (auto& transition : asset.transitions)
+                for (auto& condition : transition.conditions)
+                    if (condition.parameter == p.name) {
+                        const bool flag = p.type == AnimatorParamType::Bool || p.type == AnimatorParamType::Trigger;
+                        condition.mode = flag ? AnimatorConditionMode::IfTrue : AnimatorConditionMode::Greater;
+                    }
             changed = true;
         }
-        if (p.type == AnimatorParamType::Float)
-            changed |= ImGui::DragFloat("Default", &p.defaultFloat, 0.01f);
-        else if (p.type == AnimatorParamType::Int)
-            changed |= ImGui::DragInt("Default", &p.defaultInt);
-        else if (p.type == AnimatorParamType::Bool)
-            changed |= EditorTheme::Checkbox("Default", &p.defaultBool);
-        else
-            ImGui::TextColored(EditorTheme::TextMuted, "Trigger resets after it is consumed.");
-
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, UiTokens::Hex(0xFF9A86));
         if (ImGui::Button("Delete Parameter", ImVec2(-1.0f, 0.0f)))
             paramRemove = selectedParameter;
+        ImGui::PopStyleColor();
+        ImGui::PopItemWidth();
     }
 
     if (paramRemove >= 0 && paramRemove < static_cast<int>(asset.parameters.size())) {
@@ -369,6 +434,7 @@ void DrawAnimatorParametersSidebar(AnimatorControllerAsset& asset, bool& changed
                                      static_cast<int>(asset.parameters.size()) - 1);
         changed = true;
     }
+    ImGui::PopStyleVar(2);
 }
 
 namespace {
@@ -387,7 +453,6 @@ void DrawAnimatorClipSourceHint(EditorApp* editor, const std::string& controller
                                 std::vector<std::string>& outClips) {
     const std::string modelPath = ResolveControllerModelPath(editor, controllerRelPath, asset);
     if (!modelPath.empty()) {
-        ImGui::TextColored(EditorTheme::TextMuted, "Model: %s", modelPath.c_str());
         outClips = LoadAnimationClipNames(modelPath);
     }
 }
@@ -395,14 +460,14 @@ void DrawAnimatorClipSourceHint(EditorApp* editor, const std::string& controller
 void DrawAnimatorControllerListEditor(AnimatorControllerAsset& asset,
                                       const std::shared_ptr<SkeletalModelAsset>& model,
                                       const std::vector<std::string>& clips, bool& changed) {
-    if (ImGui::BeginCombo("Default State", asset.defaultState.empty() ? "<none>" : asset.defaultState.c_str())) {
+    if (EditorDropdown::BeginCombo("Default State", asset.defaultState.empty() ? "<none>" : asset.defaultState.c_str())) {
         for (const auto& st : asset.states) {
-            if (ImGui::Selectable(st.name.c_str(), st.name == asset.defaultState)) {
+            if (EditorDropdown::Selectable(st.name.c_str(), st.name == asset.defaultState)) {
                 asset.defaultState = st.name;
                 changed = true;
             }
         }
-        ImGui::EndCombo();
+        EditorDropdown::EndCombo();
     }
 
     ImGui::Spacing();
@@ -418,7 +483,7 @@ void DrawAnimatorControllerListEditor(AnimatorControllerAsset& asset,
             changed = true;
         }
         int typeIdx = static_cast<int>(p.type);
-        if (ImGui::Combo("Type", &typeIdx, "float\0bool\0int\0trigger\0")) {
+        if (EditorDropdown::Combo("Type", &typeIdx, "float\0bool\0int\0trigger\0")) {
             p.type = static_cast<AnimatorParamType>(typeIdx);
             changed = true;
         }
@@ -522,7 +587,7 @@ void DrawAnimatorControllerListEditor(AnimatorControllerAsset& asset,
                 changed = true;
             }
             int modeIdx = static_cast<int>(c.mode);
-            if (ImGui::Combo("Mode", &modeIdx,
+            if (EditorDropdown::Combo("Mode", &modeIdx,
                              "greater\0less\0equals\0notEquals\0ifTrue\0ifFalse\0")) {
                 c.mode = static_cast<AnimatorConditionMode>(modeIdx);
                 changed = true;
@@ -592,6 +657,7 @@ bool CreateAndAssignControllerFromModel(EditorApp* editor, AnimatorComponent& an
     SyncControllerStateClipStacks(*asset);
     const std::string rel = DefaultControllerRelForModel(modelProjectPath);
     std::string err;
+    if (editor && !editor->RecordAssetUndoSnapshot(AssetManager::Get().ToAbsolute(rel))) return false;
     if (!SaveAnimatorController(AssetManager::Get().ToAbsolute(rel), *asset, err)) {
         MIPSYNC_WARN("Create controller save failed: {}", err);
         return false;
@@ -610,11 +676,14 @@ bool CreateAndAssignControllerFromModel(EditorApp* editor, AnimatorComponent& an
 }
 
 void DrawAnimatorControllerEditor(EditorApp* editor, const std::string& projectRelPath) {
+    if (editor && !editor->RecordAssetUndoSnapshot(AssetManager::Get().ToAbsolute(projectRelPath))) return;
+    static uint64_t loadedRevision = UINT64_MAX;
     static std::string loadedPath;
     static std::shared_ptr<AnimatorControllerAsset> asset;
     static bool loadFailed = false;
 
-    if (loadedPath != projectRelPath) {
+    if (loadedPath != projectRelPath || (editor && loadedRevision != editor->GetHistoryRevision())) {
+        loadedRevision = editor ? editor->GetHistoryRevision() : 0;
         loadedPath = projectRelPath;
         loadFailed = false;
         asset.reset();
@@ -641,19 +710,17 @@ void DrawAnimatorControllerEditor(EditorApp* editor, const std::string& projectR
         : projectRelPath.c_str() + slash + 1;
 
     static bool showParameters = true;
-    ImGui::TextColored(EditorTheme::TextSecondary, "Base Layer");
-    ImGui::SameLine();
-    ImGui::TextColored(EditorTheme::TextMuted, ">  %s", fileName);
-    ImGui::SameLine();
+    EditorToolbar toolbar;
+    toolbar.Text("State Graph", EditorTheme::TextSecondary);
     const char* parameterToggle = showParameters ? "Hide Parameters" : "Show Parameters";
-    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
-                                 ImGui::GetWindowContentRegionMax().x -
-                                     ImGui::CalcTextSize(parameterToggle).x - 18.0f));
-    if (ImGui::SmallButton(parameterToggle))
+    const float toggleWidth = ImGui::CalcTextSize(parameterToggle).x + 16.0f;
+    const float fileWidth = std::max(80.0f, toolbar.Width() - toolbar.CursorX() - toggleWidth);
+    toolbar.Text(fileName, EditorTheme::TextMuted, fileWidth);
+    if (toolbar.Button(parameterToggle))
         showParameters = !showParameters;
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
         ImGui::SetTooltip("%s", projectRelPath.c_str());
-    ImGui::Separator();
+    toolbar.End();
 
     SyncControllerStateClipStacks(*asset);
     bool userChanged = false;
@@ -662,8 +729,10 @@ void DrawAnimatorControllerEditor(EditorApp* editor, const std::string& projectR
     std::shared_ptr<SkeletalModelAsset> sourceModel;
     if (!asset->sourceModelPath.empty())
         sourceModel = AssetManager::Get().GetSkeletalModel(asset->sourceModelPath);
-    const float bodyH = std::max(360.0f, ImGui::GetContentRegionAvail().y);
-    constexpr float kParamSidebarW = 188.0f;
+    const float bodyH = std::max(80.0f, ImGui::GetContentRegionAvail().y);
+    const float kParamSidebarW = std::clamp(ImGui::GetContentRegionAvail().x * 0.23f, 170.0f, 230.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
 
     if (showParameters) {
         ImGui::BeginChild("AnimatorParamRail", ImVec2(kParamSidebarW, bodyH), true);
@@ -671,9 +740,11 @@ void DrawAnimatorControllerEditor(EditorApp* editor, const std::string& projectR
         ImGui::EndChild();
         ImGui::SameLine();
     }
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::BeginChild("AnimatorMainRail", ImVec2(0.0f, bodyH), false);
     DrawAnimatorControllerGraphEditor(editor, projectRelPath, asset, availableClips, userChanged);
     ImGui::EndChild();
+    ImGui::PopStyleVar(3);
 
     Scene* scene = editor ? &editor->GetEngine()->GetScene() : nullptr;
     if (userChanged)

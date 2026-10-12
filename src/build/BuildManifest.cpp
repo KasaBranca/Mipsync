@@ -1,3 +1,5 @@
+#include "../core/AssetFiles.h"
+#include <sstream>
 #include "BuildManifest.h"
 #include "../assets/AssetManager.h"
 #include <algorithm>
@@ -30,8 +32,8 @@ BuildManifest FromPlayerSettings(const PlayerSettings& settings) {
 
 bool LoadFromFile(const std::string& absolutePath, BuildManifest& outManifest, std::string& outError) {
     try {
-        std::ifstream in(PathUtf8::FromString(absolutePath), std::ios::binary);
-        if (!in.is_open()) {
+        std::istringstream in(AssetFiles::ReadText(PathUtf8::FromString(absolutePath)));
+        if (!in) {
             outError = "Could not open boot manifest: " + absolutePath;
             return false;
         }

@@ -9,6 +9,7 @@
 #include "../renderer/Framebuffer.h"
 #include "../core/Log.h"
 #include "../audio/AudioDecoder.h"
+#include "../audio/MidiFile.h"
 #include <stb_image_write.h>
 #include <glad/glad.h>
 #include <glm/gtc/matrix_transform.hpp>
@@ -19,6 +20,9 @@
 #include <cctype>
 #include <vector>
 #include <cstring>
+#include <array>
+#include <cmath>
+#include <deque>
 
 namespace fs = std::filesystem;
 
@@ -30,6 +34,121 @@ using json = nlohmann::json;
 
 constexpr int kThumbSize = 128;
 constexpr int kThumbCacheVersion = 8;
+
+const char* AudioThumbnailPrefix(const std::string& path) {
+    return IsMidiPath(path) ? "midi" : "audio";
+}
+
+std::vector<unsigned char> RenderMidiThumbnail(const MidiSequence& midi) {
+    struct Note {
+        uint32_t start, end;
+        uint8_t key, channel, velocity;
+    };
+    std::vector<Note> notes;
+    std::array<std::array<std::deque<size_t>, 128>, 16> held;
+    std::array<std::vector<size_t>, 16> released;
+    std::array<bool, 16> sustain{};
+    int lowest = 127, highest = 0;
+    auto release = [&](size_t index, uint32_t time) {
+        auto& note = notes[index];
+        if (sustain[note.channel])
+            released[note.channel].push_back(index);
+        else
+            note.end = time;
+    };
+    for (const auto& event : midi.events) {
+        const unsigned channel = event.status & 15;
+        const unsigned type = event.status & 0xf0;
+        if (type == 0x90 && event.data2) {
+            held[channel][event.data1].push_back(notes.size());
+            notes.push_back({event.timeUs, midi.durationUs, event.data1,
+                             static_cast<uint8_t>(channel), event.data2});
+            lowest = std::min(lowest, int(event.data1));
+            highest = std::max(highest, int(event.data1));
+        } else if (type == 0x80 || (type == 0x90 && !event.data2)) {
+            auto& voices = held[channel][event.data1];
+            if (!voices.empty()) {
+                release(voices.front(), event.timeUs);
+                voices.pop_front();
+            }
+        } else if (type == 0xb0) {
+            if (event.data1 == 64) {
+                sustain[channel] = event.data2 >= 64;
+                if (!sustain[channel]) {
+                    for (size_t index : released[channel]) notes[index].end = event.timeUs;
+                    released[channel].clear();
+                }
+            } else if (event.data1 == 120 || event.data1 == 123) {
+                for (auto& voices : held[channel]) {
+                    for (size_t index : voices) {
+                        if (event.data1 == 120) notes[index].end = event.timeUs;
+                        else release(index, event.timeUs);
+                    }
+                    voices.clear();
+                }
+                if (event.data1 == 120) {
+                    for (size_t index : released[channel]) notes[index].end = event.timeUs;
+                    released[channel].clear();
+                }
+            }
+        }
+    }
+
+    // Fit the played pitches, with at least two octaves for recognizable lanes.
+    const int pitchCount = std::max(24, highest - lowest + 5);
+    const int firstPitch = std::clamp((lowest + highest - pitchCount + 1) / 2,
+                                      0, 128 - std::min(pitchCount, 128));
+    const int lanes = std::min(pitchCount, 128);
+    constexpr int keyWidth = 10, graphLeft = 12;
+    const float laneHeight = float(kThumbSize) / lanes;
+    auto blackKey = [](int pitch) {
+        const int key = pitch % 12;
+        return key == 1 || key == 3 || key == 6 || key == 8 || key == 10;
+    };
+    std::vector<unsigned char> pixels(size_t(kThumbSize) * kThumbSize * 4);
+    auto put = [&](int x, int y, int r, int g, int b) {
+        const size_t offset = (size_t(y) * kThumbSize + x) * 4;
+        pixels[offset] = static_cast<unsigned char>(r);
+        pixels[offset + 1] = static_cast<unsigned char>(g);
+        pixels[offset + 2] = static_cast<unsigned char>(b);
+        pixels[offset + 3] = 255;
+    };
+    for (int y = 0; y < kThumbSize; ++y) {
+        const int lane = std::min(lanes - 1, int(y / laneHeight));
+        const bool black = blackKey(firstPitch + lanes - 1 - lane);
+        const bool boundary = y == int(std::ceil(lane * laneHeight));
+        for (int x = 0; x < kThumbSize; ++x) {
+            if (x < keyWidth) {
+                const int shade = boundary ? 38 : (black && x < 7 ? 28 : 133);
+                put(x, y, shade, shade, shade);
+            } else if (x < graphLeft) {
+                put(x, y, 21, 26, 32);
+            } else {
+                const bool grid = boundary || (x - graphLeft) % 16 == 0;
+                put(x, y, grid ? 45 : (black ? 27 : 32),
+                          grid ? 53 : (black ? 34 : 40),
+                          grid ? 63 : (black ? 43 : 50));
+            }
+        }
+    }
+    for (const auto& note : notes) {
+        const double duration = std::max(1u, midi.durationUs);
+        const int x0 = std::clamp(graphLeft + int(note.start / duration * (kThumbSize - graphLeft)),
+                                  graphLeft, kThumbSize - 1);
+        const int x1 = std::clamp(graphLeft + int(std::ceil(note.end / duration * (kThumbSize - graphLeft))),
+                                  x0 + 1, kThumbSize);
+        const int lane = firstPitch + lanes - 1 - note.key;
+        const int y0 = std::clamp(int(std::ceil(lane * laneHeight)) + (laneHeight >= 3 ? 1 : 0),
+                                  0, kThumbSize - 1);
+        const int y1 = std::clamp(int(std::ceil((lane + 1) * laneHeight)) - (laneHeight >= 3 ? 1 : 0),
+                                  y0 + 1, kThumbSize);
+        const int brightness = note.velocity * 30 / 127;
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x)
+                put(x, y, 40 + brightness, 142 + brightness + (note.channel % 4) * 8, 220 + brightness);
+    }
+    return pixels;
+}
 
 std::string SanitizeCacheName(std::string projectRel) {
     for (char& c : projectRel) {
@@ -144,7 +263,7 @@ bool IsModelAssetPath(const std::string& path) {
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
-    return ext == ".fbx" || ext == ".obj" || ext == ".gltf" || ext == ".glb";
+    return ext == ".fbx" || ext == ".nmodel" || ext == ".obj" || ext == ".gltf" || ext == ".glb";
 }
 
 std::string FindPrefabModelPath(const json& entity) {
@@ -296,7 +415,7 @@ std::shared_ptr<Texture> AssetThumbnail::GetAudioThumbnail(const std::string& pr
     if (m_AudioThumbnailFailed.count(projectRelativePath))
         return nullptr;
     const std::string sourceAbs = AssetManager::Get().ToAbsolute(projectRelativePath);
-    const std::string thumbAbs = ThumbnailCachePath(projectRelativePath, "audio");
+    const std::string thumbAbs = ThumbnailCachePath(projectRelativePath, AudioThumbnailPrefix(projectRelativePath));
     auto it = m_AudioCache.find(projectRelativePath);
     if (it != m_AudioCache.end()) {
         if (!IsThumbnailStale(sourceAbs, thumbAbs))
@@ -345,7 +464,7 @@ std::shared_ptr<Texture> AssetThumbnail::GetPrefabThumbnail(
 
 std::shared_ptr<Texture> AssetThumbnail::LoadOrCreateAudio(const std::string& projectRelativePath) {
     const std::string sourceAbs = AssetManager::Get().ToAbsolute(projectRelativePath);
-    const std::string thumbAbs = ThumbnailCachePath(projectRelativePath, "audio");
+    const std::string thumbAbs = ThumbnailCachePath(projectRelativePath, AudioThumbnailPrefix(projectRelativePath));
     if (sourceAbs.empty() || thumbAbs.empty())
         return nullptr;
     std::error_code ec;
@@ -355,40 +474,49 @@ std::shared_ptr<Texture> AssetThumbnail::LoadOrCreateAudio(const std::string& pr
             return cached;
     }
 
-    DecodedAudio audio;
+    std::vector<unsigned char> pixels;
     std::string error;
-    if (!DecodeAudioFile(sourceAbs, audio, error)) {
-        MIPSYNC_WARN("Audio waveform decode failed for {}: {}", projectRelativePath, error);
-        return nullptr;
-    }
-
-    std::vector<unsigned char> pixels(static_cast<size_t>(kThumbSize) * kThumbSize * 4);
-    for (int y = 0; y < kThumbSize; ++y) {
+    if (IsMidiPath(sourceAbs)) {
+        MidiSequence midi;
+        if (!ReadMidi(sourceAbs, midi, error)) {
+            MIPSYNC_WARN("MIDI piano-roll decode failed for {}: {}", projectRelativePath, error);
+            return nullptr;
+        }
+        pixels = RenderMidiThumbnail(midi);
+    } else {
+        DecodedAudio audio;
+        if (!DecodeAudioFile(sourceAbs, audio, error)) {
+            MIPSYNC_WARN("Audio waveform decode failed for {}: {}", projectRelativePath, error);
+            return nullptr;
+        }
+        pixels.resize(static_cast<size_t>(kThumbSize) * kThumbSize * 4);
+        for (int y = 0; y < kThumbSize; ++y) {
+            for (int x = 0; x < kThumbSize; ++x) {
+                const size_t p = (static_cast<size_t>(y) * kThumbSize + x) * 4;
+                const bool grid = (x % 16 == 0) || (y == kThumbSize / 2);
+                pixels[p + 0] = grid ? 39 : 31;
+                pixels[p + 1] = grid ? 50 : 39;
+                pixels[p + 2] = grid ? 59 : 47;
+                pixels[p + 3] = 255;
+            }
+        }
         for (int x = 0; x < kThumbSize; ++x) {
-            const size_t p = (static_cast<size_t>(y) * kThumbSize + x) * 4;
-            const bool grid = (x % 16 == 0) || (y == kThumbSize / 2);
-            pixels[p + 0] = grid ? 39 : 31;
-            pixels[p + 1] = grid ? 50 : 39;
-            pixels[p + 2] = grid ? 59 : 47;
-            pixels[p + 3] = 255;
-        }
-    }
-    for (int x = 0; x < kThumbSize; ++x) {
-        const size_t begin = (audio.monoSamples.size() * static_cast<size_t>(x)) / kThumbSize;
-        const size_t end = std::max(begin + 1,
-            (audio.monoSamples.size() * static_cast<size_t>(x + 1)) / kThumbSize);
-        float lo = 0.0f, hi = 0.0f;
-        for (size_t i = begin; i < std::min(end, audio.monoSamples.size()); ++i) {
-            lo = std::min(lo, audio.monoSamples[i]);
-            hi = std::max(hi, audio.monoSamples[i]);
-        }
-        int y0 = std::clamp(static_cast<int>((0.5f - hi * 0.45f) * kThumbSize), 1, kThumbSize - 2);
-        int y1 = std::clamp(static_cast<int>((0.5f - lo * 0.45f) * kThumbSize), 1, kThumbSize - 2);
-        if (y1 < y0) std::swap(y0, y1);
-        if (y1 == y0) ++y1;
-        for (int y = y0; y <= y1; ++y) {
-            const size_t p = (static_cast<size_t>(y) * kThumbSize + x) * 4;
-            pixels[p + 0] = 72; pixels[p + 1] = 196; pixels[p + 2] = 211; pixels[p + 3] = 255;
+            const size_t begin = (audio.monoSamples.size() * static_cast<size_t>(x)) / kThumbSize;
+            const size_t end = std::max(begin + 1,
+                (audio.monoSamples.size() * static_cast<size_t>(x + 1)) / kThumbSize);
+            float lo = 0.0f, hi = 0.0f;
+            for (size_t i = begin; i < std::min(end, audio.monoSamples.size()); ++i) {
+                lo = std::min(lo, audio.monoSamples[i]);
+                hi = std::max(hi, audio.monoSamples[i]);
+            }
+            int y0 = std::clamp(static_cast<int>((0.5f - hi * 0.45f) * kThumbSize), 1, kThumbSize - 2);
+            int y1 = std::clamp(static_cast<int>((0.5f - lo * 0.45f) * kThumbSize), 1, kThumbSize - 2);
+            if (y1 < y0) std::swap(y0, y1);
+            if (y1 == y0) ++y1;
+            for (int y = y0; y <= y1; ++y) {
+                const size_t p = (static_cast<size_t>(y) * kThumbSize + x) * 4;
+                pixels[p + 0] = 72; pixels[p + 1] = 196; pixels[p + 2] = 211; pixels[p + 3] = 255;
+            }
         }
     }
     std::ofstream file(PathUtf8::FromString(thumbAbs), std::ios::binary | std::ios::trunc);
@@ -421,7 +549,7 @@ std::shared_ptr<Texture> AssetThumbnail::LoadOrCreateMesh(const std::string& pro
         return nullptr;
     }
 
-    const std::string ext = sourceAbs.size() >= 4 ? sourceAbs.substr(sourceAbs.size() - 4) : std::string{};
+    const std::string ext = PathUtf8::ToString(PathUtf8::FromString(sourceAbs).extension());
     if (ext == ".fbx" || ext == ".FBX") {
         // Previously we skipped skinned FBX thumbnails (fallback icon only).
         // This made many FBX files look like "non-model" assets in the Project panel.
@@ -436,14 +564,14 @@ std::shared_ptr<Texture> AssetThumbnail::LoadOrCreateMesh(const std::string& pro
             return cached;
     }
 
-    const bool isFbx = (ext == ".fbx" || ext == ".FBX");
+    const bool isFbx = (ext == ".fbx" || ext == ".FBX" || ext == ".nmodel");
 
     // Skinned FBX must use the skeletal renderer (static Mesh::LoadFromFile is incomplete).
     std::shared_ptr<SkeletalModelAsset> skel;
     if (isFbx)
         skel = AssetManager::Get().GetSkeletalModel(projectRelativePath);
 
-    auto mesh = AssetManager::Get().GetMesh(projectRelativePath);
+    auto mesh = ext == ".nmodel" ? std::shared_ptr<Mesh>{} : AssetManager::Get().GetMesh(projectRelativePath);
     const bool hasStaticMesh = mesh && mesh->GetVertexCount() > 0;
     const bool hasSkelMesh = skel && skel->mesh && !skel->bones.empty();
 
@@ -573,7 +701,7 @@ void AssetThumbnail::DropMaterialThumbnail(const std::string& projectRelativePat
 void AssetThumbnail::DropAudioThumbnail(const std::string& projectRelativePath) {
     m_AudioCache.erase(projectRelativePath);
     m_AudioThumbnailFailed.erase(projectRelativePath);
-    const std::string thumbAbs = ThumbnailCachePath(projectRelativePath, "audio");
+    const std::string thumbAbs = ThumbnailCachePath(projectRelativePath, AudioThumbnailPrefix(projectRelativePath));
     if (!thumbAbs.empty()) {
         std::error_code ec;
         fs::remove(PathUtf8::FromString(thumbAbs), ec);

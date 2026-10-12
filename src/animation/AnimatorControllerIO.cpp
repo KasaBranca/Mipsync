@@ -1,3 +1,6 @@
+#include "../core/AssetFiles.h"
+#include "../assets/AssetManager.h"
+#include <sstream>
 #include "AnimatorControllerIO.h"
 #include "SkeletalModel.h"
 #include "../assets/AssetManager.h"
@@ -59,6 +62,11 @@ json ControllerToJson(const AnimatorControllerAsset& asset) {
     root["defaultState"] = asset.defaultState;
     if (!asset.sourceModelPath.empty())
         root["model"] = asset.sourceModelPath;
+    root["editorLayout"]["anyStatePosition"] = {
+        asset.anyStateGraphPosition.x, asset.anyStateGraphPosition.y};
+    if (asset.entryGraphPosition)
+        root["editorLayout"]["entryPosition"] = {
+            asset.entryGraphPosition->x, asset.entryGraphPosition->y};
 
     json params = json::array();
     for (const auto& p : asset.parameters) {
@@ -180,6 +188,11 @@ static bool IsTransformAnimationClipPath(const std::string& path) {
 }
 
 static void ValidateAnimatorController(AnimatorControllerAsset& asset) {
+    if (asset.entryGraphPosition && (!std::isfinite(asset.entryGraphPosition->x) ||
+                                    !std::isfinite(asset.entryGraphPosition->y)))
+        asset.entryGraphPosition.reset();
+    if (!std::isfinite(asset.anyStateGraphPosition.x) || !std::isfinite(asset.anyStateGraphPosition.y))
+        asset.anyStateGraphPosition = glm::vec2(40.0f, 56.0f);
     for (auto& state : asset.states) {
         if (!std::isfinite(state.startOffset))
             state.startOffset = 0.0f;
@@ -214,7 +227,7 @@ static void ValidateAnimatorController(AnimatorControllerAsset& asset) {
                        [&](const AnimatorTransitionDef& tr) {
                            return tr.fromState.empty() || tr.toState.empty() ||
                                   tr.fromState == tr.toState ||
-                                  !StateNameExists(asset, tr.fromState) ||
+                                  (tr.fromState != kAnimatorAnyStateName && !StateNameExists(asset, tr.fromState)) ||
                                   !StateNameExists(asset, tr.toState);
                        }),
         asset.transitions.end());
@@ -296,8 +309,8 @@ bool SyncControllerStateClipStacks(AnimatorControllerAsset& asset) {
 std::shared_ptr<AnimatorControllerAsset> LoadAnimatorController(const std::string& absolutePath,
                                                                 std::string& outError) {
     try {
-        std::ifstream file(absolutePath);
-        if (!file.is_open()) {
+        std::istringstream file(AssetFiles::ReadText(PathUtf8::FromString(absolutePath)));
+        if (!file) {
             outError = "failed to open: " + absolutePath;
             return nullptr;
         }
@@ -307,6 +320,20 @@ std::shared_ptr<AnimatorControllerAsset> LoadAnimatorController(const std::strin
         auto asset = std::make_shared<AnimatorControllerAsset>();
         asset->defaultState = root.value("defaultState", std::string{});
         asset->sourceModelPath = root.value("model", std::string{});
+        if (root.contains("editorLayout") && root["editorLayout"].is_object()) {
+            const auto& layout = root["editorLayout"];
+            auto position = [&](const char* name) -> std::optional<glm::vec2> {
+                if (!layout.contains(name) || !layout[name].is_array() || layout[name].size() != 2 ||
+                    !layout[name][0].is_number() || !layout[name][1].is_number())
+                    return std::nullopt;
+                const glm::vec2 point(layout[name][0].get<float>(), layout[name][1].get<float>());
+                return std::isfinite(point.x) && std::isfinite(point.y)
+                    ? std::optional<glm::vec2>(point) : std::nullopt;
+            };
+            asset->entryGraphPosition = position("entryPosition");
+            if (const auto any = position("anyStatePosition"))
+                asset->anyStateGraphPosition = *any;
+        }
 
         if (root.contains("parameters") && root["parameters"].is_array()) {
             for (const auto& p : root["parameters"]) {

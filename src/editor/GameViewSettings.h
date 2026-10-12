@@ -4,6 +4,8 @@
 
 namespace MipsyncEngine {
 
+enum class GameViewPlayMode { Focused, Maximized };
+
 /// Unity-style Game View render target (fixed resolution; panel letterboxes around it).
 struct GameViewSettings {
     static constexpr int kRenderWidth = 1024;
@@ -11,6 +13,14 @@ struct GameViewSettings {
 
     int renderWidth = kRenderWidth;
     int renderHeight = kRenderHeight;
+    GameViewPlayMode playMode = GameViewPlayMode::Focused;
+    bool showGizmos = false;
+    bool showStatistics = false;
+    bool pSync = true;
+
+    bool IsMaximized(bool playing, bool paused = false) const {
+        return playing && !paused && playMode == GameViewPlayMode::Maximized;
+    }
 };
 
 struct GameViewLetterbox {

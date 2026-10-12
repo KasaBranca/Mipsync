@@ -120,7 +120,8 @@ void Window::Init(const WindowProps& props) {
         WindowData& data = *(WindowData*)glfwGetWindowUserPointer(window);
         data.width = width;
         data.height = height;
-        glViewport(0, 0, width, height);
+        if (glfwGetCurrentContext() == window)
+            glViewport(0, 0, width, height);
         if (data.resizeCallback) {
             data.resizeCallback(width, height);
         }

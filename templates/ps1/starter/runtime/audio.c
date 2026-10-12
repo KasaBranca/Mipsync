@@ -237,6 +237,7 @@ void ps1_audio_init(void) {
     CdInit();
     SpuSetCommonMasterVolume(0x3fff, 0x3fff);
     reset_spu_channels();
+    ps1_midi_init();
     EnterCriticalSection();
     InterruptCallback(IRQ_SPU, &audio_spu_irq);
     ExitCriticalSection();
@@ -261,6 +262,7 @@ void ps1_audio_init(void) {
 void ps1_audio_apply_entity(unsigned int entity_index) {
     const ps1_entity* entity;
     int volume;
+    ps1_midi_apply(entity_index);
     if (s_entity != (int32_t)entity_index) return;
     entity = ps1_scene_entity(entity_index);
     if (!entity) return;
@@ -275,6 +277,10 @@ int ps1_audio_play(unsigned int entity_index) {
     unsigned int clip_index;
     if (!entity || !entity->audio_enabled || entity->audio_clip_index == 0) return 0;
     clip_index = entity->audio_clip_index - 1u;
+    if (clip_index < g_ps1_audio_clip_count && g_ps1_audio_clips[clip_index].sample_data)
+        return ps1_sample_play(entity_index, clip_index);
+    if (clip_index < g_ps1_audio_clip_count && g_ps1_audio_clips[clip_index].midi)
+        return ps1_midi_play(entity_index, g_ps1_audio_clips[clip_index].midi);
     if (clip_index >= g_ps1_audio_clip_count || clip_index >= 64u ||
         !s_files[clip_index].found) return 0;
 
@@ -296,6 +302,7 @@ int ps1_audio_play(unsigned int entity_index) {
 }
 
 void ps1_audio_stop(unsigned int entity_index) {
+    ps1_midi_stop(entity_index);
     if (s_entity != (int32_t)entity_index) return;
     SpuSetKey(0, 1u << AUDIO_CHANNEL);
     s_entity = -1;
@@ -306,6 +313,7 @@ void ps1_audio_stop(unsigned int entity_index) {
 }
 
 void ps1_audio_pause(unsigned int entity_index) {
+    ps1_midi_pause(entity_index, 1);
     if (s_entity != (int32_t)entity_index) return;
     SpuSetKey(0, 1u << AUDIO_CHANNEL);
     SPU_CTRL &= ~(1u << 6);
@@ -314,6 +322,7 @@ void ps1_audio_pause(unsigned int entity_index) {
 }
 
 void ps1_audio_unpause(unsigned int entity_index) {
+    ps1_midi_pause(entity_index, 0);
     if (s_entity == (int32_t)entity_index && s_paused) {
         s_paused = 0;
         key_on_current();
@@ -321,10 +330,11 @@ void ps1_audio_unpause(unsigned int entity_index) {
 }
 
 int ps1_audio_is_playing(unsigned int entity_index) {
-    return s_entity == (int32_t)entity_index && !s_paused;
+    return ps1_midi_is_playing(entity_index) || (s_entity == (int32_t)entity_index && !s_paused);
 }
 
 void ps1_audio_update(void) {
+    ps1_midi_update();
     const ps1_entity* entity = active_entity();
     unsigned int finished;
     if (!entity || s_paused) return;

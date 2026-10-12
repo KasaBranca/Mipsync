@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <memory>
+#include "InspectorAttributes.h"
 #include "../../templates/ps1/starter/runtime/bytecode_abi.h"
 
 namespace MipsyncEngine::Mips {
@@ -31,6 +33,7 @@ struct CompiledMethod {
 enum class FieldValueKind : uint8_t { Number = 0, Bool, AudioClip, Array, EntityReference };
 
 struct CompiledField {
+    InspectorAttributes inspector;
     std::string name;
     std::string typeName;
     FieldValueKind valueKind = FieldValueKind::Number;
@@ -53,6 +56,12 @@ struct CompiledModule {
     const CompiledMethod* FindMethod(const std::string& name) const;
     int FindFieldIndex(const std::string& name) const;
 };
+
+// Returns visible field/group starts in display order, retaining VM indices.
+std::vector<size_t> InspectorFieldIndices(const std::vector<CompiledField>& fields);
+
+std::vector<uint8_t> SerializePlayerModule(const CompiledModule& module);
+std::shared_ptr<CompiledModule> DeserializePlayerModule(const std::vector<uint8_t>& bytes);
 
 class BytecodeWriter {
 public:

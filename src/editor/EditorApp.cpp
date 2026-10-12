@@ -1,4 +1,6 @@
 #include "EditorApp.h"
+#include <stb_image_write.h>
+#include "../audio/MidiFile.h"
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -7,9 +9,17 @@
 #endif
 #include "AssetBrowserPanel.h"
 #include "EditorAnimatorControllerInspector.h"
+#include "EditorAnimatorGraph.h"
 #include "EditorTheme.h"
+#include "EditorMipsInspector.h"
+#include "EditorSurface.h"
+#include "EditorObjectReference.h"
+#include "EditorMenu.h"
+#include "EditorToolbar.h"
+#include "EditorGameView.h"
 #include "EditorIcons.h"
 #include "EditorAssetIcons.h"
+#include "EditorComponentClipboard.h"
 #include "Raycast.h"
 #include "EditorColliderGizmo.h"
 #include "EditorLightGizmo.h"
@@ -26,6 +36,7 @@
 #include "../core/Log.h"
 #include "../core/Time.h"
 #include "../core/Input.h"
+#include "../ps1/Ps1ColorGrading.h"
 #include "../scene/Scene.h"
 #include "../animation/AnimationTypes.h"
 #include "../animation/AnimatorRuntime.h"
@@ -43,6 +54,8 @@
 #include "../assets/Material.h"
 #include "../core/OsFileDrop.h"
 #include "../core/RuntimePaths.h"
+#include "../core/PlayLoadingProcess.h"
+#include "../core/PreparationCancellation.h"
 #include "../command/EditorCommandHost.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -63,14 +76,46 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <cfloat>
 #include <cmath>
+#include <future>
+#include <chrono>
+#include <thread>
 #include <cstring>
 #include <string>
 
 namespace MipsyncEngine {
 
+struct EditorPlayPreparation {
+    GLFWwindow* window = nullptr;
+    std::future<std::string> work;
+    PlayLoadingProcess loading;
+    bool showLoading = true;
+    std::atomic<bool> cancelled{false};
+    void RequestCancel() {
+        cancelled.store(true, std::memory_order_relaxed);
+        loading.RequestCancel();
+    }
+    void FinishWork() {
+        if (!work.valid()) return;
+        while (work.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+            glfwPollEvents();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        try { work.get(); } catch (...) {}
+        glfwMakeContextCurrent(window);
+        Input::SetPreparationInProgress(false);
+    }
+    ~EditorPlayPreparation() { RequestCancel(); FinishWork(); }
+};
+
 namespace {
 
 EditorApp* s_EditorForWindowClose = nullptr;
+void (*s_DestroyInputViewport)(ImGuiViewport*) = nullptr;
+void DestroyInputViewport(ImGuiViewport* viewport) {
+    // Drop the input target while its GLFW handle is still alive.
+    Input::ForgetGameInputWindow(static_cast<GLFWwindow*>(viewport->PlatformHandle));
+    if (s_DestroyInputViewport) s_DestroyInputViewport(viewport);
+}
 
 struct InspectorComponentCard {
     ImVec2 min{};
@@ -233,66 +278,6 @@ void RemoveCurrentInspectorComponents(Entity& primaryEntity, Component* primaryC
             peer->entity->RemoveComponent(peer);
     }
     primaryEntity.RemoveComponent(primaryComponent);
-}
-
-void DrawStraightDockTabOverlines() {
-    ImGuiContext& context = *ImGui::GetCurrentContext();
-    const ImGuiStyle& style = context.Style;
-    const float thickness = 2.0f;
-    const ImU32 color = ImGui::GetColorU32(EditorTheme::Accent);
-
-    for (ImGuiWindow* window : context.Windows) {
-        ImGuiDockNode* node = window ? window->DockNode : nullptr;
-        if (!node || node->VisibleWindow != window || !node->TabBar || !node->HostWindow)
-            continue;
-
-        ImGuiTabBar* tabBar = node->TabBar;
-        ImGuiTabItem* tab = ImGui::TabBarFindTabByID(tabBar, tabBar->SelectedTabId);
-        if (!tab)
-            continue;
-
-        const float x1 = tabBar->BarRect.Min.x + tab->Offset;
-        const float x2 = x1 + tab->Width;
-        const float y1 = tabBar->BarRect.Min.y;
-        const float y2 = y1 + thickness;
-        const float radius = std::min({std::max(0.0f, style.TabRounding),
-                                       (x2 - x1) * 0.5f,
-                                       tabBar->BarRect.GetHeight()});
-        ImDrawList* drawList = node->HostWindow->DrawList;
-        drawList->PushClipRect(ImVec2(x1, tabBar->BarRect.Min.y),
-                               ImVec2(x2, tabBar->BarRect.Max.y), true);
-
-        // This is the geometric intersection of a full-width straight strip
-        // and the tab's rounded top edge: the ImGui equivalent of a child bar
-        // clipped by a rounded parent with CSS overflow:hidden. A fixed inset
-        // leaves the line visibly cut short and makes it look painted on top.
-        if (radius <= 0.0f) {
-            drawList->AddRectFilled(ImVec2(x1, y1), ImVec2(x2, y2), color);
-        } else {
-            constexpr int curveSteps = 4;
-            ImVec2 points[curveSteps * 2 + 4];
-            int pointCount = 0;
-            points[pointCount++] = ImVec2(x1 + radius, y1);
-            for (int step = 1; step <= curveSteps; ++step) {
-                const float y = y1 + thickness * (static_cast<float>(step) / curveSteps);
-                const float dy = std::min(radius, y - y1);
-                const float inset = radius - std::sqrt(std::max(
-                    0.0f, radius * radius - (radius - dy) * (radius - dy)));
-                points[pointCount++] = ImVec2(x1 + inset, y);
-            }
-            points[pointCount++] = ImVec2(x2 - (points[pointCount - 1].x - x1), y2);
-            for (int step = curveSteps - 1; step >= 1; --step) {
-                const float y = y1 + thickness * (static_cast<float>(step) / curveSteps);
-                const float dy = std::min(radius, y - y1);
-                const float inset = radius - std::sqrt(std::max(
-                    0.0f, radius * radius - (radius - dy) * (radius - dy)));
-                points[pointCount++] = ImVec2(x2 - inset, y);
-            }
-            points[pointCount++] = ImVec2(x2 - radius, y1);
-            drawList->AddConvexPolyFilled(points, pointCount, color);
-        }
-        drawList->PopClipRect();
-    }
 }
 
 bool IsUIButtonCallableMethod(const Mips::CompiledMethod& method) {
@@ -765,11 +750,16 @@ Entity* SelectAdjacentShotCamera(Scene& scene, const glm::vec3& triggerCenter,
     return bestOnSide ? bestOnSide : nearest;
 }
 
-/// Inspector header: enable checkbox, foldout, right-click remove.
+enum class InspectorComponentLayout { Component, Transform };
+
+/// Structural transforms share the component header but use compact axis rows.
 bool BeginInspectableComponent(const char* title, Component& comp, bool& removeRequested,
                                EditorApp* editorForUndo,
-                               const std::function<void()>& drawComponentMenu = {}) {
+                               const std::function<void()>& drawComponentMenu = {},
+                               InspectorComponentLayout layout = InspectorComponentLayout::Component) {
     ImGui::PushID(&comp);
+    const bool structural = layout == InspectorComponentLayout::Transform;
+    const bool removable = !dynamic_cast<TransformComponent*>(&comp);
 
     // Godot-style inspector section: one coherent StyleBox row contains the
     // foldout, enabled state and context action. Keep the existing positions
@@ -789,14 +779,21 @@ bool BeginInspectableComponent(const char* title, Component& comp, bool& removeR
     const ImVec2 rowMax(std::max(rowMin.x + 1.0f, visibleMaxX),
                         rowMin.y + rowHeight);
     ImDrawList* drawList = ImGui::GetWindowDrawList();
-    drawList->AddRectFilled(rowMin, rowMax,
-                            ImGui::GetColorU32(EditorTheme::SurfaceContainerHigh),
-                            EditorTheme::ShapeCornerSmall);
+    EditorSurface::DrawRaisedFace(drawList, rowMin, rowMax,
+        ImGui::GetColorU32(EditorTheme::SurfaceContainerHigh), EditorTheme::ShapeCornerSmall,
+        ImGui::GetColorU32(EditorTheme::Border), 1.0f);
 
     constexpr float checkboxSidePadding = 5.0f;
-    ImGui::SetCursorScreenPos(ImVec2(rowMin.x + checkboxSidePadding, rowMin.y));
-    DrawComponentEnabledToggle(comp.enabled);
-    const float checkboxMaxX = ImGui::GetItemRectMax().x;
+    const float iconSide = ImGui::GetFontSize() + 2.0f;
+    DrawComponentIcon(comp, drawList,
+        ImVec2(rowMin.x + checkboxSidePadding + iconSide * 0.5f,
+               rowMin.y + rowHeight * 0.5f), iconSide);
+    ImGui::SetCursorScreenPos(ImVec2(rowMin.x + checkboxSidePadding + iconSide + 4.0f,
+                                    rowMin.y));
+    if (!structural)
+        DrawComponentEnabledToggle(comp.enabled);
+    const float checkboxMaxX = structural ? ImGui::GetCursorScreenPos().x - checkboxSidePadding
+                                          : ImGui::GetItemRectMax().x;
 
     constexpr float menuSide = 14.0f;
     const ImVec2 menuMin(rowMax.x - checkboxSidePadding - menuSide,
@@ -821,14 +818,18 @@ bool BeginInspectableComponent(const char* title, Component& comp, bool& removeR
     }
     const bool headerHovered = ImGui::IsItemHovered();
     const bool headerHeld = ImGui::IsItemActive();
-    const bool headerContext = ImGui::BeginPopupContextItem("##component_context");
+    // Only OPEN here. Beginning a popup switches the current window, so all
+    // remaining header layout must finish before entering the popup below.
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup) &&
+        ImGui::IsMouseReleased(ImGuiMouseButton_Right))
+        ImGui::OpenPopup("##component_context");
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
         ImGui::SetTooltip("%s component", title);
 
     if (headerHovered || headerHeld) {
-        drawList->AddRectFilled(headerHitMin, headerHitMax,
-                                ImGui::GetColorU32(headerHeld ? EditorTheme::BtnDarkShadow
-                                                             : EditorTheme::SurfaceHover));
+        EditorSurface::DrawRaisedFace(drawList, headerHitMin, headerHitMax,
+            ImGui::GetColorU32(headerHeld ? EditorTheme::BtnDarkShadow : EditorTheme::SurfaceHover),
+            0.0f, 0, 0, headerHeld);
     }
 
     const float arrowLeft = checkboxMaxX + checkboxSidePadding;
@@ -871,26 +872,47 @@ bool BeginInspectableComponent(const char* title, Component& comp, bool& removeR
         drawList->AddCircleFilled(ImVec2(menuCenter.x + dot * 3.2f, menuCenter.y),
                                   1.0f, dotColor, 8);
 
-    if (headerContext || ImGui::BeginPopup("##component_menu")) {
-        if (drawComponentMenu) {
-            drawComponentMenu();
+    if (EditorMenu::BeginPopup("##component_context") || EditorMenu::BeginPopup("##component_menu")) {
+        if (editorForUndo) {
+            if (EditorMenu::MenuItem("Reset to Default"))
+                editorForUndo->ResetInspectorComponent(comp);
             ImGui::Separator();
+            if (EditorMenu::MenuItem("CopyComponent"))
+                editorForUndo->CopyInspectorComponent(comp);
+            if (EditorMenu::MenuItem(editorForUndo->GetInspectorPasteLabel(&comp), nullptr, false,
+                                     editorForUndo->CanPasteInspectorComponent(&comp)))
+                editorForUndo->PasteInspectorComponent(&comp);
+            if (removable || drawComponentMenu)
+                ImGui::Separator();
         }
-        if (ImGui::MenuItem("Remove Component")) {
+        if (drawComponentMenu) {
+            const float before = ImGui::GetCursorPosY();
+            drawComponentMenu();
+            if (ImGui::GetCursorPosY() > before)
+                ImGui::Separator();
+        }
+        if (removable && EditorMenu::MenuItem("Remove Component")) {
             if (editorForUndo)
                 editorForUndo->RecordUndoSnapshot();
             removeRequested = true;
         }
-        ImGui::EndPopup();
+        EditorMenu::EndPopup();
     }
     const ImVec2 afterHeaderCursor(rowMin.x,
                                    rowMax.y + ImGui::GetStyle().ItemSpacing.y);
+    if (structural) {
+        ImGui::SetCursorScreenPos(afterHeaderCursor);
+        if (open) {
+            const ImGuiStyle& style = ImGui::GetStyle();
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(style.ItemSpacing.x, 4.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(style.FramePadding.x, 2.0f));
+        }
+        return open;
+    }
     ImGui::SetCursorScreenPos(open ? ImVec2(rowMin.x, rowMax.y)
                                    : afterHeaderCursor);
     s_InspectorComponentCards.push_back(
         InspectorComponentCard{rowMin, rowMax.x, rowMax.y, open});
-    if (!comp.enabled)
-        ImGui::BeginDisabled();
     if (open) {
         // Constrain every inspector field to the same inset as the header
         // controls. Negative-width text/combo fields now resolve against this
@@ -915,7 +937,15 @@ bool BeginInspectableComponent(const char* title, Component& comp, bool& removeR
     return open;
 }
 
-void EndInspectableComponent(const Component& comp, bool open) {
+void EndInspectableComponent(const Component& comp, bool open,
+                             InspectorComponentLayout layout = InspectorComponentLayout::Component) {
+    if (layout == InspectorComponentLayout::Transform) {
+        if (open)
+            ImGui::PopStyleVar(2);
+        ImGui::PopID();
+        DrawInspectorDivider();
+        return;
+    }
     ImVec2 bodyMax{};
     if (open) {
         // AutoResizeY does not reserve trailing WindowPadding in every ImGui
@@ -925,8 +955,6 @@ void EndInspectableComponent(const Component& comp, bool open) {
         ImGui::EndChild();
         bodyMax = ImGui::GetItemRectMax();
     }
-    if (!comp.enabled)
-        ImGui::EndDisabled();
 
     if (!s_InspectorComponentCards.empty()) {
         const InspectorComponentCard card = s_InspectorComponentCards.back();
@@ -1179,7 +1207,7 @@ void EditorApp::Init() {
             m_SceneFilePath = PathUtf8::ToString(projectRoot / sceneRel);
 
         std::string migrateProjectError;
-        if (!Project::SaveToDir(projectInfo, migrateProjectError))
+        if (!m_Engine->IsPlayerMode() && !Project::SaveToDir(projectInfo, migrateProjectError))
             MIPSYNC_WARN("Project metadata migration failed: {}", migrateProjectError);
     }
 
@@ -1215,6 +1243,9 @@ void EditorApp::Init() {
     s_EditorForWindowClose = this;
     glfwSetWindowCloseCallback(window, GLFWWindowCloseCallback);
     ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplGlfw_SetCallbacksChainForAllWindows(true);
+    s_DestroyInputViewport = ImGui::GetPlatformIO().Platform_DestroyWindow;
+    ImGui::GetPlatformIO().Platform_DestroyWindow = DestroyInputViewport;
     ImGui_ImplOpenGL3_Init("#version 330 core");
 
     if (m_PendingSceneCamPivot) {
@@ -1255,6 +1286,12 @@ void EditorApp::Init() {
 }
 
 void EditorApp::Shutdown() {
+    // The worker owns scene/asset state and the GL context exclusively. Join it
+    // before destroying graphics or allowing shutdown to touch those objects.
+    m_PlayPreparation.reset();
+    Input::SetCursorLocked(false);
+    Input::SetGameInputWindow(nullptr);
+    SetMouseCaptureUI(false);
     if (m_CommandHost) {
         m_CommandHost->Stop();
         m_CommandHost.reset();
@@ -1271,28 +1308,220 @@ void EditorApp::Shutdown() {
     }
 }
 
-void EditorApp::TickPendingPlaySetup() {
-    if (!m_PendingPhysicsBeginPlay)
-        return;
-    m_PendingPhysicsBeginPlay = false;
-    MIPSYNC_INFO("Editor: deferred Physics BeginPlay");
-    m_Engine->GetPhysicsWorld().BeginPlay(m_Engine->GetScene());
-    MIPSYNC_INFO("Editor: deferred Physics BeginPlay done");
+bool EditorApp::IsPlayPreparationRunning() const {
+    return m_PlayPreparation && m_PlayPreparation->work.valid();
+}
+void EditorApp::PumpPreparationCommands() {
+    if (m_CommandHost) m_CommandHost->Pump(true);
 }
 
-void EditorApp::StartPlayMode() {
-    if (m_IsPlaying)
-        return;
+std::string EditorApp::RunPlaySetupStage(int stage) {
+    CheckPreparationCancelled();
     Scene& scene = m_Engine->GetScene();
-    auto& mips = m_Engine->GetMipsRuntime();
-    ResetShotCameraState();
-    ReloadAllSceneAnimators(scene);
-    mips.OnPlayStarted(scene);
-    m_Engine->GetAudioSystem().BeginPlay(scene, m_Engine->GetProjectPath());
-    m_PendingPhysicsBeginPlay = true;
-    m_IsPlaying = true;
-    m_IsPaused = false;
-    m_StepOneFrame = false;
+    switch (stage) {
+        case 0:
+            if (!m_Engine->IsPlayerMode() && !m_PlaySession.Active()) {
+                // Capture history together with the scene in the same worker.
+                // Stop can join this stage before a UI tick consumes its result;
+                // restoration data must already be available at that point.
+                m_PrePlayUndoStack = m_UndoStack;
+                m_PrePlaySavedFingerprint = m_SceneSavedFingerprint;
+                m_PrePlaySelection = m_SelectedEntityIDs;
+                m_PrePlaySelectedEntityID = m_SelectedEntityID;
+                std::string error;
+                if (!m_PlaySession.Begin(scene, m_SceneFilePath, error)) return error;
+                m_UndoStack.Clear();
+            }
+            break;
+        case 1: ReloadAllSceneAnimators(scene); break;
+        case 2: m_Engine->GetMipsRuntime().OnPlayStarted(scene); break;
+        case 3: m_Engine->GetAudioSystem().BeginPlay(scene, m_Engine->GetProjectPath()); break;
+        case 4: m_Engine->GetPhysicsWorld().BeginPlay(scene); break;
+    }
+    CheckPreparationCancelled();
+    return {};
+}
+
+void EditorApp::TickPendingPlaySetup() {
+    if (!IsPreparingPlay()) return;
+    const bool player = m_Engine->IsPlayerMode();
+    // Transferring the context is only legal between complete ImGui frames.
+    if (!player && ImGui::GetCurrentContext() && ImGui::GetCurrentContext()->WithinFrameScope) return;
+    if (!player && m_PlayPreparation) {
+        if (!m_PlayPreparation->showLoading && m_PlayCursorLocked) {
+            auto* gameWindow = Input::GetGameInputWindow();
+            if (!gameWindow || !glfwGetWindowAttrib(gameWindow, GLFW_FOCUSED) ||
+                glfwGetKey(gameWindow, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+                m_PlayCursorLocked = false;
+                SetMouseCaptureUI(false);
+                Input::SetCursorCaptureAllowed(false);
+            }
+        }
+        if (m_PlayPreparation->showLoading && (m_PlayPreparation->loading.CancelRequested() ||
+            glfwGetKey(m_PlayPreparation->window, GLFW_KEY_ESCAPE) == GLFW_PRESS))
+            m_PlayPreparation->RequestCancel();
+        if (m_PlayPreparation->cancelled.load(std::memory_order_relaxed) && !IsPlayPreparationRunning()) {
+            StopPlayMode();
+            return;
+        }
+    }
+    try {
+        std::string error;
+        if (player) {
+            error = RunPlaySetupStage(m_PlaySetupStep);
+        } else if (IsPlayPreparationRunning()) {
+            auto& preparation = *m_PlayPreparation;
+            if (preparation.work.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) return;
+            // get() establishes visibility of every scene/runtime write.
+            // The worker has detached the context before its future completes.
+            glfwMakeContextCurrent(preparation.window);
+            Input::SetPreparationInProgress(false);
+            error = preparation.work.get();
+            // Loading-time clicks/shortcuts must not replay into the Game View
+            // or alter the scene when regular frames resume.
+            ImGui::GetIO().ClearInputKeys();
+            ImGui::GetIO().ClearInputMouse();
+            ImGui::GetCurrentContext()->InputEventsQueue.clear();
+        } else {
+            if (!m_PlaySetupPresented) return;
+            m_PlaySetupPresented = false;
+            auto* window = m_PlayPreparation->window;
+            const int stage = m_PlaySetupStep;
+            m_PlayPreparation->loading.SetStage(stage);
+            Input::SetPreparationInProgress(true);
+            glfwMakeContextCurrent(nullptr);
+            auto* preparation = m_PlayPreparation.get();
+            m_PlayPreparation->work = std::async(std::launch::async, [this, window, stage, preparation] {
+                struct Context {
+                    Context(GLFWwindow* window) { glfwMakeContextCurrent(window); }
+                    ~Context() { glfwMakeContextCurrent(nullptr); }
+                } context(window);
+                ScopedPreparationCancellation cancellation(preparation->cancelled);
+                return RunPlaySetupStage(stage);
+            });
+            return;
+        }
+        if (m_PlayPreparation && m_PlayPreparation->cancelled.load(std::memory_order_relaxed)) {
+            StopPlayMode();
+            return;
+        }
+        if (!error.empty()) {
+            m_PlaySetupError = error;
+            MIPSYNC_CONSOLE_ERROR("Cannot start Play: {}", error);
+            StopPlayMode();
+            return;
+        }
+        m_PlaySetupPresented = false;
+        switch (m_PlaySetupStep) {
+        case 1:
+            ResetShotCameraState();
+            m_Engine->GetPSyncState().clock.Reset();
+            m_Engine->GetPSyncState().cadence.Reset();
+            m_GameViewFrameValid = false;
+            m_GamePointerPressed = m_GamePointerReleased = false;
+            break;
+        case 4:
+            if (m_PlayPreparation) m_PlayPreparation->loading.Stop();
+            m_PlaySetupStep = -1;
+            m_IsPlaying = true;
+            m_IsPaused = false;
+            m_StepOneFrame = false;
+            if ((!m_PlayPreparation || m_PlayPreparation->showLoading) &&
+                ImGui::GetCurrentContext() && m_Preferences.Enabled("focusGameOnPlay"))
+                ImGui::SetWindowFocus("Game View");
+            return;
+        }
+        ++m_PlaySetupStep;
+        if (m_PlayPreparation) m_PlayPreparation->loading.SetStage(m_PlaySetupStep);
+    } catch (const std::exception& error) {
+        m_PlaySetupError = error.what();
+        if (!player) {
+            glfwMakeContextCurrent(m_Engine->GetWindow().GetNativeWindow());
+            Input::SetPreparationInProgress(false);
+            ImGui::GetIO().ClearInputKeys();
+            ImGui::GetIO().ClearInputMouse();
+            ImGui::GetCurrentContext()->InputEventsQueue.clear();
+        }
+        if (!m_PlayPreparation || !m_PlayPreparation->cancelled.load(std::memory_order_relaxed))
+            MIPSYNC_CONSOLE_ERROR("Cannot start Play: {}", error.what());
+        StopPlayMode();
+    }
+}
+
+void EditorApp::StartPlayMode(bool saveConfirmed) {
+    if (m_IsPlaying || IsPreparingPlay())
+        return;
+    if (!saveConfirmed && !m_Engine->IsPlayerMode() &&
+        RequestSceneSaveConfirmation(SceneAction::Play))
+        return;
+    m_UndoStack.CancelFrame();
+    m_PlaySetupError.clear();
+    m_Engine->ClearCliSteps();
+    m_PlaySetupStep = 0;
+    m_PlaySetupPresented = false;
+    Input::EndGameFrame();
+    Input::SetGameInputEnabled(false);
+    if (!m_PlaySession.Transitioned()) m_PlayCursorLocked = false;
+    if (!m_Engine->IsPlayerMode()) {
+        Input::SetCursorCaptureAllowed(m_PlayCursorLocked);
+        Input::SetCursorLocked(m_PlayCursorLocked);
+        SetMouseCaptureUI(m_PlayCursorLocked);
+    }
+    if (!m_Engine->IsPlayerMode()) {
+        m_PlayPreparation = std::make_unique<EditorPlayPreparation>();
+        m_PlayPreparation->window = m_Engine->GetWindow().GetNativeWindow();
+        // Runtime scene transitions retain the original Play session. Keep
+        // their background preparation, but never create editor progress UI.
+        m_PlayPreparation->showLoading = !m_PlaySession.Transitioned();
+        m_PlaySetupPresented = !m_PlayPreparation->showLoading;
+        if (m_PlayPreparation->showLoading && !m_PlayPreparation->loading.Start(m_PlayPreparation->window))
+            MIPSYNC_WARN("Play loading helper unavailable; using the editor progress dialog");
+    }
+    // Standalone players have no editor loading UI and keep immediate startup.
+    if (m_Engine->IsPlayerMode())
+        while (IsPreparingPlay()) TickPendingPlaySetup();
+}
+
+void EditorApp::DrawPlayLoading() {
+    constexpr const char* popup = "Hold on...###PlayLoading";
+    if (!IsPreparingPlay()) {
+        if (ImGui::IsPopupOpen(popup)) {
+            ImGui::ClosePopupToLevel(0, true);
+            if (m_IsPlaying && m_Preferences.Enabled("focusGameOnPlay"))
+                ImGui::SetWindowFocus("Game View");
+        }
+        return;
+    }
+    if (m_PlayPreparation && (!m_PlayPreparation->showLoading || m_PlayPreparation->loading.Running())) {
+        if (ImGui::IsPopupOpen(popup)) ImGui::ClosePopupToLevel(0, true);
+        m_PlaySetupPresented = true;
+        return;
+    }
+    if (!ImGui::IsPopupOpen(popup)) ImGui::OpenPopup(popup);
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowViewport(viewport->ID);
+    ImGui::SetNextWindowPos(viewport->GetWorkCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(std::min(520.0f * ImGui::GetFontSize() / 13.0f,
+                                          std::max(160.0f, viewport->WorkSize.x - 32.0f)), 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
+    if (ImGui::BeginPopupModal(popup, nullptr, ImGuiWindowFlags_AlwaysAutoResize |
+                              ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings)) {
+        static const char* stages[] = {"Preserving scene", "Preparing animations",
+            "Initializing Mips# scripts", "Preparing audio", "Preparing physics"};
+        ImGui::ProgressBar(static_cast<float>(m_PlaySetupStep) / 5.0f, ImVec2(-FLT_MIN, 14.0f), "");
+        ImGui::Spacing();
+        const bool cancelling = m_PlayPreparation && m_PlayPreparation->cancelled.load(std::memory_order_relaxed);
+        ImGui::TextUnformatted(cancelling ? "Cancelling..." : stages[m_PlaySetupStep]);
+        ImGui::Spacing();
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - 110.0f));
+        ImGui::BeginDisabled(cancelling);
+        if (EditorTheme::AeroButton("Cancel", ImVec2(96.0f, 0.0f), AeroButtonKind::Secondary) && m_PlayPreparation)
+            m_PlayPreparation->RequestCancel();
+        ImGui::EndDisabled();
+        m_PlaySetupPresented = true;
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleVar();
 }
 
 void AddUniqueEdge(std::vector<std::pair<uint32_t, uint32_t>>& edges,
@@ -1362,10 +1591,10 @@ bool InspectorDragInt(const char* label, int* value, float speed = 1.0f,
 }
 
 bool InspectorSliderFloat(const char* label, float* value, float min, float max,
-                          const char* format = "%.3f") {
+                          const char* format = "%.3f", bool forceMixed = false) {
     return DrawInspectorPropertyRow(label, [&] {
-        const bool mixed = InspectorValuesMixed(value);
-        const bool changed = ImGui::SliderFloat("##value", value, min, max,
+        const bool mixed = forceMixed || InspectorValuesMixed(value);
+        const bool changed = EditorTheme::SliderFloat("##value", value, min, max,
                                                 mixed ? "-" : format);
         if (changed)
             PropagateInspectorValues(value);
@@ -1373,10 +1602,10 @@ bool InspectorSliderFloat(const char* label, float* value, float min, float max,
     });
 }
 
-bool InspectorSliderInt(const char* label, int* value, int min, int max) {
+bool InspectorSliderInt(const char* label, int* value, int min, int max, bool forceMixed = false) {
     return DrawInspectorPropertyRow(label, [&] {
-        const bool mixed = InspectorValuesMixed(value);
-        const bool changed = ImGui::SliderInt("##value", value, min, max,
+        const bool mixed = forceMixed || InspectorValuesMixed(value);
+        const bool changed = EditorTheme::SliderInt("##value", value, min, max,
                                               mixed ? "-" : "%d");
         if (changed)
             PropagateInspectorValues(value);
@@ -1416,10 +1645,10 @@ bool InspectorCombo(const char* label, int* value, const char* const items[], in
         const char* preview = mixed ? "-" :
             ((*value >= 0 && *value < count) ? items[*value] : "");
         bool changed = false;
-        if (ImGui::BeginCombo("##value", preview)) {
+        if (EditorDropdown::BeginCombo("##value", preview)) {
             for (int index = 0; index < count; ++index) {
                 const bool selected = !mixed && *value == index;
-                if (ImGui::Selectable(items[index], selected)) {
+                if (EditorDropdown::Selectable(items[index], selected)) {
                     *value = index;
                     PropagateInspectorValues(value);
                     changed = true;
@@ -1427,7 +1656,7 @@ bool InspectorCombo(const char* label, int* value, const char* const items[], in
                 if (selected)
                     ImGui::SetItemDefaultFocus();
             }
-            ImGui::EndCombo();
+            EditorDropdown::EndCombo();
         }
         return changed;
     });
@@ -1495,7 +1724,7 @@ bool UnityColorField(const char* id, float* value, int components) {
                 value[3] = edited[3];
             changed = true;
         }
-        ImGui::EndPopup();
+        EditorMenu::EndPopup();
     }
     return changed;
 }
@@ -1598,40 +1827,14 @@ std::shared_ptr<Texture> GetInspectorObjectReferenceIcon() {
     return icon;
 }
 
-bool DrawInspectorObjectReferenceButton(const char* display, float width = -1.0f) {
-    const bool pressed = ImGui::Button("##object_reference", ImVec2(width, 0.0f));
-    const ImVec2 min = ImGui::GetItemRectMin();
-    const ImVec2 max = ImGui::GetItemRectMax();
-    ImGui::RenderTextClipped(ImVec2(min.x + 5.0f, min.y),
-                             ImVec2(max.x - 20.0f, max.y),
-                             display, nullptr, nullptr, ImVec2(0.0f, 0.5f));
-
-    ImDrawList* drawList = ImGui::GetWindowDrawList();
-    const ImVec2 center(std::floor(max.x - 10.0f) + 0.5f,
-                        std::floor((min.y + max.y) * 0.5f) + 0.5f);
-    const ImU32 color = ImGui::GetColorU32(EditorTheme::TextSecondary);
-    if (const auto icon = GetInspectorObjectReferenceIcon(); icon && icon->GetID() != 0) {
-        constexpr float iconSize = 10.0f;
-        const ImVec2 iconMin(std::floor(center.x - iconSize * 0.5f),
-                             std::floor(center.y - iconSize * 0.5f));
-        const ImVec2 iconMax(iconMin.x + iconSize, iconMin.y + iconSize);
-        // The supplied PNG is 258x324 with the actual 237x237 mark at
-        // x=10..246, y=64..300. Keep the original file intact and crop only
-        // through UVs. Texture loads vertically flipped for OpenGL, hence V is
-        // reversed here.
-        constexpr ImVec2 uvTopLeft(10.0f / 258.0f, 1.0f - 64.0f / 324.0f);
-        constexpr ImVec2 uvBottomRight(247.0f / 258.0f, 1.0f - 301.0f / 324.0f);
-        drawList->AddImage(static_cast<ImTextureID>(static_cast<intptr_t>(icon->GetID())),
-                           iconMin, iconMax, uvTopLeft, uvBottomRight, color);
-    } else {
-        // Keep a functional fallback for incomplete development deployments.
-        drawList->AddCircle(center, 4.0f, color, 12, 1.0f);
-        drawList->AddLine(ImVec2(center.x - 3.0f, center.y),
-                          ImVec2(center.x + 3.0f, center.y), color, 1.0f);
-        drawList->AddLine(ImVec2(center.x, center.y - 3.0f),
-                          ImVec2(center.x, center.y + 3.0f), color, 1.0f);
-    }
-    return pressed;
+EditorSurface::ReferenceAction DrawInspectorObjectReferenceButton(const char* display,
+                                                                  bool hasReference,
+                                                                  float width = -1.0f) {
+    const auto icon = GetInspectorObjectReferenceIcon();
+    const ImTextureID texture = icon
+        ? static_cast<ImTextureID>(static_cast<intptr_t>(icon->GetID())) : 0;
+    return EditorSurface::ObjectReferenceButton(display, hasReference, width, texture,
+                                                ImGui::GetColorU32(EditorTheme::TextSecondary));
 }
 
 struct InspectorAssetPickerState {
@@ -1792,7 +1995,7 @@ bool DrawInspectorAssetPickerPopup(EditorApp* editor, std::string& selectedPath)
         ImGui::PushID(entry.projectRelPath.c_str());
         const ImVec2 cellMin = ImGui::GetCursorScreenPos();
         const bool selected = s_InspectorAssetPicker.selected == entry.projectRelPath;
-        const bool activated = ImGui::Selectable(
+        const bool activated = EditorDropdown::Selectable(
             "##asset", selected, ImGuiSelectableFlags_AllowDoubleClick,
             ImVec2(cellWidth, cellHeight));
         if (activated)
@@ -1830,7 +2033,7 @@ bool DrawInspectorAssetPickerPopup(EditorApp* editor, std::string& selectedPath)
             column = 0;
     }
     ImGui::EndChild();
-    ImGui::EndPopup();
+    EditorMenu::EndPopup();
     return changed;
 }
 
@@ -1859,7 +2062,7 @@ bool DrawInspectorSceneObjectPickerPopup(Scene& scene, const std::string& expect
         if (!search.empty() && lower.find(search) == std::string::npos)
             return;
         ImGui::PushID(static_cast<int>(id));
-        const bool activated = ImGui::Selectable(
+        const bool activated = EditorDropdown::Selectable(
             name.c_str(), s_InspectorObjectCandidate == id,
             ImGuiSelectableFlags_AllowDoubleClick);
         if (activated)
@@ -1879,6 +2082,7 @@ bool DrawInspectorSceneObjectPickerPopup(Scene& scene, const std::string& expect
             continue;
         if (expectedType == "Camera" && !entity->HasComponent<CameraComponent>())
             continue;
+        if (expectedType == "AudioSource" && !entity->HasComponent<AudioSourceComponent>()) continue;
         std::string name = "Entity #" + std::to_string(entity->GetID());
         if (const auto* tag = entity->GetComponent<TagComponent>())
             name = tag->tag;
@@ -1891,7 +2095,7 @@ bool DrawInspectorSceneObjectPickerPopup(Scene& scene, const std::string& expect
     } else {
         ImGui::TextUnformatted("None");
     }
-    ImGui::EndPopup();
+    EditorMenu::EndPopup();
     return changed;
 }
 
@@ -1912,8 +2116,8 @@ bool DrawAssetReferenceField(EditorApp* editor, const char* label, AssetKind exp
         ImGui::PushStyleColor(ImGuiCol_Button, EditorTheme::InputBg);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, EditorTheme::BtnFaceLight);
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, EditorTheme::BtnFace);
-        const bool openPicker =
-            DrawInspectorObjectReferenceButton(display.c_str(), fieldWidth);
+        const auto action =
+            DrawInspectorObjectReferenceButton(display.c_str(), !mixed && !path.empty(), fieldWidth);
         ImGui::PopStyleColor(3);
 
         if (ImGui::BeginDragDropTarget()) {
@@ -1937,13 +2141,15 @@ bool DrawAssetReferenceField(EditorApp* editor, const char* label, AssetKind exp
 
         ImGui::SameLine(0.0f, 4.0f);
         ImGui::BeginDisabled(path.empty() && !mixed);
-        if (ImGui::Button("x", ImVec2(clearWidth, 0.0f))) {
+        if (EditorSurface::ClearButton("##clear_reference", clearWidth)) {
             path.clear();
             changed = true;
         }
         ImGui::EndDisabled();
 
-        if (openPicker && editor) {
+        if (action == EditorSurface::ReferenceAction::Select && editor)
+            editor->QueueReferenceSelection(path);
+        if (action == EditorSurface::ReferenceAction::Pick && editor) {
             RefreshInspectorAssetPicker(expectedKind, mixed ? std::string{} : path);
             ImGui::OpenPopup("##asset_picker");
         }
@@ -1973,18 +2179,91 @@ void DrawInspectorCubeIcon(ImDrawList* drawList, ImVec2 center, float size, ImU3
 }
 
 void EditorApp::StopPlayMode() {
-    if (!m_IsPlaying)
+    m_Engine->ClearCliSteps();
+    if (!m_IsPlaying && !IsPreparingPlay())
         return;
-    m_PendingPhysicsBeginPlay = false;
-    m_Engine->GetMipsRuntime().OnPlayStopped(m_Engine->GetScene());
+    if (m_PlayPreparation) {
+        m_PlayPreparation->RequestCancel();
+        m_PlayPreparation->FinishWork();
+    }
+    m_PlaySetupStep = -1;
+    m_PlaySetupPresented = false;
+    if (m_Engine->GetMipsRuntime().IsPlaying())
+        m_Engine->GetMipsRuntime().OnPlayStopped(m_Engine->GetScene());
     m_Engine->GetAudioSystem().EndPlay();
     m_Engine->GetPhysicsWorld().EndPlay();
+    m_Engine->CancelPendingSceneLoad();
+    if (m_PlaySession.Active()) {
+        std::string error;
+        if (m_UndoStack.IsFrameActive() && !m_UndoStack.EndFrame(m_Engine->GetScene(), 0, error))
+            MIPSYNC_WARN("Play edit recording failed: {}", error);
+        AssetManager::Get().Clear();
+        if (m_PlaySession.Restore(m_Engine->GetScene(), error)) {
+            m_SceneFilePath = m_PlaySession.OriginalPath();
+            const EditorUndoStack playHistory = std::move(m_UndoStack);
+            m_UndoStack = m_PrePlayUndoStack;
+            if (!m_UndoStack.AppendAssetHistory(playHistory, m_Engine->GetScene(), error))
+                MIPSYNC_WARN("Could not retain Play asset history: {}", error);
+            m_SceneSavedFingerprint = m_PrePlaySavedFingerprint;
+            m_SelectedEntityIDs = m_PrePlaySelection;
+            m_SelectedEntityID = m_PrePlaySelectedEntityID;
+            m_HierarchySelectionAnchor = m_SelectedEntityID;
+            m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+            SyncAnimatorWindowToSelectedEntity();
+            PersistEditorLastScene();
+            ++m_HistoryRevision;
+            AssetThumbnail::Get().Clear();
+        } else {
+            MIPSYNC_CONSOLE_ERROR("Could not restore the pre-Play scene: {}", error);
+        }
+    }
+    m_PlaySession.Reset();
+    m_PrePlayUndoStack.Clear();
+    m_PrePlaySelection.clear();
+    m_PrePlaySavedFingerprint.clear();
+    m_Engine->GetPSyncState().clock.Reset();
+    m_Engine->GetPSyncState().cadence.Reset();
+    m_GameViewFrameValid = false;
+    m_GamePointerPressed = m_GamePointerReleased = false;
+    Input::EndGameFrame();
     m_IsPlaying = false;
     m_IsPaused = false;
     m_StepOneFrame = false;
     m_PlayCursorLocked = false;
     ResetShotCameraState();
     Input::SetCursorLocked(false);
+    SetMouseCaptureUI(false);
+    UpdateSceneDirtyState();
+    m_PlayPreparation.reset();
+}
+
+bool EditorApp::CaptureGameView(const std::string& file, std::string& error) {
+    if (!m_GameViewFrameValid || !m_GameViewFBO.GetColorAttachment()) {
+        error = "Game View has no rendered frame yet."; return false;
+    }
+    const int width=m_GameViewFBO.GetWidth(),height=m_GameViewFBO.GetHeight();
+    std::vector<unsigned char> pixels(static_cast<size_t>(width)*height*4);
+    GLint readBinding=0,drawBinding=0,alignment=0,viewport[4];
+    // The bundled minimal GL loader omits these standard query constants.
+    constexpr GLenum readFramebufferBinding=0x8CAA,drawFramebufferBinding=0x8CA6;
+    glGetIntegerv(readFramebufferBinding,&readBinding);glGetIntegerv(drawFramebufferBinding,&drawBinding);
+    glGetIntegerv(GL_PACK_ALIGNMENT,&alignment);glGetIntegerv(GL_VIEWPORT,viewport);
+    m_GameViewFBO.Bind();glPixelStorei(GL_PACK_ALIGNMENT,1);
+    glReadPixels(0,0,width,height,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,readBinding);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,drawBinding);
+    glPixelStorei(GL_PACK_ALIGNMENT,alignment);glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);
+    const size_t stride=static_cast<size_t>(width)*4;
+    for(int y=0;y<height/2;++y)for(size_t x=0;x<stride;++x)std::swap(pixels[y*stride+x],pixels[(height-1-y)*stride+x]);
+    std::error_code ec;std::filesystem::create_directories(PathUtf8::FromString(file).parent_path(),ec);
+    if(ec){error=ec.message();return false;}
+    // Use a filesystem path so Windows output filenames remain UTF-8 safe.
+    struct CaptureBuffer {std::vector<unsigned char> bytes;} buffer;
+    auto callback=[](void* context,void* data,int size){auto& b=*static_cast<CaptureBuffer*>(context);auto* first=static_cast<unsigned char*>(data);b.bytes.insert(b.bytes.end(),first,first+size);};
+    if(!stbi_write_png_to_func(callback,&buffer,width,height,4,pixels.data(),width*4)){error="PNG encoding failed.";return false;}
+    std::ofstream output(PathUtf8::FromString(file),std::ios::binary);
+    output.write(reinterpret_cast<const char*>(buffer.bytes.data()),static_cast<std::streamsize>(buffer.bytes.size()));
+    if(!output){error="Cannot write PNG output.";return false;}
+    return true;
 }
 
 void EditorApp::TickAutoPlayOnStart() {
@@ -1995,8 +2274,13 @@ void EditorApp::TickAutoPlayOnStart() {
 }
 
 void EditorApp::BeginFrame() {
+    std::string historyError;
+    if (!m_IsPlaying && !IsPreparingPlay() && !m_Engine->IsPlayerMode()) {
+        if (!m_UndoStack.BeginFrame(m_Engine->GetScene(), historyError))
+            MIPSYNC_WARN("Undo snapshot failed: {}", historyError);
+    } else m_UndoStack.CancelFrame();
 
-    if (m_CommandHost)
+    if (m_CommandHost && !IsPreparingPlay())
         m_CommandHost->Pump();
 
     const ImVec4 clear = EditorTheme::GetClearColor();
@@ -2011,6 +2295,20 @@ void EditorApp::BeginFrame() {
 }
 
 void EditorApp::EndFrame() {
+    std::string historyError;
+    if (!m_Engine->IsPlayerMode()) {
+        if (!ImGui::GetIO().MouseDown[ImGuiMouseButton_Left]) m_PointerEditGesture = 0;
+        const uint64_t gesture = m_PointerEditGesture ? m_PointerEditGesture : ImGuizmo::IsUsing()
+            ? (uint64_t(1) << 32) | m_SelectedEntityID
+            : ImGui::GetCurrentContext()->ActiveId;
+        bool sceneChanged = false;
+        if (!m_UndoStack.EndFrame(m_Engine->GetScene(), gesture, historyError, &sceneChanged))
+            MIPSYNC_WARN("Undo recording failed: {}", historyError);
+        if (m_IsPlaying && sceneChanged) {
+            m_Engine->GetMipsRuntime().RefreshPlayInstances(m_Engine->GetScene());
+            m_Engine->GetPhysicsWorld().RefreshBodies(m_Engine->GetScene());
+        }
+    } else m_UndoStack.CancelFrame();
     ImGuiIO& io = ImGui::GetIO();
     // ImGui_ImplGlfw_NewFrame has already populated DisplaySize in window
     // coordinates and DisplayFramebufferScale in physical pixels.  Window::
@@ -2031,20 +2329,34 @@ void EditorApp::EndFrame() {
 }
 
 void EditorApp::OnImGuiRender() {
-    if (m_RequestQuitAfterSaveDialog) {
-        m_RequestQuitAfterSaveDialog = false;
-        if (m_RequestRestartAfterSaveDialog) {
-            m_RequestRestartAfterSaveDialog = false;
-            TriggerRestart();
-        } else {
-            m_Engine->Quit();
-        }
-    }
+    ExecuteConfirmedSceneAction();
 
     if (m_Engine->IsPlayerMode()) {
         DrawPlayerModeUI();
         UpdatePlayInputState();
         return;
+    }
+
+    // Record only editor changes during Play, after simulation has completed.
+    if (m_IsPlaying && !m_UndoStack.IsFrameActive()) {
+        std::string error;
+        if (!m_UndoStack.BeginFrame(m_Engine->GetScene(), error))
+            MIPSYNC_WARN("Play edit snapshot failed: {}", error);
+    }
+
+    // Inspector controls hold references into the selection. Never change that
+    // selection while those controls are still being drawn.
+    const uint32_t referenceEntity = std::exchange(m_PendingReferenceEntityID, 0);
+    const std::string referenceAsset = std::move(m_PendingReferenceAssetPath);
+    m_PendingReferenceAssetPath.clear();
+    if (referenceEntity && m_Engine->GetScene().FindEntity(referenceEntity)) {
+        SelectSingleEntity(referenceEntity);
+        FocusDockedWindow("Scene Hierarchy");
+    } else if (!referenceAsset.empty() && m_AssetBrowser &&
+               m_AssetBrowser->RevealAndSelectAsset(referenceAsset)) {
+        ClearEntitySelection();
+        m_ForceProjectTab = true;
+        FocusDockedWindow("Project");
     }
 
     if (m_PendingDockLayoutReset) {
@@ -2053,10 +2365,13 @@ void EditorApp::OnImGuiRender() {
     }
 
     UpdateSceneDirtyState();
-    DrawSaveOnExitModal();
+    DrawSceneSaveConfirmation();
     DrawFontRestartModal();
 
+    ImGui::BeginDisabled(IsPreparingPlay());
     SetupDockspace();
+    const bool runtimeTransition = IsPreparingPlay() && m_PlayPreparation && !m_PlayPreparation->showLoading;
+    m_GameViewMaximized = m_GameViewSettings.IsMaximized(m_IsPlaying || runtimeTransition, m_IsPaused);
 
     ApplyLoadedTabIdsToNodes();
 
@@ -2067,9 +2382,17 @@ void EditorApp::OnImGuiRender() {
     DrawProjectPanel();
     DrawProModelerWindow();
 
+    if (m_GameViewMaximized) {
+        DrawGameViewPanel(true);
+        m_SceneViewHovered = false;
+        m_SceneViewFocused = false;
+    }
+    m_GameViewWasMaximized = m_GameViewMaximized;
+
     if (m_BuildSettings)
         m_BuildSettings->Draw();
 
+    DrawPreferencesWindow();
     DrawBuildToast();
 
     UpdatePlayInputState();
@@ -2105,9 +2428,9 @@ void EditorApp::OnImGuiRender() {
 
     EnsureAnimatorControllerDocked();
 
-    DrawStraightDockTabOverlines();
-
     ImGui::End();
+    ImGui::EndDisabled();
+    DrawPlayLoading();
 }
 
 void EditorApp::SetupDockspace() {
@@ -2145,73 +2468,94 @@ void EditorApp::SetupDockspace() {
     }
 
     if (ImGui::BeginMenuBar()) {
-        if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Save Scene", "Ctrl+S")) SaveScene();
-            if (ImGui::MenuItem("Load Scene", "Ctrl+O")) LoadScene();
+        ImGuiWindow* menuWindow = ImGui::GetCurrentWindow();
+        const ImRect menuRect = menuWindow->MenuBarRect();
+        std::vector<float> menuDividers;
+        ImGui::PushStyleVar(ImGuiStyleVar_MenuItemRounding, 0.0f);
+        auto beginBarMenu = [&](const char* label) {
+            const float spacing = ImGui::GetStyle().ItemSpacing.x;
+            menuDividers.push_back(ImGui::GetCursorScreenPos().x +
+                                   ImGui::CalcTextSize(label).x + spacing * 1.5f);
+            return std::strcmp(label, "Preferences") == 0
+                ? EditorMenu::BeginHoverMenu(label) : EditorMenu::BeginMenu(label);
+        };
+        if (beginBarMenu("File")) {
+            if (EditorMenu::MenuItem("Save Scene", "Ctrl+S")) SaveScene();
+            if (EditorMenu::MenuItem("Load Scene", "Ctrl+O")) LoadSceneFromPath(m_SceneFilePath);
             ImGui::Separator();
-            if (ImGui::MenuItem("Exit")) m_Engine->Quit();
-            ImGui::EndMenu();
+            if (EditorMenu::MenuItem("Exit") && !OnWindowCloseRequested()) m_Engine->Quit();
+            EditorMenu::EndMenu();
         }
 
-        if (ImGui::BeginMenu("Build")) {
-            if (ImGui::MenuItem("Build Settings...", "Ctrl+Shift+B")) OpenBuildSettings();
+        if (beginBarMenu("Build")) {
+            if (EditorMenu::MenuItem("Build Settings...", "Ctrl+Shift+B")) OpenBuildSettings();
             const bool canBuild = m_BuildSettings && !m_BuildSettings->IsBuildInProgress();
-            if (ImGui::MenuItem("Build PS1", nullptr, false, canBuild)) {
+            if (EditorMenu::MenuItem("Build PS1", nullptr, false, canBuild)) {
                 std::string msg;
                 const bool ok = m_BuildSettings->RunBuild(msg);
                 if (!ok)
                     TriggerBuildToast(msg.empty() ? "Could not start build." : msg, false);
             }
-            if (ImGui::MenuItem("Build PS1 && Run in Emulator", nullptr, false, canBuild)) {
+            if (EditorMenu::MenuItem("Build PS1 && Run in Emulator", nullptr, false, canBuild)) {
                 std::string msg;
                 const bool ok = m_BuildSettings->RunBuildAndRun(msg);
                 if (!ok)
                     TriggerBuildToast(msg.empty() ? "Could not start build." : msg, false);
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Build PC Native", nullptr, false, canBuild)) {
+            if (EditorMenu::MenuItem("Build PC Native", nullptr, false, canBuild)) {
                 std::string msg;
                 const bool ok = m_BuildSettings->RunPcNativeBuild(msg);
                 if (!ok)
                     TriggerBuildToast(msg.empty() ? "Could not start build." : msg, false);
             }
-            ImGui::EndMenu();
+            EditorMenu::EndMenu();
         }
 
-        if (ImGui::BeginMenu("Edit")) {
+        if (beginBarMenu("Edit")) {
             std::string err;
-            if (ImGui::MenuItem("Undo", "Ctrl+Z", false, m_UndoStack.CanUndo())) {
+            if (EditorMenu::MenuItem("Undo", "Ctrl+Z", false, m_UndoStack.CanUndo())) {
                 if (m_UndoStack.Undo(m_Engine->GetScene(), err))
                     AfterSceneRestoredFromHistory();
                 else if (!err.empty())
                     MIPSYNC_WARN("Undo failed: {}", err);
             }
-            if (ImGui::MenuItem("Redo", "Ctrl+Y", false, m_UndoStack.CanRedo())) {
+            if (EditorMenu::MenuItem("Redo", "Ctrl+Y", false, m_UndoStack.CanRedo())) {
                 if (m_UndoStack.Redo(m_Engine->GetScene(), err))
                     AfterSceneRestoredFromHistory();
                 else if (!err.empty())
                     MIPSYNC_WARN("Redo failed: {}", err);
             }
-            ImGui::EndMenu();
+            EditorMenu::EndMenu();
         }
 
-        if (ImGui::BeginMenu("Preferences")) {
+        if (beginBarMenu("Preferences")) {
             DrawPreferencesMenu();
-            ImGui::EndMenu();
+            EditorMenu::EndMenu();
         }
 
-        if (ImGui::BeginMenu("Window")) {
-            if (ImGui::MenuItem("Animation")) {
+        if (beginBarMenu("Window")) {
+            if (EditorMenu::MenuItem("Animation")) {
                 OpenAnimationWindow();
             }
             DrawLayoutMenu();
-            ImGui::EndMenu();
+            EditorMenu::EndMenu();
         }
 
+        for (float x : menuDividers) {
+            x = std::floor(x) + 0.5f;
+            menuWindow->DrawList->AddLine(ImVec2(x, menuRect.Min.y),
+                                         ImVec2(x, menuRect.Max.y),
+                                         ImGui::ColorConvertFloat4ToU32(EditorTheme::Border));
+        }
+        ImGui::PopStyleVar();
         ImGui::EndMenuBar();
     }
 
     DrawMenuBarPlayButton();
+
+    m_EditorContentMin = ImGui::GetCursorScreenPos();
+    m_EditorContentSize = ImGui::GetContentRegionAvail();
 
     ImGuiIO& io = ImGui::GetIO();
     if (io.ConfigFlags & ImGuiConfigFlags_DockingEnable) {
@@ -2231,17 +2575,17 @@ void EditorApp::SetupDockspace() {
 }
 
 void EditorApp::DrawLayoutMenu() {
-    if (ImGui::BeginMenu("Layout")) {
+    if (EditorMenu::BeginMenu("Layout")) {
         const bool isDefault = m_DockLayoutPreset == DockLayoutPreset::ClassicEditor;
         const bool isSceneTop = m_DockLayoutPreset == DockLayoutPreset::SceneTopGameBottom;
 
-        if (ImGui::MenuItem("Scene Top / Game Bottom", nullptr, isSceneTop)) {
+        if (EditorMenu::MenuItem("Scene Top / Game Bottom", nullptr, isSceneTop)) {
             if (!isSceneTop) {
                 m_DockLayoutPreset = DockLayoutPreset::SceneTopGameBottom;
                 RequestDockLayoutApply();
             }
         }
-        if (ImGui::MenuItem("Classic Editor", nullptr, isDefault)) {
+        if (EditorMenu::MenuItem("Classic Editor", nullptr, isDefault)) {
             if (!isDefault) {
                 m_DockLayoutPreset = DockLayoutPreset::ClassicEditor;
                 RequestDockLayoutApply();
@@ -2249,11 +2593,11 @@ void EditorApp::DrawLayoutMenu() {
         }
 
         ImGui::Separator();
-        if (ImGui::MenuItem("Reset Layout")) {
+        if (EditorMenu::MenuItem("Reset Layout")) {
             m_PendingDockLayoutReset = true;
         }
 
-        ImGui::EndMenu();
+        EditorMenu::EndMenu();
     }
 }
 
@@ -2646,14 +2990,17 @@ void EditorApp::SaveScene() {
 
 bool EditorApp::CommandSaveScene(std::string& outError) {
     if (m_IsPlaying) {
-        m_Engine->GetMipsRuntime().OnPlayStopped(m_Engine->GetScene());
-        m_Engine->GetAudioSystem().EndPlay();
-        m_Engine->GetPhysicsWorld().EndPlay();
-        m_IsPlaying = false;
-        m_IsPaused = false;
-        m_PlayCursorLocked = false;
-        ResetShotCameraState();
-        Input::SetCursorLocked(false);
+        // Save the original edit scene while runtime edits remain temporary.
+        if (!m_PlaySession.Active()) {
+            outError = "No edit scene is available to save.";
+            return false;
+        }
+        Scene original;
+        if (!m_PlaySession.Restore(original, outError) ||
+            !SceneIO::SaveToFile(original, m_PlaySession.OriginalPath(), outError)) return false;
+        if (!SceneIO::SerializeSceneFingerprint(original, m_PrePlaySavedFingerprint, outError)) return false;
+        m_SceneDirty = false;
+        return true;
     }
 
     if (SceneIO::SaveToFile(m_Engine->GetScene(), m_SceneFilePath, outError)) {
@@ -2695,11 +3042,52 @@ void EditorApp::OpenBuildSettings() {
 void EditorApp::LoadSceneFromPath(const std::string& absolutePath, bool restartPlayIfWasActive) {
     if (absolutePath.empty())
         return;
-    m_SceneFilePath = absolutePath;
-    LoadScene(restartPlayIfWasActive);
+    if (!m_IsPlaying && !m_Engine->IsPlayerMode() &&
+        RequestSceneSaveConfirmation(SceneAction::OpenScene, absolutePath, restartPlayIfWasActive))
+        return;
+    LoadSceneFromPathUnchecked(absolutePath, restartPlayIfWasActive);
 }
 
-void EditorApp::LoadScene(bool restartPlayIfWasActive) {
+void EditorApp::LoadSceneFromPathUnchecked(const std::string& absolutePath, bool restartPlayIfWasActive) {
+    const std::string previousPath = m_SceneFilePath;
+    m_SceneFilePath = absolutePath;
+    if (!LoadScene(restartPlayIfWasActive)) m_SceneFilePath = previousPath;
+}
+
+bool EditorApp::CommandOpenScene(const std::string& absolutePath, bool saveCurrent, std::string& outError) {
+    if (m_IsPlaying) {
+        outError = "Run 'runtime stop' before opening a scene.";
+        return false;
+    }
+    UpdateSceneDirtyState();
+    if (m_SceneDirty && !saveCurrent) {
+        outError = "Current scene has unsaved changes. Run 'scene save' or use --save-current true.";
+        return false;
+    }
+    // Load into a temporary scene so malformed files cannot replace or partially
+    // clear the current scene. Save only after the destination has loaded.
+    Scene destination;
+    if (!SceneIO::LoadFromFile(destination, absolutePath, outError))
+        return false;
+    if (m_SceneDirty && !CommandSaveScene(outError))
+        return false;
+    m_Engine->GetScene() = std::move(destination);
+    m_SceneFilePath = absolutePath;
+    m_PendingSelectedEntityID = 0;
+    m_PendingSelectedEntityIDs.clear();
+    FinishSceneLoad();
+    return true;
+}
+
+bool EditorApp::LoadScene(bool restartPlayIfWasActive) {
+    // Validate before stopping Play or replacing the current scene. A failed
+    // runtime transition must leave the original session intact.
+    Scene destination;
+    std::string error;
+    if (!SceneIO::LoadFromFile(destination, m_SceneFilePath, error)) {
+        MIPSYNC_WARN("Scene load failed: {}", error);
+        return false;
+    }
     const bool wasPlaying = m_IsPlaying;
     if (m_IsPlaying) {
         m_Engine->GetMipsRuntime().OnPlayStopped(m_Engine->GetScene());
@@ -2707,44 +3095,60 @@ void EditorApp::LoadScene(bool restartPlayIfWasActive) {
         m_Engine->GetPhysicsWorld().EndPlay();
         m_IsPlaying = false;
         m_IsPaused = false;
-        m_PlayCursorLocked = false;
         ResetShotCameraState();
-        if (!restartPlayIfWasActive)
+        if (!restartPlayIfWasActive) {
+            m_PlayCursorLocked = false;
             Input::SetCursorLocked(false);
+        }
     }
 
-    std::string error;
-    if (SceneIO::LoadFromFile(m_Engine->GetScene(), m_SceneFilePath, error)) {
-        ResetShotCameraState();
-        ClearEntitySelection();
-        if (m_PendingSelectedEntityID != 0 &&
-            m_Engine->GetScene().FindEntity(m_PendingSelectedEntityID)) {
-            m_SelectedEntityID = m_PendingSelectedEntityID;
-            m_HierarchySelectionAnchor = m_SelectedEntityID;
-        }
-        for (uint32_t id : m_PendingSelectedEntityIDs) {
-            if (m_Engine->GetScene().FindEntity(id))
-                m_SelectedEntityIDs.insert(id);
-        }
-        if (m_SelectedEntityID != 0)
-            m_SelectedEntityIDs.insert(m_SelectedEntityID);
-        m_PendingSelectedEntityID = 0;
-        m_PendingSelectedEntityIDs.clear();
-        SyncAnimatorWindowToSelectedEntity();
-        m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
-        RefreshSavedSceneState();
-        m_UndoStack.Clear();
-        m_UndoStack.PushState(m_Engine->GetScene());
-        m_HadActiveEdit = false;
-        MIPSYNC_INFO("Scene loaded: {}", m_SceneFilePath);
-        PersistEditorLastScene();
+    m_Engine->GetScene() = std::move(destination);
+    if (wasPlaying) m_PlaySession.MarkTransition();
+    if (wasPlaying && !restartPlayIfWasActive) {
+        // An explicit scene open ends Play and opens the requested edit scene.
+        m_PlaySession.Reset();
+        m_PrePlayUndoStack.Clear();
+        m_PrePlaySelection.clear();
+        m_PrePlaySavedFingerprint.clear();
+    }
+    FinishSceneLoad();
+    if (restartPlayIfWasActive && wasPlaying) StartPlayMode(true);
+    return true;
+}
 
-        if (restartPlayIfWasActive && wasPlaying) {
-            StartPlayMode();
-        }
+void EditorApp::FinishSceneLoad() {
+    ResetShotCameraState();
+    ClearEntitySelection();
+    if (m_PendingSelectedEntityID != 0 &&
+        m_Engine->GetScene().FindEntity(m_PendingSelectedEntityID)) {
+        m_SelectedEntityID = m_PendingSelectedEntityID;
+        m_HierarchySelectionAnchor = m_SelectedEntityID;
+    }
+    for (uint32_t id : m_PendingSelectedEntityIDs) {
+        if (m_Engine->GetScene().FindEntity(id))
+            m_SelectedEntityIDs.insert(id);
+    }
+    if (m_SelectedEntityID != 0)
+        m_SelectedEntityIDs.insert(m_SelectedEntityID);
+    m_PendingSelectedEntityID = 0;
+    m_PendingSelectedEntityIDs.clear();
+    SyncAnimatorWindowToSelectedEntity();
+    m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+    RefreshSavedSceneState();
+    const bool keepPlayAssets = m_PlaySession.Active() && m_PlaySession.Transitioned();
+    EditorUndoStack playHistory;
+    if (keepPlayAssets) playHistory = std::move(m_UndoStack);
+    m_UndoStack.Clear();
+    if (keepPlayAssets) {
+        std::string error;
+        if (!m_UndoStack.AppendAssetHistory(playHistory, m_Engine->GetScene(), error))
+            MIPSYNC_WARN("Could not retain Play asset history: {}", error);
     } else {
-        MIPSYNC_WARN("Scene load failed: {}", error);
+        m_UndoStack.PushState(m_Engine->GetScene());
     }
+    m_HadActiveEdit = false;
+    MIPSYNC_INFO("Scene loaded: {}", m_SceneFilePath);
+    if (!m_PlaySession.Active()) PersistEditorLastScene();
 }
 
 void EditorApp::RefreshSavedSceneState() {
@@ -2755,8 +3159,11 @@ void EditorApp::RefreshSavedSceneState() {
 }
 
 void EditorApp::UpdateSceneDirtyState() {
-    if (m_IsPlaying)
+    if (m_IsPlaying) {
+        if (m_PlaySession.Active())
+            m_SceneDirty = m_PlaySession.OriginalSnapshot() != m_PrePlaySavedFingerprint;
         return;
+    }
 
     std::string current;
     std::string err;
@@ -2766,51 +3173,142 @@ void EditorApp::UpdateSceneDirtyState() {
     m_SceneDirty = (current != m_SceneSavedFingerprint);
 }
 
-bool EditorApp::OnWindowCloseRequested() {
-    if (m_Engine->IsPlayerMode())
-        return false;
-
+bool EditorApp::RequestSceneSaveConfirmation(SceneAction action, const std::string& path,
+                                             bool restartPlay) {
     UpdateSceneDirtyState();
     if (!m_SceneDirty)
         return false;
-
-    m_OpenSaveOnExitModal = true;
+    // Keep the original requested action while its modal is awaiting a choice.
+    if (m_PendingSceneAction == SceneAction::None) {
+        m_PendingSceneAction = action;
+        m_PendingSceneActionPath = path;
+        m_PendingSceneRestartPlay = restartPlay;
+        m_SceneSaveConfirmationError.clear();
+        m_CloseSceneSaveConfirmation = false;
+        m_OpenSceneSaveConfirmation = true;
+    }
     return true;
 }
 
-void EditorApp::DrawSaveOnExitModal() {
-    if (m_OpenSaveOnExitModal)
-        ImGui::OpenPopup("SaveSceneBeforeExit");
+bool EditorApp::OnWindowCloseRequested() {
+    if (IsPreparingPlay()) return true;
+    return !m_Engine->IsPlayerMode() && RequestSceneSaveConfirmation(SceneAction::Close);
+}
+
+void EditorApp::ExecuteConfirmedSceneAction() {
+    if (!std::exchange(m_ExecuteConfirmedSceneAction, false))
+        return;
+    const SceneAction action = std::exchange(m_PendingSceneAction, SceneAction::None);
+    const std::string path = std::exchange(m_PendingSceneActionPath, {});
+    const bool restartPlay = std::exchange(m_PendingSceneRestartPlay, false);
+    m_SceneSaveConfirmationError.clear();
+    switch (action) {
+    case SceneAction::Close: m_Engine->Quit(); break;
+    case SceneAction::Restart: TriggerRestart(); break;
+    case SceneAction::OpenScene: LoadSceneFromPathUnchecked(path, restartPlay); break;
+    case SceneAction::Play: StartPlayMode(true); break;
+    case SceneAction::None: break;
+    }
+}
+
+void EditorApp::DrawSceneSaveConfirmation() {
+    constexpr const char* popup = "Save Scene?###SceneSaveConfirmation";
+    if (m_OpenSceneSaveConfirmation)
+        ImGui::OpenPopup(popup);
 
     ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Appearing);
-    if (!ImGui::BeginPopupModal("SaveSceneBeforeExit", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    if (!ImGui::BeginPopupModal(popup, nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        m_CloseSceneSaveConfirmation = false;
         return;
+    }
+    if (std::exchange(m_CloseSceneSaveConfirmation, false)) {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
 
-    ImGui::TextColored(EditorTheme::TextPrimary,
-        "The scene has unsaved changes.\nDo you want to save before closing?");
+    const char* question = "Do you want to save before closing?";
+    if (m_PendingSceneAction == SceneAction::OpenScene)
+        question = "Do you want to save before opening another scene?";
+    else if (m_PendingSceneAction == SceneAction::Play)
+        question = "Do you want to save before entering Play Mode?";
+    else if (m_PendingSceneAction == SceneAction::Restart)
+        question = "Do you want to save before restarting?";
+    ImGui::TextColored(EditorTheme::TextPrimary, "The scene has unsaved changes.");
+    ImGui::TextWrapped("%s", question);
+    if (!m_SceneSaveConfirmationError.empty())
+        ImGui::TextWrapped("Save failed: %s", m_SceneSaveConfirmationError.c_str());
     ImGui::Spacing();
 
+    const bool preferSave = m_PendingSceneAction != SceneAction::Play ||
+                            m_Preferences.Enabled("saveBeforePlay");
     const float bw = 110.0f;
     if (EditorTheme::AeroButton("Save", ImVec2(bw, EditorTheme::ButtonHeight), AeroButtonKind::Primary)) {
-        SaveScene();
-        ImGui::CloseCurrentPopup();
-        m_OpenSaveOnExitModal = false;
-        if (!m_SceneDirty)
-            m_RequestQuitAfterSaveDialog = true;
+        std::string error;
+        if (CommandRespondSceneSaveConfirmation("save", error)) {
+            ImGui::CloseCurrentPopup();
+            m_CloseSceneSaveConfirmation = false;
+        }
     }
+    if (preferSave) ImGui::SetItemDefaultFocus();
     ImGui::SameLine();
     if (EditorTheme::AeroButton("Don't Save", ImVec2(bw, EditorTheme::ButtonHeight), AeroButtonKind::Danger)) {
+        std::string error;
+        CommandRespondSceneSaveConfirmation("discard", error);
         ImGui::CloseCurrentPopup();
-        m_OpenSaveOnExitModal = false;
-        m_RequestQuitAfterSaveDialog = true;
+        m_CloseSceneSaveConfirmation = false;
     }
     ImGui::SameLine();
     if (EditorTheme::AeroButton("Cancel", ImVec2(bw, EditorTheme::ButtonHeight), AeroButtonKind::Secondary)) {
+        std::string error;
+        CommandRespondSceneSaveConfirmation("cancel", error);
         ImGui::CloseCurrentPopup();
-        m_OpenSaveOnExitModal = false;
+        m_CloseSceneSaveConfirmation = false;
     }
+    if (!preferSave) ImGui::SetItemDefaultFocus();
 
-    ImGui::EndPopup();
+    EditorMenu::EndPopup();
+}
+
+nlohmann::json EditorApp::InspectSceneSaveConfirmation() const {
+    std::string pendingAction;
+    switch (m_PendingSceneAction) {
+    case SceneAction::Close: pendingAction = "close"; break;
+    case SceneAction::Restart: pendingAction = "restart"; break;
+    case SceneAction::OpenScene: pendingAction = "open_scene"; break;
+    case SceneAction::Play: pendingAction = "play"; break;
+    case SceneAction::None: pendingAction = "none"; break;
+    }
+    return {{"id", "scene_save"}, {"pendingAction", pendingAction},
+        {"path", m_SceneFilePath}, {"destination", m_PendingSceneActionPath},
+        {"error", m_SceneSaveConfirmationError}, {"respondable", m_OpenSceneSaveConfirmation},
+        {"actions", m_OpenSceneSaveConfirmation ? nlohmann::json({"save", "discard", "cancel"}) : nlohmann::json::array()}};
+}
+
+bool EditorApp::CommandRespondSceneSaveConfirmation(const std::string& action, std::string& outError) {
+    if (!m_OpenSceneSaveConfirmation || m_PendingSceneAction == SceneAction::None) {
+        outError = "No scene save confirmation is awaiting a response.";
+        return false;
+    }
+    if (action != "save" && action != "discard" && action != "cancel") {
+        outError = "Scene save confirmation accepts save, discard or cancel.";
+        return false;
+    }
+    if (action == "save" && !CommandSaveScene(m_SceneSaveConfirmationError)) {
+        outError = m_SceneSaveConfirmationError;
+        return false;
+    }
+    m_OpenSceneSaveConfirmation = false;
+    m_CloseSceneSaveConfirmation = true;
+    m_ExecuteConfirmedSceneAction = action != "cancel";
+    if (action == "cancel") {
+        m_PendingSceneAction = SceneAction::None;
+        m_PendingSceneActionPath.clear();
+        m_PendingSceneRestartPlay = false;
+    }
+    m_SceneSaveConfirmationError.clear();
+    return true;
 }
 
 void EditorApp::DrawFontRestartModal() {
@@ -2829,15 +3327,12 @@ void EditorApp::DrawFontRestartModal() {
     if (EditorTheme::AeroButton("OK", ImVec2(bw, EditorTheme::ButtonHeight), AeroButtonKind::Primary)) {
         ImGui::CloseCurrentPopup();
         m_OpenFontRestartModal = false;
-        if (m_SceneDirty) {
-            m_RequestRestartAfterSaveDialog = true;
-            m_OpenSaveOnExitModal = true;
-        } else {
+        if (!RequestSceneSaveConfirmation(SceneAction::Restart)) {
             TriggerRestart();
         }
     }
 
-    ImGui::EndPopup();
+    EditorMenu::EndPopup();
 }
 
 void EditorApp::TriggerRestart() {
@@ -2861,8 +3356,26 @@ void EditorApp::TriggerRestart() {
 #endif
 }
 
+void EditorApp::SetMouseCaptureUI(bool captured) {
+    if (!ImGui::GetCurrentContext() || captured == m_CursorOwnsUI) return;
+    constexpr int mouseFlags = ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoMouseCursorChange;
+    auto& io = ImGui::GetIO();
+    if (captured) {
+        m_PreCaptureMouseFlags = io.ConfigFlags & mouseFlags;
+        io.ConfigFlags |= mouseFlags;
+    } else {
+        io.ConfigFlags = (io.ConfigFlags & ~mouseFlags) | m_PreCaptureMouseFlags;
+        io.ClearInputMouse();
+    }
+    m_CursorOwnsUI = captured;
+}
+
 void EditorApp::UpdatePlayInputState() {
-    if (!m_IsPlaying) {
+    const bool runtimeTransition = IsPreparingPlay() && m_PlayPreparation && !m_PlayPreparation->showLoading;
+    if (!m_IsPlaying && !runtimeTransition) {
+        SetMouseCaptureUI(false);
+        Input::SetGameInputWindow(nullptr);
+        Input::SetCursorCaptureAllowed(m_Engine->IsPlayerMode());
         Input::SetGameInputEnabled(true);
         if (m_PlayCursorLocked) {
             Input::SetCursorLocked(false);
@@ -2871,37 +3384,97 @@ void EditorApp::UpdatePlayInputState() {
         return;
     }
 
-    if (Input::IsKeyPressed(GLFW_KEY_ESCAPE))
+    if (Input::IsKeyPressed(GLFW_KEY_ESCAPE) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
         m_PlayCursorLocked = false;
 
     if (m_IsPaused) {
+        m_PlayCursorLocked = false;
+        SetMouseCaptureUI(false);
+        Input::SetCursorCaptureAllowed(false);
         Input::SetGameInputEnabled(false);
         Input::SetCursorLocked(false);
         return;
     }
 
+    if (m_Engine->IsPlayerMode()) {
+        Input::SetCursorCaptureAllowed(true);
+        Input::SetGameInputEnabled(true);
+        return; // The player has no editor panels competing for focus.
+    }
+
     const ImGuiIO& io = ImGui::GetIO();
-    const bool gameMouse = m_PlayCursorLocked ||
-                           (m_GameViewHovered && !m_SceneViewHovered && !io.WantCaptureMouse);
-    Input::SetGameInputEnabled(gameMouse);
+    const bool focused = m_GameViewFocused &&
+        glfwGetWindowAttrib(Input::GetGameInputWindow(), GLFW_FOCUSED) != 0;
+    const bool uiBlocked = io.WantTextInput || ImGui::IsPopupOpen(nullptr,ImGuiPopupFlags_AnyPopupId);
+    if (!focused || uiBlocked) m_PlayCursorLocked = false;
+    SetMouseCaptureUI(m_PlayCursorLocked);
+    const bool gameMouse = focused && !uiBlocked;
+    Input::SetGameInputEnabled(gameMouse && !runtimeTransition);
+    Input::SetCursorCaptureAllowed(m_PlayCursorLocked);
     Input::SetCursorLocked(m_PlayCursorLocked);
 }
 
 void EditorApp::RecordUndoSnapshot() {
-    if (m_IsPlaying)
+    if (m_IsPlaying) {
+        if (!m_UndoStack.IsFrameActive()) {
+            std::string error;
+            if (!m_UndoStack.BeginFrame(m_Engine->GetScene(), error))
+                MIPSYNC_WARN("Play edit snapshot failed: {}", error);
+        }
         return;
+    }
     m_UndoStack.PushState(m_Engine->GetScene());
 }
 
-void EditorApp::AfterSceneRestoredFromHistory() {
+bool EditorApp::RecordAssetUndoSnapshot(const std::string& absolutePath, bool recursive) {
+    if (m_Engine->IsPlayerMode()) return true;
+    if (!m_UndoStack.IsFrameActive() && m_IsPlaying) RecordUndoSnapshot();
+    if (!m_UndoStack.IsFrameActive()) return true;
+    std::string error;
+    if (m_UndoStack.TrackPath(absolutePath, recursive, error)) return true;
+    MIPSYNC_WARN("Asset edit could not be recorded: {}", error);
+    return false;
+}
+
+void EditorApp::CommitUndoTransaction() {
+    if (m_Engine->IsPlayerMode()) { m_UndoStack.CancelFrame(); return; }
+    std::string error;
+    if (!m_UndoStack.EndFrame(m_Engine->GetScene(),0,error)) MIPSYNC_WARN("Undo recording failed: {}",error);
+    if (!m_UndoStack.BeginFrame(m_Engine->GetScene(),error)) MIPSYNC_WARN("Undo snapshot failed: {}",error);
+}
+
+void EditorApp::AfterSceneRestoredFromHistory(bool restartUndoRecording) {
+    ++m_HistoryRevision;
     Scene& scene = m_Engine->GetScene();
     ResetShotCameraState();
     if (!scene.FindEntity(m_SelectedEntityID))
         m_SelectedEntityID = 0;
     m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
+    if (m_IsPlaying) {
+        m_Engine->GetMipsRuntime().RefreshPlayInstances(scene);
+        m_Engine->GetPhysicsWorld().RefreshBodies(scene);
+    }
     if (m_AssetBrowser)
-        m_AssetBrowser->ClearAssetSelection();
+        m_AssetBrowser->OnHistoryRestored();
+    ClearAnimatorGraphSelection();
+    if (m_BuildSettings) m_BuildSettings->ReloadFromDisk();
+    if (!m_AnimationWindow.clipPath.empty() && !m_AnimationWindow.clipReadOnly) {
+        const auto path = m_AnimationWindow.clipPath;
+        const int frame = m_AnimationWindow.frame;
+        if (std::filesystem::exists(PathUtf8::FromString(AssetManager::Get().ToAbsolute(path)))) {
+            LoadAnimationClipForWindow(path);
+            m_AnimationWindow.frame = frame;
+        } else {
+            m_AnimationWindow.keys.clear();
+            m_AnimationWindow.preview = m_AnimationWindow.playing = false;
+        }
+    }
+    AssetThumbnail::Get().Clear();
     UpdateSceneDirtyState();
+    // History restoration cancels the old frame. Subsequent controls use the restored baseline.
+    if (restartUndoRecording && !m_Engine->IsPlayerMode()) {
+        std::string error; m_UndoStack.BeginFrame(scene,error);
+    }
 }
 
 void EditorApp::UpdateUndoRecording() {
@@ -2909,28 +3482,25 @@ void EditorApp::UpdateUndoRecording() {
         return;
 
     const bool active = ImGui::IsAnyItemActive() || ImGuizmo::IsUsing();
-    if (active && !m_HadActiveEdit)
-        RecordUndoSnapshot();
     m_HadActiveEdit = active;
 }
 
 void EditorApp::HandleEditorShortcuts() {
-    if (m_IsPlaying)
+    if (IsPreparingPlay() || m_Engine->IsPlayerMode() || (m_IsPlaying &&
+        (m_PlayCursorLocked || m_GameViewFocused)))
         return;
 
     ImGuiIO& io = ImGui::GetIO();
-    const bool ctrl = Input::IsKeyPressed(GLFW_KEY_LEFT_CONTROL) ||
-                      Input::IsKeyPressed(GLFW_KEY_RIGHT_CONTROL);
+    const bool ctrl = io.KeyCtrl;
     if (io.WantTextInput)
         return;
 
-    const bool shift = Input::IsKeyPressed(GLFW_KEY_LEFT_SHIFT) ||
-                       Input::IsKeyPressed(GLFW_KEY_RIGHT_SHIFT);
+    const bool shift = io.KeyShift;
     if (ctrl) {
         if (ImGui::IsKeyPressed(ImGuiKey_S, false))
             SaveScene();
         if (ImGui::IsKeyPressed(ImGuiKey_O, false))
-            LoadScene();
+            LoadSceneFromPath(m_SceneFilePath);
 
         if (shift && ImGui::IsKeyPressed(ImGuiKey_B, false))
             OpenBuildSettings();
@@ -2943,7 +3513,7 @@ void EditorApp::HandleEditorShortcuts() {
 
         std::string err;
         if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
-            if (m_UndoStack.Undo(m_Engine->GetScene(), err))
+            if (shift ? m_UndoStack.Redo(m_Engine->GetScene(), err) : m_UndoStack.Undo(m_Engine->GetScene(), err))
                 AfterSceneRestoredFromHistory();
             else if (!err.empty())
                 MIPSYNC_WARN("Undo failed: {}", err);
@@ -2977,7 +3547,6 @@ void EditorApp::HandleEditorShortcuts() {
             Entity* duplicate = scene.DuplicateEntity(*source);
             if (!duplicate)
                 continue;
-            scene.SetParent(duplicate, scene.FindEntity(source->GetParentID()));
             pastedIds.push_back(duplicate->GetID());
         }
         if (!pastedIds.empty()) {
@@ -3031,7 +3600,6 @@ void EditorApp::HandleEditorShortcuts() {
         m_SceneDirty = true;
         return;
     }
-
     if (!ctrl) {
         if (ImGui::IsKeyPressed(ImGuiKey_W, false)) m_GizmoOperation = ImGuizmo::TRANSLATE;
         if (ImGui::IsKeyPressed(ImGuiKey_E, false)) m_GizmoOperation = ImGuizmo::ROTATE;
@@ -3044,6 +3612,7 @@ void EditorApp::HandleEditorShortcuts() {
 }
 
 void EditorApp::HandlePlayModeShortcuts() {
+    if (IsPreparingPlay()) return;
     const bool ctrl = Input::IsKeyPressed(GLFW_KEY_LEFT_CONTROL) ||
                       Input::IsKeyPressed(GLFW_KEY_RIGHT_CONTROL);
     const bool shift = Input::IsKeyPressed(GLFW_KEY_LEFT_SHIFT) ||
@@ -3055,14 +3624,12 @@ void EditorApp::HandlePlayModeShortcuts() {
         ImGui::IsKeyPressed(ImGuiKey_P, false)) {
         if (alt) {
             if (m_IsPlaying) {
-                m_IsPaused = true;
-                m_Engine->GetMipsRuntime().SetPaused(true);
+                SetPlayPaused(true);
                 m_StepOneFrame = true;
             }
         } else if (shift) {
             if (m_IsPlaying) {
-                m_IsPaused = !m_IsPaused;
-                m_Engine->GetMipsRuntime().SetPaused(m_IsPaused);
+                SetPlayPaused(!m_IsPaused);
             }
         } else if (m_IsPlaying) {
             StopPlayMode();
@@ -3072,13 +3639,20 @@ void EditorApp::HandlePlayModeShortcuts() {
         return;
     }
 
-    if (m_IsPlaying && ctrl && !ImGui::GetIO().WantTextInput) {
+    if (m_IsPlaying && ctrl && !ImGui::GetIO().WantTextInput &&
+        (m_GameViewFocused || m_PlayCursorLocked)) {
         if (ImGui::IsKeyPressed(ImGuiKey_S, false))
             SaveScene();
         if (ImGui::IsKeyPressed(ImGuiKey_O, false))
-            LoadScene();
+            LoadSceneFromPath(m_SceneFilePath);
     }
 
+}
+
+void EditorApp::SetPlayPaused(bool paused) {
+    if (!m_IsPlaying) return;
+    m_IsPaused = paused;
+    m_Engine->GetMipsRuntime().SetPaused(paused);
 }
 
 void EditorApp::TriggerBuildToast(const std::string& message, bool success) {
@@ -3136,87 +3710,82 @@ static std::filesystem::path EditorSettingsPath() {
     return GetEngineSettingsDirectory() / "editor_settings.json";
 }
 
-static constexpr int kFontSizeDefaultVersion = 1;
-
 void EditorApp::LoadEditorSettings() {
-    using json = nlohmann::json;
-    std::ifstream f(EditorSettingsPath());
-    if (!f.is_open()) {
-        m_FontSize = EditorTheme::GetDefaultFontSizeForDisplay();
-        return;
+    nlohmann::json document;
+    std::ifstream file(EditorSettingsPath());
+    if (file.is_open()) {
+        try { document = nlohmann::json::parse(file); }
+        catch (const std::exception& error) { MIPSYNC_WARN("Cannot read editor preferences: {}", error.what()); }
     }
-    try {
-        json j = json::parse(f);
-        m_FontSize = j.value("fontSize", EditorTheme::GetDefaultFontSizeForDisplay());
-        m_FontSize = std::clamp(m_FontSize, 8.0f, 32.0f);
-        // 12px was the old untouched default. Move only that legacy value to
-        // the new 13px baseline once; explicit larger/smaller choices survive.
-        const int defaultVersion = j.value("fontSizeDefaultVersion", 0);
-        if (defaultVersion < kFontSizeDefaultVersion && m_FontSize == 12.0f) {
-            m_FontSize = 13.0f;
-            SaveEditorSettings();
-        }
-    } catch (...) {
-        m_FontSize = EditorTheme::GetDefaultFontSizeForDisplay();
+    m_Preferences.Load(document, EditorTheme::GetDefaultFontSizeForDisplay());
+    ApplyEditorPreferences();
+}
+
+void EditorApp::ApplyEditorPreferences() {
+    Input::SetPS1PadMapping(m_Preferences.GetPS1PadMapping());
+    m_FontSize = static_cast<float>(m_Preferences.Get("fontSize"));
+    const bool pSync = m_Preferences.Enabled("gameViewPSync");
+    const int width = static_cast<int>(m_Preferences.Get("gameViewWidth"));
+    const int height = static_cast<int>(m_Preferences.Get("gameViewHeight"));
+    if (m_GameViewSettings.pSync != pSync) {
+        m_Engine->GetPSyncState().clock.Reset();
+        m_Engine->GetPSyncState().cadence.Reset();
+        m_GameViewFrameValid = false;
     }
+    if (m_GameViewSettings.renderWidth != width || m_GameViewSettings.renderHeight != height)
+        m_GameViewFrameValid = false;
+    m_GameViewSettings.pSync = pSync;
+    m_GameViewSettings.renderWidth = width;
+    m_GameViewSettings.renderHeight = height;
+    m_GameViewSettings.playMode = m_Preferences.Enabled("gameViewPlayMode") ? GameViewPlayMode::Maximized : GameViewPlayMode::Focused;
+    m_GameViewSettings.showGizmos = m_Preferences.Enabled("gameViewGizmos");
+    m_GameViewSettings.showStatistics = m_Preferences.Enabled("gameViewStatistics");
+    auto& io = ImGui::GetIO();
+    io.MouseDoubleClickTime = static_cast<float>(m_Preferences.Get("doubleClickTime"));
+    io.MouseDragThreshold = static_cast<float>(m_Preferences.Get("dragThreshold"));
+    auto& style = ImGui::GetStyle();
+    style.ScrollbarSize = static_cast<float>(m_Preferences.Get("scrollbarSize"));
+    style.HoverDelayNormal = static_cast<float>(m_Preferences.Get("tooltipDelay"));
+    m_UndoStack.SetMaxSteps(static_cast<size_t>(m_Preferences.Get("undoSteps")));
+    auto& camera = m_SceneCamera.GetCamera();
+    camera.SetPerspective(static_cast<float>(m_Preferences.Get("sceneFov")), m_LastSceneViewAspect,
+        static_cast<float>(m_Preferences.Get("sceneNearClip")), static_cast<float>(m_Preferences.Get("sceneFarClip")));
 }
 
 void EditorApp::SaveEditorSettings() {
-    using json = nlohmann::json;
-    json j;
-    j["fontSize"] = m_FontSize;
-    j["fontSizeDefaultVersion"] = kFontSizeDefaultVersion;
-    std::ofstream f(EditorSettingsPath());
-    if (f.is_open())
-        f << j.dump(2);
+    // Toolbar toggles and this window share the same persisted values.
+    m_Preferences.Set("fontSize", m_FontSize);
+    m_Preferences.Set("gameViewPlayMode", m_GameViewSettings.playMode == GameViewPlayMode::Maximized);
+    m_Preferences.Set("gameViewGizmos", m_GameViewSettings.showGizmos);
+    m_Preferences.Set("gameViewStatistics", m_GameViewSettings.showStatistics);
+    m_Preferences.Set("gameViewPSync", m_GameViewSettings.pSync);
+    std::error_code error;
+    std::filesystem::create_directories(EditorSettingsPath().parent_path(), error);
+    std::ofstream file(EditorSettingsPath());
+    if (file.is_open()) file << m_Preferences.Save().dump(2);
+    if (!file) MIPSYNC_CONSOLE_ERROR("Could not save editor preferences: {}", PathUtf8::ToString(EditorSettingsPath()));
 }
 
 void EditorApp::DrawPreferencesMenu() {
-    ImGui::Text("Font Size");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(120.0f);
+    m_PreferencesWindow.DrawMenu();
+}
 
-    static float s_StartFontSize = 0.0f;
-    float fs = m_FontSize;
-    if (ImGui::SliderFloat("##fontsize", &fs, 8.0f, 32.0f, "%.0f px")) {
-        float rounded = std::round(fs);
-        if (rounded != m_FontSize) {
-            m_FontSize = rounded;
-            SaveEditorSettings();
-        }
-    }
-    if (ImGui::IsItemActivated()) {
-        s_StartFontSize = m_FontSize;
-    }
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        if (m_FontSize != s_StartFontSize) {
-            m_OpenFontRestartModal = true;
-        }
-    }
-
-    ImGui::Separator();
-    const float autoSize = EditorTheme::GetDefaultFontSizeForDisplay();
-    char autoLabel[64];
-    std::snprintf(autoLabel, sizeof(autoLabel), "Reset to Auto (%.0f px)", autoSize);
-    if (ImGui::MenuItem(autoLabel)) {
-        if (m_FontSize != autoSize) {
-            m_FontSize = autoSize;
-            SaveEditorSettings();
-            m_OpenFontRestartModal = true;
-        }
+void EditorApp::DrawPreferencesWindow() {
+    if (m_PreferencesWindow.Draw(m_Preferences)) {
+        ApplyEditorPreferences();
+        SaveEditorSettings();
     }
 }
 
 void EditorApp::DrawMenuBarPlayButton() {
     constexpr float toolbarHeight = 32.0f;
     constexpr float buttonWidth = 42.0f;
-    constexpr float buttonHeight = 22.0f;
-    constexpr float buttonGap = 4.0f;
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.145f, 0.145f, 0.145f, 1.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 5.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, EditorTheme::PanelFace);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("##MainPlayToolbar", ImVec2(0.0f, toolbarHeight), false,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    EditorToolbar toolbar(toolbarHeight);
 
     std::string sceneLabel = PathUtf8::ToString(
         PathUtf8::FromString(m_SceneFilePath).filename());
@@ -3224,10 +3793,8 @@ void EditorApp::DrawMenuBarPlayButton() {
         sceneLabel = "Untitled Scene";
     if (m_SceneDirty)
         sceneLabel += " *";
-    ImGui::SetCursorPos(ImVec2(8.0f, 5.0f));
-    ImGui::SetNextItemWidth(282.0f);
     std::string pendingScenePath;
-    if (ImGui::BeginCombo("##ToolbarScene", sceneLabel.c_str())) {
+    if (toolbar.BeginCombo("##ToolbarScene", sceneLabel.c_str(), 180.0f)) {
         std::vector<std::filesystem::path> sceneFiles;
         const std::filesystem::path scenesDir =
             PathUtf8::FromString(m_Engine->GetProjectPath()) / "scenes";
@@ -3244,12 +3811,14 @@ void EditorApp::DrawMenuBarPlayButton() {
             const std::string label = PathUtf8::ToString(
                 scenePath.lexically_relative(scenesDir));
             const bool selected = scenePath == current;
-            if (ImGui::Selectable(label.c_str(), selected))
+            if (EditorDropdown::Selectable(label.c_str(), selected))
                 pendingScenePath = PathUtf8::ToString(scenePath);
             if (selected)
                 ImGui::SetItemDefaultFocus();
         }
-        ImGui::EndCombo();
+        EditorDropdown::EndCombo();
+    } else if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", sceneLabel.c_str());
     }
     if (!pendingScenePath.empty())
         LoadSceneFromPath(pendingScenePath, m_IsPlaying);
@@ -3258,15 +3827,13 @@ void EditorApp::DrawMenuBarPlayButton() {
     auto transportButton = [&](const char* id, TransportIcon icon, bool enabled,
                                bool active) {
         const ImVec2 pos = ImGui::GetCursorScreenPos();
-        ImGui::InvisibleButton(id, ImVec2(buttonWidth, buttonHeight));
+        ImGui::InvisibleButton(id, ImVec2(buttonWidth, toolbar.Height()));
         const bool hovered = enabled && ImGui::IsItemHovered();
         const bool held = enabled && ImGui::IsItemActive();
         const bool pressed = enabled && ImGui::IsItemClicked();
         ImDrawList* draw = ImGui::GetWindowDrawList();
-        const float visualInset = 1.0f;
-        const ImVec2 visualMin(pos.x + visualInset, pos.y + visualInset);
-        const ImVec2 max(pos.x + buttonWidth - visualInset,
-                         pos.y + buttonHeight - visualInset);
+        const ImVec2 visualMin = pos;
+        const ImVec2 max(pos.x + buttonWidth, pos.y + toolbar.Height());
         ImVec4 face = active ? UiTokens::Success : UiTokens::BgTertiary;
         if (icon == TransportIcon::PlayStop && m_IsPlaying)
             face = UiTokens::Danger;
@@ -3276,11 +3843,7 @@ void EditorApp::DrawMenuBarPlayButton() {
             face = UiTokens::BgPressed;
         else if (hovered && !active)
             face = UiTokens::BgHover;
-        draw->AddRectFilled(visualMin, max, ImGui::ColorConvertFloat4ToU32(face), 2.0f);
-        draw->AddRect(visualMin, max,
-                      ImGui::ColorConvertFloat4ToU32(enabled ? UiTokens::BorderHighlight
-                                                            : UiTokens::Border),
-                      2.0f);
+        toolbar.CapsuleFace(face, static_cast<int>(icon), 3);
         const ImU32 iconColor = ImGui::ColorConvertFloat4ToU32(
             enabled ? UiTokens::Icon : UiTokens::IconSecondary);
         const ImVec2 center((visualMin.x + max.x) * 0.5f,
@@ -3306,12 +3869,13 @@ void EditorApp::DrawMenuBarPlayButton() {
             draw->AddRectFilled(ImVec2(center.x + 3.0f, center.y - 5.0f),
                                 ImVec2(center.x + 5.0f, center.y + 5.0f), iconColor);
         }
+        toolbar.Item(false);
         return pressed;
     };
 
-    const float transportWidth = buttonWidth * 3.0f + buttonGap * 2.0f;
-    const float transportX = (ImGui::GetWindowWidth() - transportWidth) * 0.5f;
-    ImGui::SetCursorPos(ImVec2(transportX, 5.0f));
+    const float transportWidth = buttonWidth * 3.0f;
+    const float transportX = (toolbar.Width() - transportWidth) * 0.5f;
+    toolbar.SetX(transportX);
     if (transportButton("##PlayStop", TransportIcon::PlayStop, true, m_IsPlaying)) {
         if (m_IsPlaying)
             StopPlayMode();
@@ -3320,42 +3884,39 @@ void EditorApp::DrawMenuBarPlayButton() {
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Play / Stop  (Ctrl+P)");
-    ImGui::SetCursorPos(ImVec2(transportX + buttonWidth + buttonGap, 5.0f));
     if (transportButton("##Pause", TransportIcon::Pause, m_IsPlaying, m_IsPaused)) {
-        m_IsPaused = !m_IsPaused;
-        m_Engine->GetMipsRuntime().SetPaused(m_IsPaused);
+        SetPlayPaused(!m_IsPaused);
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Pause / Resume  (Ctrl+Shift+P)");
-    ImGui::SetCursorPos(ImVec2(transportX + (buttonWidth + buttonGap) * 2.0f, 5.0f));
     if (transportButton("##Step", TransportIcon::Step, m_IsPlaying, false)) {
-        m_IsPaused = true;
-        m_Engine->GetMipsRuntime().SetPaused(true);
+        SetPlayPaused(true);
         m_StepOneFrame = true;
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Step one frame  (Ctrl+Alt+P)");
 
-    constexpr float layoutWidth = 218.0f;
-    ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - layoutWidth - 8.0f, 5.0f));
-    ImGui::SetNextItemWidth(layoutWidth);
-    const char* layoutLabel = m_DockLayoutPreset == DockLayoutPreset::SceneTopGameBottom
-        ? "Layout: Scene Top / Game Bottom"
-        : "Layout: Classic Editor";
-    if (ImGui::BeginCombo("##ToolbarLayout", layoutLabel)) {
+    constexpr float layoutWidth = 150.0f;
+    toolbar.SetX(toolbar.Width() - layoutWidth);
+    const bool sceneTopLayout = m_DockLayoutPreset == DockLayoutPreset::SceneTopGameBottom;
+    const char* layoutLabel = sceneTopLayout ? "Scene / Game" : "Classic Editor";
+    if (toolbar.BeginCombo("##ToolbarLayout", layoutLabel, layoutWidth)) {
         const bool sceneTop = m_DockLayoutPreset == DockLayoutPreset::SceneTopGameBottom;
-        if (ImGui::Selectable("Scene Top / Game Bottom", sceneTop) && !sceneTop) {
+        if (EditorDropdown::Selectable("Scene Top / Game Bottom", sceneTop) && !sceneTop) {
             m_DockLayoutPreset = DockLayoutPreset::SceneTopGameBottom;
             RequestDockLayoutApply();
         }
         const bool classic = m_DockLayoutPreset == DockLayoutPreset::ClassicEditor;
-        if (ImGui::Selectable("Classic Editor", classic) && !classic) {
+        if (EditorDropdown::Selectable("Classic Editor", classic) && !classic) {
             m_DockLayoutPreset = DockLayoutPreset::ClassicEditor;
             RequestDockLayoutApply();
         }
-        ImGui::EndCombo();
+        EditorDropdown::EndCombo();
+    } else if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Layout: %s", sceneTopLayout ? "Scene Top / Game Bottom" : "Classic Editor");
     }
 
+    toolbar.End();
     ImGui::EndChild();
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
@@ -3546,7 +4107,28 @@ void EditorApp::PlaceNewSceneEntity(Entity& entity, Entity* parentForNew) {
     scene.SetWorldPosition(entity, GetSceneViewSpawnPosition());
 }
 
+void EditorApp::ClearEntitySelection() {
+    m_PendingReferenceEntityID = 0;
+    m_PendingReferenceAssetPath.clear();
+    m_SelectedEntityID = 0;
+    m_SelectedEntityIDs.clear();
+    m_HierarchySelectionAnchor = 0;
+    m_PendingHierarchyRevealEntityID = 0;
+    ClearAnimatorGraphSelection();
+}
+
+void EditorApp::QueueReferenceSelection(uint32_t entityId) {
+    m_PendingReferenceEntityID = entityId;
+    m_PendingReferenceAssetPath.clear();
+}
+
+void EditorApp::QueueReferenceSelection(const std::string& assetPath) {
+    m_PendingReferenceAssetPath = assetPath;
+    m_PendingReferenceEntityID = 0;
+}
+
 void EditorApp::SelectSingleEntity(uint32_t entityId) {
+    ClearAnimatorGraphSelection();
     m_SelectedEntityID = entityId;
     m_SelectedEntityIDs.clear();
     if (entityId != 0)
@@ -3559,6 +4141,7 @@ void EditorApp::SelectSingleEntity(uint32_t entityId) {
 }
 
 void EditorApp::QueueHierarchyReveal(uint32_t entityId) {
+    m_PendingHierarchyRevealEntityID = entityId;
     Scene& scene = m_Engine->GetScene();
     Entity* current = scene.FindEntity(entityId);
     while (current && current->GetParentID() != 0) {
@@ -3580,10 +4163,6 @@ void EditorApp::CommandRevealEntity(uint32_t entityId, bool frameInSceneView) {
 }
 
 bool EditorApp::CommandUndo(std::string& outError) {
-    if (m_IsPlaying) {
-        outError = "Undo is unavailable during Play Mode.";
-        return false;
-    }
     if (!m_UndoStack.CanUndo()) {
         outError = "Nothing to undo.";
         return false;
@@ -3595,10 +4174,6 @@ bool EditorApp::CommandUndo(std::string& outError) {
 }
 
 bool EditorApp::CommandRedo(std::string& outError) {
-    if (m_IsPlaying) {
-        outError = "Redo is unavailable during Play Mode.";
-        return false;
-    }
     if (!m_UndoStack.CanRedo()) {
         outError = "Nothing to redo.";
         return false;
@@ -3628,6 +4203,7 @@ void EditorApp::CollectHierarchyOrder(Entity& entity, std::vector<uint32_t>& out
 }
 
 void EditorApp::HandleHierarchySelection(uint32_t entityId) {
+    ClearAnimatorGraphSelection();
     const ImGuiIO& io = ImGui::GetIO();
     if (io.KeyShift && m_HierarchySelectionAnchor != 0) {
         auto anchor = std::find(m_HierarchyOrder.begin(), m_HierarchyOrder.end(),
@@ -3796,21 +4372,23 @@ void EditorApp::HandleSceneViewControls(bool viewportHovered) {
     if (allowSceneCamera) {
         // Unity-style orbit: Alt + LMB
         if (alt && Input::IsMouseButtonPressed(GLFW_MOUSE_BUTTON_LEFT)) {
-            m_SceneCamera.ProcessOrbit(mouseDelta.x, mouseDelta.y);
+            m_SceneCamera.ProcessOrbit(mouseDelta.x,
+                mouseDelta.y * (m_Preferences.Enabled("invertOrbitY") ? -1.0f : 1.0f),
+                static_cast<float>(m_Preferences.Get("orbitSensitivity")));
         }
         // Pan: MMB (or Alt+MMB)
         else if (Input::IsMouseButtonPressed(GLFW_MOUSE_BUTTON_MIDDLE)) {
-            m_SceneCamera.ProcessPan(mouseDelta.x, mouseDelta.y);
+            m_SceneCamera.ProcessPan(mouseDelta.x, mouseDelta.y, static_cast<float>(m_Preferences.Get("panSensitivity")));
         }
         // Zoom: Alt + RMB drag
         else if (alt && Input::IsMouseButtonPressed(GLFW_MOUSE_BUTTON_RIGHT)) {
-            m_SceneCamera.ProcessZoom(-mouseDelta.y * 0.02f);
+            m_SceneCamera.ProcessZoom(-mouseDelta.y * 0.02f * static_cast<float>(m_Preferences.Get("zoomSensitivity")));
         }
         // Fly: RMB + WASD/QE
         else if (Input::IsMouseButtonPressed(GLFW_MOUSE_BUTTON_RIGHT)) {
-            float speed = 5.0f;
+            float speed = static_cast<float>(m_Preferences.Get("flySpeed"));
             if (Input::IsKeyPressed(GLFW_KEY_LEFT_SHIFT) || Input::IsKeyPressed(GLFW_KEY_RIGHT_SHIFT))
-                speed = 15.0f;
+                speed *= static_cast<float>(m_Preferences.Get("flyBoost"));
 
             glm::vec3 moveDir(0.0f);
             const Camera& cam = m_SceneCamera.GetCamera();
@@ -3825,13 +4403,15 @@ void EditorApp::HandleSceneViewControls(bool viewportHovered) {
                 m_SceneCamera.ProcessFly(glm::normalize(moveDir), speed, Time::GetDeltaTime());
 
             if (mouseDelta.x != 0.0f || mouseDelta.y != 0.0f)
-                m_SceneCamera.ProcessOrbit(mouseDelta.x, mouseDelta.y);
+                m_SceneCamera.ProcessOrbit(mouseDelta.x,
+                mouseDelta.y * (m_Preferences.Enabled("invertOrbitY") ? -1.0f : 1.0f),
+                static_cast<float>(m_Preferences.Get("orbitSensitivity")));
         }
     }
 
     float scroll = Input::GetScrollDelta();
     if (scroll != 0.0f)
-        m_SceneCamera.ProcessZoom(scroll);
+        m_SceneCamera.ProcessZoom(scroll * static_cast<float>(m_Preferences.Get("zoomSensitivity")));
 
 }
 
@@ -4031,6 +4611,7 @@ bool EditorApp::HandleTerrainBrush(const ImVec2& imageMin, const ImVec2& imageSi
     const bool painting = io.MouseDown[ImGuiMouseButton_Left] && !ImGui::IsAnyItemActive();
     if (!painting)
         return true;
+    m_PointerEditGesture = (uint64_t(2) << 32) | selected->GetID();
 
     if (io.MouseClicked[ImGuiMouseButton_Left])
         RecordUndoSnapshot();
@@ -4460,7 +5041,7 @@ void EditorApp::DrawProModelerWindow() {
     ImGui::SeparatorText("Shape Preset");
     const char* shapeNames[] = { "Box", "Plane", "Ramp", "Stairs", "Custom", "Cylinder" };
     int shape = static_cast<int>(proModelerComp->shape);
-    if (ImGui::Combo("Preset##combo", &shape, shapeNames, IM_ARRAYSIZE(shapeNames))) {
+    if (EditorDropdown::Combo("Preset##combo", &shape, shapeNames, IM_ARRAYSIZE(shapeNames))) {
         RecordUndoSnapshot();
         proModelerComp->shape = static_cast<ProModelerComponent::Shape>(std::clamp(shape, 0, 5));
         if      (proModelerComp->shape == ProModelerComponent::Shape::Plane)  proModelerComp->ResetPlane();
@@ -4475,11 +5056,11 @@ void EditorApp::DrawProModelerWindow() {
         changed = true;
     if (ImGui::IsItemActivated()) RecordUndoSnapshot();
     if (proModelerComp->shape == ProModelerComponent::Shape::Stairs) {
-        if (ImGui::SliderInt("Steps", &proModelerComp->steps, 1, 32)) changed = true;
+        if (EditorTheme::SliderInt("Steps", &proModelerComp->steps, 1, 32)) changed = true;
         if (ImGui::IsItemActivated()) RecordUndoSnapshot();
     }
     if (proModelerComp->shape == ProModelerComponent::Shape::Cylinder) {
-        if (ImGui::SliderInt("Sides", &proModelerComp->sides, 3, 64)) changed = true;
+        if (EditorTheme::SliderInt("Sides", &proModelerComp->sides, 3, 64)) changed = true;
         if (ImGui::IsItemActivated()) RecordUndoSnapshot();
     }
 
@@ -4682,11 +5263,7 @@ void EditorApp::DrawSceneViewPanel() {
         ScopedDrawListClipRect viewportClip(sceneDrawList, imageMin, imageMax);
 
         DrawGizmoControls(imageMin, imageSize, m_SceneCamera.GetCamera());
-        DrawColliderGizmos(imageMin, imageSize, m_SceneCamera.GetCamera());
-        DrawMeshSubdivisionPreview(imageMin, imageSize, m_SceneCamera.GetCamera());
-        DrawLightGizmos(imageMin, imageSize, m_SceneCamera.GetCamera());
-        DrawCameraFrustumGizmo(imageMin, imageSize, m_SceneCamera.GetCamera());
-        DrawProModelerOverlay(imageMin, imageSize, m_SceneCamera.GetCamera());
+        DrawViewportGizmos(imageMin, imageSize, m_SceneCamera.GetCamera());
 
         ImGuiIO& io = ImGui::GetIO();
         bool windowHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
@@ -4766,8 +5343,14 @@ void EditorApp::DrawSceneViewPanel() {
 }
 
 void EditorApp::DrawGameViewToolbar() {
-    // Keep the visual toolbar row while the PS1 Game View remains fixed to 4:3.
-    ImGui::Dummy(ImVec2(0.0f, ImGui::GetFrameHeight()));
+    const bool wasSync = m_GameViewSettings.pSync;
+    if (DrawGameViewControls(m_GameViewSettings, &m_Engine->GetPSyncState()))
+        SaveEditorSettings();
+    if (wasSync != m_GameViewSettings.pSync) {
+        m_Engine->GetPSyncState().cadence.Reset();
+        m_Engine->GetPSyncState().clock.Reset();
+        m_GameViewFrameValid = false;
+    }
 }
 
 void EditorApp::DrawPlayerModeUI() {
@@ -4840,23 +5423,31 @@ void EditorApp::DrawPlayerModeUI() {
         m_Engine->RequestQuit();
 }
 
-void EditorApp::DrawGameViewPanel() {
+void EditorApp::DrawGameViewPanel(bool maximized) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{ 4, 4 });
-    if (!ImGui::Begin("Game View")) {
+    if (!maximized && !m_GameViewMaximized && m_GameViewWasMaximized)
+        ImGui::SetNextWindowFocus();
+    const bool visible = maximized
+        ? BeginMaximizedGameView(m_EditorContentMin, m_EditorContentSize, !m_GameViewWasMaximized)
+        : ImGui::Begin("Game View", nullptr, m_IsPlaying ? ImGuiWindowFlags_NoNavInputs : 0);
+    if (!visible || (!maximized && m_GameViewMaximized)) {
         m_GameViewHovered = false;
+        m_GameViewFocused = false;
         m_Engine->GetUIRenderer().SetPointerState(false, 0.0f, 0.0f, false, false, false);
         ImGui::End();
         ImGui::PopStyleVar();
         return;
     }
 
+    m_GameViewFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    if (m_IsPlaying)
+        Input::SetGameInputWindow(static_cast<GLFWwindow*>(ImGui::GetWindowViewport()->PlatformHandle));
     DrawGameViewToolbar();
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{ 0, 0 });
     ImVec2 viewportPanelSize = ImGui::GetContentRegionAvail();
     if (viewportPanelSize.x > 0.0f && viewportPanelSize.y > 0.0f) {
         Scene& scene = m_Engine->GetScene();
-        SyncSceneCanvasesToGameView(scene, m_GameViewSettings);
 
         Entity* cameraEntity = ResolveActiveShotCameraEntity(m_IsPlaying || m_Engine->IsPlayerMode());
         Camera activeCamera = m_FallbackGameCamera;
@@ -4909,16 +5500,78 @@ void EditorApp::DrawGameViewPanel() {
             std::max(letterbox.displaySize.y, 1.0f)) *
             static_cast<float>(m_GameViewSettings.renderHeight);
         const bool pointerActive = m_GameViewHovered && !Input::IsCursorLocked();
+        m_GamePointerPressed |= pointerActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+        m_GamePointerReleased |= ImGui::IsMouseReleased(ImGuiMouseButton_Left);
         m_Engine->GetUIRenderer().SetPointerState(
             pointerActive, pointerX, pointerY, io.MouseDown[ImGuiMouseButton_Left],
-            pointerActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left),
-            ImGui::IsMouseReleased(ImGuiMouseButton_Left));
+            m_GamePointerPressed, m_GamePointerReleased);
 
-        RenderSceneToFramebuffer(m_GameViewFBO, activeCamera, renderSize, 0, activeCamId, false,
-                                 m_GameViewSettings.renderWidth, m_GameViewSettings.renderHeight);
+        auto& sync = m_Engine->GetPSyncState();
+        const bool repaint = !m_GameViewSettings.pSync || !m_IsPlaying || m_IsPaused ||
+            sync.frameDue || !m_GameViewFrameValid;
+        if (repaint) {
+            PSyncWorkload workload;
+            if (m_GameViewSettings.pSync) {
+                PS1Settings effective = m_Engine->GetRenderer().GetPS1Settings();
+                ApplyPostProcessVolumeSettings(effective);
+                if (Ps1::NeedsColorGrading({effective.colorGradingEnabled,effective.exposure,
+                    effective.contrast,effective.saturation,{effective.colorFilter.r,
+                    effective.colorFilter.g,effective.colorFilter.b}})) workload.colorGradingPixels = 320 * 240;
+                workload.opcodes = m_Engine->GetMipsRuntime().GetOpcodeCounts();
+                workload.hostCalls = m_Engine->GetMipsRuntime().GetHostCounts();
+                for (const auto& object : scene.GetEntities()) {
+                    if (!object || !scene.IsActiveInHierarchy(*object)) continue;
+                    ++workload.objects;
+                    const auto* collider = object->GetComponent<ColliderComponent>();
+                    if (collider && collider->enabled) {
+                        ++workload.colliders;
+                        const auto* mesh = object->GetComponent<MeshRendererComponent>();
+                        if (collider->shape == ColliderShape::Mesh && mesh && mesh->mesh)
+                            workload.colliderTriangles += mesh->mesh->GetIndexCount() / 3;
+                    }
+                    const auto* body = object->GetComponent<RigidbodyComponent>();
+                    if (body && body->enabled && body->bodyType != RigidbodyType::Static) ++workload.movingBodies;
+                    const auto* audio = object->GetComponent<AudioSourceComponent>();
+                    if (audio && audio->enabled && !audio->clipPath.empty()) ++workload.audioSources;
+                    const auto* animator = object->GetComponent<AnimatorComponent>();
+                    if (animator && animator->enabled && animator->model && scene.GetAnimateCharacters())
+                        workload.animatedBones += animator->model->bones.size();
+                }
+                m_Engine->GetRenderer().SetPSyncWorkload(&workload);
+                m_Engine->GetUIRenderer().SetPSyncWorkload(&workload);
+            }
+            Input::BeginGameUIFrame(m_GameViewSettings.pSync && m_IsPlaying && !m_IsPaused);
+            RenderSceneToFramebuffer(m_GameViewFBO, activeCamera, renderSize, 0, activeCamId, false,
+                                     m_GameViewSettings.renderWidth, m_GameViewSettings.renderHeight);
+            Input::EndGameUIFrame();
+            m_Engine->GetRenderer().SetPSyncWorkload(nullptr);
+            m_Engine->GetUIRenderer().SetPSyncWorkload(nullptr);
+            m_GameViewStatistics = m_Engine->GetRenderer().GetStatistics();
+            m_GameViewFrameValid = true;
+            m_GamePointerPressed = m_GamePointerReleased = false;
+            if (m_GameViewSettings.pSync) {
+                // UI callbacks run during RenderUI, so sample VM counts again.
+                workload.opcodes = m_Engine->GetMipsRuntime().GetOpcodeCounts();
+                workload.hostCalls = m_Engine->GetMipsRuntime().GetHostCounts();
+                sync.workload = workload;
+                sync.estimate = sync.cadence.Update(EstimatePSync(workload), ImGui::GetTime());
+                sync.sampleValid = true;
+            }
+        }
 
-        if (m_IsPlaying && m_GameViewHovered) {
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+        drawList->PushClipRect(letterbox.displayMin, displayMax, true);
+        if (m_GameViewSettings.showGizmos)
+            DrawGameViewGizmos(letterbox.displayMin, letterbox.displaySize, activeCamera, activeCamId);
+        drawList->PopClipRect();
+        if (m_GameViewSettings.showStatistics) {
+            const size_t activeObjects = std::count_if(scene.GetEntities().begin(), scene.GetEntities().end(),
+                [](const auto& entity) { return entity && entity->IsActive(); });
+            DrawGameViewStatistics(panelMin, viewportPanelSize, m_GameViewSettings,
+                                    m_GameViewStatistics, activeObjects, io.Framerate, &sync);
+        }
+
+        if (m_IsPlaying && !m_IsPaused && m_GameViewHovered) {
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsMouseClicked(ImGuiMouseButton_Right))
                 m_PlayCursorLocked = true;
         }
 
@@ -4928,12 +5581,29 @@ void EditorApp::DrawGameViewPanel() {
     }
 
     if (m_IsPlaying && m_GameViewHovered && !m_PlayCursorLocked) {
-        ImGui::SetTooltip("Right-click to capture mouse (Esc to release)");
+        ImGui::SetTooltip("Click to capture mouse (Esc to release)");
     }
 
     ImGui::PopStyleVar();
     ImGui::End();
     ImGui::PopStyleVar();
+}
+
+void EditorApp::DrawViewportGizmos(const ImVec2& imageMin, const ImVec2& imageSize,
+                                    const Camera& camera, uint32_t excludeCameraId) {
+    if (m_Preferences.Enabled("gizmoColliders")) DrawColliderGizmos(imageMin, imageSize, camera);
+    if (m_Preferences.Enabled("gizmoMeshes")) DrawMeshSubdivisionPreview(imageMin, imageSize, camera);
+    if (m_Preferences.Enabled("gizmoLights")) DrawLightGizmos(imageMin, imageSize, camera);
+    if (m_Preferences.Enabled("gizmoCameras")) DrawCameraFrustumGizmo(imageMin, imageSize, camera, excludeCameraId);
+    if (m_Preferences.Enabled("gizmoModeler")) DrawProModelerOverlay(imageMin, imageSize, camera);
+}
+
+void EditorApp::DrawGameViewGizmos(const ImVec2& imageMin, const ImVec2& imageSize,
+                                   const Camera& camera, uint32_t activeCameraId) {
+    DrawViewportGizmos(imageMin, imageSize, camera, activeCameraId);
+    if (m_Preferences.Enabled("gizmoCanvases")) EditorCanvasGizmo::DrawSceneCanvases(m_Engine->GetScene(), camera, camera.GetViewMatrix(),
+        camera.GetProjectionMatrix(), imageMin, imageSize, ImGui::GetWindowDrawList(), m_SelectedEntityID,
+        m_GameViewSettings.renderWidth, m_GameViewSettings.renderHeight, false, activeCameraId);
 }
 
 void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
@@ -4947,18 +5617,18 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
     };
 
     if (!GetSelectedHierarchyRootIDs(m_SelectedEntityID).empty()) {
-        if (ImGui::MenuItem("Create Empty Parent"))
+        if (EditorMenu::MenuItem("Create Empty Parent"))
             CreateEmptyParentForSelection();
         ImGui::Separator();
     }
 
-    if (ImGui::MenuItem("Create Empty Entity")) {
+    if (EditorMenu::MenuItem("Create Empty Entity")) {
         RecordUndoSnapshot();
         selectNew(scene.CreateEntity("Empty Entity"));
     }
 
-    if (ImGui::BeginMenu("3D Object")) {
-        if (ImGui::MenuItem("Cube")) {
+    if (EditorMenu::BeginMenu("3D Object")) {
+        if (EditorMenu::MenuItem("Cube")) {
             RecordUndoSnapshot();
             auto* entity = scene.CreateEntity("Cube");
             auto& mr = entity->AddComponent<MeshRendererComponent>();
@@ -4967,7 +5637,7 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
             AddDefaultCollider(*entity, "Cube", 1.0f);
             selectNew(entity);
         }
-        if (ImGui::MenuItem("Sphere")) {
+        if (EditorMenu::MenuItem("Sphere")) {
             RecordUndoSnapshot();
             auto* entity = scene.CreateEntity("Sphere");
             auto& mr = entity->AddComponent<MeshRendererComponent>();
@@ -4976,7 +5646,7 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
             AddDefaultCollider(*entity, "Sphere", 1.0f);
             selectNew(entity);
         }
-        if (ImGui::MenuItem("Plane")) {
+        if (EditorMenu::MenuItem("Plane")) {
             RecordUndoSnapshot();
             auto* entity = scene.CreateEntity("Plane");
             auto& mr = entity->AddComponent<MeshRendererComponent>();
@@ -4985,7 +5655,7 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
             AddDefaultCollider(*entity, "Plane", 10.0f);
             selectNew(entity);
         }
-        if (ImGui::MenuItem("Terrain")) {
+        if (EditorMenu::MenuItem("Terrain")) {
             RecordUndoSnapshot();
             auto* entity = scene.CreateEntity("Terrain");
             auto& mr = entity->AddComponent<MeshRendererComponent>();
@@ -4996,7 +5666,7 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
                 tr->position.y = 0.0f;
             selectNew(entity);
         }
-        if (ImGui::BeginMenu("ProModeler")) {
+        if (EditorMenu::BeginMenu("ProModeler")) {
             auto createProModeler = [&](const char* name, ProModelerComponent::Shape shape) {
                 RecordUndoSnapshot();
                 auto* entity = scene.CreateEntity(name);
@@ -5012,66 +5682,60 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
                 mr.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
                 selectNew(entity);
             };
-            if (ImGui::MenuItem("Cube")) createProModeler("ProModeler Cube", ProModelerComponent::Shape::Box);
-            if (ImGui::MenuItem("Plane")) createProModeler("ProModeler Plane", ProModelerComponent::Shape::Plane);
-            if (ImGui::MenuItem("Cylinder")) createProModeler("ProModeler Cylinder", ProModelerComponent::Shape::Cylinder);
-            if (ImGui::MenuItem("Ramp")) createProModeler("ProModeler Ramp", ProModelerComponent::Shape::Ramp);
-            if (ImGui::MenuItem("Stairs")) createProModeler("ProModeler Stairs", ProModelerComponent::Shape::Stairs);
-            ImGui::EndMenu();
+            if (EditorMenu::MenuItem("Cube")) createProModeler("ProModeler Cube", ProModelerComponent::Shape::Box);
+            if (EditorMenu::MenuItem("Plane")) createProModeler("ProModeler Plane", ProModelerComponent::Shape::Plane);
+            if (EditorMenu::MenuItem("Cylinder")) createProModeler("ProModeler Cylinder", ProModelerComponent::Shape::Cylinder);
+            if (EditorMenu::MenuItem("Ramp")) createProModeler("ProModeler Ramp", ProModelerComponent::Shape::Ramp);
+            if (EditorMenu::MenuItem("Stairs")) createProModeler("ProModeler Stairs", ProModelerComponent::Shape::Stairs);
+            EditorMenu::EndMenu();
         }
-        ImGui::EndMenu();
+        EditorMenu::EndMenu();
     }
 
-    if (ImGui::MenuItem("Camera")) {
+    if (EditorMenu::MenuItem("Camera")) {
         RecordUndoSnapshot();
         if (Entity* cam = CreateCamera(parentForNew)) {
             SelectSingleEntity(cam->GetID());
         }
     }
 
-    if (ImGui::MenuItem("Audio Source")) {
+    if (EditorMenu::MenuItem("Audio Source")) {
         RecordUndoSnapshot();
         auto* audioEntity = scene.CreateEntity("Audio Source");
         audioEntity->AddComponent<AudioSourceComponent>();
         selectNew(audioEntity);
     }
 
-    if (ImGui::BeginMenu("Light")) {
+    if (EditorMenu::BeginMenu("Light")) {
         const glm::vec3 defaultPos = GetSceneViewSpawnPosition();
-        if (ImGui::MenuItem("Point Light")) {
+        if (EditorMenu::MenuItem("Point Light")) {
             RecordUndoSnapshot();
-            if (Entity* light = CreatePointLight(parentForNew, defaultPos))
+            if (Entity* light = CreateLight(parentForNew, defaultPos, LightType::Point))
                 selectNew(light);
         }
-        if (ImGui::MenuItem("Spot Light")) {
+        if (EditorMenu::MenuItem("Spot Light")) {
             RecordUndoSnapshot();
-            if (Entity* light = CreateSpotLight(parentForNew, defaultPos))
+            if (Entity* light = CreateLight(parentForNew, defaultPos, LightType::Spot))
                 selectNew(light);
         }
-        if (ImGui::MenuItem("Directional Light")) {
+        if (EditorMenu::MenuItem("Directional Light")) {
             RecordUndoSnapshot();
-            if (Entity* light = CreatePointLight(parentForNew, defaultPos)) {
-                if (auto* l = light->GetComponent<LightComponent>()) {
-                    l->type = LightType::Directional;
-                    l->range = 0.0f;
-                }
-                if (auto* tr = light->GetComponent<TransformComponent>())
-                    tr->rotation = { -50.0f, 30.0f, 0.0f };
+            if (Entity* light = CreateLight(parentForNew, defaultPos, LightType::Directional)) {
                 selectNew(light);
             }
         }
-        ImGui::EndMenu();
+        EditorMenu::EndMenu();
     }
 
-    if (ImGui::MenuItem("Post Process Volume")) {
+    if (EditorMenu::MenuItem("Post Process Volume")) {
         RecordUndoSnapshot();
         if (Entity* volume = CreatePostProcessVolume(parentForNew)) {
             selectNew(volume);
         }
     }
 
-    if (ImGui::BeginMenu("UI")) {
-        if (ImGui::MenuItem("Canvas")) {
+    if (EditorMenu::BeginMenu("UI")) {
+        if (EditorMenu::MenuItem("Canvas")) {
             RecordUndoSnapshot();
             if (Entity* canvas = CreateUICanvas(parentForNew)) {
                 SelectSingleEntity(canvas->GetID());
@@ -5090,19 +5754,19 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
             }
         }
 
-        if (ImGui::MenuItem("Image", nullptr, false, canvasParent != nullptr)) {
+        if (EditorMenu::MenuItem("Image", nullptr, false, canvasParent != nullptr)) {
             RecordUndoSnapshot();
             if (Entity* img = CreateUIImage(canvasParent)) {
                 SelectSingleEntity(img->GetID());
             }
         }
-        if (ImGui::MenuItem("Text", nullptr, false, canvasParent != nullptr)) {
+        if (EditorMenu::MenuItem("Text", nullptr, false, canvasParent != nullptr)) {
             RecordUndoSnapshot();
             if (Entity* txt = CreateUIText(canvasParent)) {
                 SelectSingleEntity(txt->GetID());
             }
         }
-        if (ImGui::MenuItem("Button Group")) {
+        if (EditorMenu::MenuItem("Button Group")) {
             RecordUndoSnapshot();
             Entity* parent = canvasParent;
             if (!parent)
@@ -5111,54 +5775,51 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
                 SelectSingleEntity(group->GetID());
             }
         }
-        if (ImGui::MenuItem("Button")) {
+        if (EditorMenu::MenuItem("Button")) {
             RecordUndoSnapshot();
             if (Entity* button = CreateUIButton(parentForNew)) {
                 SelectSingleEntity(button->GetID());
             }
         }
-        if (ImGui::MenuItem("Audio Spectrum", nullptr, false, canvasParent != nullptr)) {
+        if (EditorMenu::MenuItem("Audio Spectrum", nullptr, false, canvasParent != nullptr)) {
             RecordUndoSnapshot();
             if (Entity* spectrum = CreateUIAudioSpectrum(canvasParent)) {
                 SelectSingleEntity(spectrum->GetID());
             }
         }
-        ImGui::EndMenu();
+        EditorMenu::EndMenu();
     }
 
-    if (ImGui::MenuItem("First Person Controller")) {
-        RecordUndoSnapshot();
-        if (Entity* fps = CreateFirstPersonController(parentForNew)) {
-            SelectSingleEntity(fps->GetID());
+    if (EditorMenu::BeginMenu("Character")) {
+        if (EditorMenu::MenuItem("First Person Controller")) {
+            RecordUndoSnapshot();
+            if (Entity* fps = CreateFirstPersonController(parentForNew)) {
+                SelectSingleEntity(fps->GetID());
+            }
         }
+        EditorMenu::EndMenu();
     }
 }
 
-Entity* EditorApp::CreatePointLight(Entity* parentForNew, const glm::vec3& worldPosition) {
+Entity* EditorApp::CreateLight(Entity* parentForNew, const glm::vec3& worldPosition, LightType type) {
     Scene& scene = m_Engine->GetScene();
-    Entity* entity = scene.CreateEntity("Point Light");
-    if (auto* transform = entity->GetComponent<TransformComponent>())
-        transform->position = worldPosition;
-    auto& light = entity->AddComponent<LightComponent>();
-    light.type = LightType::Point;
-    light.range = 10.0f;
-    if (parentForNew)
-        scene.SetParent(entity, parentForNew);
-    return entity;
-}
-
-Entity* EditorApp::CreateSpotLight(Entity* parentForNew, const glm::vec3& worldPosition) {
-    Scene& scene = m_Engine->GetScene();
-    Entity* entity = scene.CreateEntity("Spot Light");
+    const char* name = type == LightType::Directional ? "Directional Light" :
+                       type == LightType::Spot ? "Spot Light" : "Point Light";
+    Entity* entity = scene.CreateEntity(name);
     if (auto* transform = entity->GetComponent<TransformComponent>()) {
         transform->position = worldPosition;
-        transform->rotation = { -50.0f, 0.0f, 0.0f };
+        if (type == LightType::Directional)
+            transform->rotation = { -50.0f, 30.0f, 0.0f };
+        else if (type == LightType::Spot)
+            transform->rotation = { -50.0f, 0.0f, 0.0f };
     }
     auto& light = entity->AddComponent<LightComponent>();
-    light.type = LightType::Spot;
-    light.range = 15.0f;
-    light.spotAngle = 45.0f;
-    light.spotInnerAngle = 30.0f;
+    light.type = type;
+    light.range = type == LightType::Directional ? 0.0f : type == LightType::Spot ? 15.0f : 10.0f;
+    if (type == LightType::Spot) {
+        light.spotAngle = 45.0f;
+        light.spotInnerAngle = 30.0f;
+    }
     if (parentForNew)
         scene.SetParent(entity, parentForNew);
     return entity;
@@ -5424,12 +6085,25 @@ Entity* EditorApp::CreateFirstPersonController(Entity* parentForNew) {
     Entity* fps = scene.CreateEntity("First Person Controller");
     PlaceNewSceneEntity(*fps, parentForNew);
 
-    fps->AddComponent<CameraComponent>();
-    scene.SetPrimaryCamera(*fps);
+    Entity* camera = scene.CreateEntity("Camera");
+    scene.SetParent(camera, fps);
+    camera->GetComponent<TransformComponent>()->position = { 0.0f, 1.7f, 0.0f };
+    camera->AddComponent<CameraComponent>();
+    scene.SetPrimaryCamera(*camera);
 
     auto& script = fps->AddComponent<MipsScriptComponent>();
     script.scriptPath = "assets/scripts/FirstPersonController.mips";
     ColliderUtils::EnsureFirstPersonPhysics(*fps);
+    // New controllers use a feet-level pivot; legacy controllers retain their
+    // existing eye-level collider offset when their built-in script updates.
+    fps->GetComponent<ColliderComponent>()->center = { 0.0f, 0.85f, 0.0f };
+    std::vector<std::string> errors;
+    if (Mips::MipsRuntime::EnsureScriptReady(script, errors)) {
+        const int field = script.module->FindFieldIndex("viewCamera");
+        if (field >= 0) script.fieldValues[static_cast<size_t>(field)] = camera->GetID();
+    }
+    for (const auto& error : errors) MIPSYNC_WARN("FPS controller: {}", error);
+    m_PendingHierarchyExpansionIDs.insert(fps->GetID());
 
     m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
     return fps;
@@ -5442,7 +6116,8 @@ void EditorApp::DrawHierarchyEntityNode(Entity& entity) {
     std::string name = tagComp ? tagComp->tag : "Unknown";
 
     const bool hasChildren = !entity.GetChildIDs().empty();
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
+                              ImGuiTreeNodeFlags_DrawLinesNone;
     if (!hasChildren) {
         flags |= ImGuiTreeNodeFlags_Leaf;
         // Match the Project tree: a leaf has no branch to communicate, so do
@@ -5455,9 +6130,19 @@ void EditorApp::DrawHierarchyEntityNode(Entity& entity) {
     if (hasChildren && m_PendingHierarchyExpansionIDs.count(entity.GetID()) != 0)
         ImGui::SetNextItemOpen(true, ImGuiCond_Always);
 
+    const bool activeInHierarchy = scene.IsActiveInHierarchy(entity);
+    if (!activeInHierarchy)
+        ImGui::PushStyleColor(ImGuiCol_Text, EditorTheme::TextMuted);
     bool opened = ImGui::TreeNodeEx((void*)(uint64_t)entity.GetID(), flags, "%s", name.c_str());
+    if (m_PendingHierarchyRevealEntityID == entity.GetID()) {
+        ImGui::SetScrollHereY(0.5f);
+        m_PendingHierarchyRevealEntityID = 0;
+    }
+    if (!activeInHierarchy)
+        ImGui::PopStyleColor();
 
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen()) {
+        ClearAnimatorGraphSelection();
         const ImGuiIO& io = ImGui::GetIO();
         const uint32_t clickedId = entity.GetID();
         if (!IsEntitySelected(clickedId) || io.KeyCtrl || io.KeyShift) {
@@ -5547,22 +6232,20 @@ void EditorApp::DrawHierarchyEntityNode(Entity& entity) {
         ImGui::EndDragDropTarget();
     }
 
-    if (ImGui::BeginPopupContextItem()) {
+    if (EditorMenu::BeginPopupContextItem()) {
         if (!IsEntitySelected(entity.GetID()))
             SelectSingleEntity(entity.GetID());
         DrawHierarchyContextMenu(&entity);
         ImGui::Separator();
-        if (ImGui::MenuItem("Duplicate")) {
+        if (EditorMenu::MenuItem("Duplicate")) {
             RecordUndoSnapshot();
             Entity* dup = scene.DuplicateEntity(entity);
             if (dup) {
-                Entity* parent = scene.FindEntity(entity.GetParentID());
-                scene.SetParent(dup, parent);
                 SelectSingleEntity(dup->GetID());
                 m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
             }
         }
-        if (ImGui::MenuItem("Save as Prefab")) {
+        if (EditorMenu::MenuItem("Save as Prefab")) {
             std::string baseName = "Prefab";
             if (auto* tag = entity.GetComponent<TagComponent>())
                 baseName = tag->tag;
@@ -5576,25 +6259,25 @@ void EditorApp::DrawHierarchyEntityNode(Entity& entity) {
                 ++counter;
             }
             std::string err;
-            if (SceneIO::SaveEntityToFile(entity, scene, absTarget, err)) {
+            if (RecordAssetUndoSnapshot(absTarget) && SceneIO::SaveEntityToFile(entity, scene, absTarget, err)) {
                 const_cast<Entity&>(entity).SetPrefabSourcePath(absTarget);
                 if (m_AssetBrowser) m_AssetBrowser->Refresh();
             } else {
                 MIPSYNC_WARN("Save as Prefab failed: {}", err);
             }
         }
-        if (ImGui::MenuItem("Unparent (move to root)") && entity.GetParentID() != 0) {
+        if (EditorMenu::MenuItem("Unparent (move to root)") && entity.GetParentID() != 0) {
             RecordUndoSnapshot();
             m_PendingReparentChildren = { entity.GetID() };
             m_PendingReparentParent = 0;
             m_PendingReparentSibling = 0;
             m_PendingReparentAfterSibling = false;
         }
-        if (ImGui::MenuItem("Delete Entity")) {
+        if (EditorMenu::MenuItem("Delete Entity")) {
             RecordUndoSnapshot();
             m_PendingHierarchyDeleteIDs = GetSelectedHierarchyRootIDs(entity.GetID());
         }
-        ImGui::EndPopup();
+        EditorMenu::EndPopup();
     }
 
     if (opened) {
@@ -5618,9 +6301,12 @@ void EditorApp::DrawHierarchyPanel() {
     Scene& scene = m_Engine->GetScene();
 
     m_HierarchyOrder.clear();
+    std::vector<uint32_t> rootIds;
     for (const auto& entityPtr : scene.GetEntities()) {
-        if (entityPtr->GetParentID() == 0)
+        if (entityPtr->GetParentID() == 0) {
+            rootIds.push_back(entityPtr->GetID());
             CollectHierarchyOrder(*entityPtr, m_HierarchyOrder);
+        }
     }
 
     m_PendingHierarchyDelete = nullptr;
@@ -5630,9 +6316,10 @@ void EditorApp::DrawHierarchyPanel() {
     m_PendingReparentSibling = 0;
     m_PendingReparentAfterSibling = false;
 
-    for (const auto& entityPtr : scene.GetEntities()) {
-        if (entityPtr->GetParentID() == 0)
-            DrawHierarchyEntityNode(*entityPtr);
+    // Context-menu creation can grow/reorder the entity vector during drawing.
+    for (uint32_t id : rootIds) {
+        if (Entity* entity = scene.FindEntity(id))
+            DrawHierarchyEntityNode(*entity);
     }
     m_PendingHierarchyExpansionIDs.clear();
 
@@ -5643,10 +6330,10 @@ void EditorApp::DrawHierarchyPanel() {
         ImGui::InvisibleButton("##hier_empty", ImVec2(-1.0f, emptyH));
         if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
             ClearEntitySelection();
-        if (ImGui::BeginPopupContextItem()) {
+        if (EditorMenu::BeginPopupContextItem()) {
             ClearEntitySelection();
             DrawHierarchyContextMenu(nullptr);
-            ImGui::EndPopup();
+            EditorMenu::EndPopup();
         }
         if (ImGui::BeginDragDropTarget()) {
             if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(DragDrop::kEntityId)) {
@@ -5665,11 +6352,11 @@ void EditorApp::DrawHierarchyPanel() {
     }
 
     // Right-click on window padding / gaps between items (not on an entity row).
-    if (ImGui::BeginPopupContextWindow("HierarchyPanelCtx",
+    if (EditorMenu::BeginPopupContextWindow("HierarchyPanelCtx",
             ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
         ClearEntitySelection();
         DrawHierarchyContextMenu(nullptr);
-        ImGui::EndPopup();
+        EditorMenu::EndPopup();
     }
 
     AcceptPrefabDrop();
@@ -5701,7 +6388,7 @@ void EditorApp::DrawHierarchyPanel() {
             for (uint32_t cid : m_PendingReparentChildren) {
                 Entity* child = scene.FindEntity(cid);
                 if (child)
-                    reparented = scene.SetParent(child, parent, true) || reparented;
+                    reparented = scene.ReorderEntity(child, parent, nullptr, false, true) || reparented;
             }
         }
         if (reparented) {
@@ -5770,19 +6457,22 @@ std::vector<std::string> EditorApp::CollectProjectScripts() const {
     return out;
 }
 
-void EditorApp::DrawAddComponentScriptMenu(const std::vector<Entity*>& entities) {
-    if (!ImGui::BeginMenu("Scripts"))
-        return;
-
+void EditorApp::DrawCreateComponentScriptForm(const std::vector<Entity*>& entities, const char* suggestedName) {
     static char newScriptName[128] = "NewScript";
-    constexpr float createScriptControlWidth = 220.0f;
-    ImGui::TextDisabled("Create and Add");
+    static std::string creationError;
+    if (suggestedName) {
+        std::snprintf(newScriptName, sizeof(newScriptName), "%s", *suggestedName ? suggestedName : "NewScript");
+        creationError.clear();
+    }
+    const float createScriptControlWidth = ImGui::GetContentRegionAvail().x;
+    ImGui::TextUnformatted("Script name");
     ImGui::SetNextItemWidth(createScriptControlWidth);
+    if (suggestedName) ImGui::SetKeyboardFocusHere();
     const bool createOnEnter = ImGui::InputTextWithHint(
         "##new_component_script", "Script name", newScriptName,
         sizeof(newScriptName), ImGuiInputTextFlags_EnterReturnsTrue);
     const bool createClicked = ImGui::Button(
-        "Create New", ImVec2(createScriptControlWidth, 0.0f));
+        "Create and Add", ImVec2(createScriptControlWidth, 0.0f));
     if (createOnEnter || createClicked) {
         std::string scriptPath;
         std::string error;
@@ -5802,43 +6492,13 @@ void EditorApp::DrawAddComponentScriptMenu(const std::vector<Entity*>& entities)
             newScriptName[sizeof(newScriptName) - 1] = '\0';
             ImGui::CloseCurrentPopup();
         } else {
+            creationError = error;
             MIPSYNC_WARN("Create New Mips# script failed: {}", error);
         }
     }
 
-    ImGui::SeparatorText("Existing Scripts");
-
-    const auto scripts = CollectProjectScripts();
-    if (scripts.empty()) {
-        ImGui::TextDisabled("No .mips scripts found");
-    } else {
-        for (const std::string& path : scripts) {
-            if (ImGui::MenuItem(path.c_str())) {
-                RecordUndoSnapshot();
-                for (Entity* entity : entities) {
-                    auto& script = entity->AddComponent<MipsScriptComponent>();
-                    script.scriptPath = path;
-                    script.module.reset();
-                    script.fieldValues.clear();
-                }
-                m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
-                m_SceneDirty = true;
-                ImGui::CloseCurrentPopup();
-            }
-        }
-    }
-    ImGui::Separator();
-    if (ImGui::MenuItem("Empty (set path manually)")) {
-        RecordUndoSnapshot();
-        for (Entity* entity : entities) {
-            auto& script = entity->AddComponent<MipsScriptComponent>();
-            script.scriptPath.clear();
-        }
-        m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
-        m_SceneDirty = true;
-        ImGui::CloseCurrentPopup();
-    }
-    ImGui::EndMenu();
+    if (!creationError.empty())
+        ImGui::TextWrapped("%s", creationError.c_str());
 }
 
 void EditorApp::FocusDockedWindow(const char* windowName) {
@@ -5933,13 +6593,13 @@ void EditorApp::DrawMipsScriptIdeMenuItems(const std::string& projectRelPath) {
     if (!hasScript)
         ImGui::BeginDisabled();
 
-    if (ImGui::MenuItem("Open in IDE")) {
+    if (EditorMenu::MenuItem("Open in IDE")) {
         if (!MipsEditorIntegration::OpenScriptInIde(projectRelPath)) {
             EDITOR_WARN("[Mips# IDE] Failed to open script in IDE: {}", projectRelPath);
             TriggerBuildToast("Could not open script in IDE", false);
         }
     }
-    if (ImGui::MenuItem("Validate")) {
+    if (EditorMenu::MenuItem("Validate")) {
         const auto result = MipsEditorIntegration::ValidateScript(projectRelPath);
         MipsEditorIntegration::LogValidationResult(projectRelPath, result);
         if (result.success) {
@@ -5974,8 +6634,136 @@ void EditorApp::DrawMipsScriptAssetInspector(const std::string& projectRelPath) 
     ImGui::TextWrapped("Diagnostics use the same Mips# compiler as builds, so editor errors and build errors stay aligned.");
 }
 
+bool EditorApp::HasCopiedInspectorComponent() const {
+    return m_ComponentClipboard && m_ComponentClipboard->HasValue();
+}
+
+const char* EditorApp::GetInspectorPasteLabel(const Component* destination) const {
+    // Keep the navigation ID stable when the clipboard changes while open.
+    return destination && m_ComponentClipboard && m_ComponentClipboard->Matches(*destination)
+        ? "Paste Component Values###component_paste"
+        : "Paste as New Component###component_paste";
+}
+
+bool EditorApp::CanPasteInspectorComponent(const Component* destination) const {
+    if (!HasCopiedInspectorComponent()) return false;
+    Entity* primary = m_Engine->GetScene().FindEntity(m_SelectedEntityID);
+    if (!primary || !m_ComponentClipboard->CanPaste(*primary, destination)) return false;
+    const bool replace = destination && m_ComponentClipboard->Matches(*destination);
+    const size_t occurrence = destination ? InspectorComponentOccurrence(*primary, *destination) : 0;
+    // A multi-selection paste is one action: enable it only if every target
+    // can receive it, so no objects are partially changed or duplicated.
+    for (uint32_t id : m_SelectedEntityIDs) {
+        Entity* entity = m_Engine->GetScene().FindEntity(id);
+        if (!entity || entity == primary) continue;
+        Component* matching = replace ? FindMatchingInspectorComponent(*entity, *destination, occurrence) : nullptr;
+        if (!m_ComponentClipboard->CanPaste(*entity, matching)) return false;
+    }
+    return true;
+}
+
+void EditorApp::CopyInspectorComponent(const Component& component) {
+    if (!m_ComponentClipboard) m_ComponentClipboard = std::make_unique<EditorComponentClipboard>();
+    m_ComponentClipboard->Copy(component);
+}
+
+bool EditorApp::PasteInspectorComponent(Component* destination) {
+    if (!CanPasteInspectorComponent(destination)) return false;
+    Entity* primary = GetSelectedEntity();
+    if (!primary || (destination && destination->entity != primary)) return false;
+    std::vector<Entity*> targets{primary};
+    for (uint32_t id : m_SelectedEntityIDs) {
+        Entity* entity = m_Engine->GetScene().FindEntity(id);
+        if (entity && entity != primary) targets.push_back(entity);
+    }
+    const bool replace = destination && m_ComponentClipboard->Matches(*destination);
+    const size_t occurrence = destination ? InspectorComponentOccurrence(*primary, *destination) : 0;
+    RecordUndoSnapshot();
+    for (Entity* entity : targets) {
+        Component* matching = replace ? FindMatchingInspectorComponent(*entity, *destination, occurrence) : nullptr;
+        Component* pasted = m_ComponentClipboard->Paste(*entity, matching);
+        if (!pasted) continue;
+        if (auto* terrain = dynamic_cast<TerrainComponent*>(pasted)) {
+            auto* mesh = entity->GetComponent<MeshRendererComponent>();
+            if (!mesh) mesh = &entity->AddComponent<MeshRendererComponent>();
+            terrain->RebuildMesh(*mesh);
+        }
+        if (auto* modeler = dynamic_cast<ProModelerComponent*>(pasted)) {
+            auto* mesh = entity->GetComponent<MeshRendererComponent>();
+            if (!mesh) mesh = &entity->AddComponent<MeshRendererComponent>();
+            modeler->RebuildMesh(*mesh);
+        }
+        if (auto* script = dynamic_cast<MipsScriptComponent*>(pasted); script && m_IsPlaying)
+            m_Engine->GetMipsRuntime().ApplyFieldOverrides(entity, *script);
+        SyncSelectedCameraFromTransform(entity);
+    }
+    if (m_IsPlaying) m_Engine->GetPhysicsWorld().RefreshBodies(m_Engine->GetScene());
+    m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+    m_SceneDirty = true;
+    CommitUndoTransaction();
+    return true;
+}
+
+bool EditorApp::ResetInspectorComponent(Component& component) {
+    if (IsPreparingPlay()) return false;
+    Entity* primary = GetSelectedEntity();
+    if (!primary || component.entity != primary) return false;
+    const size_t occurrence = InspectorComponentOccurrence(*primary, component);
+    std::vector<Component*> targets{&component};
+    for (uint32_t id : m_SelectedEntityIDs) {
+        Entity* entity = m_Engine->GetScene().FindEntity(id);
+        if (entity && entity != primary) {
+            if (auto* matching = FindMatchingInspectorComponent(*entity, component, occurrence))
+                targets.push_back(matching);
+        }
+    }
+    std::vector<std::unique_ptr<Component>> defaults;
+    for (Component* target : targets) {
+        auto value = CreateDefaultComponentValue(*target);
+        if (!value) return false;
+        if (auto* script = dynamic_cast<MipsScriptComponent*>(value.get()); script && !script->scriptPath.empty()) {
+            std::vector<std::string> errors;
+            if (!Mips::MipsRuntime::EnsureScriptReady(*script, errors)) {
+                for (const auto& error : errors) MIPSYNC_CONSOLE_WARN("{}", error);
+                TriggerBuildToast("Cannot reset script: see Console", false);
+                return false;
+            }
+        }
+        defaults.push_back(std::move(value));
+    }
+    RecordUndoSnapshot();
+    for (size_t i = 0; i < targets.size(); ++i) {
+        Component* target = targets[i];
+        AssignComponentValue(*target, *defaults[i]);
+        Entity* entity = target->entity;
+        if (auto* terrain = dynamic_cast<TerrainComponent*>(target)) {
+            auto* mesh = entity->GetComponent<MeshRendererComponent>();
+            if (!mesh) mesh = &entity->AddComponent<MeshRendererComponent>();
+            terrain->RebuildMesh(*mesh);
+        }
+        if (auto* modeler = dynamic_cast<ProModelerComponent*>(target)) {
+            auto* mesh = entity->GetComponent<MeshRendererComponent>();
+            if (!mesh) mesh = &entity->AddComponent<MeshRendererComponent>();
+            modeler->RebuildMesh(*mesh);
+        }
+        if (auto* script = dynamic_cast<MipsScriptComponent*>(target); script && script->module && m_IsPlaying)
+            m_Engine->GetMipsRuntime().ApplyFieldOverrides(entity, *script);
+        SyncSelectedCameraFromTransform(entity);
+    }
+    if (m_IsPlaying) m_Engine->GetPhysicsWorld().RefreshBodies(m_Engine->GetScene());
+    m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+    m_SceneDirty = true;
+    CommitUndoTransaction();
+    return true;
+}
+
 void EditorApp::DrawInspectorPanel() {
     ImGui::Begin("Inspector");
+
+    if (DrawAnimatorGraphSelectionInspector(this, m_AnimatorControllerWindowPath)) {
+        ImGui::End();
+        return;
+    }
 
     const bool singleAssetSelected =
         m_AssetBrowser && m_AssetBrowser->GetSelectedAssetCount() == 1 &&
@@ -6116,16 +6904,16 @@ void EditorApp::DrawInspectorPanel() {
                 [&](const Entity* entity) {
                     return entity->GetEditorTag() != selectedEntity->GetEditorTag();
                 });
-            if (ImGui::BeginCombo("##object_tag", editorTagMixed ? "-" : tags[tagIndex])) {
+            if (EditorDropdown::BeginCombo("##object_tag", editorTagMixed ? "-" : tags[tagIndex])) {
                 for (int index = 0; index < IM_ARRAYSIZE(tags); ++index) {
-                    if (ImGui::Selectable(tags[index], !editorTagMixed && tagIndex == index)) {
+                    if (EditorDropdown::Selectable(tags[index], !editorTagMixed && tagIndex == index)) {
                         RecordUndoSnapshot();
                         for (Entity* target : inspectorEntities)
                             target->SetEditorTag(tags[index]);
                         m_SceneDirty = true;
                     }
                 }
-                ImGui::EndCombo();
+                EditorDropdown::EndCombo();
             }
             ImGui::SameLine(); ImGui::TextDisabled("Layer"); ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
@@ -6138,16 +6926,22 @@ void EditorApp::DrawInspectorPanel() {
                 [&](const Entity* entity) {
                     return entity->GetEditorLayer() != selectedEntity->GetEditorLayer();
                 });
-            if (ImGui::BeginCombo("##object_layer", editorLayerMixed ? "-" : layers[layerIndex])) {
+            if (EditorDropdown::BeginCombo("##object_layer", editorLayerMixed ? "-" : layers[layerIndex])) {
                 for (int index = 0; index < IM_ARRAYSIZE(layers); ++index) {
-                    if (ImGui::Selectable(layers[index], !editorLayerMixed && layerIndex == index)) {
+                    if (EditorDropdown::Selectable(layers[index], !editorLayerMixed && layerIndex == index)) {
                         RecordUndoSnapshot();
                         for (Entity* target : inspectorEntities)
                             target->SetEditorLayer(layers[index]);
                         m_SceneDirty = true;
                     }
                 }
-                ImGui::EndCombo();
+                EditorDropdown::EndCombo();
+            }
+            if (EditorMenu::BeginPopupContextWindow("##object_header_component_paste",
+                    ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
+                if (EditorMenu::MenuItem(GetInspectorPasteLabel(), nullptr, false, CanPasteInspectorComponent()))
+                    PasteInspectorComponent();
+                EditorMenu::EndPopup();
             }
             ImGui::EndChild();
             ImGui::Spacing();
@@ -6212,10 +7006,14 @@ void EditorApp::DrawInspectorPanel() {
 
             auto* transformComp = dynamic_cast<TransformComponent*>(orderedComponent);
             if (transformComp && !selectedEntity->GetComponent<RectTransformComponent>()) {
-                if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
-                    if (InspectorDragFloat3("Position", glm::value_ptr(transformComp->position), 0.1f) ||
-                        InspectorDragFloat3("Rotation", glm::value_ptr(transformComp->rotation), 0.1f) ||
-                        InspectorDragFloat3("Scale", glm::value_ptr(transformComp->scale), 0.1f)) {
+                const bool transformOpen = BeginInspectableComponent(
+                    "Transform", *transformComp, removeComponent, this, {},
+                    InspectorComponentLayout::Transform);
+                if (transformOpen) {
+                    bool changed = InspectorDragFloat3("Position", glm::value_ptr(transformComp->position), 0.1f);
+                    changed |= InspectorDragFloat3("Rotation", glm::value_ptr(transformComp->rotation), 0.1f);
+                    changed |= InspectorDragFloat3("Scale", glm::value_ptr(transformComp->scale), 0.1f);
+                    if (changed) {
                         for (Entity* target : inspectorEntities) {
                             SyncSelectedCameraFromTransform(target);
                             SyncPhysicsAfterTransformEdit(target);
@@ -6224,15 +7022,14 @@ void EditorApp::DrawInspectorPanel() {
                         m_SceneDirty = true;
                     }
                 }
-                DrawInspectorDivider();
-                DrawInspectorDivider();
+                EndInspectableComponent(*transformComp, transformOpen, InspectorComponentLayout::Transform);
             }
 
             auto* cameraComp = dynamic_cast<CameraComponent*>(orderedComponent);
             if (cameraComp) {
                 const bool open = BeginInspectableComponent(
                     "Camera", *cameraComp, removeComponent, this, [&] {
-                        if (ImGui::MenuItem("Clear Prerendered Background", nullptr, false,
+                        if (EditorMenu::MenuItem("Clear Prerendered Background", nullptr, false,
                                             !cameraComp->prerenderedBackgroundPath.empty())) {
                             cameraComp->prerenderedBackgroundPath.clear();
                             m_PrerenderedBackgroundTextures.clear();
@@ -6246,7 +7043,7 @@ void EditorApp::DrawInspectorPanel() {
                             m_Engine->GetScene().SetPrimaryCamera(*selectedEntity);
                         cameraChanged = true;
                     }
-                    cameraChanged |= InspectorDragFloat("Field of View", &cameraComp->camera.fov, 0.5f, 15.0f, 120.0f);
+                    cameraChanged |= InspectorSliderFloat("Field of View", &cameraComp->camera.fov, 15.0f, 120.0f, "%.1f");
                     cameraChanged |= InspectorDragFloat("Near Clip", &cameraComp->camera.nearClip, 0.01f, 0.01f, 10.0f);
                     cameraChanged |= InspectorDragFloat("Far Clip (Draw Dist)", &cameraComp->camera.farClip, 0.5f, 1.0f, 500.0f);
 
@@ -6311,8 +7108,8 @@ void EditorApp::DrawInspectorPanel() {
                             targetLabel = "Missing (ID: " + std::to_string(distanceCullComp->targetEntityId) + ")";
                         }
                     }
-                    if (ImGui::BeginCombo("Target Center", targetLabel.c_str())) {
-                        if (ImGui::Selectable("Self (This Entity / Camera)", distanceCullComp->targetEntityId == 0)) {
+                    if (EditorDropdown::BeginCombo("Target Center", targetLabel.c_str())) {
+                        if (EditorDropdown::Selectable("Self (This Entity / Camera)", distanceCullComp->targetEntityId == 0)) {
                             distanceCullComp->targetEntityId = 0;
                             changed = true;
                         }
@@ -6323,12 +7120,12 @@ void EditorApp::DrawInspectorPanel() {
                             if (auto* tag = entityPtr->GetComponent<TagComponent>())
                                 name = tag->tag;
                             const bool isPicked = (distanceCullComp->targetEntityId == entityPtr->GetID());
-                            if (ImGui::Selectable(name.c_str(), isPicked)) {
+                            if (EditorDropdown::Selectable(name.c_str(), isPicked)) {
                                 distanceCullComp->targetEntityId = entityPtr->GetID();
                                 changed = true;
                             }
                         }
-                        ImGui::EndCombo();
+                        EditorDropdown::EndCombo();
                     }
 
                     changed |= InspectorCheckbox("Cull Static Meshes", &distanceCullComp->cullMeshRenderers);
@@ -6510,7 +7307,7 @@ void EditorApp::DrawInspectorPanel() {
                 const bool open = BeginInspectableComponent(
                     "Skinned Mesh Renderer", *skinnedComp, removeComponent, this, [&] {
                         const bool hasModel = !skinnedComp->modelPath.empty();
-                        if (ImGui::MenuItem("Reload Model", nullptr, false, hasModel)) {
+                        if (EditorMenu::MenuItem("Reload Model", nullptr, false, hasModel)) {
                             RecordUndoSnapshot();
                             skinnedComp->SetModelFile(skinnedComp->modelPath);
                             ApplySkeletalModelFitScale(*selectedEntity, skinnedComp->modelPath);
@@ -6520,11 +7317,11 @@ void EditorApp::DrawInspectorPanel() {
                                 anim->ReloadAssets();
                             }
                         }
-                        if (ImGui::MenuItem("Fit Scale", nullptr, false, hasModel)) {
+                        if (EditorMenu::MenuItem("Fit Scale", nullptr, false, hasModel)) {
                             RecordUndoSnapshot();
                             ApplySkeletalModelFitScale(*selectedEntity, skinnedComp->modelPath);
                         }
-                        if (ImGui::MenuItem("Save Material", nullptr, false,
+                        if (EditorMenu::MenuItem("Save Material", nullptr, false,
                                             !skinnedComp->materialPath.empty())) {
                             Material mat;
                             mat.color = skinnedComp->color;
@@ -6532,7 +7329,8 @@ void EditorApp::DrawInspectorPanel() {
                             mat.mainTextureTiling = skinnedComp->textureTiling;
                             mat.mainTextureOffset = skinnedComp->textureOffset;
                             std::string err;
-                            if (Material::Save(AssetManager::Get().ToAbsolute(
+                            if (RecordAssetUndoSnapshot(AssetManager::Get().ToAbsolute(skinnedComp->materialPath)) &&
+                                Material::Save(AssetManager::Get().ToAbsolute(
                                                    skinnedComp->materialPath), mat, err)) {
                                 AssetThumbnail::Get().DropMaterialThumbnail(
                                     skinnedComp->materialPath);
@@ -6566,6 +7364,48 @@ void EditorApp::DrawInspectorPanel() {
                         }
                     }
                     DrawMaterialSlot(*skinnedComp);
+                    const char* renderTypes[] = {"Lit", "Unlit"};
+                    int renderType = static_cast<int>(skinnedComp->renderType);
+                    if (InspectorCombo("Render Type", &renderType, renderTypes, 2,
+                                       InspectorValuesMixed(&skinnedComp->renderType))) {
+                        RecordUndoSnapshot();
+                        skinnedComp->renderType = static_cast<RendererType>(renderType);
+                        PropagateInspectorValues(&skinnedComp->renderType);
+                        m_SceneDirty = true;
+                    }
+
+                    const char* presetNames[] = {
+                        "Prop", "Corridor", "Character", "ViewModel", "Floor"
+                    };
+                    int preset = static_cast<int>(skinnedComp->typePreset);
+                    if (InspectorCombo("Type Preset", &preset, presetNames,
+                                       IM_ARRAYSIZE(presetNames),
+                                       InspectorValuesMixed(&skinnedComp->typePreset))) {
+                        RecordUndoSnapshot();
+                        skinnedComp->typePreset =
+                            static_cast<SkinnedMeshRendererComponent::TypePreset>(
+                                std::clamp(preset, 0, 4));
+                        PropagateInspectorValues(&skinnedComp->typePreset);
+                        m_SceneDirty = true;
+                    }
+                    switch (skinnedComp->typePreset) {
+                    case SkinnedMeshRendererComponent::TypePreset::Corridor:
+                        ImGui::TextDisabled("Near-field static geometry; close clipping and cache optimized.");
+                        break;
+                    case SkinnedMeshRendererComponent::TypePreset::Character:
+                        ImGui::TextDisabled("Dynamic skinned object; prioritized without static projection caching.");
+                        break;
+                    case SkinnedMeshRendererComponent::TypePreset::Viewmodel:
+                        ImGui::TextDisabled("First-person foreground pass with a reduced near clip.");
+                        break;
+                    case SkinnedMeshRendererComponent::TypePreset::Floor:
+                        ImGui::TextDisabled("Static floor path; intended for planar world geometry.");
+                        break;
+                    case SkinnedMeshRendererComponent::TypePreset::Prop:
+                    default:
+                        ImGui::TextDisabled("Static world object; projection and lighting cache optimized.");
+                        break;
+                    }
 
                     ImGui::SeparatorText("PS1 Export");
                     const char* ps1Modes[] = { "Off", "Static Pose", "Rigid Bones" };
@@ -6615,9 +7455,31 @@ void EditorApp::DrawInspectorPanel() {
                 const bool open = BeginInspectableComponent("Audio Source", *audioSource,
                                                             removeComponent, this);
                 if (!removeComponent && open) {
-                    if (DrawAssetReferenceField(this, "Audio Clip", AssetKind::Audio,
-                                                audioSource->clipPath, "None (Audio Clip)"))
+                    const char* audioTypes[] = { "BGM (CD Streaming)", "SFX (MIDI / SPU)", "SFX (Sample / SPU)" };
+                    int audioType = static_cast<int>(audioSource->type);
+                    if (InspectorCombo("Type", &audioType, audioTypes, 3,
+                                       InspectorValuesMixed(&audioSource->type))) {
+                        audioSource->type = static_cast<AudioSourceType>(audioType);
+                        PropagateInspectorValues(&audioSource->type);
+                        if (audioSource->type != AudioSourceType::BGM) {
+                            audioSource->playOnAwake = false;
+                            PropagateInspectorValues(&audioSource->playOnAwake);
+                        }
+                    }
+                    const bool sfx = audioSource->type == AudioSourceType::SFX;
+                    const bool sampleSfx = audioSource->type == AudioSourceType::SampleSFX;
+                    if (DrawAssetReferenceField(this, sfx ? "MIDI Clip" : sampleSfx ? "Sample Clip" : "Audio Clip", AssetKind::Audio,
+                                                audioSource->clipPath, sfx ? "None (MIDI .mid / .midi)" : sampleSfx ? "None (Short WAV / MP3 / VAG)" : "None (Audio Clip)")) {
                         RecordUndoSnapshot();
+                        if (IsMidiPath(audioSource->clipPath)) {
+                            audioSource->type = AudioSourceType::SFX;
+                            audioSource->playOnAwake = false;
+                            PropagateInspectorValues(&audioSource->type);
+                            PropagateInspectorValues(&audioSource->playOnAwake);
+                        }
+                    }
+                    if (!audioSource->clipPath.empty() && sfx != IsMidiPath(audioSource->clipPath))
+                        ImGui::TextColored(ImVec4(1, 0.55f, 0.2f, 1), "Clip format does not match the selected type.");
                     if (InspectorCheckbox("Play On Awake", &audioSource->playOnAwake))
                         RecordUndoSnapshot();
                     if (InspectorCheckbox("Loop", &audioSource->loop))
@@ -6626,6 +7488,12 @@ void EditorApp::DrawInspectorPanel() {
                         RecordUndoSnapshot();
                     if (InspectorSliderFloat("Volume", &audioSource->volume, 0.0f, 1.0f))
                         RecordUndoSnapshot();
+                    ImGui::BeginDisabled(audioSource->clipPath.empty());
+                    if (ImGui::Button("Preview"))
+                        m_Engine->GetAudioSystem().Play(m_Engine->GetScene(), selectedEntity->GetID(), AssetManager::Get().GetProjectRoot());
+                    ImGui::SameLine();
+                    if (ImGui::Button("Stop")) m_Engine->GetAudioSystem().Stop(selectedEntity->GetID());
+                    ImGui::EndDisabled();
                 }
                 EndInspectableComponent(*audioSource, open);
                 if (removeComponent) {
@@ -6642,18 +7510,18 @@ void EditorApp::DrawInspectorPanel() {
                     selectedEntity->GetComponent<SkinnedMeshRendererComponent>();
                 const bool open = BeginInspectableComponent(
                     "Animator", *animatorComp, removeComponent, this, [&] {
-                        if (ImGui::MenuItem("Reload Assets"))
+                        if (EditorMenu::MenuItem("Reload Assets"))
                             animatorComp->ReloadAssets();
 
                         std::string modelForController = animatorComp->modelPath;
                         if (modelForController.empty() && animatorSkinnedComp)
                             modelForController = animatorSkinnedComp->modelPath;
-                        if (ImGui::MenuItem("Create from Model Clips", nullptr, false,
+                        if (EditorMenu::MenuItem("Create from Model Clips", nullptr, false,
                                             !modelForController.empty())) {
                             CreateAndAssignControllerFromModel(
                                 this, *animatorComp, modelForController, animatorSkinnedComp);
                         }
-                        if (ImGui::MenuItem("Open Controller Window", nullptr, false,
+                        if (EditorMenu::MenuItem("Open Controller Window", nullptr, false,
                                             !animatorComp->controllerPath.empty())) {
                             OpenAnimatorControllerWindow(animatorComp->controllerPath);
                         }
@@ -6714,7 +7582,7 @@ void EditorApp::DrawInspectorPanel() {
                 removeComponent = false;
                 const bool open = BeginInspectableComponent(
                     "Mesh Renderer", *meshRendererComp, removeComponent, this, [&] {
-                        if (ImGui::MenuItem("Use Primitive Cube", nullptr, false,
+                        if (EditorMenu::MenuItem("Use Primitive Cube", nullptr, false,
                                             meshRendererComp->meshPrimitive == "File")) {
                             RecordUndoSnapshot();
                             meshRendererComp->SetPrimitive("Cube", 1.0f);
@@ -6722,8 +7590,17 @@ void EditorApp::DrawInspectorPanel() {
                     });
                 if (!removeComponent && open) {
                     const char* presetNames[] = {
-                        "Prop", "Corridor", "Character", "Viewmodel", "Floor"
+                        "Prop", "Corridor", "Character", "ViewModel", "Floor"
                     };
+                    const char* renderTypes[] = {"Lit", "Unlit"};
+                    int renderType = static_cast<int>(meshRendererComp->renderType);
+                    if (InspectorCombo("Render Type", &renderType, renderTypes, 2,
+                                       InspectorValuesMixed(&meshRendererComp->renderType))) {
+                        RecordUndoSnapshot();
+                        meshRendererComp->renderType = static_cast<RendererType>(renderType);
+                        PropagateInspectorValues(&meshRendererComp->renderType);
+                        m_SceneDirty = true;
+                    }
                     int preset = static_cast<int>(meshRendererComp->typePreset);
                     if (InspectorCombo("Type Preset", &preset, presetNames,
                                        IM_ARRAYSIZE(presetNames),
@@ -6739,7 +7616,23 @@ void EditorApp::DrawInspectorPanel() {
                                                     meshRendererComp->meshPath, "None (Mesh)")) {
                             RecordUndoSnapshot();
                             if (!meshRendererComp->meshPath.empty())
+                                meshRendererComp->meshPartIndex = -1;
+                            if (!meshRendererComp->meshPath.empty())
                                 meshRendererComp->SetMeshFile(meshRendererComp->meshPath);
+                        }
+                        auto sourceModel = AssetManager::Get().GetMesh(meshRendererComp->meshPath);
+                        if (sourceModel && sourceModel->GetParts().size() > 1) {
+                            std::vector<std::string> names{"All Meshes"};
+                            std::vector<const char*> labels;
+                            for (const auto& part : sourceModel->GetParts()) names.push_back(part.name);
+                            for (const auto& name : names) labels.push_back(name.c_str());
+                            int part = meshRendererComp->meshPartIndex + 1;
+                            if (InspectorCombo("Mesh Part", &part, labels.data(), static_cast<int>(labels.size()))) {
+                                RecordUndoSnapshot();
+                                meshRendererComp->meshPartIndex = part - 1;
+                                meshRendererComp->RebuildMesh();
+                                PropagateInspectorValues(&meshRendererComp->meshPartIndex);
+                            }
                         }
                     } else {
                         const char* meshTypes[] = { "Cube", "Sphere", "Plane", "Terrain" };
@@ -6856,17 +7749,17 @@ void EditorApp::DrawInspectorPanel() {
                 };
                 const bool open = BeginInspectableComponent(
                     "Terrain", *terrainComp, removeComponent, this, [&] {
-                        if (ImGui::MenuItem("Flatten Terrain")) {
+                        if (EditorMenu::MenuItem("Flatten Terrain")) {
                             RecordUndoSnapshot();
                             terrainComp->ResetProcedural();
                             rebuildTerrain();
                         }
-                        if (ImGui::MenuItem("Clear Paint")) {
+                        if (EditorMenu::MenuItem("Clear Paint")) {
                             RecordUndoSnapshot();
                             terrainComp->ClearPaint();
                             rebuildTerrain();
                         }
-                        if (ImGui::MenuItem("Fill Layer")) {
+                        if (EditorMenu::MenuItem("Fill Layer")) {
                             RecordUndoSnapshot();
                             terrainComp->EnsureData();
                             std::fill(terrainComp->paintColors.begin(),
@@ -6944,7 +7837,7 @@ void EditorApp::DrawInspectorPanel() {
                 const bool canFitCollider = colliderMeshRenderer && colliderMeshRenderer->mesh;
                 const bool open = BeginInspectableComponent(
                     "Collider", *collider, removeComponent, this, [&] {
-                        if (ImGui::MenuItem("Fit to Mesh", nullptr, false, canFitCollider)) {
+                        if (EditorMenu::MenuItem("Fit to Mesh", nullptr, false, canFitCollider)) {
                             RecordUndoSnapshot();
                             ColliderUtils::FitColliderToMesh(*collider,
                                                              *colliderMeshRenderer->mesh);
@@ -7043,15 +7936,22 @@ void EditorApp::DrawInspectorPanel() {
             auto* rectTransform = dynamic_cast<RectTransformComponent*>(orderedComponent);
             if (rectTransform) {
                 removeComponent = false;
-                const bool open = BeginInspectableComponent("Rect Transform", *rectTransform, removeComponent, this);
+                const bool open = BeginInspectableComponent(
+                    "Rect Transform", *rectTransform, removeComponent, this, {},
+                    InspectorComponentLayout::Transform);
                 if (!removeComponent && open) {
-                    InspectorDragFloat2("Anchor Min", glm::value_ptr(rectTransform->anchorMin), 0.01f, 0.0f, 1.0f);
-                    InspectorDragFloat2("Anchor Max", glm::value_ptr(rectTransform->anchorMax), 0.01f, 0.0f, 1.0f);
-                    InspectorDragFloat2("Pivot", glm::value_ptr(rectTransform->pivot), 0.01f, 0.0f, 1.0f);
-                    InspectorDragFloat2("Anchored Position", glm::value_ptr(rectTransform->anchoredPosition), 1.0f);
-                    InspectorDragFloat2("Size Delta", glm::value_ptr(rectTransform->sizeDelta), 1.0f);
+                    bool changed = InspectorDragFloat2("Position", glm::value_ptr(rectTransform->anchoredPosition), 1.0f);
+                    changed |= InspectorDragFloat2("Size Delta", glm::value_ptr(rectTransform->sizeDelta), 1.0f);
+                    ImGui::Spacing();
+                    changed |= InspectorDragFloat2("Anchor Min", glm::value_ptr(rectTransform->anchorMin), 0.01f, 0.0f, 1.0f);
+                    changed |= InspectorDragFloat2("Anchor Max", glm::value_ptr(rectTransform->anchorMax), 0.01f, 0.0f, 1.0f);
+                    changed |= InspectorDragFloat2("Pivot", glm::value_ptr(rectTransform->pivot), 0.01f, 0.0f, 1.0f);
+                    if (changed) {
+                        m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+                        m_SceneDirty = true;
+                    }
                 }
-                EndInspectableComponent(*rectTransform, open);
+                EndInspectableComponent(*rectTransform, open, InspectorComponentLayout::Transform);
                 if (removeComponent) {
                     RemoveCurrentInspectorComponents(*selectedEntity, rectTransform);
                     ImGui::End();
@@ -7182,6 +8082,53 @@ void EditorApp::DrawInspectorPanel() {
                         uiButtonGroup->confirmButton = static_cast<UIConfirmGamepadButton>(button);
                         PropagateInspectorValues(&uiButtonGroup->confirmButton);
                     }
+                    ImGui::SeparatorText("Sounds (Optional)");
+                    auto soundSlot = [&](const char* label, uint32_t& id) {
+                        Entity* target = m_Engine->GetScene().FindEntity(id);
+                        auto* audio = target ? target->GetComponent<AudioSourceComponent>() : nullptr;
+                        const std::string preview = id == 0 ? "None" :
+                            (audio && audio->type != AudioSourceType::BGM
+                                ? (target->GetComponent<TagComponent>() ? target->GetComponent<TagComponent>()->tag : "AudioSource")
+                                : "Missing / not SFX");
+                        auto assign = [&](uint32_t value) {
+                            RecordUndoSnapshot(); id = value; PropagateInspectorValues(&id); m_SceneDirty = true;
+                        };
+                        ImGui::PushID(label);
+                        ImGui::TextUnformatted(label);
+                        ImGui::SetNextItemWidth(-1);
+                        const auto soundAction = DrawInspectorObjectReferenceButton(preview.c_str(), target != nullptr);
+                        if (ImGui::BeginDragDropTarget()) {
+                            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(DragDrop::kEntityId)) {
+                                if (payload->DataSize >= static_cast<int>(sizeof(uint32_t))) {
+                                    uint32_t dropped = *static_cast<const uint32_t*>(payload->Data);
+                                    Entity* entity = m_Engine->GetScene().FindEntity(dropped);
+                                    auto* source = entity ? entity->GetComponent<AudioSourceComponent>() : nullptr;
+                                    if (source && source->type != AudioSourceType::BGM) assign(dropped);
+                                }
+                            }
+                            ImGui::EndDragDropTarget();
+                        }
+                        if (soundAction == EditorSurface::ReferenceAction::Select && target)
+                            QueueReferenceSelection(target->GetID());
+                        if (soundAction == EditorSurface::ReferenceAction::Pick)
+                            ImGui::OpenPopup("##sound");
+                        if (EditorMenu::BeginPopup("##sound")) {
+                            if (EditorDropdown::Selectable("None", id == 0)) assign(0);
+                            for (const auto& entity : m_Engine->GetScene().GetEntities()) {
+                                auto* source = entity ? entity->GetComponent<AudioSourceComponent>() : nullptr;
+                                if (!source || source->type == AudioSourceType::BGM) continue;
+                                ImGui::PushID(static_cast<int>(entity->GetID()));
+                                auto* tag = entity->GetComponent<TagComponent>();
+                                if (EditorDropdown::Selectable(tag ? tag->tag.c_str() : "AudioSource", id == entity->GetID())) assign(entity->GetID());
+                                ImGui::PopID();
+                            }
+                            EditorMenu::EndPopup();
+                        }
+                        ImGui::PopID();
+                    };
+                    soundSlot("Navigation Sound", uiButtonGroup->navigationAudioSourceId);
+                    soundSlot("Confirm Sound", uiButtonGroup->confirmAudioSourceId);
+                    ImGui::TextWrapped("Choose an SFX AudioSource or drop one from the Hierarchy. None disables that sound.");
                     ImGui::SeparatorText("Cursor");
                     DrawUIButtonGroupCursorSlot(*uiButtonGroup);
                     InspectorDragFloat2("Cursor Offset", glm::value_ptr(uiButtonGroup->cursorOffset), 1.0f);
@@ -7208,7 +8155,7 @@ void EditorApp::DrawInspectorPanel() {
                 }
                 const bool open = BeginInspectableComponent(
                     "Button", *uiButton, removeComponent, this, [&] {
-                        if (ImGui::MenuItem("Create Child Text", nullptr, false, !hasTextChild)) {
+                        if (EditorMenu::MenuItem("Create Child Text", nullptr, false, !hasTextChild)) {
                             RecordUndoSnapshot();
                             Scene& scene = m_Engine->GetScene();
                             Entity* textEntity = scene.CreateEntity("Text");
@@ -7227,7 +8174,7 @@ void EditorApp::DrawInspectorPanel() {
                             m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
                             m_SceneDirty = true;
                         }
-                        if (ImGui::MenuItem("Add On Click Listener")) {
+                        if (EditorMenu::MenuItem("Add On Click Listener")) {
                             RecordUndoSnapshot();
                             uiButton->onClick.emplace_back();
                             m_SceneDirty = true;
@@ -7286,8 +8233,8 @@ void EditorApp::DrawInspectorPanel() {
                                 targetLabel = "Entity #" + std::to_string(target->GetID());
                         }
                         ImGui::SetNextItemWidth(-1.0f);
-                        const bool openTargetPicker =
-                            DrawInspectorObjectReferenceButton(targetLabel.c_str());
+                        const auto targetAction =
+                            DrawInspectorObjectReferenceButton(targetLabel.c_str(), target != nullptr);
                         if (ImGui::BeginDragDropTarget()) {
                             if (const ImGuiPayload* payload =
                                     ImGui::AcceptDragDropPayload(DragDrop::kEntityId)) {
@@ -7305,17 +8252,19 @@ void EditorApp::DrawInspectorPanel() {
                             }
                             ImGui::EndDragDropTarget();
                         }
-                        if (target && ImGui::BeginPopupContextItem("ObjectContext")) {
-                            if (ImGui::MenuItem("Clear")) {
+                        if (target && EditorMenu::BeginPopupContextItem("ObjectContext")) {
+                            if (EditorMenu::MenuItem("Clear")) {
                                 RecordUndoSnapshot();
                                 listener.targetEntityId = 0;
                                 listener.scriptPath.clear();
                                 listener.methodName.clear();
                                 m_SceneDirty = true;
                             }
-                                ImGui::EndPopup();
+                                EditorMenu::EndPopup();
                             }
-                        if (openTargetPicker) {
+                        if (targetAction == EditorSurface::ReferenceAction::Select && target)
+                            QueueReferenceSelection(target->GetID());
+                        if (targetAction == EditorSurface::ReferenceAction::Pick) {
                             s_InspectorObjectSearch[0] = '\0';
                             s_InspectorObjectCandidate = listener.targetEntityId;
                             ImGui::OpenPopup("##scene_object_picker");
@@ -7333,8 +8282,8 @@ void EditorApp::DrawInspectorPanel() {
                         const std::string functionPreview = listener.methodName.empty()
                             ? "No Function" : listener.methodName;
                         ImGui::SetNextItemWidth(-1.0f);
-                        if (ImGui::BeginCombo("##Function", functionPreview.c_str())) {
-                            if (ImGui::Selectable("No Function", listener.methodName.empty())) {
+                        if (EditorDropdown::BeginCombo("##Function", functionPreview.c_str())) {
+                            if (EditorDropdown::Selectable("No Function", listener.methodName.empty())) {
                                 RecordUndoSnapshot();
                                 listener.scriptPath.clear();
                                 listener.methodName.clear();
@@ -7357,7 +8306,7 @@ void EditorApp::DrawInspectorPanel() {
                                         }
                                         const bool selected = listener.scriptPath == script->scriptPath &&
                                                               listener.methodName == method.name;
-                                        if (ImGui::Selectable(method.name.c_str(), selected)) {
+                                        if (EditorDropdown::Selectable(method.name.c_str(), selected)) {
                                             RecordUndoSnapshot();
                                             listener.scriptPath = script->scriptPath;
                                             listener.methodName = method.name;
@@ -7366,7 +8315,7 @@ void EditorApp::DrawInspectorPanel() {
                                     }
                                 }
                             }
-                            ImGui::EndCombo();
+                            EditorDropdown::EndCombo();
                         }
                         if (!target)
                             ImGui::TextDisabled("Drag a scene object here.");
@@ -7418,8 +8367,12 @@ void EditorApp::DrawInspectorPanel() {
             auto* mipsScript = dynamic_cast<MipsScriptComponent*>(orderedComponent);
             if (mipsScript) {
                 removeComponent = false;
+                const size_t nameStart = mipsScript->scriptPath.find_last_of("/\\");
+                const std::string scriptTitle = mipsScript->scriptPath.empty()
+                    ? "Mips# Script"
+                    : mipsScript->scriptPath.substr(nameStart == std::string::npos ? 0 : nameStart + 1);
                 const bool open = BeginInspectableComponent(
-                    "Mips# Script", *mipsScript, removeComponent, this,
+                    scriptTitle.c_str(), *mipsScript, removeComponent, this,
                     [&] { DrawMipsScriptIdeMenuItems(mipsScript->scriptPath); });
                 if (!removeComponent && open) {
                     std::vector<MipsScriptComponent*> peerScripts;
@@ -7460,11 +8413,12 @@ void EditorApp::DrawInspectorPanel() {
                         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "%s", err.c_str());
 
                     if (compiled && mipsScript->module) {
-                        if (m_IsPlaying)
-                            ImGui::BeginDisabled();
 
-                        for (size_t i = 0; i < mipsScript->module->fields.size(); ++i) {
+                        for (size_t i : Mips::InspectorFieldIndices(mipsScript->module->fields)) {
                             const auto& field = mipsScript->module->fields[i];
+                            MipsInspectorFieldScope fieldScope(i, field.inspector);
+                            const std::string displayLabel = field.inspector.displayName.empty()
+                                ? field.name : field.inspector.displayName;
                             const bool isVector3Start =
                                 field.typeName == "Vector3.x" && i + 2 < mipsScript->module->fields.size() &&
                                 mipsScript->module->fields[i + 1].typeName == "Vector3.y" &&
@@ -7475,7 +8429,8 @@ void EditorApp::DrawInspectorPanel() {
                                     static_cast<float>(mipsScript->fieldValues[i + 1]),
                                     static_cast<float>(mipsScript->fieldValues[i + 2]),
                                 };
-                                const std::string label = field.name.size() > 2
+                                const std::string label = !field.inspector.displayName.empty()
+                                    ? field.inspector.displayName : field.name.size() > 2
                                     ? field.name.substr(0, field.name.size() - 2)
                                     : field.name;
                                 bool mixedAxes[3]{};
@@ -7501,7 +8456,6 @@ void EditorApp::DrawInspectorPanel() {
                                         script->fieldValues[i + 2] = static_cast<double>(value[2]);
                                     }
                                 }
-                                i += 2;
                                 continue;
                             }
                             const bool isFloat = field.typeName == "float";
@@ -7514,14 +8468,14 @@ void EditorApp::DrawInspectorPanel() {
                             if (isAudio) {
                                 if (i >= mipsScript->fieldAssetPaths.size())
                                     mipsScript->fieldAssetPaths.resize(mipsScript->module->fields.size());
-                                if (DrawAssetReferenceField(this, field.name.c_str(), AssetKind::Audio,
+                                if (DrawAssetReferenceField(this, displayLabel.c_str(), AssetKind::Audio,
                                                             mipsScript->fieldAssetPaths[i],
                                                             "None (Audio Clip)"))
                                     RecordUndoSnapshot();
                                 continue;
                             }
                             if (isArray) {
-                                ImGui::Text("%s", field.name.c_str());
+                                ImGui::Text("%s", displayLabel.c_str());
                                 ImGui::SameLine();
                                 ImGui::TextDisabled("Array (initialized by script)");
                                 continue;
@@ -7542,9 +8496,9 @@ void EditorApp::DrawInspectorPanel() {
                                 }
 
                                 ImGui::PushID(static_cast<int>(i));
-                                DrawInspectorPropertyRow(field.name.c_str(), [&] {
-                                    const bool openPicker =
-                                        DrawInspectorObjectReferenceButton(label.c_str());
+                                DrawInspectorPropertyRow(displayLabel.c_str(), [&] {
+                                    const auto referenceAction =
+                                        DrawInspectorObjectReferenceButton(label.c_str(), referenced != nullptr);
                                     if (ImGui::BeginDragDropTarget()) {
                                         if (const ImGuiPayload* payload =
                                                 ImGui::AcceptDragDropPayload(DragDrop::kEntityId)) {
@@ -7554,7 +8508,8 @@ void EditorApp::DrawInspectorPanel() {
                                                 Entity* dropped = scene.FindEntity(droppedId);
                                                 const bool compatible = dropped &&
                                                     (field.typeName != "Camera" ||
-                                                     dropped->HasComponent<CameraComponent>());
+                                                     dropped->HasComponent<CameraComponent>()) &&
+                                                    (field.typeName != "AudioSource" || dropped->HasComponent<AudioSourceComponent>());
                                                 if (compatible) {
                                                     RecordUndoSnapshot();
                                                     mipsScript->fieldValues[i] =
@@ -7566,20 +8521,22 @@ void EditorApp::DrawInspectorPanel() {
                                         ImGui::EndDragDropTarget();
                                     }
                                     if (referenced &&
-                                        ImGui::BeginPopupContextItem("ReferenceContext")) {
-                                        if (ImGui::MenuItem("Clear")) {
+                                        EditorMenu::BeginPopupContextItem("ReferenceContext")) {
+                                        if (EditorMenu::MenuItem("Clear")) {
                                             RecordUndoSnapshot();
                                             mipsScript->fieldValues[i] = 0.0;
                                             m_SceneDirty = true;
                                         }
-                                        ImGui::EndPopup();
+                                        EditorMenu::EndPopup();
                                     }
                                     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
                                         field.typeName == "Camera") {
                                         ImGui::SetTooltip(
                                             "Drag a Scene object with a Camera component here.");
                                     }
-                                    if (openPicker) {
+                                    if (referenceAction == EditorSurface::ReferenceAction::Select && referenced)
+                                        QueueReferenceSelection(referenced->GetID());
+                                    if (referenceAction == EditorSurface::ReferenceAction::Pick) {
                                         s_InspectorObjectSearch[0] = '\0';
                                         s_InspectorObjectCandidate = referencedId;
                                         ImGui::OpenPopup("##scene_object_picker");
@@ -7605,7 +8562,7 @@ void EditorApp::DrawInspectorPanel() {
                                         return i >= script->fieldValues.size() ||
                                                (script->fieldValues[i] != 0.0) != value;
                                     });
-                                if (InspectorCheckbox(field.name.c_str(), &value, mixed)) {
+                                if (InspectorCheckbox(displayLabel.c_str(), &value, mixed)) {
                                     mipsScript->fieldValues[i] = value ? 1.0 : 0.0;
                                     for (MipsScriptComponent* script : peerScripts) {
                                         if (script->fieldValues.size() <= i)
@@ -7627,8 +8584,14 @@ void EditorApp::DrawInspectorPanel() {
                                         return i >= script->fieldValues.size() ||
                                                static_cast<int>(std::lround(script->fieldValues[i])) != value;
                                     });
-                                if (InspectorDragInt(field.name.c_str(), &value,
-                                                     1.0f, 0, 0, mixed)) {
+                                const auto& attr = field.inspector;
+                                const bool edited = attr.hasRange
+                                    ? InspectorSliderInt(displayLabel.c_str(), &value,
+                                        static_cast<int>(std::ceil(attr.hasMin ? std::max(attr.rangeMin, attr.minimum) : attr.rangeMin)),
+                                        static_cast<int>(std::floor(attr.rangeMax)), mixed)
+                                    : InspectorDragInt(displayLabel.c_str(), &value, 1.0f, 0, 0, mixed);
+                                if (edited) {
+                                    value = static_cast<int>(attr.Constrain(value, true));
                                     mipsScript->fieldValues[i] = static_cast<double>(value);
                                     for (MipsScriptComponent* script : peerScripts) {
                                         if (script->fieldValues.size() <= i)
@@ -7645,8 +8608,14 @@ void EditorApp::DrawInspectorPanel() {
                                         return i >= script->fieldValues.size() ||
                                                static_cast<float>(script->fieldValues[i]) != value;
                                     });
-                                if (InspectorDragFloat(field.name.c_str(), &value, 0.1f,
-                                                       0.0f, 0.0f, "%.3f", mixed)) {
+                                const auto& attr = field.inspector;
+                                const bool edited = attr.hasRange
+                                    ? InspectorSliderFloat(displayLabel.c_str(), &value,
+                                        static_cast<float>(attr.hasMin ? std::max(attr.rangeMin, attr.minimum) : attr.rangeMin),
+                                        static_cast<float>(attr.rangeMax), "%.3f", mixed)
+                                    : InspectorDragFloat(displayLabel.c_str(), &value, 0.1f, 0.0f, 0.0f, "%.3f", mixed);
+                                if (edited) {
+                                    value = static_cast<float>(attr.Constrain(value));
                                     mipsScript->fieldValues[i] = static_cast<double>(value);
                                     for (MipsScriptComponent* script : peerScripts) {
                                         if (script->fieldValues.size() <= i)
@@ -7667,8 +8636,6 @@ void EditorApp::DrawInspectorPanel() {
                             }
                         }
 
-                        if (m_IsPlaying)
-                            ImGui::EndDisabled();
                     } else if (!mipsScript->scriptPath.empty()) {
                         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "Compile failed");
                     } else {
@@ -7682,6 +8649,13 @@ void EditorApp::DrawInspectorPanel() {
                 }
             }
             EndInspectorMultiEdit();
+            }
+
+            if (EditorMenu::BeginPopupContextWindow("##inspector_component_paste",
+                    ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
+                if (EditorMenu::MenuItem(GetInspectorPasteLabel(), nullptr, false, CanPasteInspectorComponent()))
+                    PasteInspectorComponent();
+                EditorMenu::EndPopup();
             }
 
             ImGui::Spacing();
@@ -7700,13 +8674,13 @@ void EditorApp::DrawInspectorPanel() {
                 m_SceneDirty = true;
             };
             if (ImGui::Button("Add Component", ImVec2(-1, 0))) {
-                ImGui::OpenPopup("AddComponentPopup");
+                m_ComponentPicker.Open("AddComponentPopup");
             }
 
-            if (ImGui::BeginPopup("AddComponentPopup")) {
-                if (ImGui::BeginMenu("Mesh")) {
+            if (m_ComponentPicker.Begin("AddComponentPopup")) {
+                if (m_ComponentPicker.BeginCategory("Mesh")) {
                   if (!allInspectorEntitiesHave.operator()<MeshRendererComponent>()) {
-                    if (ImGui::MenuItem("Mesh Renderer")) {
+                    m_ComponentPicker.Add("Mesh Renderer", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<MeshRendererComponent>(
                             [](Entity&, MeshRendererComponent& mr) {
@@ -7715,10 +8689,10 @@ void EditorApp::DrawInspectorPanel() {
                                     Texture::CreateCheckerboard(128, 16));
                             });
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<SkinnedMeshRendererComponent>()) {
-                    if (ImGui::MenuItem("Skinned Mesh Renderer")) {
+                    m_ComponentPicker.Add("Skinned Mesh Renderer", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<SkinnedMeshRendererComponent>(
                             [](Entity&, SkinnedMeshRendererComponent& sk) {
@@ -7726,10 +8700,10 @@ void EditorApp::DrawInspectorPanel() {
                                     Texture::CreateCheckerboard(128, 16));
                             });
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<TerrainComponent>()) {
-                    if (ImGui::MenuItem("Terrain")) {
+                    m_ComponentPicker.Add("Terrain", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<TerrainComponent>(
                             [](Entity& entity, TerrainComponent& terrain) {
@@ -7742,10 +8716,10 @@ void EditorApp::DrawInspectorPanel() {
                                 terrain.RebuildMesh(*mr);
                             });
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<ProModelerComponent>()) {
-                    if (ImGui::MenuItem("ProModeler Mesh")) {
+                    m_ComponentPicker.Add("ProModeler Mesh", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<ProModelerComponent>(
                             [&](Entity& entity, ProModelerComponent& pb) {
@@ -7760,7 +8734,7 @@ void EditorApp::DrawInspectorPanel() {
                                 AddProModelerMeshCollider(entity, *mr);
                             });
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<MeshSubdividerComponent>()) {
                     const bool hasMesh = std::all_of(
@@ -7768,19 +8742,19 @@ void EditorApp::DrawInspectorPanel() {
                         [](Entity* entity) {
                             return entity->HasComponent<MeshRendererComponent>();
                         });
-                    if (ImGui::MenuItem("Mesh Subdivider", nullptr, false, hasMesh)) {
+                    m_ComponentPicker.Add("Mesh Subdivider", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<MeshSubdividerComponent>(
                             [](Entity&, MeshSubdividerComponent&) {});
                         ImGui::CloseCurrentPopup();
-                    }
+                    }, hasMesh);
                 }
-                  ImGui::EndMenu();
+                  m_ComponentPicker.EndCategory();
                 }
 
-                if (ImGui::BeginMenu("Animation")) {
+                if (m_ComponentPicker.BeginCategory("Animation")) {
                   if (!allInspectorEntitiesHave.operator()<AnimatorComponent>()) {
-                    if (ImGui::MenuItem("Animator")) {
+                    m_ComponentPicker.Add("Animator", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<AnimatorComponent>(
                             [](Entity& entity, AnimatorComponent& anim) {
@@ -7790,93 +8764,93 @@ void EditorApp::DrawInspectorPanel() {
                                 }
                             });
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
-                  ImGui::EndMenu();
+                  m_ComponentPicker.EndCategory();
                 }
 
-                if (ImGui::BeginMenu("Rendering")) {
+                if (m_ComponentPicker.BeginCategory("Rendering")) {
                   if (!allInspectorEntitiesHave.operator()<CameraComponent>()) {
-                    if (ImGui::MenuItem("Camera")) {
+                    m_ComponentPicker.Add("Camera", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<CameraComponent>(
                             [&](Entity& entity, CameraComponent&) {
                                 SyncSelectedCameraFromTransform(&entity);
                             });
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<DistanceCullComponent>()) {
-                    if (ImGui::MenuItem("Distance Cull")) {
+                    m_ComponentPicker.Add("Distance Cull", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<DistanceCullComponent>(
                             [](Entity&, DistanceCullComponent&) {});
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<FrustumCullComponent>()) {
-                    if (ImGui::MenuItem("Frustum Cull")) {
+                    m_ComponentPicker.Add("Frustum Cull", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<FrustumCullComponent>(
                             [](Entity&, FrustumCullComponent&) {});
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<PostProcessVolumeComponent>()) {
-                    if (ImGui::MenuItem("Post Process Volume")) {
+                    m_ComponentPicker.Add("Post Process Volume", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<PostProcessVolumeComponent>(
                             [](Entity&, PostProcessVolumeComponent&) {});
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<LightComponent>()) {
-                    if (ImGui::BeginMenu("Light")) {
-                        if (ImGui::MenuItem("Directional")) {
+                    if (m_ComponentPicker.BeginCategory("Light")) {
+                        m_ComponentPicker.Add("Directional", [&] {
                             RecordUndoSnapshot();
                             addMissingInspectorComponents.operator()<LightComponent>(
                                 [](Entity&, LightComponent& light) {
                                     light.type = LightType::Directional;
                                 });
                             ImGui::CloseCurrentPopup();
-                        }
-                        if (ImGui::MenuItem("Point")) {
+                        });
+                        m_ComponentPicker.Add("Point", [&] {
                             RecordUndoSnapshot();
                             addMissingInspectorComponents.operator()<LightComponent>(
                                 [](Entity&, LightComponent& light) {
                                     light.type = LightType::Point;
                                 });
                             ImGui::CloseCurrentPopup();
-                        }
-                        if (ImGui::MenuItem("Spot")) {
+                        });
+                        m_ComponentPicker.Add("Spot", [&] {
                             RecordUndoSnapshot();
                             addMissingInspectorComponents.operator()<LightComponent>(
                                 [](Entity&, LightComponent& light) {
                                     light.type = LightType::Spot;
                                 });
                             ImGui::CloseCurrentPopup();
-                        }
-                        ImGui::EndMenu();
+                        });
+                        m_ComponentPicker.EndCategory();
                     }
                 }
-                  ImGui::EndMenu();
+                  m_ComponentPicker.EndCategory();
                 }
 
-                if (ImGui::BeginMenu("Audio")) {
+                if (m_ComponentPicker.BeginCategory("Audio")) {
                   if (!allInspectorEntitiesHave.operator()<AudioSourceComponent>()) {
-                    if (ImGui::MenuItem("Audio Source")) {
+                    m_ComponentPicker.Add("Audio Source", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<AudioSourceComponent>(
                             [](Entity&, AudioSourceComponent&) {});
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                   }
-                  ImGui::EndMenu();
+                  m_ComponentPicker.EndCategory();
                 }
 
-                if (ImGui::BeginMenu("Physics")) {
+                if (m_ComponentPicker.BeginCategory("Physics")) {
                   if (!allInspectorEntitiesHave.operator()<ColliderComponent>()) {
-                    if (ImGui::BeginMenu("Collider")) {
+                    if (m_ComponentPicker.BeginCategory("Collider")) {
                     auto addCollider = [&](ColliderShape shape) {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<ColliderComponent>(
@@ -7892,31 +8866,27 @@ void EditorApp::DrawInspectorPanel() {
                             });
                         ImGui::CloseCurrentPopup();
                     };
-                    if (ImGui::MenuItem("Box"))
-                        addCollider(ColliderShape::Box);
-                    if (ImGui::MenuItem("Sphere"))
-                        addCollider(ColliderShape::Sphere);
-                    if (ImGui::MenuItem("Capsule"))
-                        addCollider(ColliderShape::Capsule);
-                    if (ImGui::MenuItem("Mesh Collider"))
-                        addCollider(ColliderShape::Mesh);
-                    ImGui::EndMenu();
+                    m_ComponentPicker.Add("Box", [&, addCollider] { addCollider(ColliderShape::Box); });
+                    m_ComponentPicker.Add("Sphere", [&, addCollider] { addCollider(ColliderShape::Sphere); });
+                    m_ComponentPicker.Add("Capsule", [&, addCollider] { addCollider(ColliderShape::Capsule); });
+                    m_ComponentPicker.Add("Mesh Collider", [&, addCollider] { addCollider(ColliderShape::Mesh); });
+                    m_ComponentPicker.EndCategory();
                     }
                 }
                 if (!allInspectorEntitiesHave.operator()<RigidbodyComponent>()) {
-                    if (ImGui::MenuItem("Rigidbody")) {
+                    m_ComponentPicker.Add("Rigidbody", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<RigidbodyComponent>(
                             [](Entity&, RigidbodyComponent&) {});
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
-                  ImGui::EndMenu();
+                  m_ComponentPicker.EndCategory();
                 }
 
-                if (ImGui::BeginMenu("UI")) {
+                if (m_ComponentPicker.BeginCategory("UI")) {
                   if (!allInspectorEntitiesHave.operator()<CanvasComponent>()) {
-                    if (ImGui::MenuItem("Canvas")) {
+                    m_ComponentPicker.Add("Canvas", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<CanvasComponent>(
                             [](Entity& entity, CanvasComponent&) {
@@ -7928,34 +8898,34 @@ void EditorApp::DrawInspectorPanel() {
                                 }
                             });
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<RectTransformComponent>()) {
-                    if (ImGui::MenuItem("Rect Transform")) {
+                    m_ComponentPicker.Add("Rect Transform", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<RectTransformComponent>(
                             [](Entity&, RectTransformComponent&) {});
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<UIImageComponent>()) {
-                    if (ImGui::MenuItem("Image")) {
+                    m_ComponentPicker.Add("Image", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<UIImageComponent>(
                             [](Entity&, UIImageComponent&) {});
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<UITextComponent>()) {
-                    if (ImGui::MenuItem("Text")) {
+                    m_ComponentPicker.Add("Text", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<UITextComponent>(
                             [](Entity&, UITextComponent&) {});
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<UIButtonGroupComponent>()) {
-                    if (ImGui::MenuItem("Button Group")) {
+                    m_ComponentPicker.Add("Button Group", [&] {
                         RecordUndoSnapshot();
                         Scene& scene = m_Engine->GetScene();
                         addMissingInspectorComponents.operator()<UIButtonGroupComponent>(
@@ -7972,10 +8942,10 @@ void EditorApp::DrawInspectorPanel() {
                             });
                         m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<UIButtonComponent>()) {
-                    if (ImGui::MenuItem("Button")) {
+                    m_ComponentPicker.Add("Button", [&] {
                         RecordUndoSnapshot();
                         Scene& scene = m_Engine->GetScene();
                         addMissingInspectorComponents.operator()<UIButtonComponent>(
@@ -8007,10 +8977,10 @@ void EditorApp::DrawInspectorPanel() {
                             });
                         m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
                         ImGui::CloseCurrentPopup();
-                    }
+                    });
                 }
                 if (!allInspectorEntitiesHave.operator()<UIAudioSpectrumComponent>()) {
-                    if (ImGui::MenuItem("Audio Spectrum")) {
+                    m_ComponentPicker.Add("Audio Spectrum", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<UIAudioSpectrumComponent>(
                             [](Entity& entity, UIAudioSpectrumComponent&) {
@@ -8018,12 +8988,43 @@ void EditorApp::DrawInspectorPanel() {
                                     entity.AddComponent<RectTransformComponent>();
                             });
                         ImGui::CloseCurrentPopup();
+                    });
+                }
+                  m_ComponentPicker.EndCategory();
+                }
+                if (m_ComponentPicker.BeginCategory("Scripts")) {
+                    for (const std::string& path : CollectProjectScripts()) {
+                        const std::string label = PathUtf8::ToString(PathUtf8::FromString(path).stem());
+                        m_ComponentPicker.Add(label.c_str(), [&, path] {
+                            RecordUndoSnapshot();
+                            for (Entity* entity : inspectorEntities) {
+                                auto& script = entity->AddComponent<MipsScriptComponent>();
+                                script.scriptPath = path;
+                                script.module.reset();
+                                script.fieldValues.clear();
+                            }
+                            m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+                            m_SceneDirty = true;
+                            ImGui::CloseCurrentPopup();
+                        }, true, path);
                     }
+                    m_ComponentPicker.Add("Empty Script", [&] {
+                        RecordUndoSnapshot();
+                        for (Entity* entity : inspectorEntities) {
+                            auto& script = entity->AddComponent<MipsScriptComponent>();
+                            script.scriptPath.clear();
+                        }
+                        m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
+                        m_SceneDirty = true;
+                        ImGui::CloseCurrentPopup();
+                    });
+                    m_ComponentPicker.EndCategory();
                 }
-                  ImGui::EndMenu();
-                }
-                DrawAddComponentScriptMenu(inspectorEntities);
-                ImGui::EndPopup();
+                m_ComponentPicker.AddCreateScript();
+                m_ComponentPicker.Draw([&](const char* name) {
+                    DrawCreateComponentScriptForm(inspectorEntities, name);
+                });
+                m_ComponentPicker.End();
             }
         }
     }
@@ -8102,6 +9103,7 @@ void EditorApp::DispatchProjectAssetDrop(const std::string& projectRelPath,
         Entity* audioEntity = m_Engine->GetScene().CreateEntity(entityName);
         auto& audio = audioEntity->AddComponent<AudioSourceComponent>();
         audio.clipPath = projectRelPath;
+                if (IsMidiPath(projectRelPath)) { audio.type = AudioSourceType::SFX; audio.playOnAwake = false; }
         if (viewMin && viewSize && viewSize->x > 0.0f && viewSize->y > 0.0f) {
             const ImGuiIO& io = ImGui::GetIO();
             if (auto* transform = audioEntity->GetComponent<TransformComponent>()) {
@@ -8263,10 +9265,13 @@ void EditorApp::AcceptSceneViewDrops(const ImVec2& imageMin, const ImVec2& image
 
 void EditorApp::DrawMaterialAssetInspector(const std::string& projectRelPath) {
     static std::string loadedPath;
+    static uint64_t loadedRevision = UINT64_MAX;
     static Material mat;
     static bool loadFailed = false;
 
-    if (loadedPath != projectRelPath) {
+    if (!RecordAssetUndoSnapshot(AssetManager::Get().ToAbsolute(projectRelPath))) return;
+    if (loadedPath != projectRelPath || loadedRevision != m_HistoryRevision) {
+        loadedRevision = m_HistoryRevision;
         loadedPath = projectRelPath;
         loadFailed = false;
         std::string err;
@@ -8305,6 +9310,13 @@ void EditorApp::DrawMaterialAssetInspector(const std::string& projectRelPath) {
         changed = true;
     if (InspectorDragFloat2("Offset", glm::value_ptr(mat.mainTextureOffset), 0.01f, -100.0f, 100.0f))
         changed = true;
+
+    static const char* ps1TextureSizes[] = { "64", "128", "256" };
+    int ps1Size = mat.ps1TextureMaxSize <= 64 ? 0 : mat.ps1TextureMaxSize <= 128 ? 1 : 2;
+    if (InspectorCombo("PS1 Texture Size", &ps1Size, ps1TextureSizes, 3)) {
+        mat.ps1TextureMaxSize = 64 << ps1Size;
+        changed = true;
+    }
 
     auto commitMaterial = [&]() {
         AssetManager::Get().ApplyMaterialToSceneUsers(m_Engine->GetScene(), projectRelPath, mat);
@@ -8373,18 +9385,27 @@ void EditorApp::DrawMaterialSlot(SkinnedMeshRendererComponent& mr) {
 void EditorApp::DrawConsolePanel() {
     ImGui::Begin("Console");
 
-    if (EditorTheme::AeroButton("Clear", ImVec2(64.0f, EditorTheme::ButtonHeight * 0.85f),
-                                 AeroButtonKind::Secondary)) {
+    EditorToolbar toolbar;
+    if (toolbar.Button("Clear", 64.0f)) {
         Log::ClearEntries();
     }
-    ImGui::SameLine();
-    ImGui::TextColored(EditorTheme::TextMuted, "%zu entries", Log::GetRecentEntries().size());
-    ImGui::Separator();
+    toolbar.Text((std::to_string(Log::GetRecentEntries().size()) + " entries").c_str(),
+                 EditorTheme::TextMuted);
+    toolbar.End();
 
     auto entries = Log::GetRecentEntries();
     
     const float commandHeight = m_CommandHost ? ImGui::GetFrameHeightWithSpacing() : 0.0f;
     ImGui::BeginChild("LogRegion", ImVec2(0, -commandHeight), false, ImGuiWindowFlags_HorizontalScrollbar);
+    const size_t displayLimit = static_cast<size_t>(m_Preferences.Get("consoleDisplayLimit"));
+    // Apply filters before taking the last N entries so hidden messages do not consume the limit.
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const auto& entry) {
+        const char* key = entry.level >= spdlog::level::err ? "consoleErrors" :
+            entry.level == spdlog::level::warn ? "consoleWarnings" :
+            entry.level <= spdlog::level::debug ? "consoleDebug" : "consoleInfo";
+        return !m_Preferences.Enabled(key);
+    }), entries.end());
+    if (entries.size() > displayLimit) entries.erase(entries.begin(), entries.end() - displayLimit);
     for (const auto& entry : entries) {
         ImVec4 color = EditorTheme::TextPrimary;
         if (entry.level == spdlog::level::trace) color = EditorTheme::TextSecondary;
@@ -8395,7 +9416,7 @@ void EditorApp::DrawConsolePanel() {
         ImGui::TextUnformatted(entry.message.c_str());
         ImGui::PopStyleColor();
     }
-    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+    if (m_Preferences.Enabled("consoleAutoScroll") && ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
         ImGui::SetScrollHereY(1.0f);
 
     ImGui::EndChild();

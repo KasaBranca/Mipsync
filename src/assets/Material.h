@@ -16,6 +16,8 @@ struct Material {
     glm::vec2 mainTextureTiling = { 1.0f, 1.0f };
     /// Main texture offset (Unity Offset), default 0×0.
     glm::vec2 mainTextureOffset = { 0.0f, 0.0f };
+    /// Longest PS1 texture edge; larger textures reserve multiple VRAM cells.
+    int ps1TextureMaxSize = 64;
 
     /// Unity _MainTex_ST: (tiling.x, tiling.y, offset.x, offset.y).
     glm::vec4 MainTexST() const {

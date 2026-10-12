@@ -1,4 +1,5 @@
 #include "UIRenderer.h"
+#include "../ps1/PSync.h"
 #include "RectTransform.h"
 #include "UICanvasLayout.h"
 #include "UILayout.h"
@@ -179,26 +180,19 @@ struct GamepadEdgeState {
 std::unordered_map<uint32_t, GamepadEdgeState> s_GamepadPrev;
 
 bool ReadGamepadButton(int button) {
-    GLFWgamepadstate state{};
-    if (glfwGetGamepadState(GLFW_JOYSTICK_1, &state) != GLFW_TRUE)
-        return false;
-    if (button < 0 || button >= GLFW_GAMEPAD_BUTTON_LAST + 1)
-        return false;
-    return state.buttons[button] == GLFW_PRESS;
+    const char* name = button==GLFW_GAMEPAD_BUTTON_A ? "Cross" : button==GLFW_GAMEPAD_BUTTON_B ? "Circle" :
+        button==GLFW_GAMEPAD_BUTTON_X ? "Square" : button==GLFW_GAMEPAD_BUTTON_Y ? "Triangle" :
+        button==GLFW_GAMEPAD_BUTTON_START ? "Start" : button==GLFW_GAMEPAD_BUTTON_DPAD_UP ? "DPadUp" :
+        button==GLFW_GAMEPAD_BUTTON_DPAD_DOWN ? "DPadDown" : "";
+    return Input::GetPS1Button(name);
 }
 
 bool ReadGamepadAxisDown() {
-    GLFWgamepadstate state{};
-    if (glfwGetGamepadState(GLFW_JOYSTICK_1, &state) != GLFW_TRUE)
-        return false;
-    return state.axes[GLFW_GAMEPAD_AXIS_LEFT_Y] > 0.65f;
+    return Input::GetPS1Axis("LeftStickY") < -.25f;
 }
 
 bool ReadGamepadAxisUp() {
-    GLFWgamepadstate state{};
-    if (glfwGetGamepadState(GLFW_JOYSTICK_1, &state) != GLFW_TRUE)
-        return false;
-    return state.axes[GLFW_GAMEPAD_AXIS_LEFT_Y] < -0.65f;
+    return Input::GetPS1Axis("LeftStickY") > .25f;
 }
 
 bool ReadGamepadEdge(uint32_t groupId, int confirmButton, bool& outUp, bool& outDown,
@@ -207,9 +201,12 @@ bool ReadGamepadEdge(uint32_t groupId, int confirmButton, bool& outUp, bool& out
     const bool downNow = ReadGamepadButton(GLFW_GAMEPAD_BUTTON_DPAD_DOWN) || ReadGamepadAxisDown();
     const bool confirmNow = ReadGamepadButton(confirmButton);
     GamepadEdgeState& prev = s_GamepadPrev[groupId];
-    outUp = upNow && !prev.up;
-    outDown = downNow && !prev.down;
-    outConfirm = confirmNow && !prev.confirm;
+    outUp = (upNow && !prev.up) || Input::GetPS1ButtonDown("DPadUp");
+    outDown = (downNow && !prev.down) || Input::GetPS1ButtonDown("DPadDown");
+    const char* confirmName = confirmButton==GLFW_GAMEPAD_BUTTON_B ? "Circle" :
+        confirmButton==GLFW_GAMEPAD_BUTTON_X ? "Square" : confirmButton==GLFW_GAMEPAD_BUTTON_Y ? "Triangle" :
+        confirmButton==GLFW_GAMEPAD_BUTTON_START ? "Start" : "Cross";
+    outConfirm = (confirmNow && !prev.confirm) || Input::GetPS1ButtonDown(confirmName);
     prev = { upNow, downNow, confirmNow };
     return upNow || downNow || confirmNow || outUp || outDown || outConfirm;
 }
@@ -346,6 +343,14 @@ void UIRenderer::EndPass() {
 }
 
 void UIRenderer::DrawSolidQuad(const glm::mat4& mvp, const glm::vec4& color, const Texture* texture) {
+    if (m_PSyncWorkload && color.a > 0.0f) {
+        const auto& vertices = m_Quad.GetVertices();
+        if (vertices.size() >= 4)
+            m_PSyncWorkload->UIQuad(mvp * glm::vec4(vertices[0].position, 1.0f),
+                mvp * glm::vec4(vertices[1].position, 1.0f),
+                mvp * glm::vec4(vertices[2].position, 1.0f),
+                mvp * glm::vec4(vertices[3].position, 1.0f), texture != nullptr);
+    }
     if (!m_UIShader.IsValid())
         return;
 
@@ -370,6 +375,12 @@ void UIRenderer::DrawSolidQuad(const glm::mat4& mvp, const glm::vec4& color, con
 
 void UIRenderer::DrawGlyphQuad(const glm::mat4& mvp, const glm::vec4& color, GLuint textureId,
                                const glm::vec3 corners[4], const glm::vec2 uvs[4]) {
+    if (m_PSyncWorkload && color.a > 0.0f) {
+        for (const auto& triangle : {glm::ivec3(0, 1, 2), glm::ivec3(0, 2, 3)})
+            m_PSyncWorkload->Triangle(mvp * glm::vec4(corners[triangle.x], 1.0f),
+                mvp * glm::vec4(corners[triangle.y], 1.0f), mvp * glm::vec4(corners[triangle.z], 1.0f),
+                true, false, true, true, 4);
+    }
     if (!m_UIShader.IsValid() || m_TextVAO == 0 || textureId == 0)
         return;
 
@@ -488,7 +499,7 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
         return;
     }
 
-    std::sort(canvases.begin(), canvases.end(),
+    std::stable_sort(canvases.begin(), canvases.end(),
               [](const CanvasEntry& a, const CanvasEntry& b) { return a.sortOrder < b.sortOrder; });
 
     BeginPass(viewportWidth, viewportHeight, targetFBO);
@@ -689,6 +700,12 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
             }
         });
 
+        auto playGroupSound = [&](uint32_t id) {
+            Entity* entity = scene.FindEntity(id);
+            auto* source = entity ? entity->GetComponent<AudioSourceComponent>() : nullptr;
+            if (source && source->type != AudioSourceType::BGM)
+                Engine::Get().GetAudioSystem().Play(scene, id, AssetManager::Get().GetProjectRoot());
+        };
         uint32_t hoveredButtonId = 0;
         size_t hoveredButtonIndex = 0;
         if (acceptRuntimeInput && m_PointerActive) {
@@ -743,9 +760,11 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
                         const auto indexIt = std::find(groupIt->second.buttonIndices.begin(),
                                                        groupIt->second.buttonIndices.end(),
                                                        hoveredButtonIndex);
-                        if (indexIt != groupIt->second.buttonIndices.end())
-                            hovered.group->selectedIndex = static_cast<int>(
-                                std::distance(groupIt->second.buttonIndices.begin(), indexIt));
+                        if (indexIt != groupIt->second.buttonIndices.end()) {
+                            const int next = static_cast<int>(std::distance(groupIt->second.buttonIndices.begin(), indexIt));
+                            if (next != hovered.group->selectedIndex) playGroupSound(hovered.group->navigationAudioSourceId);
+                            hovered.group->selectedIndex = next;
+                        }
                     }
                 }
             }
@@ -763,11 +782,11 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
                 bool moveUp = false;
                 bool moveDown = false;
                 bool confirm = false;
-                if (group.keyboardNavigation) {
+                if (group.keyboardNavigation && !group.gamepadNavigation) {
                     moveUp = moveUp || Input::IsKeyDown(GLFW_KEY_UP);
                     moveDown = moveDown || Input::IsKeyDown(GLFW_KEY_DOWN);
                 }
-                if (group.keyboardConfirm)
+                if (group.keyboardConfirm && !group.gamepadConfirm)
                     confirm = confirm || Input::IsKeyDown(ConfirmKeyToGlfw(group.confirmKey));
                 if (group.gamepadNavigation || group.gamepadConfirm) {
                     bool padUp = false;
@@ -783,6 +802,7 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
                         confirm = confirm || padConfirm;
                 }
 
+                const int previousSelection = group.selectedIndex;
                 if (moveUp && !moveDown) {
                     if (group.selectedIndex > 0)
                         --group.selectedIndex;
@@ -794,10 +814,12 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
                     else if (group.wrapNavigation)
                         group.selectedIndex = 0;
                 }
+                if (previousSelection != group.selectedIndex) playGroupSound(group.navigationAudioSourceId);
                 group.pressedThisFrame = confirm;
                 if (confirm) {
                     const size_t selectedButtonIndex = state.buttonIndices[static_cast<size_t>(
                         std::clamp(group.selectedIndex, 0, count - 1))];
+                    if (buttons[selectedButtonIndex].button->interactable) playGroupSound(group.confirmAudioSourceId);
                     invokeButton(*buttons[selectedButtonIndex].button);
                 }
             }
@@ -877,11 +899,14 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
                     DrawSolidQuad(buildQuadMvp(barRect, pixelSpace, canvasWorld), spectrum->color, nullptr);
                 }
             }
-        });
-
-        for (auto& [groupId, state] : groups) {
+        }, [&](Entity& entity, const UIRect&) {
+            // A group's cursor belongs above its own buttons, below later siblings
+            // such as a loading overlay, matching the PS1 UI draw order.
+            const auto groupIt = groups.find(entity.GetID());
+            if (groupIt == groups.end()) return;
+            auto& state = groupIt->second;
             if (!state.group || state.buttonIndices.empty())
-                continue;
+                return;
             UIButtonGroupComponent& group = *state.group;
             const int selected = std::clamp(group.selectedIndex, 0,
                                             static_cast<int>(state.buttonIndices.size()) - 1);
@@ -915,11 +940,13 @@ void UIRenderer::Render(Scene& scene, const Camera& camera, int viewportWidth, i
                 drawText(cursorRect, UITextAlignment::Center, ">", std::max(size.y, 12.0f),
                          glm::vec4(1.0f), pixelSpace, canvasWorld);
             }
-        }
+        });
 
         if (acceptRuntimeInput && m_PointerReleased) {
-            if (hoveredButtonId != 0 && hoveredButtonId == m_PointerPressedButtonEntityId)
+            if (hoveredButtonId != 0 && hoveredButtonId == m_PointerPressedButtonEntityId) {
+                if (buttons[hoveredButtonIndex].group) playGroupSound(buttons[hoveredButtonIndex].group->confirmAudioSourceId);
                 invokeButton(*buttons[hoveredButtonIndex].button);
+            }
             m_PointerPressedButtonEntityId = 0;
         }
     }

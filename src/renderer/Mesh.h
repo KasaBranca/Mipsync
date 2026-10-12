@@ -17,11 +17,19 @@ struct Vertex {
     glm::vec4 color;
 };
 
+struct MeshPart {
+    std::string name;
+    uint32_t indexOffset = 0;
+    uint32_t indexCount = 0;
+    glm::vec3 origin{0.0f};
+};
+
 class Mesh {
 public:
     Mesh() = default;
     Mesh(const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices,
-         bool dynamicVbo = false, bool skipGpuUpload = false);
+         bool dynamicVbo = false, bool skipGpuUpload = false,
+         std::vector<MeshPart> parts = {});
     ~Mesh();
 
     Mesh(Mesh&& other) noexcept;
@@ -40,6 +48,10 @@ public:
     const glm::vec3& GetBoundsMax() const { return m_BoundsMax; }
     const std::vector<Vertex>& GetVertices() const { return m_Vertices; }
     const std::vector<uint32_t>& GetIndices() const { return m_Indices; }
+    const std::vector<MeshPart>& GetParts() const { return m_Parts; }
+    bool IsModelPart() const { return m_IsModelPart; }
+    /// Keep the shared model scale; vertices become local to MeshPart::origin.
+    static Mesh ExtractPart(const Mesh& source, int partIndex, bool cpuOnly = false);
 
     // Primitive generators
     static Mesh CreateCube(float size = 1.0f, bool cpuOnly = false);
@@ -86,6 +98,8 @@ private:
     glm::vec3 m_BoundsMax = { 0.0f, 0.0f, 0.0f };
     std::vector<Vertex> m_Vertices;
     std::vector<uint32_t> m_Indices;
+    std::vector<MeshPart> m_Parts;
+    bool m_IsModelPart = false;
 };
 
 } // namespace MipsyncEngine

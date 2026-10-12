@@ -1,10 +1,16 @@
 #include "Ps1Build.h"
+#include "Ps1Output.h"
 #include "Ps1Toolchain.h"
+#include "BootLogo.h"
 #include "../build/BuildManifest.h"
 #include "../core/Log.h"
+#include "../core/NativePaths.h"
 #include "../assets/AssetManager.h"
 #include "../mips/PS1SceneExport.h"
 #include <fstream>
+#include <algorithm>
+#include <iomanip>
+#include <sstream>
 #include <nlohmann/json.hpp>
 #include <unordered_set>
 
@@ -23,7 +29,9 @@ namespace {
 
 #ifdef _WIN32
 fs::path ExtendedLengthPath(const fs::path& path) {
-    const fs::path absolute = fs::absolute(path);
+    // Extended-length Win32 paths require backslashes, even when the CLI
+    // caller supplied a normal path with forward slashes.
+    const fs::path absolute = fs::absolute(path).make_preferred();
     const std::wstring native = absolute.native();
     if (native.rfind(LR"(\\?\)", 0) == 0)
         return absolute;
@@ -106,9 +114,8 @@ void CopyDirIfExists(const fs::path& src, const fs::path& dst, std::string& outE
     std::error_code ec;
     if (!fs::exists(src, ec))
         return;
-    fs::copy(src, dst, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
-    if (ec)
-        outError = "Copy failed: " + PathUtf8::ToString(src) + " — " + ec.message();
+    try { NativePaths::CopyTree(src, dst); }
+    catch (const std::exception& ex) { outError = ex.what(); }
 }
 
 void CopyFileIfExists(const fs::path& src, const fs::path& dst, std::string& outError) {
@@ -144,49 +151,52 @@ void CopyPs1StarterSources(const fs::path& starterRoot, const fs::path& ps1Src,
 }
 
 /// Search for a PS1 license file (licensea.dat, licensee.dat, or licensej.dat)
-/// in common locations and, if found, copy it into ps1Src and patch iso.xml
+/// in common locations and preserve its entire standard system area unchanged.
 /// so mkpsxiso injects it into the disc image's first 16 sectors.
 /// Without this data, PS2's POPS emulator (POPStarter) refuses to boot the
 /// disc and returns to the PS2 browser screen.
 bool InjectLicenseFile(const fs::path& projectRoot, const fs::path& engineDir,
                        const fs::path& templates, const fs::path& ps1Src) {
-    const char* licenseNames[] = {"licensea.dat", "licensee.dat", "licensej.dat"};
+    const char* licenseNames[] = {"licensej.dat", "licensea.dat", "licensee.dat"};
     fs::path foundLicense;
     std::string foundName;
     std::error_code ec;
 
+    // Project-provided metadata always overrides the engine's NTSC-J default.
     for (const char* name : licenseNames) {
-        const fs::path candidates[] = {
-            projectRoot / name,
-            engineDir / name,
-            engineDir / "ps1_runtime" / name,
-            templates / name,
-        };
-        for (const auto& c : candidates) {
-            if (fs::is_regular_file(c, ec)) {
-                foundLicense = c;
-                foundName = name;
-                break;
+        const fs::path candidate = projectRoot / name;
+        if (fs::is_regular_file(candidate, ec)) {
+            foundLicense = candidate; foundName = name; break;
+        }
+    }
+    // Prefer the bundled Japanese system area across all engine locations.
+    // An older US file in ps1_runtime must not mask templates/licensej.dat.
+    const fs::path roots[] = {engineDir, engineDir / "ps1_runtime", templates};
+    if (foundLicense.empty()) for (const char* name : licenseNames) {
+        for (const auto& root : roots) {
+            const fs::path candidate = root / name;
+            if (fs::is_regular_file(candidate, ec)) {
+                foundLicense = candidate; foundName = name; break;
             }
         }
         if (!foundLicense.empty()) break;
     }
-
-    if (foundLicense.empty()) {
-        MIPSYNC_WARN("PS1 license file not found — disc image will NOT boot on PS2 "
-                     "(POPStarter / POPS). Place licensea.dat in your project folder "
-                     "or next to the engine executable.");
+    std::vector<uint8_t> original;
+    if (!foundLicense.empty()) {
+        std::ifstream source(foundLicense, std::ios::binary);
+        if (!source) return false;
+        original.assign(std::istreambuf_iterator<char>(source), {});
+    }
+    std::vector<uint8_t> systemArea;
+    std::string systemAreaError;
+    if (!BuildPs1SystemArea(original, systemArea, systemAreaError)) {
+        MIPSYNC_ERROR("PS1 system-area packaging failed: {}", systemAreaError);
         return false;
     }
-
-    // Copy license file into ps1_src/ so mkpsxiso can find it.
-    fs::copy_file(foundLicense, ps1Src / foundName,
-                  fs::copy_options::overwrite_existing, ec);
-    if (ec) {
-        MIPSYNC_WARN("Failed to copy license file: {}", ec.message());
-        return false;
-    }
-
+    std::ofstream licenseOut(ps1Src / foundName, std::ios::binary);
+    licenseOut.write(reinterpret_cast<const char*>(systemArea.data()), systemArea.size());
+    licenseOut.close();
+    if (!licenseOut) return false;
     // Patch iso.xml: insert <license file="..."/> before <directory_tree>
     // if not already present.
     const fs::path isoXml = ps1Src / "iso.xml";
@@ -197,8 +207,13 @@ bool InjectLicenseFile(const fs::path& projectRoot, const fs::path& engineDir,
     in.close();
 
     if (content.find("<license") != std::string::npos) {
-        // Already has a license tag — skip patching.
-        MIPSYNC_INFO("iso.xml already contains <license> tag.");
+        const size_t start = content.find("<license");
+        const size_t end = content.find('>', start);
+        if (end == std::string::npos) return false;
+        content.replace(start, end - start + 1, "<license file=\"" + foundName + "\"/>");
+        std::ofstream out(isoXml, std::ios::binary);
+        out << content;
+        if (!out) return false;
         return true;
     }
 
@@ -214,7 +229,7 @@ bool InjectLicenseFile(const fs::path& projectRoot, const fs::path& engineDir,
     if (!out.is_open()) return false;
     out << content;
 
-    MIPSYNC_INFO("PS1 license injected from: {}", PathUtf8::ToString(foundLicense));
+    MIPSYNC_INFO("PS1 standard system area preserved: {}", foundName);
     return true;
 }
 
@@ -262,6 +277,61 @@ fs::path ResolveTemplatesRoot(const std::string& engineRoot) {
     return {};
 }
 
+bool ExportBuildScenes(const fs::path& projectRoot, const BuildManifest& manifest,
+                       const fs::path& templates, const fs::path& ps1Src,
+                       Mips::Ps1SceneExportResult& startupExport, std::string& error) {
+    if (manifest.scenesInBuild.size() > 1000) {
+        error = "PS1 supports at most 1000 scenes in a build.";
+        return false;
+    }
+    std::ostringstream targets;
+    std::ostringstream discEntries;
+    for (size_t index = 0; index < manifest.scenesInBuild.size(); ++index) {
+        const fs::path sceneDir = index == 0 ? ps1Src : ps1Src / "scenes" / std::to_string(index);
+        fs::create_directories(sceneDir / "generated");
+        if (index != 0) {
+            CopyPs1StarterSources(templates / "starter", sceneDir, error);
+            if (!error.empty()) return false;
+        }
+        BuildManifest sceneManifest = manifest;
+        sceneManifest.startupSceneIndex = static_cast<int>(index);
+        Mips::Ps1SceneExportResult sceneExport;
+        if (!Mips::ExportPs1SceneAndScripts(PathUtf8::ToString(projectRoot), sceneManifest,
+                PathUtf8::ToString(sceneDir / "generated"), sceneExport, error)) {
+            error = "Scene '" + manifest.scenesInBuild[index] + "': " + error;
+            return false;
+        }
+        if (index == 0) {
+            startupExport = std::move(sceneExport);
+            continue;
+        }
+        targets << "mipsync_add_scene_executable(scene_" << index
+                << " \"${CMAKE_CURRENT_SOURCE_DIR}/scenes/" << index << "\")\n"
+                << "list(APPEND MIPSYNC_SCENE_TARGETS scene_" << index << ")\n";
+        discEntries << "            <file name=\"SCN" << std::setfill('0') << std::setw(5) << index
+                    << ".EXE\" type=\"data\" source=\"scene_" << index << ".exe\" />\n";
+        for (size_t clip = 0; clip < sceneExport.audioClips.size(); ++clip) {
+            if (sceneExport.audioClips[clip].sfx) continue;
+            std::ostringstream filename;
+            filename << "S" << std::setfill('0') << std::setw(3) << index
+                     << "A" << std::setw(2) << clip << ".VAG";
+            discEntries << "            <file name=\"" << filename.str()
+                        << "\" type=\"data\" source=\"${PROJECT_SOURCE_DIR}/scenes/"
+                        << index << "/audio/" << filename.str() << "\" />\n";
+        }
+    }
+    if (!WriteText(ps1Src / "generated" / "scene_targets.cmake", targets.str(), error))
+        return false;
+    std::ifstream isoIn(ps1Src / "iso.xml", std::ios::binary);
+    if (!isoIn) { error = "Cannot open PS1 iso.xml"; return false; }
+    std::string iso((std::istreambuf_iterator<char>(isoIn)), std::istreambuf_iterator<char>());
+    isoIn.close();
+    const size_t marker = iso.find("            <dummy sectors=\"1024\"/>");
+    if (marker == std::string::npos) { error = "Cannot add scenes to PS1 iso.xml"; return false; }
+    iso.insert(marker, discEntries.str());
+    return WriteText(ps1Src / "iso.xml", iso, error);
+}
+
 // Copy the pre-built starter PSX.EXE (and optional .cue / .bin disc image) into
 // the build output, so "Build & Run in Emulator" always has something runnable
 // even when PSn00bSDK isn't installed yet.
@@ -295,7 +365,7 @@ bool ApplyPrebuiltFallback(const fs::path& templates, const fs::path& outDir,
 }
 
 #ifdef _WIN32
-bool RunPowerShellBuild(const fs::path& script, const fs::path& workingDir,
+bool RunPowerShellBuildDirect(const fs::path& script, const fs::path& workingDir,
                         const fs::path& engineDir, const std::string& sdkRoot,
                         std::string& outLog) {
     auto quote = [](const std::wstring& s) { return L"\"" + s + L"\""; };
@@ -332,6 +402,48 @@ bool RunPowerShellBuild(const fs::path& script, const fs::path& workingDir,
     return exitCode == 0;
 }
 
+bool RunPowerShellBuild(const fs::path& script, const fs::path& workingDir,
+                        const fs::path& engineDir, const std::string& sdkRoot,
+                        const fs::path& artifactDirectory, std::string& outLog) {
+    // GCC, Ninja and mkpsxiso cannot reliably build inside long Unicode paths.
+    // Compile a native copy in a short temporary workspace, then return all
+    // generated artifacts to the project's normal output directory.
+    auto temporary = fs::temp_directory_path();
+    wchar_t shortPath[32768]{};
+    if (GetShortPathNameW(temporary.c_str(), shortPath, 32768)) temporary = shortPath;
+    for (wchar_t c : temporary.native()) {
+        if (c > 127) { outLog = "PS1 tools require an ASCII temporary directory. Set TEMP to a writable ASCII path."; return false; }
+    }
+    const auto scratch = temporary / (L"mpb-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+    struct Cleanup {
+        fs::path path;
+        ~Cleanup() { try { NativePaths::RemoveTree(path); } catch (...) {} }
+    } cleanup{scratch};
+    try {
+        NativePaths::CopyTree(workingDir / "ps1_src", scratch / "ps1_src", true);
+        NativePaths::CopyRegularFile(script, scratch / "build.ps1");
+        auto toolRoot = scratch / "tools";
+        NativePaths::CopyRegularFile(engineDir / "tools" / "ninja.exe", toolRoot / "tools" / "ninja.exe");
+        auto sdk = PathUtf8::FromString(sdkRoot);
+        const auto sdkName = sdk.native();
+        if (sdkName.size() > 120 || std::any_of(sdkName.begin(), sdkName.end(), [](wchar_t c) { return c > 127; })) {
+            NativePaths::CopyTree(sdk, scratch / "sdk"); sdk = scratch / "sdk";
+        }
+        const bool succeeded = RunPowerShellBuildDirect(scratch / "build.ps1", scratch, toolRoot, PathUtf8::ToString(sdk), outLog);
+        if (fs::exists(scratch / "build.log")) NativePaths::CopyRegularFile(scratch / "build.log", workingDir / "build.log");
+        if (succeeded) {
+            NativePaths::CopyTree(scratch / "out", artifactDirectory);
+            NativePaths::CopyTree(scratch / "ps1_src" / "build", workingDir / "ps1_src" / "build");
+        }
+        return succeeded;
+    } catch (const std::exception& ex) {
+        outLog += "\nArtifact finalization failed: "; outLog += ex.what();
+        std::ofstream logFile(workingDir / "build.log", std::ios::app);
+        if (logFile) logFile << "\nArtifact finalization failed: " << ex.what() << '\n';
+        return false;
+    }
+}
+
 std::string SummarizeBuildLog(const std::string& log) {
     if (log.empty()) return {};
     std::string last;
@@ -341,7 +453,8 @@ std::string SummarizeBuildLog(const std::string& log) {
             if (i > lineStart) {
                 std::string line = log.substr(lineStart, i - lineStart);
                 const size_t tsEnd = line.find(" ");
-                if (tsEnd != std::string::npos && tsEnd + 1 < line.size())
+                if (line.size() > 19 && line[4] == '-' && line[7] == '-' &&
+                    tsEnd != std::string::npos && tsEnd + 1 < line.size())
                     line = line.substr(tsEnd + 1);
                 if (!line.empty())
                     last = line;
@@ -369,6 +482,9 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
     };
     progress(0.02f, "Validating PS1 build settings");
     PlayerSettings settings = request.settings;
+    // PS1 boots build index zero. Older projects may still store a separate
+    // startup selection that followed a scene when the list was reordered.
+    settings.startupSceneIndex = 0;
     settings.productName = SanitizeProductName(settings.productName);
 
     if (settings.scenesInBuild.empty()) {
@@ -391,12 +507,39 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
     const fs::path mipsyncExport = productRoot / "mipsync_export";
     const fs::path projectCopy = mipsyncExport / "Project";
     const fs::path ps1Src = productRoot / "ps1_src";
-    const fs::path outDir = productRoot / "out";
+    fs::path outDir;
+
+    // Export can fail before the SDK script starts. Never leave a previous
+    // successful build.log as the explanation for the current failed build.
+    struct BuildLog {
+        fs::path path;
+        const Ps1BuildResult& result;
+        bool started = false;
+        void Begin() {
+            std::ofstream log(path, std::ios::trunc);
+            if (log) { log << "Mipsync PS1 build starting\n"; started = true; }
+        }
+        void AppendResult() {
+            if (!started) return;
+            started = false;
+            try {
+                std::ofstream log(path, std::ios::app);
+                if (log) log << "\nPS1 build " << (result.success ? "succeeded: " : "failed: ")
+                             << result.message << '\n';
+            } catch (...) {}
+        }
+        Ps1BuildResult Finish() { AppendResult(); return result; }
+        ~BuildLog() { AppendResult(); }
+    } buildLog{productRoot / "build.log", result};
 
     std::string error;
     try {
+        outDir = SelectArtifactDirectory(productRoot);
+        if (outDir != productRoot / "out")
+            MIPSYNC_INFO("Previous PS1 output is in use; writing this build to {}", PathUtf8::ToString(outDir));
         progress(0.08f, "Preparing PS1 output folders");
         fs::create_directories(productRoot, ec);
+        buildLog.Begin();
         fs::create_directories(mipsyncExport, ec);
         fs::create_directories(projectCopy, ec);
         fs::create_directories(ps1Src, ec);
@@ -430,7 +573,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
         CopyProjectTree(projectRoot, projectCopy, error);
         if (!error.empty()) {
             result.message = error;
-            return result;
+            return buildLog.Finish();
         }
 
         progress(0.24f, "Writing PS1 build manifest");
@@ -438,7 +581,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
         const fs::path bootPath = mipsyncExport / "boot.json";
         if (!BuildManifestIO::SaveToFile(PathUtf8::ToString(bootPath), manifest, error)) {
             result.message = error;
-            return result;
+            return buildLog.Finish();
         }
 
         json exportMeta;
@@ -454,7 +597,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
         WriteText(mipsyncExport / "mipsync_export.json", exportMeta.dump(2), error);
         if (!error.empty()) {
             result.message = error;
-            return result;
+            return buildLog.Finish();
         }
 
         const fs::path templates = ResolveTemplatesRoot(PathUtf8::ToString(engineDir));
@@ -464,7 +607,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
             result.message =
                 "Staged PS1 export at " + result.outputDirectory +
                 "\n(templates/ps1 not found — add starter from repo to build PSX.EXE)";
-            return result;
+            return buildLog.Finish();
         }
 
         progress(0.31f, "Copying PS1 runtime sources");
@@ -472,12 +615,16 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
         CopyPs1StarterSources(templates / "starter", ps1Src, error);
         if (!error.empty()) {
             result.message = error;
-            return result;
+            return buildLog.Finish();
         }
 
         // Inject PS1 license data so the disc boots on PS2 (POPStarter/POPS).
         const bool hasLicense = InjectLicenseFile(
             projectRoot, engineDir, templates, ps1Src);
+        if (!hasLicense) {
+            result.message = "Failed to package standard PS1 system-area data. Check the PS1 template or project license file.";
+            return buildLog.Finish();
+        }
 
         // Export startup scene + scene-referenced Mipsync scripts into generated/
         // C tables consumed by the PS1 runtime (scene_data.c + scripts_data.c).
@@ -485,13 +632,12 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
         Mips::Ps1SceneExportResult sceneExport{};
         std::vector<std::string> exportDiagnostics;
         std::string exportError;
-        const bool sceneExported = Mips::ExportPs1SceneAndScripts(
-            PathUtf8::ToString(projectRoot), manifest,
-            PathUtf8::ToString(ps1Src / "generated"), sceneExport, exportError);
+        const bool sceneExported = ExportBuildScenes(
+            projectRoot, manifest, templates, ps1Src, sceneExport, exportError);
         if (!sceneExported) {
             result.message = "PS1 scene export failed: " + exportError;
             MIPSYNC_ERROR("{}", result.message);
-            return result;
+            return buildLog.Finish();
         } else {
             result.scriptCount = sceneExport.bindingCount;
             result.entityCount = sceneExport.entities.size();
@@ -519,15 +665,15 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
             sdkRoot ? PathUtf8::ToString(*sdkRoot) : std::string{};
 
         if (fs::is_regular_file(script, ec)) {
-            if (sdkRootStr.empty() && result.scriptCount > 0) {
+            if (sdkRootStr.empty() && (result.scriptCount > 0 || settings.scenesInBuild.size() > 1)) {
                 log = "PSn00bSDK not found. Install it from the Hub (PS1 Toolchain), then rebuild.";
             } else {
                 progress(0.72f, "Compiling with PSn00bSDK");
-                const bool ran = RunPowerShellBuild(script, productRoot, engineDir, sdkRootStr, log);
+                const bool ran = RunPowerShellBuild(script, productRoot, engineDir, sdkRootStr, outDir, log);
                 const fs::path psx = outDir / "PSX.EXE";
                 const bool hasPsx = fs::is_regular_file(psx, ec);
                 sdkBuilt = ran && hasPsx;
-                if (hasPsx) {
+                if (sdkBuilt) {
                     result.psxExePath = PathUtf8::ToString(psx);
                     const fs::path cue = outDir / "game.cue";
                     if (fs::is_regular_file(cue, ec))
@@ -537,7 +683,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
         }
 
         if (result.psxExePath.empty()) {
-            if (result.scriptCount > 0) {
+            if (result.scriptCount > 0 || settings.scenesInBuild.size() > 1) {
                 result.success = false;
                 result.outputDirectory = PathUtf8::ToString(productRoot);
                 result.message =
@@ -550,7 +696,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
                          ? "Install PSn00bSDK from the Hub (PS1 Toolchain tab), then Build PS1 again."
                          : "PSn00bSDK build failed — open Builds/PS1/<Product>/build.log for details.") +
                     (log.empty() ? "" : "\n" + SummarizeBuildLog(log));
-                return result;
+                return buildLog.Finish();
             }
             fellBack = ApplyPrebuiltFallback(templates, outDir, result);
         }
@@ -566,7 +712,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
         const std::string licenseNote = hasLicense
             ? ""
             : "\n⚠ No PS1 license file found — disc will NOT boot on PS2 (POPStarter)."
-              "\n  Place licensea.dat in your project folder and rebuild.";
+              "\n  Place a standard licensej.dat, licensea.dat or licensee.dat in your project folder and rebuild.";
         if (sdkBuilt && !fellBack) {
             result.message = "PS1 build OK: " + result.psxExePath + scriptSummary + licenseNote;
             MIPSYNC_INFO("{}", result.message);
@@ -587,7 +733,7 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
                 "\nSDK build did not produce PSX.EXE and no pre-built fallback is available.\n" +
                 (log.empty() ? "" : log.substr(0, std::min<size_t>(log.size(), 800)));
         }
-        return result;
+        return buildLog.Finish();
 #else
         result.success = true;
         result.outputDirectory = PathUtf8::ToString(productRoot);
@@ -596,12 +742,13 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
     } catch (const std::exception& ex) {
         result.message = ex.what();
     }
-    return result;
+    return buildLog.Finish();
 }
 
 Ps1BuildResult ExportOnly(const Ps1BuildRequest& request) {
     Ps1BuildResult result;
     PlayerSettings settings = request.settings;
+    settings.startupSceneIndex = 0;
     settings.productName = SanitizeProductName(settings.productName);
 
     if (settings.scenesInBuild.empty()) {
@@ -643,9 +790,7 @@ Ps1BuildResult ExportOnly(const Ps1BuildRequest& request) {
         BuildManifest manifest = BuildManifestIO::FromPlayerSettings(settings);
         Mips::Ps1SceneExportResult sceneExport{};
         std::string exportError;
-        if (!Mips::ExportPs1SceneAndScripts(PathUtf8::ToString(projectRoot), manifest,
-                                            PathUtf8::ToString(ps1Src / "generated"), sceneExport,
-                                            exportError)) {
+        if (!ExportBuildScenes(projectRoot, manifest, templates, ps1Src, sceneExport, exportError)) {
             result.message = "PS1 export failed: " + exportError;
             return result;
         }
@@ -673,7 +818,7 @@ Ps1BuildResult BuildDiscFolder(const Ps1BuildRequest& request) {
     }
 
     const fs::path productRoot = PathUtf8::FromString(result.outputDirectory);
-    const fs::path outDir = productRoot / "out";
+    const fs::path outDir = PathUtf8::FromString(result.psxExePath).parent_path();
     const fs::path discDir = productRoot / "disc";
     const fs::path ps1Src = productRoot / "ps1_src";
 
@@ -704,6 +849,18 @@ Ps1BuildResult BuildDiscFolder(const Ps1BuildRequest& request) {
     }
 
     // Generate SYSTEM.CNF
+    for (const auto& file : fs::directory_iterator(outDir)) {
+        const std::string name = file.path().filename().string();
+        if (name.rfind("SCN", 0) == 0 && file.path().extension() == ".EXE") {
+            fs::copy_file(file.path(), discDir / file.path().filename(),
+                          fs::copy_options::overwrite_existing, ec);
+            if (ec) {
+                result.success = false;
+                result.message = "Failed to copy scene executable: " + ec.message();
+                return result;
+            }
+        }
+    }
     const std::string sysCnf = "BOOT = cdrom:\\PSX.EXE;1\r\nTCB = 4\r\nEVENT = 10\r\nSTACK = 801FFF00\r\n";
     std::string error;
     if (!WriteText(discDir / "SYSTEM.CNF", sysCnf, error)) {
@@ -712,8 +869,8 @@ Ps1BuildResult BuildDiscFolder(const Ps1BuildRequest& request) {
         return result;
     }
 
-    // Copy license file if one was injected/found in ps1_src.
-    const char* licenseNames[] = {"licensea.dat", "licensee.dat", "licensej.dat"};
+    // Include the same branded boot sectors in the manual disc package.
+    const char* licenseNames[] = {"licensej.dat", "licensea.dat", "licensee.dat"};
     bool hasLicense = false;
     for (const char* name : licenseNames) {
         if (fs::is_regular_file(ps1Src / name, ec)) {

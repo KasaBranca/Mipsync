@@ -76,9 +76,6 @@ const char* UnsupportedHostReason(HostFunc func) {
         return "Physics.Raycast is not available on the PS1 runtime yet (Physics.Move and Physics.IsGrounded are supported)";
     case HostFunc::Entity_GetName:
         return "Entity.name is not available on the PS1 runtime yet";
-    case HostFunc::Scene_Load:
-    case HostFunc::Scene_LoadBuildIndex:
-        return "Scene loading from Mips# is not available on the PS1 runtime yet";
     case HostFunc::Application_Quit:
         return "Application.Quit is not available on the PS1 runtime";
     case HostFunc::Save_GetInt:
@@ -98,6 +95,15 @@ const char* UnsupportedHostReason(HostFunc func) {
         return "AudioSource.clip runtime assignment is not available on PS1; configure the clip in scene/build data";
     default:
         return nullptr;
+    }
+}
+
+bool IsKnownHostFunction(uint16_t id) {
+    switch (static_cast<HostFunc>(id)) {
+#define MIPSYNC_KNOWN_HOST(cName, cppName, value) case HostFunc::cppName: return true;
+        MIPSYNC_HOST_FUNC_LIST(MIPSYNC_KNOWN_HOST)
+#undef MIPSYNC_KNOWN_HOST
+    default: return false;
     }
 }
 
@@ -202,7 +208,7 @@ void ValidateMethodBytecode(const CompiledModule& module,
             if (!need(3)) break;
             const uint16_t id = readU16();
             ++pc; // argc
-            if (id > static_cast<uint16_t>(HostFunc::Physics_MoveKinematic)) {
+            if (!IsKnownHostFunction(id)) {
                 AddUniqueError(errors, where + ": unknown PS1 host function #" +
                                        std::to_string(id));
             } else if (const char* reason = UnsupportedHostReason(static_cast<HostFunc>(id))) {

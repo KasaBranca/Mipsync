@@ -10,6 +10,8 @@
 #include "Framebuffer.h"
 #include <glm/glm.hpp>
 #include <memory>
+#include "../ps1/PSync.h"
+#include <unordered_map>
 
 namespace MipsyncEngine {
 
@@ -66,6 +68,17 @@ enum class RenderMode : int {
 
 class SkinnedMesh;
 
+struct RenderStatistics {
+    uint64_t drawCalls = 0;
+    uint64_t triangles = 0;
+    uint64_t lightingUploads = 0;
+    void RecordGeometry(uint32_t indexCount) {
+        if (!indexCount) return;
+        ++drawCalls;
+        triangles += indexCount / 3;
+    }
+};
+
 class Renderer {
 public:
     Renderer();
@@ -85,7 +98,8 @@ public:
                   const glm::vec2& textureTiling = glm::vec2(1.0f),
                   const glm::vec2& textureOffset = glm::vec2(0.0f),
                   uint32_t indexOffset = 0, uint32_t indexCount = 0,
-                  float projectionDepthClamp = 0.0f, bool doubleSided = false);
+                  float projectionDepthClamp = 0.0f, bool doubleSided = false,
+                  PSyncDrawOptions syncOptions = {});
     void DrawMeshDepthOnly(const Mesh& mesh, const glm::mat4& transform);
 
     void DrawSkinnedMesh(const SkinnedMesh& mesh, const glm::mat4& entityWorld,
@@ -99,7 +113,10 @@ public:
 
     // Render mode (resets to Shaded after EndScene)
     void SetRenderMode(RenderMode mode) { m_RenderMode = mode; }
+    void SetObjectUnlit(bool unlit) { m_ObjectUnlit = unlit; }
     RenderMode GetRenderMode() const { return m_RenderMode; }
+    const RenderStatistics& GetStatistics() const { return m_Statistics; }
+    void SetPSyncWorkload(PSyncWorkload* workload) { m_PSyncWorkload = workload; }
 
     // Post-process selection outline: draws a clean N-pixel outline around the
     // silhouette of `mesh` directly on top of `targetFBO` using a mask + edge pass.
@@ -110,7 +127,10 @@ public:
     // Access
     GLuint GetOutputTexture() const;
     PS1Settings& GetPS1Settings() { return m_PS1Settings; }
-    LightData& GetLightData() { return m_Light; }
+    LightData& GetLightData() {
+        m_MeshLightingUploaded = m_SkinnedLightingUploaded = false;
+        return m_Light;
+    }
 
     void SetSkyboxTexture(const Texture* texture, const glm::vec3& tint,
                           float exposure, float rotationDegrees);
@@ -131,6 +151,7 @@ public:
 private:
     void CreateShaders();
     void CreateDefaultResources();
+    void UploadLightingUniforms(Shader& shader, bool& uploaded);
 
     Shader m_PS1Shader;
     Shader m_PS1SkinnedShader;
@@ -150,6 +171,13 @@ private:
     int m_SceneLightCount = 0;
     SceneLightGpu m_SceneLights[kMaxSceneLights]{};
     RenderMode m_RenderMode = RenderMode::Shaded;
+    bool m_ObjectUnlit = false;
+    bool m_MeshLightingUploaded = false;
+    bool m_SkinnedLightingUploaded = false;
+    RenderStatistics m_Statistics;
+    PSyncWorkload* m_PSyncWorkload = nullptr;
+    std::unordered_map<uint64_t, PSyncGeometryCacheEntry> m_PSyncPrevious, m_PSyncCurrent;
+    uint64_t m_PSyncCachedVertices = 0;
 
     const Texture* m_SkyboxTexture = nullptr;
     glm::vec3 m_SkyboxTint{1.0f, 1.0f, 1.0f};

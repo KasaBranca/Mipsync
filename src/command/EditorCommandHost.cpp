@@ -2,21 +2,31 @@
 
 #include "CommandLine.h"
 #include "ResultRenderer.h"
+#include "AuthoringCatalog.h"
+#include "AnimationAuthoring.h"
+#include <stb_image_write.h>
+#include <fstream>
+#include <sstream>
 #include "../assets/AssetManager.h"
 #include "../assets/Material.h"
+#include "../audio/MidiFile.h"
 #include "../core/Engine.h"
+#include "../core/Input.h"
 #include "../core/Log.h"
 #include "../core/RuntimePaths.h"
 #include "../editor/EditorApp.h"
 #include "../editor/MipsEditorIntegration.h"
 #include "../scene/Scene.h"
 #include "../scene/SceneIO.h"
+#include "../mips/MipsRuntime.h"
+#include <set>
 #include "EngineVersion.h"
 
 #include <charconv>
 #include <chrono>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 
 namespace MipsyncEngine::Command {
@@ -146,6 +156,10 @@ bool AddUniqueComponent(Entity& entity, const char* name, std::string& outError)
 
 bool AddNamedComponent(Entity& entity, const std::string& input, std::string& outError) {
     const std::string name = Lower(input);
+    if (name=="uiimage"||name=="uitext"||name=="uibutton"||name=="uibuttongroup"||name=="uiaudiospectrum"||name=="canvas") {
+        for(const auto& existing:ComponentNames(entity))if(Lower(existing)==name){outError=input+" already exists on the entity.";return false;}
+        if(!entity.GetComponent<RectTransformComponent>())entity.AddComponent<RectTransformComponent>();
+    }
     if (name == "meshrenderer") {
         if (!AddUniqueComponent<MeshRendererComponent>(entity, "MeshRenderer", outError)) return false;
         entity.GetComponent<MeshRendererComponent>()->SetPrimitive("Cube", 1.0f);
@@ -254,7 +268,7 @@ bool EditorCommandHost::Start(std::string& outError) {
     m_Instance.instanceId = std::to_string(pid);
     m_Instance.processId = pid;
     m_Instance.projectPath = m_Engine.GetProjectPath();
-    m_Instance.projectId = std::filesystem::path(m_Instance.projectPath).filename().string();
+    m_Instance.projectId = PathUtf8::ToString(PathUtf8::FromString(m_Instance.projectPath).filename());
     m_Instance.engineVersion = MIPSYNC_ENGINE_VERSION;
     m_Instance.executablePath = PathUtf8::ToString(GetExecutablePath());
     m_Instance.endpoint = MakeEditorEndpoint(pid);
@@ -298,11 +312,18 @@ std::string EditorCommandHost::HandleIpcPayload(const std::string& payload) {
     }
 }
 
-void EditorCommandHost::Pump() {
+void EditorCommandHost::Pump(bool preparationOnly) {
     std::queue<std::shared_ptr<PendingRequest>> pending;
     {
         std::lock_guard lock(m_QueueMutex);
-        std::swap(pending, m_Pending);
+        if (!preparationOnly) std::swap(pending, m_Pending);
+        else {
+            const size_t count=m_Pending.size();
+            for(size_t i=0;i<count;++i){auto request=m_Pending.front();m_Pending.pop();
+                if(request->request.command=="runtime.inspect"||request->request.command=="runtime.stop")pending.push(request);
+                else m_Pending.push(request);
+            }
+        }
     }
     while (!pending.empty()) {
         auto request = pending.front();
@@ -317,7 +338,12 @@ void EditorCommandHost::Pump() {
         }
         MIPSYNC_INFO("[CLI] {} {}", request->request.command,
                      request->request.arguments.empty() ? std::string{} : request->request.arguments.dump());
+        const auto* descriptor = m_Commands.Find(request->request.command);
+        const bool mutation = descriptor && std::find(descriptor->effects.begin(),descriptor->effects.end(),
+            SideEffect::EditorMutation) != descriptor->effects.end();
+        if (mutation) m_Engine.GetEditor().CommitUndoTransaction();
         const auto result = m_Executor.Execute(request->request, m_Context);
+        if (mutation) m_Engine.GetEditor().CommitUndoTransaction();
         if (!result.success && !result.diagnostics.empty())
             MIPSYNC_WARN("[CLI] {} failed: {}", request->request.command,
                          result.diagnostics.front().message);
@@ -332,7 +358,13 @@ std::string EditorCommandHost::ExecuteConsoleLine(const std::string& line) {
     auto parsed = ParseCommandLine(tokens, m_Commands);
     if (!parsed.valid) return "error: " + parsed.error;
     parsed.request.projectPath = m_Engine.GetProjectPath();
-    return RenderHuman(parsed.request.command, m_Executor.Execute(parsed.request, m_Context));
+    const auto* descriptor = m_Commands.Find(parsed.request.command);
+    const bool mutation = descriptor && std::find(descriptor->effects.begin(),descriptor->effects.end(),
+        SideEffect::EditorMutation) != descriptor->effects.end();
+    if (mutation) m_Engine.GetEditor().CommitUndoTransaction();
+    const auto result = m_Executor.Execute(parsed.request,m_Context);
+    if (mutation) m_Engine.GetEditor().CommitUndoTransaction();
+    return RenderHuman(parsed.request.command,result);
 }
 
 Json EditorCommandHost::DescribeEntity(Entity& entity) const {
@@ -358,6 +390,111 @@ Json EditorCommandHost::DescribeEntity(Entity& entity) const {
 CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& request) {
     Scene& scene = m_Engine.GetScene();
     EditorApp& editor = m_Engine.GetEditor();
+    if (request.command == "editor.dialog.inspect" || request.command == "editor.dialog.respond") {
+        auto& builds = editor.GetBuildSettings();
+        if (request.command == "editor.dialog.respond") {
+            const auto id = request.arguments.at("dialog").get<std::string>();
+            const auto action = request.arguments.at("action").get<std::string>();
+            std::string error;
+            bool ok = false;
+            if (id == "scene_save") ok = editor.CommandRespondSceneSaveConfirmation(action, error);
+            else if (id == "build_progress" && builds.HasBuildDialog()) {
+                if (action == "cancel" && builds.IsBuildInProgress()) {
+                    builds.CommandCancelBuild();
+                    ok = builds.CommandCloseBuildDialog(error);
+                } else if (action == "close") ok = builds.CommandCloseBuildDialog(error);
+                else error = "Build dialog accepts cancel while running or close after completion.";
+            } else error = "The requested dialog is not awaiting a response.";
+            if (!ok) {
+                auto result = CommandResult::Fail("MIPSYNC_DIALOG_RESPONSE", error);
+                if (id == "scene_save" && editor.HasSceneSaveConfirmation())
+                    result.value = editor.InspectSceneSaveConfirmation();
+                return result;
+            }
+            return CommandResult::Ok({{"dialog", id}, {"action", action}, {"accepted", true},
+                {"actionPending", id == "scene_save" && editor.HasSceneSaveConfirmation()}});
+        }
+        Json dialogs = Json::array();
+        if (editor.HasSceneSaveConfirmation()) dialogs.push_back(editor.InspectSceneSaveConfirmation());
+        if (builds.HasBuildDialog()) dialogs.push_back({{"id", "build_progress"},
+            {"state", builds.IsBuildInProgress() ? "running" : builds.WasBuildSuccessful() ? "complete" : "failed"},
+            {"message", builds.GetBuildMessage()}, {"respondable", true},
+            {"actions", Json::array({builds.IsBuildInProgress() ? "cancel" : "close"})}});
+        return CommandResult::Ok({{"dialogs", dialogs}, {"required", !dialogs.empty()}});
+    }
+    // Do not let a queued save choice act on a scene modified by a later CLI
+    // request. Queries and explicit save/stop remain available without a wait.
+    if (editor.HasSceneSaveConfirmation() && request.command != "scene.save" && request.command != "runtime.stop" && request.command != "build.cancel") {
+        const auto* descriptor = m_Commands.Find(request.command);
+        const bool readOnly = descriptor && std::all_of(descriptor->effects.begin(), descriptor->effects.end(),
+            [](SideEffect effect) { return effect == SideEffect::ReadOnly; });
+        if (!readOnly) {
+            auto result = CommandResult::Fail("MIPSYNC_DIALOG_REQUIRED",
+                "A scene save confirmation is pending. Use editor.dialog.inspect and editor.dialog.respond.");
+            result.status = "dialog_required";
+            result.value = editor.InspectSceneSaveConfirmation();
+            return result;
+        }
+    }
+#include "EditorAuthoringCommands.inl"
+    if (request.command == "build.start" || request.command == "build.inspect" || request.command == "build.cancel") {
+        auto& builds = editor.GetBuildSettings();
+        builds.UpdateBuildProcess();
+        if (request.command == "build.start") {
+            if (editor.IsPlaying()) return CommandResult::Fail("MIPSYNC_BUILD_PLAY_MODE", "Stop Play Mode before building.");
+            const auto target = Lower(request.arguments.at("target").get<std::string>());
+            if (target != "pc" && target != "ps1" && target != "disc")
+                return CommandResult::Fail("MIPSYNC_BUILD_TARGET", "Build target must be pc, ps1 or disc.");
+            if (builds.IsBuildInProgress()) {
+                auto result = CommandResult::Fail("MIPSYNC_BUILD_BUSY", "A build is already running. Use build.inspect or build.cancel.");
+                result.status = "busy";
+                result.value = {{"state", "running"}, {"running", true}};
+                return result;
+            }
+            editor.CommandRefreshSceneDirtyState();
+            if (editor.IsSceneDirty()) {
+                if (!request.arguments.value("save-current", false)) {
+                    auto result = CommandResult::Fail("MIPSYNC_SAVE_REQUIRED", "Save the scene or use build.start --save-current true.");
+                    result.status = "save_required";
+                    result.value = {{"state", "save_required"}, {"path", editor.GetSceneFilePath()}};
+                    return result;
+                }
+                std::string error;
+                if (!editor.CommandSaveScene(error)) return CommandResult::Fail("MIPSYNC_SCENE_SAVE", error);
+            }
+            std::string message;
+            bool started = false;
+            if (target == "pc") started = builds.RunPcNativeBuild(message, false, false);
+            else if (target == "ps1") started = builds.RunBuild(message, false, false);
+            else if (target == "disc") started = builds.RunBuildDiscFolder(message, false, false);
+            if (!started) return CommandResult::Fail("MIPSYNC_BUILD_START", message);
+        }
+        if (request.command == "build.cancel") {
+            if (!builds.IsBuildInProgress()) return CommandResult::Fail("MIPSYNC_BUILD_NOT_RUNNING", "No build is running.");
+            builds.CommandCancelBuild();
+            std::string error;
+            builds.CommandCloseBuildDialog(error);
+        }
+        const auto& pc = builds.GetPcBuildResult();
+        const auto& ps1 = builds.GetPs1BuildResult();
+        const std::string state = builds.IsBuildInProgress() ? "running" : !builds.HasBuildFinished() ? "idle" :
+            builds.WasBuildCancelled() ? "cancelled" : builds.WasBuildSuccessful() ? "complete" : "failed";
+        Json value = {{"state", state}, {"running", builds.IsBuildInProgress()}, {"finished", builds.HasBuildFinished()},
+            {"success", builds.WasBuildSuccessful()}, {"progress", builds.GetBuildProgress()},
+            {"cancelled", builds.WasBuildCancelled()},
+            {"exitCode", builds.HasBuildFinished() ? Json(builds.GetBuildExitCode()) : Json(nullptr)},
+            {"stage", builds.GetBuildStage()}, {"message", builds.GetBuildMessage()},
+            {"log", builds.GetBuildLog()}, {"dialogVisible", builds.HasBuildDialog()},
+            {"output", pc.outputDirectory.empty() ? ps1.outputDirectory : pc.outputDirectory},
+            {"executable", pc.executablePath.empty() ? ps1.psxExePath : pc.executablePath},
+            {"cue", ps1.discCuePath}, {"discFolder", ps1.discFolderPath}};
+        auto result = builds.HasBuildFinished() && !builds.WasBuildSuccessful() && request.command != "build.cancel"
+            ? CommandResult::Fail(builds.WasBuildCancelled() ? "MIPSYNC_BUILD_CANCELLED" : "MIPSYNC_BUILD_FAILED", builds.GetBuildMessage())
+            : CommandResult::Ok();
+        result.value = std::move(value);
+        result.status = builds.IsBuildInProgress() ? "pending" : state;
+        return result;
+    }
     if (request.command == "scene.inspect") {
         return CommandResult::Ok({
             {"path", editor.GetSceneFilePath()}, {"entityCount", scene.GetEntities().size()},
@@ -370,6 +507,28 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         if (!SceneIO::SerializeSceneFingerprint(scene, serialized, error))
             return CommandResult::Fail("MIPSYNC_SCENE_SERIALIZE", error);
         return CommandResult::Ok({{"scene", Json::parse(serialized)}});
+    }
+    if (request.command == "scene.open") {
+        CommandResult blocked;
+        if (!RequireEditMode(editor, blocked)) return blocked;
+        const auto root = std::filesystem::weakly_canonical(PathUtf8::FromString(m_Engine.GetProjectPath()));
+        const auto input = PathUtf8::FromString(request.arguments.at("path").get<std::string>());
+        if (input.empty())
+            return CommandResult::Fail("MIPSYNC_SCENE_PATH", "Scene path cannot be empty.");
+        const auto path = std::filesystem::weakly_canonical(input.is_absolute() ? input : root / input);
+        const auto relative = path.lexically_relative(root);
+        if (relative.empty() || relative.is_absolute() || *relative.begin() == ".." ||
+            Lower(PathUtf8::ToString(path.extension())) != ".nscene")
+            return CommandResult::Fail("MIPSYNC_SCENE_PATH", "Scene must be a .nscene file inside the current project.");
+        std::string error;
+        if (!editor.CommandOpenScene(PathUtf8::ToString(path), request.arguments.value("save-current", false), error)) {
+            const bool saveRequired = editor.IsSceneDirty() && !request.arguments.value("save-current", false);
+            auto result = CommandResult::Fail(saveRequired ? "MIPSYNC_SAVE_REQUIRED" : "MIPSYNC_SCENE_OPEN", error);
+            if (saveRequired) { result.status = "save_required"; result.value = {{"state", "save_required"}, {"path", editor.GetSceneFilePath()}}; }
+            return result;
+        }
+        return CommandResult::Ok({{"path", editor.GetSceneFilePath()}, {"opened", true},
+            {"entityCount", scene.GetEntities().size()}, {"dirty", editor.IsSceneDirty()}});
     }
     if (request.command == "scene.patch") {
         CommandResult blocked;
@@ -395,7 +554,7 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         editor.RecordUndoSnapshot();
         if (!SceneIO::LoadFromJsonString(scene, patched.dump(), error))
             return CommandResult::Fail("MIPSYNC_SCENE_PATCH_APPLY", error);
-        editor.AfterSceneRestoredFromHistory();
+        editor.AfterSceneRestoredFromHistory(false);
         return CommandResult::Ok({{"applied", true}, {"operations", patch.size()},
                                   {"entityCount", scene.GetEntities().size()}, {"dirty", editor.IsSceneDirty()}});
     }
@@ -428,7 +587,12 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         std::string lookupError;
         Entity* entity = FindEntity(scene, query, &lookupError);
         if (!entity) return CommandResult::Fail("MIPSYNC_ENTITY_NOT_FOUND", lookupError);
-        return CommandResult::Ok(DescribeEntity(*entity));
+        auto value=DescribeEntity(*entity);
+        if(request.arguments.value("include-components",false)) {
+            const auto serialized=sceneJson(scene);
+            for(const auto& item:serialized["entities"])if(item["id"]==entity->GetID())value["serialized"]=item;
+        }
+        return CommandResult::Ok(value);
     }
     if (request.command == "entity.select") {
         const std::string query = request.arguments.at("entity").get<std::string>();
@@ -437,6 +601,68 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         if (!entity) return CommandResult::Fail("MIPSYNC_ENTITY_NOT_FOUND", lookupError);
         editor.CommandRevealEntity(entity->GetID(), true);
         return CommandResult::Ok(DescribeEntity(*entity));
+    }
+    if (request.command == "audio.set") {
+        CommandResult blocked; if (!RequireEditMode(editor, blocked)) return blocked;
+        std::string error;
+        Entity* entity = FindEntity(scene, request.arguments.at("entity").get<std::string>(), &error);
+        auto* source = entity ? entity->GetComponent<AudioSourceComponent>() : nullptr;
+        if (!source) return CommandResult::Fail("MIPSYNC_AUDIO_SOURCE", "Choose an entity with an AudioSource component.");
+        auto type = source->type;
+        auto clip = source->clipPath;
+        if (request.arguments.contains("clip")) {
+            clip = request.arguments.at("clip").get<std::string>();
+            if (Lower(clip) == "none") clip.clear();
+            if (IsMidiPath(clip) && !request.arguments.contains("type")) type = AudioSourceType::SFX;
+        }
+        if (request.arguments.contains("type")) {
+            auto value = Lower(request.arguments.at("type").get<std::string>());
+            if (value != "bgm" && value != "sfx" && value != "sample") return CommandResult::Fail("MIPSYNC_AUDIO_TYPE", "Type must be bgm, sfx or sample.");
+            type = value == "sfx" ? AudioSourceType::SFX : value == "sample" ? AudioSourceType::SampleSFX : AudioSourceType::BGM;
+        }
+        float volume = request.arguments.value("volume", source->volume);
+        if (!std::isfinite(volume) || volume < 0 || volume > 1) return CommandResult::Fail("MIPSYNC_AUDIO_VOLUME", "Volume must be between 0 and 1.");
+        if (!clip.empty()) {
+            if ((type == AudioSourceType::SFX) != IsMidiPath(clip)) return CommandResult::Fail("MIPSYNC_AUDIO_CLIP", "SFX requires .mid/.midi; BGM requires recorded audio.");
+            auto path = PathUtf8::FromString(clip);
+            if (path.is_absolute()) return CommandResult::Fail("MIPSYNC_AUDIO_CLIP", "Use a project-relative clip path.");
+            path = PathUtf8::FromString(AssetManager::Get().GetProjectRoot()) / path;
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(path, ec)) return CommandResult::Fail("MIPSYNC_AUDIO_CLIP", "Audio asset does not exist.");
+            if (type == AudioSourceType::SFX) {
+                MidiSequence midi; if (!ReadMidi(PathUtf8::ToString(path), midi, error)) return CommandResult::Fail("MIPSYNC_MIDI", error);
+            }
+        }
+        editor.RecordUndoSnapshot();
+        if (type != AudioSourceType::BGM && source->type != type) source->playOnAwake = false;
+        source->type = type; source->clipPath = clip; source->volume = volume;
+        if (request.arguments.contains("play-on-awake")) source->playOnAwake = request.arguments.at("play-on-awake").get<bool>();
+        if (request.arguments.contains("loop")) source->loop = request.arguments.at("loop").get<bool>();
+        if (request.arguments.contains("mute")) source->mute = request.arguments.at("mute").get<bool>();
+        editor.CommandMarkSceneDirty();
+        return CommandResult::Ok({{"entity", entity->GetID()}, {"type", type == AudioSourceType::SFX ? "sfx" : type == AudioSourceType::SampleSFX ? "sample" : "bgm"},
+            {"clip", clip}, {"volume", source->volume}, {"playOnAwake", source->playOnAwake}, {"loop", source->loop}, {"mute", source->mute}});
+    }
+    if (request.command == "ui.button-group-sounds") {
+        CommandResult blocked; if (!RequireEditMode(editor, blocked)) return blocked;
+        std::string error;
+        Entity* entity = FindEntity(scene, request.arguments.at("entity").get<std::string>(), &error);
+        auto* group = entity ? entity->GetComponent<UIButtonGroupComponent>() : nullptr;
+        if (!group) return CommandResult::Fail("MIPSYNC_BUTTON_GROUP", "Choose an entity with a UIButtonGroup component.");
+        uint32_t navigation = group->navigationAudioSourceId, press = group->confirmAudioSourceId;
+        auto resolve = [&](const char* key, uint32_t& id) {
+            if (!request.arguments.contains(key)) return true;
+            auto query = request.arguments.at(key).get<std::string>();
+            if (query == "0" || Lower(query) == "none") {id=0;return true;}
+            Entity* target = FindEntity(scene, query, &error);
+            auto* audio = target ? target->GetComponent<AudioSourceComponent>() : nullptr;
+            if (!audio || audio->type == AudioSourceType::BGM) {error="Button sounds require an SFX AudioSource, or none.";return false;}
+            id=target->GetID();return true;
+        };
+        if (!resolve("navigation",navigation) || !resolve("press",press)) return CommandResult::Fail("MIPSYNC_BUTTON_SOUND",error);
+        editor.RecordUndoSnapshot(); group->navigationAudioSourceId=navigation;group->confirmAudioSourceId=press;
+        editor.CommandMarkSceneDirty();
+        return CommandResult::Ok({{"entity",entity->GetID()},{"navigationAudioSource",navigation},{"confirmAudioSource",press}});
     }
     if (request.command == "entity.set") {
         CommandResult blocked;
@@ -475,7 +701,6 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         editor.RecordUndoSnapshot();
         Entity* duplicate = scene.DuplicateEntity(*source);
         if (!duplicate) return CommandResult::Fail("MIPSYNC_ENTITY_DUPLICATE", "Unable to duplicate entity.");
-        scene.SetParent(duplicate, scene.FindEntity(source->GetParentID()));
         if (request.arguments.contains("name")) {
             const std::string name = request.arguments.at("name").get<std::string>();
             duplicate->GetComponent<TagComponent>()->tag = name;
@@ -756,15 +981,48 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         return CommandResult::Ok({{"opened", true}, {"file", file}, {"line", line}, {"column", column}});
     }
     if (request.command == "runtime.play") {
+        editor.CommandRefreshSceneDirtyState();
+        if(editor.IsSceneDirty() && !editor.IsPlaying() && !editor.IsPreparingPlay()) {
+            if(!request.arguments.value("save-current",false)) {
+                auto result=CommandResult::Fail("MIPSYNC_SAVE_REQUIRED","Save the scene or use runtime.play --save-current true.");
+                result.status="save_required";result.value={{"state","save_required"},{"playing",false},{"preparing",false}};return result;
+            }
+            std::string error;if(!editor.CommandSaveScene(error))return CommandResult::Fail("MIPSYNC_SAVE_FAILED",error);
+        }
         editor.CommandStartPlayMode();
-        return CommandResult::Ok({{"playing", editor.IsPlaying()}, {"paused", editor.IsPaused()}});
+        auto result=CommandResult::Ok({{"state",editor.IsPreparingPlay()?"preparing":editor.IsPlaying()?"playing":"failed"},
+            {"playing", editor.IsPlaying()},{"preparing",editor.IsPreparingPlay()}, {"paused", editor.IsPaused()}});
+        if(editor.IsPreparingPlay())result.status="pending";
+        return result;
     }
     if (request.command == "runtime.stop") {
         editor.CommandStopPlayMode();
         return CommandResult::Ok({{"playing", editor.IsPlaying()}, {"paused", editor.IsPaused()}});
     }
-    if (request.command == "runtime.inspect")
-        return CommandResult::Ok({{"playing", editor.IsPlaying()}, {"paused", editor.IsPaused()}});
+    if (request.command == "runtime.inspect") {
+        const auto& sync = m_Engine.GetPSyncState();
+        const auto& w = sync.workload;
+        Json animators=Json::array();
+        if(!editor.IsPreparingPlay())for(const auto& entity:scene.GetEntities())if(auto* a=entity->GetComponent<AnimatorComponent>()) {
+            auto value=InspectAnimator(*a);value["entity"]=entity->GetID();animators.push_back(value);
+        }
+        return CommandResult::Ok({{"playing", editor.IsPlaying()}, {"paused", editor.IsPaused()},
+            {"state",editor.IsPreparingPlay()?"preparing":editor.IsPlaying()?"playing":editor.GetPlaySetupError().empty()?"stopped":"failed"},
+            {"preparing",editor.IsPreparingPlay()},{"error",editor.GetPlaySetupError()},
+            {"queuedFrames",m_Engine.GetQueuedCliFrames()},
+            {"animators",animators},
+            {"execution",editor.IsPreparingPlay()?Json::object():m_Engine.GetMipsRuntime().InspectExecution()},
+            {"input", {{"enabled", Input::IsGameInputEnabled()}, {"cursorLocked", Input::IsCursorLocked()},
+                {"leftStickX", Input::GetPS1Axis("LeftStickX")}, {"leftStickY", Input::GetPS1Axis("LeftStickY")},
+                {"rightStickX", Input::GetPS1Axis("RightStickX")}, {"rightStickY", Input::GetPS1Axis("RightStickY")}}},
+            {"pSync", {{"enabled", editor.GetGameViewSettings().pSync}, {"sampleValid", sync.sampleValid},
+                {"fps", sync.estimate.fps}, {"vblanks", sync.estimate.vblanks},
+                {"cpuMs", sync.estimate.cpuMs}, {"gpuMs", sync.estimate.gpuMs}, {"dmaMs", sync.estimate.dmaMs},
+                {"submittedTriangles", w.submittedTriangles}, {"drawnTriangles", w.drawnTriangles},
+                {"projectedVertices", w.projectedVertices}, {"litVertices", w.litVertices},
+                {"litFaces", w.litFaces}, {"pointLights", w.pointLights}, {"spotLights", w.spotLights},
+                {"lights", w.lights}, {"colorGradingPixels", w.colorGradingPixels}}}});
+    }
     return CommandResult::Fail("MIPSYNC_EDITOR_COMMAND_NOT_FOUND", "Unsupported Editor command: " + request.command);
 }
 

@@ -8,9 +8,11 @@ param(
 # fatal native-command errors, so we keep ErrorActionPreference loose and rely
 # on $LASTEXITCODE for failure detection.
 $ErrorActionPreference = "Continue"
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
 
 $log = Join-Path $ProductRoot "build.log"
-function Log($msg) { "$(Get-Date -Format o) $msg" | Tee-Object -FilePath $log -Append | Out-Null }
+function Log($msg) { Add-Content -LiteralPath $log -Value "$(Get-Date -Format o) $msg" -Encoding UTF8 }
 
 Remove-Item -ErrorAction SilentlyContinue $log
 
@@ -93,11 +95,11 @@ try {
         "-DCMAKE_TOOLCHAIN_FILE=$psn00bLibs/cmake/sdk.cmake" `
         "-DCMAKE_BUILD_TYPE=Release" `
         "-DCMAKE_MAKE_PROGRAM=$ninja" `
-        "-DPSN00BSDK_TARGET=mipsel-none-elf" 2>&1 | Tee-Object -FilePath $log -Append
+        "-DPSN00BSDK_TARGET=mipsel-none-elf" 2>&1 | ForEach-Object { Add-Content -LiteralPath $log -Value "$_" -Encoding UTF8 }
     if ($LASTEXITCODE -ne 0) { throw "cmake configure failed ($LASTEXITCODE)" }
 
     Log "Building..."
-    & $cmake.Source --build build 2>&1 | Tee-Object -FilePath $log -Append
+    & $cmake.Source --build build 2>&1 | ForEach-Object { Add-Content -LiteralPath $log -Value "$_" -Encoding UTF8 }
     if ($LASTEXITCODE -ne 0) { throw "cmake build failed ($LASTEXITCODE)" }
 
     # PSn00bSDK can successfully link an executable whose loaded image plus
@@ -113,7 +115,8 @@ try {
             if ($endHex.Length -gt 8) { $endHex = $endHex.Substring($endHex.Length - 8) }
             $endAddress = [Convert]::ToUInt64($endHex, 16)
             $ramStart = [Convert]::ToUInt64("80010000", 16)
-            $ramEnd = [Convert]::ToUInt64("80200000", 16)
+            # Reserve the final 64 KiB of main RAM for the runtime stack.
+            $ramEnd = [Convert]::ToUInt64("801F0000", 16)
             $usedBytes = $endAddress - $ramStart
             if ($endAddress -gt $ramEnd) {
                 $overBytes = $endAddress - $ramEnd
@@ -126,13 +129,21 @@ try {
         }
     }
 
-    $exe = Get-ChildItem (Join-Path $src "build") -Filter "*.exe" -Recurse | Select-Object -First 1
+    $exe = Get-Item (Join-Path $src "build/mipsync.exe") -ErrorAction SilentlyContinue
     if (-not $exe) {
         $exe = Get-ChildItem (Join-Path $src "build") -Filter "*.psexe" -Recurse | Select-Object -First 1
     }
     if (-not $exe) { throw "PSn00bSDK did not produce a PS-EXE binary" }
     Copy-Item $exe.FullName (Join-Path $out "PSX.EXE") -Force
     Log "Copied $($exe.FullName) -> $out\PSX.EXE"
+    # Scene images share the PS1 address space and are loaded from disc on
+    # demand. Keep filesystem-disc exports consistent with the BIN/CUE image.
+    foreach ($sceneExe in Get-ChildItem (Join-Path $src "build") -Filter "scene_*.exe") {
+        if ($sceneExe.BaseName -match '^scene_(\d+)$') {
+            $sceneName = 'SCN' + ([int]$Matches[1]).ToString('D5') + '.EXE'
+            Copy-Item -LiteralPath $sceneExe.FullName -Destination (Join-Path $out $sceneName) -Force
+        }
+    }
 
     $cue = Get-ChildItem (Join-Path $src "build") -Filter "*.cue" -Recurse | Select-Object -First 1
     $bin = Get-ChildItem (Join-Path $src "build") -Filter "*.bin" -Recurse | Select-Object -First 1
@@ -155,14 +166,7 @@ try {
             Set-Content -Encoding ASCII (Join-Path $out "game.cue")
         Log "Disc image: $out\game.cue + $trackName"
     } else {
-        # Fallback minimal cue pointing directly at the PS-EXE (sufficient for
-        # PCSX-Redux/DuckStation's "-iso" loaders that accept raw binaries).
-        @"
-FILE "PSX.EXE" BINARY
-  TRACK 01 MODE2/2352
-    INDEX 01 00:00:00
-"@ | Out-File -FilePath (Join-Path $out "game.cue") -Encoding ascii
-        Log "No CD image produced; wrote stub game.cue pointing at PSX.EXE"
+        throw "PSn00bSDK did not produce a complete BIN/CUE disc image"
     }
 } finally {
     Pop-Location

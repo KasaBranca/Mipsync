@@ -1,4 +1,5 @@
 #include "textures.h"
+#include "gpu_transfer.h"
 #include <psxgpu.h>
 #include <stdint.h>
 
@@ -35,8 +36,8 @@ void ps1_texture_load_to_vram(unsigned int texture_index) {
     if (!ps1_texture_get_tim(texture_index, &tim))
         return;
     if (tim.mode & 0x8)
-        LoadImage(tim.crect, tim.caddr);
-    LoadImage(tim.prect, tim.paddr);
+        ps1_gpu_load_image(tim.crect, tim.caddr);
+    ps1_gpu_load_image(tim.prect, tim.paddr);
     DrawSync(0);
     ps1_texture_flush_gpu_cache();
     s_widths[texture_index - 1u] = (uint16_t)tim.prect->w;
@@ -64,8 +65,8 @@ void ps1_textures_init(void) {
             continue;
 
         if (tim.mode & 0x8)
-            LoadImage(tim.crect, tim.caddr);
-        LoadImage(tim.prect, tim.paddr);
+            ps1_gpu_load_image(tim.crect, tim.caddr);
+        ps1_gpu_load_image(tim.prect, tim.paddr);
 
         {
             const int tp = (int)(tim.mode & 3u);
@@ -132,4 +133,8 @@ uint8_t ps1_texture_is_background(unsigned int texture_index) {
     if (texture_index == 0 || texture_index > g_ps1_texture_count)
         return 0;
     return g_ps1_textures[texture_index - 1].is_background;
+}
+uint8_t ps1_texture_has_cutout(unsigned int texture_index) {
+    if (texture_index == 0 || texture_index > g_ps1_texture_count) return 0;
+    return g_ps1_textures[texture_index - 1].has_cutout;
 }

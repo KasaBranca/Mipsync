@@ -12,6 +12,7 @@
 namespace MipsyncEngine {
 
 class Scene;
+struct PSyncWorkload;
 
 class UIRenderer {
 public:
@@ -27,6 +28,7 @@ public:
 
     /// Supplies pointer coordinates in canvas layout space (origin at bottom-left).
     void SetPointerState(bool active, float x, float y, bool held, bool pressed, bool released);
+    void SetPSyncWorkload(PSyncWorkload* workload) { m_PSyncWorkload = workload; }
 
 private:
     void CreateShaders();
@@ -55,6 +57,7 @@ private:
     bool m_PointerReleased = false;
     glm::vec2 m_PointerPosition{};
     uint32_t m_PointerPressedButtonEntityId = 0;
+    PSyncWorkload* m_PSyncWorkload = nullptr;
 };
 
 } // namespace MipsyncEngine

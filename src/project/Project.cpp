@@ -1,3 +1,5 @@
+#include "../core/AssetFiles.h"
+#include "../assets/AssetManager.h"
 #include "Project.h"
 #include "../core/Log.h"
 #include <nlohmann/json.hpp>
@@ -75,7 +77,7 @@ bool WriteText(const fs::path& path, const std::string& contents, std::string& o
             fs::create_directories(path.parent_path());
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) {
-            outError = "failed to open file for writing: " + path.string();
+            outError = "failed to open file for writing: " + PathUtf8::ToString(path);
             return false;
         }
         out << contents;
@@ -88,14 +90,14 @@ bool WriteText(const fs::path& path, const std::string& contents, std::string& o
 
 std::string NormalizeProjectPath(const std::string& path) {
     std::error_code ec;
-    fs::path input(path);
+    fs::path input=PathUtf8::FromString(path);
     fs::path resolved = fs::weakly_canonical(input, ec);
     if (ec)
         resolved = fs::absolute(input, ec);
     if (ec)
         resolved = input;
 
-    std::string s = resolved.string();
+    std::string s = PathUtf8::ToString(resolved);
 #ifdef _WIN32
     const std::string extended = R"(\\?\)";
     if (s.rfind(extended, 0) == 0) {
@@ -147,14 +149,14 @@ namespace Project {
 
 bool IsValidDir(const std::string& dir) {
     std::error_code ec;
-    return fs::is_regular_file(fs::path(dir) / kProjectFile, ec);
+    return AssetFiles::Exists(PathUtf8::FromString(dir) / kProjectFile);
 }
 
 bool LoadFromDir(const std::string& projectDir, ProjectInfo& outInfo, std::string& outError) {
     try {
-        const fs::path filePath = fs::path(projectDir) / kProjectFile;
-        std::ifstream file(filePath);
-        if (!file.is_open()) {
+        const fs::path filePath = PathUtf8::FromString(projectDir) / kProjectFile;
+        std::istringstream file(AssetFiles::ReadText(filePath));
+        if (!file) {
             outError = "missing nostalty.project in: " + projectDir;
             return false;
         }
@@ -162,7 +164,7 @@ bool LoadFromDir(const std::string& projectDir, ProjectInfo& outInfo, std::strin
         file >> j;
 
         outInfo.path          = NormalizeProjectPath(projectDir);
-        outInfo.name          = j.value("name", fs::path(projectDir).filename().string());
+        outInfo.name          = j.value("name", PathUtf8::ToString(PathUtf8::FromString(projectDir).filename()));
         outInfo.engineVersion = j.value("engineVersion", "0.1.0");
         outInfo.defaultScene  = j.value("defaultScene", "scenes/default.nscene");
         outInfo.editorLastScene = j.value("editorLastScene", outInfo.defaultScene);
@@ -195,7 +197,7 @@ bool LoadFromDir(const std::string& projectDir, ProjectInfo& outInfo, std::strin
 
 bool SaveToDir(const ProjectInfo& info, std::string& outError) {
     try {
-        const fs::path filePath = fs::path(info.path) / kProjectFile;
+        const fs::path filePath = PathUtf8::FromString(info.path) / kProjectFile;
         fs::create_directories(filePath.parent_path());
 
         json j;
@@ -216,7 +218,7 @@ bool SaveToDir(const ProjectInfo& info, std::string& outError) {
 
         std::ofstream out(filePath);
         if (!out.is_open()) {
-            outError = "failed to open: " + filePath.string();
+            outError = "failed to open: " + PathUtf8::ToString(filePath);
             return false;
         }
         out << j.dump(2);
@@ -234,10 +236,10 @@ bool Create(const std::string& parentDir, const std::string& name, ProjectInfo& 
             return false;
         }
 
-        const fs::path projectPath = fs::path(parentDir) / name;
+        const fs::path projectPath = PathUtf8::FromString(parentDir) / PathUtf8::FromString(name);
         std::error_code ec;
         if (fs::exists(projectPath, ec) && !fs::is_empty(projectPath, ec)) {
-            outError = "directory already exists and is not empty: " + projectPath.string();
+            outError = "directory already exists and is not empty: " + PathUtf8::ToString(projectPath);
             return false;
         }
 
@@ -248,7 +250,7 @@ bool Create(const std::string& parentDir, const std::string& name, ProjectInfo& 
         }
 
         outInfo.name         = name;
-        outInfo.path         = NormalizeProjectPath(projectPath.string());
+        outInfo.path         = NormalizeProjectPath(PathUtf8::ToString(projectPath));
         outInfo.lastOpened   = std::time(nullptr);
         outInfo.defaultScene = "scenes/default.nscene";
         outInfo.editorLastScene = outInfo.defaultScene;
@@ -284,7 +286,7 @@ namespace {
 
 fs::path MipsyncConfigDir() {
 #ifdef _WIN32
-    if (const char* appdata = std::getenv("APPDATA"))
+    if (const wchar_t* appdata = _wgetenv(L"APPDATA"))
         return fs::path(appdata) / "MipsyncEngine";
 #else
     if (const char* home = std::getenv("HOME"))
@@ -296,24 +298,24 @@ fs::path MipsyncConfigDir() {
 } // namespace
 
 std::string GetRegistryPath() {
-    return (MipsyncConfigDir() / "hub.json").string();
+    return PathUtf8::ToString(MipsyncConfigDir() / "hub.json");
 }
 
 std::string DefaultProjectsRoot() {
 #ifdef _WIN32
-    if (const char* userProfile = std::getenv("USERPROFILE"))
-        return (fs::path(userProfile) / "MipsyncProjects").string();
+    if (const wchar_t* userProfile = _wgetenv(L"USERPROFILE"))
+        return PathUtf8::ToString(fs::path(userProfile) / "MipsyncProjects");
 #else
     if (const char* home = std::getenv("HOME"))
-        return (fs::path(home) / "MipsyncProjects").string();
+        return PathUtf8::ToString(fs::path(home) / "MipsyncProjects");
 #endif
-    return (fs::current_path() / "MipsyncProjects").string();
+    return PathUtf8::ToString(fs::current_path() / "MipsyncProjects");
 }
 
 std::vector<ProjectInfo> Load() {
     std::vector<ProjectInfo> result;
     try {
-        const fs::path path = GetRegistryPath();
+        const fs::path path = PathUtf8::FromString(GetRegistryPath());
         std::ifstream file(path);
         if (!file.is_open())
             return result;
@@ -345,7 +347,7 @@ std::vector<ProjectInfo> Load() {
 
 bool Save(const std::vector<ProjectInfo>& projects) {
     try {
-        const fs::path path = GetRegistryPath();
+        const fs::path path = PathUtf8::FromString(GetRegistryPath());
         fs::create_directories(path.parent_path());
 
         json j;

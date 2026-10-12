@@ -1,7 +1,9 @@
 #pragma once
+#include "../ps1/Ps1ColorGrading.h"
 
 #include "../build/BuildManifest.h"
 #include "Bytecode.h"
+#include "../audio/MidiFile.h"
 #include "PS1Export.h"
 #include <memory>
 #include <string>
@@ -61,6 +63,7 @@ struct Ps1ExportedEntity {
     bool meshEnabled = false;
     /// 0=Prop, 1=Corridor, 2=Character, 3=Viewmodel, 4=Floor.
     uint8_t renderPreset = 0;
+    bool renderUnlit = false;
     bool prerenderOccluder = false;
     bool seamFill = false;
     uint8_t meshSubdivisionLevels = 0;
@@ -102,6 +105,9 @@ struct Ps1ExportedEntity {
     uint16_t rigidTriggerFirstFrame = 0;
     uint16_t rigidTriggerFrameCount = 0;
     uint8_t rigidTriggerFps = 0;
+    uint16_t animatorStateHashes[4] = {0,0,0,0}; // idle, walk, aim, trigger
+    uint8_t animatorActionCondition = 0; // 0: trigger; 1..6: numeric/bool condition
+    float animatorActionThreshold = 0.0f;
     uint16_t animatorTriggerParameterHash = 0;
     /// Effective time from trigger-state entry to its first Exit Time,
     /// unsigned 8.8 seconds. Zero keeps the legacy full-clip one-shot length.
@@ -152,6 +158,8 @@ struct Ps1ExportedEntity {
     int colliderCameraTargetEntityIndex = -1;
 
     std::string audioClipPath;
+    bool audioSfx = false;
+    bool audioSample = false;
     uint8_t audioClipIndex = 0; // 0=none, 1+ into generated audio table
     bool audioEnabled = false;
     bool audioPlayOnAwake = true;
@@ -163,6 +171,8 @@ struct Ps1ExportedEntity {
 };
 
 struct Ps1ExportedUiElement {
+    uint32_t entityId = 0;
+    bool visible = true;
     uint8_t kind = 0; // 1=image, 2=text, 3=audio spectrum
     int16_t x = 0;
     int16_t y = 0;
@@ -202,6 +212,8 @@ struct Ps1ExportedUiButtonAction {
 };
 
 struct Ps1ExportedUiButtonGroup {
+    uint32_t navigationAudioSourceId = 0, confirmAudioSourceId = 0;
+    uint16_t navigationAudioSourceIndex = 0, confirmAudioSourceIndex = 0;
     uint8_t selectedIndex = 0;
     uint8_t wrapNavigation = 1;
     uint8_t gamepadNavigation = 1;
@@ -215,6 +227,7 @@ struct Ps1ExportedUiButtonGroup {
     int16_t cursorH = 24;
     std::string cursorTexturePath;
     uint8_t cursorTextureIndex = 0;
+    uint16_t cursorUiOffset = 0;
 };
 
 struct Ps1ExportedUiGlyph {
@@ -226,6 +239,9 @@ struct Ps1ExportedUiGlyph {
 };
 
 struct Ps1ExportedAudioClip {
+    bool sfx = false;
+    bool sample = false;
+    MidiSequence midi;
     std::string path;
     bool loop = false;
     uint32_t sampleRate = 0;
@@ -283,14 +299,26 @@ struct Ps1RigidAnimFrame {
     };
 };
 
+struct Ps1ExportedLight {
+    int entityIndex = -1;
+    uint8_t type = 0;
+    float position[3] = {};
+    int16_t direction[3] = { 0, 0, 4096 }; // surface to light
+    int32_t colorQ12[3] = { 4096, 4096, 4096 }; // includes intensity, no LDR clamp
+    float range = 0;
+    int16_t cosOuter = 0, cosInner = 4096;
+};
+
 struct Ps1SceneExportResult {
+    unsigned int buildSceneIndex = 0;
     std::vector<Ps1ExportedEntity> entities;
     int cameraEntityIndex = -1;
     std::vector<CompiledModule> modules; // unique, scene-referenced scripts only
     std::vector<std::string> moduleClassNames;
     uint32_t bindingCount = 0;
 
-    // Single directional light export (Milestone: minimal lighting).
+    std::vector<Ps1ExportedLight> lights; // same eight-light limit as the editor
+    // Legacy template compatibility; new runtimes use lights above.
     bool     hasLight = false;
     int16_t  lightDirXYZ12_4[3] = { 0, -2048, -2048 }; // default-ish
     uint8_t  lightColor[3] = { 255, 255, 255 };
@@ -298,10 +326,11 @@ struct Ps1SceneExportResult {
 
     // Highest-priority enabled Post Process Volume. Distances stay in editor
     // world units here and are emitted as 16.16 fixed for the PS1 runtime.
-    bool     fogEnabled = false;
+    bool     fogEnabled = true;
     uint8_t  fogColor[3] = { 13, 13, 20 };
     float    fogStart = 10.0f;
     float    fogEnd = 40.0f;
+    Ps1::ColorGrading colorGrading;
 
     // Custom mesh export.
     std::vector<std::string> meshPaths; // unique project-relative
@@ -320,6 +349,7 @@ struct Ps1SceneExportResult {
 
     // Textures referenced by entities (project-relative paths).
     std::vector<std::string> texturePaths;
+    std::vector<int> textureMaxSizes;
 
     // Pre-rendered background image (project-relative path, empty = none).
     std::string backgroundImagePath;
@@ -348,6 +378,24 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
 
 /// Builds the same reduced static mesh used by PS1 export, but uploads it for editor preview.
 std::shared_ptr<Mesh> BuildPs1PreviewMesh(const Mesh& sourceMesh, bool preserveUvSeams = true);
+
+/// Stable clustered topology shared with vertex-animation export. Pose vertices
+/// are averaged after skinning, preserving influences across articulated joints.
+struct Ps1SkinnedPreview {
+    std::shared_ptr<SkinnedMesh> mesh;
+    std::vector<std::vector<uint32_t>> sourceClusters;
+    std::vector<uint32_t> indices;
+    std::shared_ptr<SkeletalModelAsset> sourceModel;
+    int meshPart = -1, targetTris = 0, targetVerts = 0;
+    std::string controllerPath, state;
+    uint64_t poseHash = 0;
+    bool poseValid = false;
+};
+std::shared_ptr<Ps1SkinnedPreview> BuildPs1SkinnedPreview(
+    const std::shared_ptr<SkeletalModelAsset>& model, int meshPartIndex, int targetTris, int targetVerts,
+    const std::string& controllerPath, const std::string& state, bool viewModel = true);
+void UpdatePs1SkinnedPreview(Ps1SkinnedPreview& preview, const SkeletalModelAsset& model,
+                              const glm::mat4* bones);
 
 
 

@@ -2,10 +2,11 @@
 #define MIPSYNC_SCENE_H
 
 #include "fixedp.h"
+#include "bytecode_abi.h"
 #include "mipsync_gte.h"
 #include <stdint.h>
 
-#define PS1_MAX_FIELD_VALUES 32
+#define PS1_MAX_FIELD_VALUES VM_FIELD_CAP
 
 typedef enum {
     PS1_MESH_NONE   = 0,
@@ -46,7 +47,17 @@ typedef struct ps1_mesh {
      * Precomputing this at export avoids shading all 27 possible directions
      * for every small character part on every frame. */
     uint32_t            rigid_light_bin_mask;
+    /* Baked character poses share topology, but their lighting directions
+     * must follow deformation instead of retaining the first pose's normals. */
+    const SVECTOR*      face_norms;
 } ps1_mesh;
+
+static inline SVECTOR ps1_mesh_face_normal(const ps1_mesh* mesh,
+                                          const ps1_mesh_tri* triangle, unsigned index) {
+    SVECTOR normal = { triangle->nx, triangle->ny, triangle->nz, 0 };
+    if (mesh->face_norms && index < mesh->tri_count) normal = mesh->face_norms[index];
+    return normal;
+}
 
 #define PS1_MESH_FLAG_TERRAIN 1
 #define PS1_MESH_FLAG_SMOOTH  2
@@ -161,6 +172,10 @@ typedef struct ps1_entity {
     fix16_t     camera_frustum_cull_margin;
     uint8_t     camera_frustum_cull_meshes;
     uint8_t     camera_frustum_cull_skinned;
+    uint16_t animator_state_hashes[4]; /* idle, walk, aim, trigger */
+    uint8_t animator_action_condition; /* 0: trigger; 1..6: AnimatorConditionMode + 1 */
+    fix16_t animator_action_threshold;
+    uint8_t render_unlit;
 } ps1_entity;
 
 typedef struct ps1_rigid_anim_frame {
@@ -192,6 +207,16 @@ typedef struct ps1_light {
     uint8_t ambient_r, ambient_g, ambient_b;
 } ps1_light;
 
+typedef struct ps1_scene_light {
+    int16_t entity_index;
+    uint8_t type; /* 0 directional, 1 point, 2 spot */
+    fix16_t position[3];
+    int16_t direction[3]; /* normalized surface-to-light, Q12 */
+    int32_t color_q12[3]; /* linear RGB times intensity */
+    fix16_t range;
+    int16_t cos_outer, cos_inner;
+} ps1_scene_light;
+
 typedef enum {
     PS1_UI_IMAGE = 1,
     PS1_UI_TEXT  = 2,
@@ -213,6 +238,8 @@ typedef struct ps1_ui_element {
     uint8_t spectrum_gap;
     uint16_t spectrum_sensitivity_q8;
     int16_t rotation_degrees;
+    uint32_t entity_id;
+    uint8_t visible;
 } ps1_ui_element;
 
 typedef struct ps1_ui_glyph {
@@ -249,6 +276,8 @@ typedef struct ps1_ui_button_group {
     int16_t cursor_w;
     int16_t cursor_h;
     uint8_t cursor_texture_index;
+    uint16_t cursor_ui_offset;
+    uint16_t navigation_audio_source, confirm_audio_source; /* entity index + 1, zero = None */
 } ps1_ui_button_group;
 
 typedef struct ps1_scene {
@@ -283,6 +312,9 @@ typedef struct ps1_scene {
     const ps1_ui_button_action* ui_button_actions;
     unsigned int              ui_button_action_count;
     unsigned int              background_texture_index;
+    const ps1_scene_light*     lights;
+    unsigned int              light_count;
+    const uint16_t*            color_grading_lut;
 } ps1_scene;
 
 extern const ps1_scene g_ps1_scene;
@@ -294,6 +326,7 @@ void ps1_scene_init(void);
 void ps1_scene_resolve_hierarchy(void);
 void ps1_scene_begin_frame(void);
 void ps1_scene_update_vertex_anims(fix16_t delta_time);
+fix16_t ps1_scene_animator_normalized_time(unsigned root_index, const char* state_name);
 void ps1_scene_set_animator_float(unsigned int root_index, const char* name, fix16_t value);
 void ps1_scene_set_animator_trigger(unsigned int root_index, const char* name);
 void ps1_scene_set_animator_trigger_held(unsigned int root_index, const char* name);

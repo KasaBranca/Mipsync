@@ -59,7 +59,22 @@ struct AnimatorRuntimeValues {
     std::unordered_map<std::string, bool> triggers;
 };
 
+/// Selects the renderer path used for PS1 caching, clipping and draw priority.
+/// Shared by rigid and skinned mesh renderers so both serialize and export the
+/// same Mesh Type contract.
+enum class MeshTypePreset : uint8_t {
+    Prop = 0,
+    Corridor = 1,
+    Character = 2,
+    Viewmodel = 3,
+    Floor = 4,
+};
+enum class RendererType : uint8_t { Lit = 0, Unlit = 1 };
+
 struct SkinnedMeshRendererComponent : public Component {
+    RendererType renderType = RendererType::Lit;
+    using TypePreset = MeshTypePreset;
+
     enum class Ps1ExportMode : uint8_t {
         Off = 0,
         StaticPose,
@@ -74,6 +89,8 @@ struct SkinnedMeshRendererComponent : public Component {
     std::string materialPath;
     glm::vec2 textureTiling = { 1.0f, 1.0f };
     glm::vec2 textureOffset = { 0.0f, 0.0f };
+    /// Skinned renderers default to the dynamic Character path.
+    TypePreset typePreset = TypePreset::Character;
     /// Index into SkeletalModelAsset::meshParts (-1 = draw all submeshes).
     int meshPartIndex = -1;
     Ps1ExportMode ps1ExportMode = Ps1ExportMode::RigidBones;
@@ -86,6 +103,7 @@ struct SkinnedMeshRendererComponent : public Component {
 
     std::shared_ptr<SkinnedMesh> ps1RigidPreviewMesh;
     uint32_t ps1RigidPreviewVersion = 0;
+    std::shared_ptr<Mips::Ps1SkinnedPreview> ps1VertexPreview;
 
     void SetModelFile(const std::string& projectRelPath);
 };
@@ -127,13 +145,8 @@ struct AnimatorComponent : public Component {
 };
 
 struct MeshRendererComponent : public Component {
-    enum class TypePreset : uint8_t {
-        Prop = 0,
-        Corridor = 1,
-        Character = 2,
-        Viewmodel = 3,
-        Floor = 4,
-    };
+    RendererType renderType = RendererType::Lit;
+    using TypePreset = MeshTypePreset;
 
     std::shared_ptr<Mesh> mesh;
     std::shared_ptr<Mesh> ps1PreviewMesh;
@@ -147,6 +160,8 @@ struct MeshRendererComponent : public Component {
     float meshSize = 1.0f;
     /// Project-relative path when meshPrimitive == "File" (e.g. assets/models/foo.fbx).
     std::string meshPath;
+    /// Imported mesh instance; -1 keeps the legacy combined model.
+    int meshPartIndex = -1;
 
     /// Optional asset-bound texture / material (project-relative paths).
     std::string texturePath;
@@ -403,7 +418,10 @@ struct PostProcessVolumeComponent : public Component {
 
 /// Unity-style audio emitter. Clip paths are project-relative and currently
 /// support WAV/MP3 playback in the Windows editor/player.
+enum class AudioSourceType { BGM = 0, SFX = 1, SampleSFX = 2 };
+
 struct AudioSourceComponent : public Component {
+  AudioSourceType type = AudioSourceType::BGM;
     std::string clipPath;
     bool playOnAwake = true;
     bool loop = false;
@@ -485,6 +503,8 @@ enum class UIConfirmGamepadButton : uint8_t {
 /// Navigation scope for child UIButtonComponents. It owns the selected index,
 /// cursor sprite, and keyboard/gamepad confirm bindings.
 struct UIButtonGroupComponent : public Component {
+  uint32_t navigationAudioSourceId = 0;
+  uint32_t confirmAudioSourceId = 0;
     int selectedIndex = 0;
     bool wrapNavigation = true;
     bool keyboardNavigation = true;
@@ -573,6 +593,15 @@ public:
             if (ptr) return ptr;
         }
         return nullptr;
+    }
+
+    /// Adopt an independently owned value snapshot without changing its type.
+    Component* AdoptComponent(std::unique_ptr<Component> component) {
+        if (!component) return nullptr;
+        component->entity = this;
+        Component* result = component.get();
+        m_Components.push_back(std::move(component));
+        return result;
     }
 
     template<typename T>
@@ -698,6 +727,8 @@ class Scene {
 public:
     Scene() = default;
     ~Scene() = default;
+    Scene(Scene&&) noexcept = default;
+    Scene& operator=(Scene&&) noexcept = default;
 
     Entity* CreateEntity(const std::string& name = "Entity");
     Entity* CreateEntityWithId(uint32_t id, const std::string& name = "Entity");
@@ -731,6 +762,11 @@ public:
 
     Entity* FindEntity(uint32_t id);
     const Entity* FindEntity(uint32_t id) const;
+
+    /// True only when the entity and every parent in its hierarchy are active.
+    /// Rendering and runtime systems should use this instead of checking only
+    /// Entity::IsActive(), so disabling a parent disables the whole branch.
+    bool IsActiveInHierarchy(const Entity& entity) const;
 
     /// Reparents `child` under `parent` (or detaches when `parent == nullptr`).
     /// When worldPositionStays is true, converts the existing world transform

@@ -21,7 +21,11 @@ const KEYWORDS = [
   "true",
   "false",
   "new",
+  "null",
+  "get",
+  "set",
   "yield",
+  "extends",
 ];
 
 const TYPES = [
@@ -36,6 +40,7 @@ const TYPES = [
   "AudioSource",
   "Collider",
   "Rigidbody",
+  "Camera",
 ];
 
 const GLOBALS = {
@@ -44,6 +49,7 @@ const GLOBALS = {
     documentation: "現在のオブジェクトの Transform。",
     members: {
       position: "Vector3 position",
+      worldPosition: "Vector3 worldPosition",
       rotation: "Vector3 rotation",
       scale: "Vector3 scale",
     },
@@ -61,18 +67,21 @@ const GLOBALS = {
     documentation: "フレーム時間 API。",
     members: {
       deltaTime: "float deltaTime",
-      time: "float time",
     },
   },
   Input: {
     detail: "Input",
-    documentation: "キーボード・軸入力 API。",
+    documentation: "PS1 ボタン・スティック入力 API。Game View のキーボード／マウス割り当ては Preferences で変更できます。",
     members: {
+      GetButton: "bool GetButton(string button)",
+      GetButtonDown: "bool GetButtonDown(string button)",
+      GetButtonUp: "bool GetButtonUp(string button)",
       GetKey: "bool GetKey(string key)",
       GetKeyDown: "bool GetKeyDown(string key)",
       GetKeyUp: "bool GetKeyUp(string key)",
       GetAxis: "float GetAxis(string axis)",
       SetCursorLocked: "void SetCursorLocked(bool locked)",
+      cursorLocked: "bool cursorLocked",
       mouseDeltaX: "float mouseDeltaX",
       mouseDeltaY: "float mouseDeltaY",
     },
@@ -95,6 +104,12 @@ const GLOBALS = {
     detail: "Mathf",
     documentation: "数学ヘルパー。",
     members: {
+      Sin: "float Sin(float v)",
+      Cos: "float Cos(float v)",
+      Sqrt: "float Sqrt(float v)",
+      Abs: "float Abs(float v)",
+      Clamp: "float Clamp(float value, float min, float max)",
+      Atan2: "float Atan2(float y, float x)",
       Min: "float Min(float a, float b)",
       Max: "float Max(float a, float b)",
       Lerp: "float Lerp(float a, float b, float t)",
@@ -139,6 +154,7 @@ const GLOBALS = {
     detail: "Animator",
     documentation: "同じ Entity の Animator を操作するショートカット。",
     members: {
+      GetNormalizedTime: "float GetNormalizedTime(string stateName)",
       SetFloat: "void SetFloat(string name, float value)",
       SetBool: "void SetBool(string name, bool value)",
       SetInt: "void SetInt(string name, int value)",
@@ -164,6 +180,22 @@ const GLOBALS = {
       isPlaying: "bool isPlaying",
     },
   },
+  Camera: {
+    detail: "Camera",
+    documentation: "カメラ方向と追従。",
+    members: {
+      Follow: "void Follow(Camera camera, float yaw, float distance, float height, float lookHeight, float sharpness, float pitchOffset = 0.0)",
+      RotatePitch: "float RotatePitch(Camera camera, float deltaDegrees, float minPitch, float maxPitch)",
+      rightX: "float rightX", rightZ: "float rightZ", forwardX: "float forwardX", forwardZ: "float forwardZ", yaw: "float yaw",
+    },
+  },
+  UI: {
+    detail: "UI", documentation: "UI の表示切り替え。",
+    members: { SetTextVisible: "bool SetTextVisible(int entityId, bool visible)", SetImageVisible: "bool SetImageVisible(int entityId, bool visible)", SetText: "bool SetText(int entityId, string text)", SetTextNumber: "bool SetTextNumber(int entityId, float number)", SetColor: "bool SetColor(int entityId, float r, float g, float b, float a)" },
+  },
+  GetComponent: { detail: "T GetComponent<T>()", documentation: "同じ Entity のコンポーネントを取得。", members: {} },
+  StartCoroutine: { detail: "void StartCoroutine(IEnumerator routine)", documentation: "コルーチンを開始。", members: {} },
+  StopAllCoroutines: { detail: "void StopAllCoroutines()", documentation: "このスクリプトのコルーチンを停止。", members: {} },
   Scene: {
     detail: "Scene",
     documentation: "シーン遷移 API。",
@@ -216,7 +248,7 @@ const SNIPPETS = [
   {
     label: "MipsBehaviour class",
     insertText:
-      "class ${1:PlayerController} : MipsBehaviour {\n    void Start() {\n        $0\n    }\n\n    void Update() {\n    }\n}",
+      "class ${1:PlayerController} : MipsBehaviour {\n    public float speed = 3.0;\n\n    void Start() {\n        $0\n    }\n\n    void Update() {\n    }\n}",
     documentation: "Mips# component script template.",
   },
   {
@@ -242,7 +274,20 @@ const SNIPPETS = [
   },
 ];
 
+const ATTRIBUTES = {
+  Header: { signature: 'Header(string title)', snippet: 'Header("${1:Settings}")', documentation: 'Show a section heading before this public field.' },
+  Space: { signature: 'Space(float pixels = 8)', snippet: 'Space(${1:8})', documentation: 'Add vertical space before this field (0 to 1000 pixels, scaled with the editor font).' },
+  Tooltip: { signature: 'Tooltip(string text)', snippet: 'Tooltip("${1:Description}")', documentation: 'Show help when hovering over the field label or control, including read-only fields.' },
+  Range: { signature: 'Range(float min, float max)', snippet: 'Range(${1:0}, ${2:1})', documentation: 'Display an int or float field as a slider. Bounds apply to Inspector edits only.' },
+  Min: { signature: 'Min(float value)', snippet: 'Min(${1:0})', documentation: 'Set a minimum for Inspector edits to an int or float field. Script assignments remain unrestricted.' },
+  ReadOnly: { signature: 'ReadOnly', snippet: 'ReadOnly', documentation: 'Display a field without allowing Inspector edits. Script code can still assign it.' },
+  HideInInspector: { signature: 'HideInInspector', snippet: 'HideInInspector', documentation: 'Hide a public field in the Inspector while preserving its stored value and script access.' },
+  InspectorName: { signature: 'InspectorName(string label)', snippet: 'InspectorName("${1:Display Name}")', documentation: 'Change the visible label without renaming the field or losing saved values.' },
+  Order: { signature: 'Order(int value)', snippet: 'Order(${1:0})', documentation: 'Sort visible fields by this value, then declaration order. Does not change serialization or VM field indices.' },
+};
+
 module.exports = {
+  ATTRIBUTES,
   KEYWORDS,
   TYPES,
   GLOBALS,

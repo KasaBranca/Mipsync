@@ -1,0 +1,6 @@
+{
+  "version": "1.13.2",
+  "source": "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip",
+  "sha256": "e52a7ad9538d9618c67a0bd777964e2eec8a30f68b810a2f6adce1f2daf847b8",
+  "license": "../resources/licenses/Ninja.txt"
+}

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Token.h"
+#include "InspectorAttributes.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -45,6 +46,7 @@ struct ClassDecl {
 };
 
 struct FieldDecl {
+    InspectorAttributes inspector;
     SourceLocation location;
     std::string typeName;
     std::string name;

@@ -4,6 +4,8 @@
 #include "audio.h"
 #include "fixedp.h"
 #include "input.h"
+#include "bytecode_abi.h"
+#include <string.h>
 
 #include <psxgpu.h>
 
@@ -12,6 +14,69 @@
 static uint8_t s_spectrum_display[32];
 static uint8_t s_button_group_selected[32];
 static uint8_t s_button_groups_initialized = 0;
+static uint32_t s_text_override_ids[128];
+static uint8_t s_text_override_visible[128];
+static uint8_t s_text_override_kind[128];
+static unsigned int s_text_override_count = 0;
+typedef struct dynamic_ui {uint32_t id;uint8_t kind,has_text,has_color;uint8_t color[4];char text[MIPSYNC_UI_TEXT_BYTES];} dynamic_ui;
+static dynamic_ui s_dynamic_ui[MIPSYNC_UI_DYNAMIC_CAP];
+static unsigned int s_dynamic_count;
+static dynamic_ui* dynamic_element(uint32_t id,uint8_t kind,int create) {
+    unsigned int i;int found=0;
+    for(i=0;i<s_dynamic_count;++i)if(s_dynamic_ui[i].id==id&&s_dynamic_ui[i].kind==kind)return &s_dynamic_ui[i];
+    if(!create||s_dynamic_count>=MIPSYNC_UI_DYNAMIC_CAP)return 0;
+    for(i=0;i<g_ps1_scene.ui_count;++i)if(g_ps1_scene.ui_elements[i].entity_id==id&&g_ps1_scene.ui_elements[i].kind==kind){found=1;break;}
+    if(!found)return 0;
+    {dynamic_ui* result=&s_dynamic_ui[s_dynamic_count++];memset(result,0,sizeof(*result));result->id=id;result->kind=kind;return result;}
+}
+int ps1_ui_set_text(uint32_t id,const char* text) {
+    dynamic_ui* value;if(!text||strlen(text)>=MIPSYNC_UI_TEXT_BYTES)return 0;
+    value=dynamic_element(id,PS1_UI_TEXT,1);if(!value)return 0;
+    strcpy(value->text,text);value->has_text=1;return 1;
+}
+int ps1_ui_set_color(uint32_t id,uint8_t r,uint8_t g,uint8_t b,uint8_t a) {
+    int found=0;unsigned int kind;
+    for(kind=PS1_UI_IMAGE;kind<=PS1_UI_TEXT;++kind){dynamic_ui* value=dynamic_element(id,(uint8_t)kind,1);if(value){value->color[0]=r;value->color[1]=g;value->color[2]=b;value->color[3]=a;value->has_color=1;found=1;}}
+    return found;
+}
+void ps1_ui_reset(void){s_dynamic_count=s_text_override_count=0;s_button_groups_initialized=0;memset(s_spectrum_display,0,sizeof(s_spectrum_display));}
+
+static int set_visible(uint32_t entity_id, uint8_t kind, int visible) {
+    unsigned int i;
+    int found = 0;
+    for (i = 0; i < g_ps1_scene.ui_count; ++i) {
+        const ps1_ui_element* ui = &g_ps1_scene.ui_elements[i];
+        if (ui->kind == kind && ui->entity_id == entity_id) { found = 1; break; }
+    }
+    if (!found) return 0;
+    for (i = 0; i < s_text_override_count; ++i) {
+        if (s_text_override_ids[i] == entity_id && s_text_override_kind[i] == kind) {
+            s_text_override_visible[i] = visible != 0;
+            return 1;
+        }
+    }
+    if (s_text_override_count >= 128) return 0;
+    s_text_override_ids[s_text_override_count] = entity_id;
+    s_text_override_kind[s_text_override_count] = kind;
+    s_text_override_visible[s_text_override_count++] = visible != 0;
+    return 1;
+}
+
+int ps1_ui_set_text_visible(uint32_t entity_id, int visible) {
+    return set_visible(entity_id, PS1_UI_TEXT, visible);
+}
+
+int ps1_ui_set_image_visible(uint32_t entity_id, int visible) {
+    return set_visible(entity_id, PS1_UI_IMAGE, visible);
+}
+
+static int element_visible(const ps1_ui_element* ui) {
+    unsigned int i;
+    for (i = 0; i < s_text_override_count; ++i)
+        if (s_text_override_ids[i] == ui->entity_id && s_text_override_kind[i] == ui->kind)
+            return s_text_override_visible[i];
+    return ui->visible;
+}
 
 static const char* confirm_button_name(uint8_t button) {
     switch (button) {
@@ -239,8 +304,6 @@ static void draw_image(uint32_t* ot, char** pri, const char* packet_end, const p
             w = fit_w;
             h = fit_h;
         }
-        if (tw > 255) tw = 255;
-        if (th > 255) th = 255;
         if ((const char*)(*pri + sizeof(POLY_FT4)) > packet_end)
             return;
         poly = (POLY_FT4*)*pri;
@@ -275,10 +338,10 @@ static void draw_image(uint32_t* ot, char** pri, const char* packet_end, const p
          * Textured PS1 polygons treat RGB 128 as neutral modulation; 255 makes
          * UI images look emissive/overbright compared to the editor preview. */
         setUV4(poly,
-               clamp_ui_uv(uoff), clamp_ui_uv(voff + th),
-               clamp_ui_uv(uoff + tw), clamp_ui_uv(voff + th),
+               clamp_ui_uv(uoff), clamp_ui_uv(voff + th - 1),
+               clamp_ui_uv(uoff + tw - 1), clamp_ui_uv(voff + th - 1),
                clamp_ui_uv(uoff), clamp_ui_uv(voff),
-               clamp_ui_uv(uoff + tw), clamp_ui_uv(voff));
+               clamp_ui_uv(uoff + tw - 1), clamp_ui_uv(voff));
         setRGB0(poly,
                 (uint8_t)((ui->color_r + 1u) >> 1),
                 (uint8_t)((ui->color_g + 1u) >> 1),
@@ -311,12 +374,12 @@ static void draw_text(uint32_t* ot, char** pri, const char* packet_end, const ps
     int width;
     int height;
 
-    if (ui->color_a == 0 || ui->text_length == 0)
-        return;
-    if (!g_ps1_scene.ui_text || ui->text_offset + ui->text_length > g_ps1_scene.ui_text_size)
-        return;
-
-    text = g_ps1_scene.ui_text + ui->text_offset;
+    ps1_ui_element current=*ui;
+    dynamic_ui* dynamic=dynamic_element(ui->entity_id,ui->kind,0);
+    if(dynamic&&dynamic->has_text){text=dynamic->text;current.text_length=(uint16_t)strlen(text);}
+    else {if(!g_ps1_scene.ui_text||ui->text_offset+ui->text_length>g_ps1_scene.ui_text_size)return;text=g_ps1_scene.ui_text+ui->text_offset;}
+    ui=&current;
+    if(ui->color_a==0||ui->text_length==0)return;
     width = text_width_px(text, ui->text_length, ui);
     height = text_height_px(text, ui->text_length, ui);
     x = ui->x;
@@ -467,6 +530,8 @@ void ps1_ui_update(void) {
             else if (group->wrap_navigation)
                 selected = 0;
         }
+        if (selected != s_button_group_selected[i] && group->navigation_audio_source)
+            ps1_audio_play(group->navigation_audio_source - 1u);
         s_button_group_selected[i] = selected;
         if (confirm) {
             unsigned int rect_index = (unsigned int)group->button_rect_offset + selected;
@@ -475,6 +540,7 @@ void ps1_ui_update(void) {
                 unsigned int action_index;
                 if (!rect->interactable)
                     continue;
+                if (group->confirm_audio_source) ps1_audio_play(group->confirm_audio_source - 1u);
                 for (action_index = 0; action_index < rect->action_count; ++action_index) {
                     unsigned int absolute = (unsigned int)rect->action_offset + action_index;
                     if (absolute >= g_ps1_scene.ui_button_action_count)
@@ -499,11 +565,13 @@ static void draw_default_cursor(uint32_t* ot, char** pri, const char* packet_end
     draw_tile(ot, pri, packet_end, x + bar * 2, y + h / 2 - bar / 2, bar, bar, 255, 255, 255);
 }
 
-static void draw_button_group_cursors(uint32_t* ot, char** pri, const char* packet_end) {
+static void draw_button_group_cursors(uint32_t* ot, char** pri, const char* packet_end,
+                                      unsigned int element_offset) {
     unsigned int i;
     init_button_group_state();
     for (i = 0; i < g_ps1_scene.ui_button_group_count && i < 32u; ++i) {
         const ps1_ui_button_group* group = &g_ps1_scene.ui_button_groups[i];
+        if (group->cursor_ui_offset != element_offset) continue;
         unsigned int rect_index;
         const ps1_ui_button_rect* rect;
         int cx, cy, x, y, w, h;
@@ -559,9 +627,16 @@ void ps1_ui_render(uint32_t* ot, char** nextpri, const char* packet_end) {
     unsigned int i;
     if (!ot || !nextpri || !*nextpri || !packet_end)
         return;
-    draw_button_group_cursors(ot, nextpri, packet_end);
-    for (i = 0; i < g_ps1_scene.ui_count; ++i) {
-        const ps1_ui_element* ui = &g_ps1_scene.ui_elements[i];
+    /* addPrim prepends packets: emit front-to-back to draw the hierarchy back-to-front. */
+    for (i = g_ps1_scene.ui_count; ; --i) {
+        const ps1_ui_element* ui;
+        ps1_ui_element current;dynamic_ui* dynamic;
+        draw_button_group_cursors(ot, nextpri, packet_end, i);
+        if (i == 0) break;
+        ui = &g_ps1_scene.ui_elements[i - 1];
+        current=*ui;dynamic=dynamic_element(ui->entity_id,ui->kind,0);
+        if(dynamic&&dynamic->has_color){current.color_r=dynamic->color[0];current.color_g=dynamic->color[1];current.color_b=dynamic->color[2];current.color_a=dynamic->color[3];ui=&current;}
+        if (!element_visible(ui)) continue;
         if ((const char*)*nextpri >= packet_end)
             return;
         if (ui->kind == PS1_UI_IMAGE)

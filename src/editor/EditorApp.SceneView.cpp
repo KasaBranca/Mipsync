@@ -8,6 +8,7 @@
 #include "EditorRectTransformGizmo.h"
 #include "EditorSceneFraming.h"
 #include "EditorTheme.h"
+#include "EditorToolbar.h"
 #include "../core/Engine.h"
 #include "../mips/MipsRuntime.h"
 #include "../physics/PhysicsWorld.h"
@@ -78,35 +79,29 @@ glm::vec3 ExtractYXZEulerDegrees(const glm::mat4& transform,
 } // namespace
 
 void EditorApp::DrawGizmoToolbar() {
-    ImGui::Dummy(ImVec2(0.0f, 2.0f));
-    // Scene View deliberately has zero window padding so the framebuffer can
-    // touch its edges. Give only the toolbar chrome its own left inset.
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(3, 2));
+    EditorToolbar toolbar;
 
     DrawGizmoIconButton(GizmoIcon::Translate, ImGuizmo::TRANSLATE, m_GizmoOperation, m_GizmoOperation);
+    toolbar.Item();
     DrawGizmoIconButton(GizmoIcon::Rotate, ImGuizmo::ROTATE, m_GizmoOperation, m_GizmoOperation);
+    toolbar.Item();
     DrawGizmoIconButton(GizmoIcon::Scale, ImGuizmo::SCALE, m_GizmoOperation, m_GizmoOperation);
+    toolbar.Item();
 
-    ImGui::SameLine(0.0f, 6.0f);
     const bool worldMode = m_GizmoMode == ImGuizmo::WORLD;
-    if (ImGui::Button(worldMode ? "World##GizmoSpace" : "Local##GizmoSpace",
-                      ImVec2(48.0f, 0.0f))) {
+    const float spaceWidth = std::max(EditorToolbar::IconButtonWidth("Local"), EditorToolbar::IconButtonWidth("World"));
+    if (toolbar.IconButton(worldMode ? "World##GizmoSpace" : "Local##GizmoSpace",
+                           worldMode ? ToolbarIcon::World : ToolbarIcon::Local, spaceWidth)) {
         m_GizmoMode = worldMode ? ImGuizmo::LOCAL : ImGuizmo::WORLD;
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Transform orientation: %s (click to switch)",
                           worldMode ? "World" : "Local");
 
-    ImGui::SameLine(0.0f, 10.0f);
-    DrawRenderModeSelector();
-
-    ImGui::PopStyleVar(2);
-    ImGui::Dummy(ImVec2(0.0f, 2.0f));
+    DrawRenderModeSelector(toolbar);
 }
 
-void EditorApp::DrawRenderModeSelector() {
+void EditorApp::DrawRenderModeSelector(EditorToolbar& toolbar) {
     static const char* kModeLabels[] = {
         "Shaded",
         "Wireframe",
@@ -115,26 +110,21 @@ void EditorApp::DrawRenderModeSelector() {
         "Normals",
     };
     constexpr int kModeCount = (int)(sizeof(kModeLabels) / sizeof(kModeLabels[0]));
-    constexpr float kToolbarHeight = 22.0f;
 
     const int currentIndex = (int)m_SceneRenderMode;
     const char* currentLabel = (currentIndex >= 0 && currentIndex < kModeCount)
         ? kModeLabels[currentIndex] : kModeLabels[0];
 
-    const float paddingY = (kToolbarHeight - ImGui::GetTextLineHeight()) * 0.5f;
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.0f, paddingY));
-    ImGui::SetNextItemWidth(140.0f);
-    if (ImGui::BeginCombo("##SceneRenderMode", currentLabel)) {
+    if (toolbar.BeginCombo("##SceneRenderMode", currentLabel, 140.0f)) {
         for (int i = 0; i < kModeCount; ++i) {
             const bool selected = (i == currentIndex);
-            if (ImGui::Selectable(kModeLabels[i], selected))
+            if (EditorDropdown::Selectable(kModeLabels[i], selected))
                 m_SceneRenderMode = static_cast<RenderMode>(i);
             if (selected)
                 ImGui::SetItemDefaultFocus();
         }
-        ImGui::EndCombo();
+        EditorDropdown::EndCombo();
     }
-    ImGui::PopStyleVar();
 }
 
 void EditorApp::DrawGizmoControls(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& camera) {
@@ -400,6 +390,7 @@ void EditorApp::FrameEntityInSceneView(Entity& entity) {
 }
 
 void EditorApp::DrawCanvasGizmo(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& sceneCamera) {
+    if (!m_Preferences.Enabled("gizmoCanvases")) return;
     EditorCanvasGizmo::DrawSceneCanvases(
         m_Engine->GetScene(),
         sceneCamera,
@@ -413,7 +404,8 @@ void EditorApp::DrawCanvasGizmo(const ImVec2& imageMin, const ImVec2& imageSize,
         m_GameViewSettings.renderHeight);
 }
 
-void EditorApp::DrawCameraFrustumGizmo(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& sceneCamera) {
+void EditorApp::DrawCameraFrustumGizmo(const ImVec2& imageMin, const ImVec2& imageSize,
+                                       const Camera& sceneCamera, uint32_t excludeCameraId) {
     if (!m_Engine)
         return;
 
@@ -421,47 +413,21 @@ void EditorApp::DrawCameraFrustumGizmo(const ImVec2& imageMin, const ImVec2& ima
     Entity* selected = GetSelectedEntity();
     const float aspect = (m_GameViewSettings.renderHeight > 0)
         ? ((float)m_GameViewSettings.renderWidth / (float)m_GameViewSettings.renderHeight)
-        : (imageSize.x / imageSize.y);
+        : (imageSize.y > 0 ? imageSize.x / imageSize.y : 1.0f);
 
-    // Draw unselected cameras in scene (subtle wireframe)
-    for (auto& entity : scene.GetEntities()) {
-        if (!entity || entity.get() == selected)
+    for (const auto& entity : scene.GetEntities()) {
+        if (!entity || !entity->IsActive() || entity->GetID() == excludeCameraId)
             continue;
-        auto* cameraComp = entity->GetComponent<CameraComponent>();
-        auto* transformComp = entity->GetComponent<TransformComponent>();
-        if (!cameraComp || !cameraComp->enabled || !transformComp)
+        const auto* cameraComp = entity->GetComponent<CameraComponent>();
+        if (!cameraComp || !cameraComp->enabled || !entity->HasComponent<TransformComponent>())
             continue;
-
-        cameraComp->camera.SyncFromTransform(transformComp->position, transformComp->rotation);
+        const glm::mat4 world = scene.GetWorldMatrix(*entity);
+        Camera other = cameraComp->camera;
+        other.SyncFromWorldMatrix(glm::vec3(world[3]), world);
         EditorCameraGizmo::DrawFrustum(
-            cameraComp->camera,
-            *transformComp,
-            aspect,
-            sceneCamera.GetViewMatrix(),
-            sceneCamera.GetProjectionMatrix(),
-            imageMin,
-            imageSize,
-            ImGui::GetWindowDrawList(),
-            false);
-    }
-
-    // Draw selected camera (highlighted with Far Clip plane and distance label)
-    if (selected) {
-        auto* cameraComp = selected->GetComponent<CameraComponent>();
-        auto* transformComp = selected->GetComponent<TransformComponent>();
-        if (cameraComp && transformComp) {
-            cameraComp->camera.SyncFromTransform(transformComp->position, transformComp->rotation);
-            EditorCameraGizmo::DrawFrustum(
-                cameraComp->camera,
-                *transformComp,
-                aspect,
-                sceneCamera.GetViewMatrix(),
-                sceneCamera.GetProjectionMatrix(),
-                imageMin,
-                imageSize,
-                ImGui::GetWindowDrawList(),
-                true);
-        }
+            other, glm::inverse(other.GetViewMatrix()), aspect,
+            sceneCamera.GetViewMatrix(), sceneCamera.GetProjectionMatrix(),
+            imageMin, imageSize, ImGui::GetWindowDrawList(), IsEntitySelected(entity->GetID()));
     }
 
     // Draw Distance Cull gizmos for active entities in scene

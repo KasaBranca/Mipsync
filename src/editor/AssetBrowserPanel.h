@@ -77,6 +77,8 @@ public:
 
     void OnImGuiRender();
     void Refresh();
+    void SetSearchQuery(const std::string& query);
+    const char* GetSearchQuery() const { return m_SearchQuery; }
 
     /// Currently displayed folder, project-relative.
     const std::string& GetCurrentFolder() const { return m_CurrentFolder; }
@@ -93,6 +95,7 @@ public:
     const std::vector<SelectedAsset>& GetSelectedAssets() const { return m_SelectedAssets; }
     size_t GetSelectedAssetCount() const { return m_SelectedAssets.size(); }
     void ClearAssetSelection();
+    void OnHistoryRestored();
     /// Opens the containing folder and selects an asset by relative or absolute path.
     bool RevealAndSelectAsset(const std::string& projectOrAbsolutePath);
     /// When a virtual animation clip sub-asset is selected.
@@ -113,6 +116,7 @@ public:
                                                  int* outClipStackIndex = nullptr);
 
 private:
+    void DrawSearchBar();
     void DrawPanelContextMenu();
     void DrawFolderTree();
     void DrawFolderTreeNode(const std::string& projectRelPath, const std::string& displayName);
@@ -146,6 +150,7 @@ private:
     void HandleGridKeyboardShortcuts();
 
     void RescanFolder();
+    void RescanProjectAssets();
     void RescanFolderTree();
     void HandleEntityDropOnFolder(const std::string& projectRelFolder);
     void HandleAssetMoveDropOnFolder(const std::string& projectRelFolder);
@@ -167,10 +172,15 @@ private:
     EditorApp* m_Editor;
     std::string m_CurrentFolder;     // project-relative; "" or "." for root
     std::vector<AssetEntry> m_Entries;
+    char m_SearchQuery[256] = {};
+    std::vector<std::string> m_SearchTerms;
+    std::vector<AssetEntry> m_ProjectEntries;
+    bool m_ProjectScanRequested = true;
     std::vector<std::string> m_FolderTreeRoots; // top-level folders inside the project
     std::unordered_set<std::string> m_ExpandedTreeFolders;
     std::unordered_set<std::string> m_ExpandedModels;
     bool m_ScanRequested = true;
+    double m_LastAutomaticRefresh = 0;
 
     // Modals
     bool m_OpenNewMaterialDialog = false;
@@ -193,14 +203,20 @@ private:
 
     std::string m_LastError;
     std::string m_LastInfo;
+    // Folder row/cell under the cursor when GLFW reports an external file
+    // drop. Empty means the currently open folder.
+    std::string m_OsDropTargetFolder;
 
     std::vector<SelectedAsset> m_SelectedAssets;
     size_t m_SelectionAnchorIndex = SIZE_MAX;
+    std::string m_PendingRevealPath;
     static const std::string kEmptyPath;
 
     void RunPendingImportDialog();
     void ProcessOsFileDrop();
     int ImportExternalPath(const std::string& absSourcePath);
+    int ImportExternalPathToFolder(const std::string& absSourcePath,
+                                   const std::string& projectRelFolder);
 };
 
 } // namespace MipsyncEngine

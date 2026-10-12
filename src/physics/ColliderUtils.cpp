@@ -1,3 +1,4 @@
+#include "../core/PreparationCancellation.h"
 #include "ColliderUtils.h"
 #include "../scene/Scene.h"
 #include "../renderer/Mesh.h"
@@ -124,6 +125,7 @@ static JPH::RefConst<JPH::Shape> CreateConvexMeshShape(const ColliderComponent& 
 
     const size_t stride = std::max<size_t>(1, verts.size() / kMaxHullPoints);
     for (size_t i = 0; i < verts.size() && points.size() < static_cast<size_t>(kMaxHullPoints); i += stride) {
+        CheckPreparationCancelled();
         const glm::vec3 p = (verts[i].position - col.center) * lossyScale;
         points.emplace_back(p.x, p.y, p.z);
     }
@@ -155,6 +157,7 @@ static JPH::RefConst<JPH::Shape> CreateTriangleMeshShape(const ColliderComponent
     scaledPositions.reserve(sourceVertices.size());
 
     for (size_t i = 0; i < sourceVertices.size(); ++i) {
+        if ((i & 255u) == 0) CheckPreparationCancelled();
         const glm::vec3 p = (sourceVertices[i].position - col.center) * lossyScale;
         if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
             continue;
@@ -167,6 +170,7 @@ static JPH::RefConst<JPH::Shape> CreateTriangleMeshShape(const ColliderComponent
     const size_t indexCount = sourceIndices.empty() ? sourceVertices.size() : sourceIndices.size();
     triangles.reserve(indexCount / 3u);
     for (size_t i = 0; i + 2u < indexCount; i += 3u) {
+        if ((i & 255u) == 0) CheckPreparationCancelled();
         const uint32_t source[3] = {
             sourceIndices.empty() ? static_cast<uint32_t>(i) : sourceIndices[i],
             sourceIndices.empty() ? static_cast<uint32_t>(i + 1u) : sourceIndices[i + 1u],

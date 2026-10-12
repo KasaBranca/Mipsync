@@ -47,6 +47,7 @@ private:
     std::unique_ptr<Ast::Expr> FinishCall(std::unique_ptr<Ast::Expr> callee);
     std::string ParseTypeName(bool allowVoid = false);
     bool LooksLikeField() const;
+    InspectorAttributes ParseInspectorAttributes();
 
     std::string m_FileName;
     std::vector<Token> m_Tokens;

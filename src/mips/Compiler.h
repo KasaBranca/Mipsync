@@ -39,6 +39,7 @@ private:
     void BeginScope();
     void EndScope();
     void AddError(const Ast::Stmt& stmt, const std::string& message);
+    void AddLocatedError(const std::string& message);
 
     struct LoopContext {
         std::vector<size_t> breakJumps;
@@ -60,6 +61,7 @@ private:
     std::vector<std::string> m_Locals;
     std::vector<size_t> m_ScopeBases;
     std::vector<LoopContext> m_Loops;
+    SourceLocation m_CurrentLocation;
 };
 
 std::unique_ptr<CompiledModule> CompileClass(const Ast::ClassDecl& classDecl,

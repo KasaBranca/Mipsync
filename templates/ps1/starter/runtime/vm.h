@@ -19,7 +19,7 @@
  *   numbers : 128 constants
  *   strings : 128 strings (max len 96)
  *   names   : 128 names   (max len 32)
- *   fields  : 32
+ *   fields  : 64
  *   methods : 16
  *   code    : 4 KiB per method
  */

@@ -104,7 +104,7 @@ Visit the [Mipsync website](https://mipsyncweb.pages.dev/) for the current proje
 
 - Windows 10 or Windows 11
 - Git
-- CMake 3.20 or newer
+- CMake 3.25 or newer
 - A C++20 MinGW-w64 toolchain on `PATH`
 - Node.js 20+ and Rust when building the Hub
 - [PSn00bSDK](https://github.com/Lameguy64/PSn00bSDK) for compiling PS1 targets
@@ -114,11 +114,17 @@ Visit the [Mipsync website](https://mipsyncweb.pages.dev/) for the current proje
 ```powershell
 git clone https://github.com/KasaBranca/Mipsync.git
 cd Mipsync
-cmake --preset default
-cmake --build --preset default
+.\scripts\BuildEngine.ps1
 ```
 
 The editor executable is generated at `build/src/MipsyncEngine.exe`.
+
+The script uses the bundled `tools/ninja.exe` and a short source junction so
+paths containing spaces or Japanese characters work with MinGW. It runs
+configure, build, and tests. It finds GCC/G++ on `PATH` or in the standard
+MSYS2 `mingw64` / `ucrt64` directories. For another installation, pass
+`-CompilerRoot C:\Tools\mingw64\bin`. Use `-Step Configure`, `-Step Build`, or
+`-Step Test` to run one stage, and `-Jobs 4` to change the default parallelism of 2.
 
 Open a project explicitly with:
 

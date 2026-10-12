@@ -1,6 +1,9 @@
 #include "Parser.h"
 #include "MipsSpec.h"
 #include <utility>
+#include <cmath>
+#include <limits>
+#include <set>
 
 namespace MipsyncEngine::Mips {
 
@@ -143,14 +146,33 @@ std::unique_ptr<Ast::ClassDecl> Parser::ParseClass() {
     Consume(TokenType::LBrace, "expected '{' after class declaration");
 
     while (!Check(TokenType::RBrace) && !IsAtEnd()) {
+        const Token attributeStart = Peek();
+        const bool annotated = Check(TokenType::LBracket);
+        auto inspector = ParseInspectorAttributes();
         if (Check(TokenType::KwPublic)) {
             Advance();
             if (LooksLikeField()) {
-                decl->fields.push_back(ParseField());
+                auto field = ParseField();
+                field->inspector = std::move(inspector);
+                if ((field->inspector.hasRange || field->inspector.hasMin) &&
+                    field->typeName != "int" && field->typeName != "float")
+                    Error(attributeStart, "Range and Min require an int or float field");
+                if (field->typeName == "int" && field->inspector.hasRange &&
+                    (std::ceil(field->inspector.hasMin ? std::max(field->inspector.rangeMin, field->inspector.minimum) : field->inspector.rangeMin) > std::floor(field->inspector.rangeMax) ||
+                     field->inspector.rangeMin < std::numeric_limits<int>::min() ||
+                     field->inspector.rangeMax > std::numeric_limits<int>::max()))
+                    Error(attributeStart, "Range does not contain a representable int");
+                if (field->typeName == "int" && field->inspector.hasMin &&
+                    (field->inspector.minimum < std::numeric_limits<int>::min() ||
+                     field->inspector.minimum > std::numeric_limits<int>::max()))
+                    Error(attributeStart, "Min is outside the int inspector range");
+                decl->fields.push_back(std::move(field));
             } else {
+                if (annotated) Error(attributeStart, "inspector attributes can only annotate fields");
                 decl->methods.push_back(ParseMethod(true));
             }
         } else if (Check(TokenType::KwVoid)) {
+            if (annotated) Error(attributeStart, "inspector attributes can only annotate fields");
             decl->methods.push_back(ParseMethod());
         } else {
             Error(Peek(), "expected 'public' field or method");
@@ -160,6 +182,74 @@ std::unique_ptr<Ast::ClassDecl> Parser::ParseClass() {
 
     Consume(TokenType::RBrace, "expected '}' after class body");
     return decl;
+}
+
+InspectorAttributes Parser::ParseInspectorAttributes() {
+    InspectorAttributes result;
+    std::set<std::string> seen;
+    while (Match(TokenType::LBracket)) {
+        do {
+            const Token attribute = Consume(TokenType::Identifier, "expected inspector attribute name");
+            std::string name = attribute.lexeme;
+            if (name.ends_with("Attribute")) name.resize(name.size() - 9);
+            struct Argument { bool text = false; std::string string; double number = 0; };
+            std::vector<Argument> arguments;
+            if (Match(TokenType::LParen)) {
+                if (!Check(TokenType::RParen)) do {
+                    Argument arg;
+                    if (Check(TokenType::StringLiteral)) {
+                        arg.text = true; arg.string = Advance().lexeme;
+                    } else {
+                        const bool negative = Match(TokenType::Minus);
+                        if (!negative) Match(TokenType::Plus);
+                        if (Check(TokenType::IntLiteral)) arg.number = static_cast<double>(Advance().intValue);
+                        else if (Check(TokenType::FloatLiteral)) arg.number = Advance().floatValue;
+                        else {
+                            Error(Peek(), "attribute arguments must be string or numeric literals");
+                            if (!Check(TokenType::RBracket) && !Check(TokenType::RParen) && !IsAtEnd()) Advance();
+                        }
+                        if (negative) arg.number = -arg.number;
+                    }
+                    arguments.push_back(std::move(arg));
+                } while (Match(TokenType::Comma));
+                Consume(TokenType::RParen, "expected ')' after attribute arguments");
+            }
+            const auto count = arguments.size();
+            const auto numeric = [&] { return std::all_of(arguments.begin(), arguments.end(),
+                [](const Argument& a) { return !a.text && std::isfinite(a.number); }); };
+            const auto invalid = [&] { Error(attribute, "invalid arguments for [" + name + "]"); };
+            if (!seen.insert(name).second) Error(attribute, "duplicate inspector attribute [" + name + "]");
+            if (name == "Header" || name == "Tooltip" || name == "InspectorName") {
+                if (count != 1 || !arguments[0].text) invalid();
+                else if (name == "Header") result.header = arguments[0].string;
+                else if (name == "Tooltip") result.tooltip = arguments[0].string;
+                else result.displayName = arguments[0].string;
+            } else if (name == "Space") {
+                if (count > 1 || !numeric() || (count && (arguments[0].number < 0 || arguments[0].number > 1000))) invalid();
+                else result.space = count ? arguments[0].number : 8.0;
+            } else if (name == "Range") {
+                if (count != 2 || !numeric() || arguments[0].number > arguments[1].number ||
+                    std::abs(arguments[0].number) > std::numeric_limits<float>::max() ||
+                    std::abs(arguments[1].number) > std::numeric_limits<float>::max()) invalid();
+                else { result.hasRange = true; result.rangeMin = arguments[0].number; result.rangeMax = arguments[1].number; }
+            } else if (name == "Min") {
+                if (count != 1 || !numeric() || std::abs(arguments[0].number) > std::numeric_limits<float>::max()) invalid();
+                else { result.hasMin = true; result.minimum = arguments[0].number; }
+            } else if (name == "Order") {
+                if (count != 1 || !numeric() || arguments[0].number != std::trunc(arguments[0].number) ||
+                    arguments[0].number < std::numeric_limits<int>::min() || arguments[0].number > std::numeric_limits<int>::max()) invalid();
+                else result.order = static_cast<int>(arguments[0].number);
+            } else if (name == "ReadOnly" || name == "HideInInspector") {
+                if (count) invalid();
+                else if (name == "ReadOnly") result.readOnly = true;
+                else result.hidden = true;
+            } else Error(attribute, "unknown inspector attribute [" + name + "]");
+        } while (Match(TokenType::Comma));
+        Consume(TokenType::RBracket, "expected ']' after inspector attributes");
+    }
+    if (result.hasMin && result.hasRange && result.minimum > result.rangeMax)
+        Error(Previous(), "Min cannot exceed the Range maximum");
+    return result;
 }
 
 std::string Parser::ParseTypeName(bool allowVoid) {

@@ -11,6 +11,7 @@ static uint8_t s_animator_trigger_holding[128];
 static uint8_t s_animator_transition_active[128];
 static uint8_t s_animator_trigger_manual_hold[128];
 static uint8_t s_animator_trigger_release_requested[128];
+static uint8_t s_animator_action_active[128];
 static fix16_t s_previous_position[128][3];
 static fix16_t s_previous_rotation[128][3];
 static fix16_t s_previous_scale[128][3];
@@ -30,6 +31,7 @@ static void select_vertex_clip(ps1_entity* e, uint16_t active_trigger, int aimin
 static void select_rigid_clip(ps1_entity* e, uint16_t active_trigger, int aiming, int moving);
 static uint16_t vertex_locomotion_first(const ps1_entity* e, int aiming, int moving);
 static uint16_t rigid_locomotion_first(const ps1_entity* e, int aiming, int moving);
+static void set_animator_trigger(unsigned int root_index, const char* name, int manual_hold);
 
 static uint16_t animator_parameter_hash(const char* name) {
     uint32_t hash = 2166136261u;
@@ -312,6 +314,7 @@ void ps1_scene_init(void) {
             s_animator_transition_active[r_count] = 0;
             s_animator_trigger_manual_hold[r_count] = 0;
             s_animator_trigger_release_requested[r_count] = 0;
+            s_animator_action_active[r_count] = 0;
             s_runtime_lookup[i] = (int16_t)r_count;
             r_count++;
         }
@@ -332,6 +335,7 @@ void ps1_scene_init(void) {
             s_animator_transition_active[r_count] = 0;
             s_animator_trigger_manual_hold[r_count] = 0;
             s_animator_trigger_release_requested[r_count] = 0;
+            s_animator_action_active[r_count] = 0;
             s_runtime_lookup[i] = (int16_t)r_count;
             r_count++;
         }
@@ -768,6 +772,31 @@ static void select_rigid_clip(ps1_entity* e, uint16_t active_trigger, int aiming
     e->rigid_anim_blend_target_frame_plus_one = 0;
 }
 
+fix16_t ps1_scene_animator_normalized_time(unsigned root_index, const char* state_name) {
+    const ps1_entity* root=ps1_scene_entity(root_index);
+    if(!root)return -FIX16_ONE;
+    const uint16_t wanted=state_name && *state_name ? animator_parameter_hash(state_name) : 0;
+    for(unsigned i=0;i<s_runtime_count;++i) {
+        const ps1_entity* e=&s_runtime_entities[i];
+        if(e!=root && e->rigid_root_entity_index!=(int)root_index)continue;
+        uint32_t count=0, fps=0, elapsed=0;unsigned mode=0;
+        if(e->vertex_anim_frame_count && e->vertex_anim_fps) {
+            count=e->vertex_anim_frame_count;fps=e->vertex_anim_fps;elapsed=s_vertex_anim_time_q16[i];
+            if(e->vertex_trigger_frame_count && e->vertex_anim_first_mesh_index==e->vertex_trigger_first_mesh_index)mode=3;
+            else if(e->vertex_aim_frame_count && e->vertex_anim_first_mesh_index==e->vertex_aim_first_mesh_index)mode=2;
+            else if(e->vertex_walk_frame_count && e->vertex_anim_first_mesh_index==e->vertex_walk_first_mesh_index)mode=1;
+        } else if(e->rigid_anim_frame_count && e->rigid_anim_fps) {
+            count=e->rigid_anim_frame_count;fps=e->rigid_anim_fps;elapsed=s_rigid_anim_time_q16[i];
+            if(e->rigid_trigger_frame_count && e->rigid_anim_first_frame>=e->rigid_trigger_first_frame && e->rigid_anim_first_frame<e->rigid_trigger_first_frame+e->rigid_trigger_frame_count)mode=3;
+            else if(e->rigid_aim_frame_count && e->rigid_anim_first_frame==e->rigid_aim_first_frame)mode=2;
+            else if(e->rigid_walk_frame_count && e->rigid_anim_first_frame==e->rigid_walk_first_frame)mode=1;
+        } else continue;
+        if(wanted && wanted!=e->animator_state_hashes[mode])return -FIX16_ONE;
+        return (fix16_t)(((uint64_t)elapsed*fps/count)&0xffffu);
+    }
+    return -FIX16_ONE;
+}
+
 void ps1_scene_set_animator_float(unsigned int root_index, const char* name, fix16_t value) {
     ps1_entity* root;
     int aiming;
@@ -784,6 +813,30 @@ void ps1_scene_set_animator_float(unsigned int root_index, const char* name, fix
     } else if (strcmp(name, "Moving") == 0) {
         root->animator_speed = value ? FIX16_ONE : 0;
     } else {
+        /* Controller-authored float/bool/int actions (e.g. Punch) must not
+         * silently disappear on PS1. A rising condition starts the exported
+         * one-shot; resetting the parameter does not cut the clip short. */
+        const uint16_t hash = animator_parameter_hash(name);
+        const int runtime = root_index < 4096u ? s_runtime_lookup[root_index] : -1;
+        if (runtime < 0) return;
+        for (unsigned int i = 0; i < s_runtime_count; ++i) {
+            const ps1_entity* e = &s_runtime_entities[i];
+            if (e->rigid_root_entity_index != (int16_t)root_index ||
+                e->animator_trigger_parameter_hash != hash || !e->animator_action_condition) continue;
+            int active = 0;
+            switch (e->animator_action_condition) {
+                case 1: active = value > e->animator_action_threshold; break;
+                case 2: active = value < e->animator_action_threshold; break;
+                case 3: active = value == e->animator_action_threshold; break;
+                case 4: active = value != e->animator_action_threshold; break;
+                case 5: active = value != 0; break;
+                case 6: active = value == 0; break;
+            }
+            const int rising = active && !s_animator_action_active[runtime];
+            s_animator_action_active[runtime] = (uint8_t)active;
+            if (rising) set_animator_trigger(root_index, name, 0);
+            return;
+        }
         return;
     }
 

@@ -2,6 +2,7 @@
 #include "../assets/AssetManager.h"
 #include "../core/Log.h"
 #include <fstream>
+#include <cstring>
 #include <nlohmann/json.hpp>
 
 namespace MipsyncEngine::Ps1 {
@@ -12,7 +13,7 @@ namespace {
 
 fs::path HubConfigDir() {
 #ifdef _WIN32
-    if (const char* appdata = std::getenv("APPDATA"))
+    if (const wchar_t* appdata = _wgetenv(L"APPDATA"))
         return fs::path(appdata) / "MipsyncEngine";
 #endif
     return fs::path();
@@ -24,8 +25,14 @@ bool IsValidSdkRoot(const fs::path& root) {
 }
 
 std::optional<fs::path> FromEnvVar(const char* name) {
+#ifdef _WIN32
+    const std::wstring wideName(name, name + std::strlen(name));
+    if (const wchar_t* value = _wgetenv(wideName.c_str())) {
+        const fs::path root(value);
+#else
     if (const char* value = std::getenv(name)) {
         const fs::path root = PathUtf8::FromString(value);
+#endif
         if (IsValidSdkRoot(root))
             return root;
     }

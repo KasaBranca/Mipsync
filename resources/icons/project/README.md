@@ -12,7 +12,12 @@ Place **PNG** files in this folder. They are copied next to the editor executabl
 | Color space | sRGB |
 | Naming | Exact filenames below (lowercase, underscores) |
 
-SVG is not loaded at runtime — export to PNG from your design tool.
+The Project browser loads PNGs at runtime. `script.svg` is the vector source of
+the existing `script.png` artwork. CMake compiles its paths and rectangles into
+ImDrawList commands for the Mips# Inspector icon, using a softer blue background
+and dark lettering. The Inspector draws vectors directly at the current UI scale.
+Its supported SVG geometry is convex M/L/C/Z paths and rectangles with
+`data-role="background"` or `data-role="foreground"` palette assignments.
 
 ## Filenames ↔ asset type
 

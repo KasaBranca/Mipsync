@@ -2,11 +2,14 @@
 #define MIPSYNC_AUDIO_H
 
 #include <stdint.h>
+#include "midi.h"
 
 typedef struct ps1_audio_clip {
     const char* cd_path;
     uint32_t size;
     uint16_t sample_rate;
+    const ps1_midi_sequence* midi; /* non-null: resident SPU SFX, never CD I/O */
+    const uint8_t* sample_data; /* non-null: resident ADPCM SFX */
 } ps1_audio_clip;
 
 extern const ps1_audio_clip g_ps1_audio_clips[];

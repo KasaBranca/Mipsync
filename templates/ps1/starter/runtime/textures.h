@@ -7,6 +7,7 @@ typedef struct {
     const uint32_t* tim;
     unsigned int    tim_word_count;
     uint8_t         is_background;
+    uint8_t         has_cutout;
 } ps1_texture_desc;
 
 extern const ps1_texture_desc g_ps1_textures[];
@@ -25,5 +26,6 @@ uint16_t ps1_texture_vram_y(unsigned int texture_index);
 uint8_t ps1_texture_u_offset(unsigned int texture_index);
 uint8_t ps1_texture_v_offset(unsigned int texture_index);
 uint8_t ps1_texture_is_background(unsigned int texture_index);
+uint8_t ps1_texture_has_cutout(unsigned int texture_index);
 
 #endif /* MIPSYNC_TEXTURES_H */

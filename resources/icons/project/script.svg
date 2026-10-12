@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 431 566">
+  <title>Mips# script</title>
+  <desc>Vector version of the Project browser script.png artwork.</desc>
+  <path data-role="background" fill="#0d99ff" d="M 20 0 L 331 0 C 386.228 0 431 44.772 431 100 L 431 546 C 431 557.046 422.046 566 411 566 L 20 566 C 8.954 566 0 557.046 0 546 L 0 20 C 0 8.954 8.954 0 20 0 Z"/>
+  <rect data-role="foreground" fill="#ffffff" x="75" y="151" width="56" height="283"/>
+  <rect data-role="foreground" fill="#ffffff" x="131" y="151" width="57" height="58"/>
+  <rect data-role="foreground" fill="#ffffff" x="188" y="209" width="56" height="225"/>
+  <rect data-role="foreground" fill="#ffffff" x="244" y="151" width="57" height="58"/>
+  <rect data-role="foreground" fill="#ffffff" x="301" y="209" width="56" height="225"/>
+</svg>

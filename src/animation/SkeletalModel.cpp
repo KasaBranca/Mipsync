@@ -1,4 +1,7 @@
+#include "../core/AssetFiles.h"
 #include "SkeletalModel.h"
+#include "SkeletalModelPartition.h"
+#include <nlohmann/json.hpp>
 #include "UfbxMath.h"
 #include "../assets/AssetManager.h"
 #include "../core/Log.h"
@@ -282,7 +285,7 @@ static std::string PickExistingTexturePath(const ufbx_texture* tex, const fs::pa
         if (!p.is_absolute())
             p = fbxDir / p;
         std::error_code ec;
-        if (fs::exists(p, ec))
+        if (AssetFiles::Exists(p))
             return PathUtf8::ToString(fs::absolute(p, ec));
         return {};
     };
@@ -319,7 +322,11 @@ static std::string ResolveTexturePath(const ufbx_material* mat, const std::strin
         fbxDir / (PathUtf8::ToString(fbxPath.stem()) + "_textures");
     const fs::path outPath = outDir / PathUtf8::FromString(fileName);
     std::error_code ec;
-    if (!fs::exists(outPath, ec)) {
+    if (!AssetFiles::Exists(outPath)) {
+        if(AssetFiles::IsPackedPath(outPath)) {
+            AssetFiles::PutMemoryFile(outPath,std::vector<uint8_t>(static_cast<const uint8_t*>(fileTex->content.data),static_cast<const uint8_t*>(fileTex->content.data)+fileTex->content.size));
+            return AssetManager::Get().ToProjectRelative(PathUtf8::ToString(outPath));
+        }
         if (!WriteEmbeddedTextureFile(fileTex, outPath))
             return {};
         MIPSYNC_INFO("Extracted embedded FBX texture: {}", PathUtf8::ToString(outPath));
@@ -1058,6 +1065,23 @@ static void PopulateAnimationClips(SkeletalModelAsset& asset, ufbx_scene* scene,
 }
 
 std::shared_ptr<SkeletalModelAsset> LoadSkeletalModelFromFile(const std::string& path) {
+    if(fs::path(path).extension()==".nmodel") {
+        try {
+            const auto descriptor=nlohmann::json::parse(AssetFiles::ReadText(PathUtf8::FromString(path)));
+            const auto source=descriptor.at("model").get<std::string>();
+            const auto rel=PathUtf8::FromString(source);
+            if(rel.is_absolute()||source.empty()||rel.extension()==".nmodel")return nullptr;
+            for(const auto& piece:rel)if(piece=="..")return nullptr;
+            auto asset=LoadSkeletalModelFromFile(AssetManager::Get().ToAbsolute(source));
+            if(!asset)return nullptr;
+            auto partition=PartitionSkeletalModel(*asset,descriptor.value("boneRoots",std::vector<std::string>{}),descriptor.value("meshParts",std::vector<int>{}));
+            if(partition.indices.empty())return nullptr;
+            asset->sourceIndices=std::move(partition.indices);asset->submeshes=std::move(partition.submeshes);asset->meshParts=std::move(partition.parts);
+            asset->mesh=std::make_shared<SkinnedMesh>(asset->sourceVertices,asset->sourceIndices);
+            asset->cpuDisplayMesh.reset();asset->cpuSkinBoneHash=0;
+            return asset;
+        } catch(const std::exception& error){MIPSYNC_WARN("Derived model {}: {}",path,error.what());return nullptr;}
+    }
     auto asset = std::make_shared<SkeletalModelAsset>();
     asset->sourcePath = path;
 
@@ -1071,7 +1095,10 @@ std::shared_ptr<SkeletalModelAsset> LoadSkeletalModelFromFile(const std::string&
     opts.target_unit_meters = 1.0f;
 
     ufbx_error error{};
-    asset->scene = ufbx_load_file(path.c_str(), &opts, &error);
+    const bool packed=AssetFiles::IsPackedPath(PathUtf8::FromString(path));
+    std::vector<uint8_t> packedBytes;
+    if(packed) {packedBytes=AssetFiles::Read(PathUtf8::FromString(path));opts.filename={path.data(),path.size()};opts.load_external_files=false;}
+    asset->scene = packed ? ufbx_load_memory(packedBytes.data(),packedBytes.size(),&opts,&error) : ufbx_load_file(path.c_str(), &opts, &error);
     if (!asset->scene) {
         MIPSYNC_ERROR("Skeletal FBX load failed {}: {}", path, error.description.data);
         return nullptr;
@@ -1263,6 +1290,10 @@ void ApplySkeletalModelFitScale(Entity& entity, const std::string& modelProjectP
 }
 
 bool SkeletalModelFileHasSkin(const std::string& path) {
+    if (PathUtf8::FromString(path).extension() == ".nmodel") {
+        const auto model = LoadSkeletalModelFromFile(path);
+        return model && model->hasSkin;
+    }
     const std::string ext = path.size() >= 4 ? path.substr(path.size() - 4) : std::string{};
     std::string lower;
     lower.resize(ext.size());
@@ -1274,7 +1305,10 @@ bool SkeletalModelFileHasSkin(const std::string& path) {
     ufbx_load_opts opts{};
     opts.load_external_files = false;
     ufbx_error error{};
-    ufbx_scene* scene = ufbx_load_file(path.c_str(), &opts, &error);
+    const bool packed=AssetFiles::IsPackedPath(PathUtf8::FromString(path));
+    std::vector<uint8_t> packedBytes;
+    if(packed) {packedBytes=AssetFiles::Read(PathUtf8::FromString(path));opts.filename={path.data(),path.size()};}
+    ufbx_scene* scene = packed ? ufbx_load_memory(packedBytes.data(),packedBytes.size(),&opts,&error) : ufbx_load_file(path.c_str(), &opts, &error);
     if (!scene)
         return false;
 

@@ -21,6 +21,7 @@
   --radius-sm: 4px;
   --radius-md: 6px;
   --radius-lg: 8px;
+  --radius-pill: 9999px;
   --sidebar-w: 232px;
   --font: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: "JetBrains Mono", "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
@@ -149,12 +150,8 @@ select:focus-visible,
   left: 0;
   height: 42px;
   box-sizing: border-box;
-  border: 0;
-  border-radius: var(--radius-md);
-  background: rgba(13, 153, 255, 0.22);
   pointer-events: none;
   transform: translateY(0);
-  transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1), background 180ms ease;
 }
 
 .nav-highlight.installs {
@@ -170,29 +167,19 @@ select:focus-visible,
   gap: 10px;
   padding: 8px 12px;
   border: 1px solid transparent;
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-pill);
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
   text-align: left;
-  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease;
 }
 
 .nav-item:hover:not(:disabled) {
-  border-color: var(--border);
-  background: var(--surface);
   color: var(--text);
 }
 
 .nav-item.active {
-  border-color: transparent;
-  background: transparent;
   color: var(--text-strong);
-}
-
-.nav-item.active:hover {
-  border-color: transparent;
-  background: transparent;
 }
 
 .nav-item:disabled {
@@ -241,20 +228,9 @@ select:focus-visible,
   width: 100%;
   min-height: 36px;
   padding: 7px 12px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--text);
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
-  transition: border-color 0.16s ease, color 0.16s ease, background 0.16s ease;
-}
-
-.support-card-button:hover {
-  border-color: var(--brand);
-  background: rgba(13, 153, 255, 0.08);
-  color: var(--brand-hover);
 }
 
 .sidebar-footer {
@@ -308,7 +284,7 @@ select:focus-visible,
   min-height: 42px;
   padding: 9px 13px 9px 38px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-pill);
   outline: none;
   background: var(--surface-soft);
   color: var(--text);
@@ -337,58 +313,21 @@ select:focus-visible,
 .btn {
   min-height: 40px;
   padding: 8px 15px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--text);
   font-weight: 600;
   cursor: pointer;
-  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease, transform 0.12s ease;
-}
-
-.btn:hover:not(:disabled) {
-  border-color: var(--border-strong);
-  background: var(--surface-hover);
-}
-
-.btn:active:not(:disabled) {
-  transform: translateY(1px);
 }
 
 .btn-primary {
-  border-color: var(--brand);
-  background: var(--brand);
   color: #ffffff;
 }
 
 .btn-primary:hover:not(:disabled) {
-  border-color: var(--brand-hover);
-  background: var(--brand-hover);
   color: #ffffff;
-}
-
-.btn-primary:active:not(:disabled) {
-  border-color: var(--brand-pressed);
-  background: var(--brand-pressed);
-}
-
-.btn-secondary {
-  border-color: var(--border);
-  background: var(--surface);
-  color: var(--text);
 }
 
 .btn-ghost {
   padding-right: 11px;
   padding-left: 11px;
-  border-color: transparent;
-  background: transparent;
-  color: var(--text-muted);
-}
-
-.btn-ghost:hover:not(:disabled) {
-  border-color: var(--border);
-  color: var(--text);
 }
 
 button:disabled {
@@ -492,14 +431,9 @@ button:disabled {
   justify-content: space-between;
   gap: 10px;
   padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
   outline: none;
-  background: var(--surface-soft);
-  color: var(--text-secondary);
   text-align: left;
   cursor: pointer;
-  transition: border-color 180ms ease, background 180ms ease;
 }
 
 .smooth-select-trigger > span:first-child {
@@ -507,12 +441,6 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.smooth-select-trigger:hover:not(:disabled),
-.smooth-select.open .smooth-select-trigger {
-  border-color: var(--brand);
-  background: var(--surface);
 }
 
 .smooth-select-chevron {
@@ -771,18 +699,8 @@ button:disabled {
   display: grid;
   place-items: center;
   padding: 0;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-muted);
   font-size: 18px;
   cursor: pointer;
-}
-
-.toast-close:hover {
-  border-color: var(--border);
-  background: var(--surface-hover);
-  color: var(--text);
 }
 
 .toast-body {
@@ -849,8 +767,7 @@ button:disabled {
   width: 100%;
 }
 
-.field input,
-.field .smooth-select-trigger {
+.field input {
   min-height: 42px;
   padding: 9px 12px;
   border: 1px solid var(--border);
@@ -861,8 +778,7 @@ button:disabled {
   transition: border-color 0.16s ease, background 0.16s ease;
 }
 
-.field input:focus,
-.field .smooth-select.open .smooth-select-trigger {
+.field input:focus {
   border-color: var(--brand);
   background: var(--surface);
 }
@@ -942,4 +858,9 @@ button:disabled {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+.field .smooth-select-trigger {
+  min-height: 42px;
+  padding: 9px 12px;
 }

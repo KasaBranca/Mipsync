@@ -13,6 +13,9 @@
 #include "EditorCameraGizmo.h"
 #include "GameViewSettings.h"
 #include "EditorBuildSettings.h"
+#include "EditorComponentPicker.h"
+#include "EditorPreferences.h"
+#include "EditorPlaySession.h"
 #include <imgui.h>
 #include <ImGuizmo.h>
 #include <memory>
@@ -21,14 +24,19 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 namespace MipsyncEngine {
+class EditorToolbar;
+struct EditorPlayPreparation;
 
 namespace Command { class EditorCommandHost; }
 
 class Engine;
 class Entity;
 class AssetBrowserPanel;
+class EditorComponentClipboard;
+struct Component;
 
 enum class DockLayoutPreset {
     ClassicEditor,
@@ -48,7 +56,13 @@ public:
     void OnImGuiRender();
 
     bool IsPlaying() const { return m_IsPlaying; }
+    bool IsPreparingPlay() const { return m_PlaySetupStep >= 0; }
+    const std::string& GetPlaySetupError() const { return m_PlaySetupError; }
+    bool IsPlayPreparationRunning() const;
     bool IsPaused() const { return m_IsPaused; }
+    void SetPlayPaused(bool paused);
+    const GameViewSettings& GetGameViewSettings() const { return m_GameViewSettings; }
+    const EditorPreferences& GetPreferences() const { return m_Preferences; }
     bool ConsumeSingleStepRequest() {
         const bool requested = m_StepOneFrame;
         m_StepOneFrame = false;
@@ -58,21 +72,37 @@ public:
     void SetAutoPlayOnStart(bool enabled) { m_AutoPlayOnStart = enabled; }
     void TickAutoPlayOnStart();
 
-    /// Runs deferred PhysicsWorld::BeginPlay (called from Engine::Update, not inside ImGui).
+    /// Advances one preparation stage, after its loading frame has been presented.
     void TickPendingPlaySetup();
+    void PumpPreparationCommands();
 
     void HandlePlayModeShortcuts();
     void HandleEditorShortcuts();
     void UpdateUndoRecording();
     void RecordUndoSnapshot();
-    void AfterSceneRestoredFromHistory();
+    bool HasCopiedInspectorComponent() const;
+    bool CanPasteInspectorComponent(const Component* destination = nullptr) const;
+    const char* GetInspectorPasteLabel(const Component* destination = nullptr) const;
+    void CopyInspectorComponent(const Component& component);
+    bool PasteInspectorComponent(Component* destination = nullptr);
+    bool ResetInspectorComponent(Component& component);
+    void CommitUndoTransaction();
+    bool RecordAssetUndoSnapshot(const std::string& absolutePath, bool recursive = false);
+    uint64_t GetHistoryRevision() const { return m_HistoryRevision; }
+    void AfterSceneRestoredFromHistory(bool restartUndoRecording = true);
     void UpdatePlayInputState();
 
     bool IsSceneDirty() const { return m_SceneDirty; }
     void CommandStartPlayMode() { StartPlayMode(); }
     void CommandStopPlayMode() { StopPlayMode(); }
+    bool CaptureGameView(const std::string& file, std::string& error);
     void CommandMarkSceneDirty() { m_SceneDirty = true; }
+    void CommandRefreshSceneDirtyState() { UpdateSceneDirtyState(); }
     bool CommandSaveScene(std::string& outError);
+    bool CommandOpenScene(const std::string& absolutePath, bool saveCurrent, std::string& outError);
+    bool HasSceneSaveConfirmation() const { return m_PendingSceneAction != SceneAction::None; }
+    nlohmann::json InspectSceneSaveConfirmation() const;
+    bool CommandRespondSceneSaveConfirmation(const std::string& action, std::string& outError);
     /// Select an entity changed by the live CLI session and reveal it in Scene View.
     void CommandRevealEntity(uint32_t entityId, bool frameInSceneView);
     bool CommandUndo(std::string& outError);
@@ -82,13 +112,12 @@ public:
 
     Engine* GetEngine() const { return m_Engine; }
 
-    void ClearEntitySelection() {
-        m_SelectedEntityID = 0;
-        m_SelectedEntityIDs.clear();
-        m_HierarchySelectionAnchor = 0;
-    }
+    void ClearEntitySelection();
+    /// Apply reference clicks next frame, after the current Inspector has finished.
+    void QueueReferenceSelection(uint32_t entityId);
+    void QueueReferenceSelection(const std::string& assetPath);
 
-    /// Opens/focuses the docked Animator Controller window (Unity-style, not Inspector).
+    /// Opens/focuses the docked Animator Controller graph.
     void OpenAnimatorControllerWindow(const std::string& projectRelPath);
     /// Load a scene file (absolute path). Stops play mode unless restartPlayIfWasActive.
     void LoadSceneFromPath(const std::string& absolutePath, bool restartPlayIfWasActive = false);
@@ -158,18 +187,21 @@ private:
     
     // Panels
     void DrawSceneViewPanel();
-    void DrawGameViewPanel();
+    void DrawGameViewPanel(bool maximized = false);
     void DrawPlayerModeUI();
-    void StartPlayMode();
+    void StartPlayMode(bool saveConfirmed = false);
     void StopPlayMode();
     Entity* ResolveActiveShotCameraEntity(bool allowShotSelection);
     void ResetShotCameraState();
     void DrawGameViewToolbar();
+    void DrawGameViewGizmos(const ImVec2& imageMin, const ImVec2& imageSize,
+                            const Camera& camera, uint32_t activeCameraId);
+    void DrawViewportGizmos(const ImVec2& imageMin, const ImVec2& imageSize,
+                            const Camera& camera, uint32_t excludeCameraId = 0);
     void DrawHierarchyPanel();
     void DrawHierarchyEntityNode(class Entity& entity);
     void DrawHierarchyContextMenu(class Entity* parentForNew);
-    class Entity* CreatePointLight(class Entity* parentForNew, const glm::vec3& worldPosition);
-    class Entity* CreateSpotLight(class Entity* parentForNew, const glm::vec3& worldPosition);
+    class Entity* CreateLight(class Entity* parentForNew, const glm::vec3& worldPosition, LightType type);
     class Entity* CreatePostProcessVolume(class Entity* parentForNew);
     class Entity* CreateCamera(class Entity* parentForNew);
     class Entity* CreateFirstPersonController(class Entity* parentForNew);
@@ -182,7 +214,7 @@ private:
     void DrawUITextureSlot(class UIImageComponent& image);
     void DrawUIButtonBackgroundSlot(class UIButtonComponent& button);
     void DrawUIButtonGroupCursorSlot(class UIButtonGroupComponent& group);
-    void DrawAddComponentScriptMenu(const std::vector<class Entity*>& entities);
+    void DrawCreateComponentScriptForm(const std::vector<class Entity*>& entities, const char* suggestedName);
     std::vector<std::string> CollectProjectScripts() const;
     void DrawInspectorPanel();
     void DrawMipsScriptAssetInspector(const std::string& projectRelPath);
@@ -224,9 +256,10 @@ private:
     const Texture* ResolvePrerenderedBackgroundTexture(uint32_t cameraEntityId);
     void HandleSceneViewControls(bool viewportHovered);
     void DrawGizmoToolbar();
-    void DrawRenderModeSelector();
+    void DrawRenderModeSelector(EditorToolbar& toolbar);
     void DrawGizmoControls(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& camera);
-    void DrawCameraFrustumGizmo(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& camera);
+    void DrawCameraFrustumGizmo(const ImVec2& imageMin, const ImVec2& imageSize,
+                                const Camera& camera, uint32_t excludeCameraId = 0);
     void DrawCanvasGizmo(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& camera);
     void DrawColliderGizmos(const ImVec2& imageMin, const ImVec2& imageSize, const Camera& camera);
     void DrawMeshSubdivisionPreview(const ImVec2& imageMin, const ImVec2& imageSize,
@@ -262,20 +295,30 @@ private:
     std::unordered_map<std::string, std::shared_ptr<Texture>> m_PrerenderedBackgroundTextures;
     Camera m_FallbackGameCamera;
     GameViewSettings m_GameViewSettings;
+    RenderStatistics m_GameViewStatistics;
+    bool m_GameViewFrameValid = false;
+    bool m_GamePointerPressed = false, m_GamePointerReleased = false;
+    ImVec2 m_EditorContentMin{}, m_EditorContentSize{};
+    bool m_GameViewMaximized = false;
+    bool m_GameViewWasMaximized = false;
     
     // State
     bool m_SceneViewHovered = false;
     bool m_SceneViewFocused = false;
     float m_LastSceneViewAspect = 16.0f / 9.0f;
     uint32_t m_SelectedEntityID = 0;
+    uint32_t m_PendingReferenceEntityID = 0;
+    std::string m_PendingReferenceAssetPath;
     uint32_t m_PendingSelectedEntityID = 0;
     std::unordered_set<uint32_t> m_PendingSelectedEntityIDs;
     std::unordered_set<uint32_t> m_SelectedEntityIDs;
     uint32_t m_HierarchySelectionAnchor = 0;
     uint32_t m_PendingHierarchyClickEntityID = 0;
+    uint32_t m_PendingHierarchyRevealEntityID = 0;
     std::unordered_set<uint32_t> m_PendingHierarchyExpansionIDs;
     std::vector<uint32_t> m_HierarchyOrder;
     std::vector<uint32_t> m_HierarchyClipboardEntityIDs;
+    std::unique_ptr<EditorComponentClipboard> m_ComponentClipboard;
     ImGuizmo::OPERATION m_GizmoOperation = ImGuizmo::TRANSLATE;
     ImGuizmo::MODE m_GizmoMode = ImGuizmo::LOCAL;
     int m_ProModelerEditMode = 0; // 0=object, 1=vertex, 2=edge, 3=face
@@ -309,13 +352,27 @@ private:
     RenderMode m_SceneRenderMode = RenderMode::Shaded;
 
     bool m_IsPlaying = false;
+    EditorPlaySession m_PlaySession;
+    EditorUndoStack m_PrePlayUndoStack;
+    std::string m_PrePlaySavedFingerprint;
+    std::unordered_set<uint32_t> m_PrePlaySelection;
+    uint32_t m_PrePlaySelectedEntityID = 0;
     bool m_AutoPlayOnStart = false;
     bool m_AutoPlayTriggered = false;
     bool m_IsPaused = false;
     bool m_StepOneFrame = false;
-    bool m_PendingPhysicsBeginPlay = false;
+    int m_PlaySetupStep = -1;
+    bool m_PlaySetupPresented = false;
+    std::unique_ptr<EditorPlayPreparation> m_PlayPreparation;
+    std::string RunPlaySetupStage(int stage);
+    void DrawPlayLoading();
     bool m_GameViewHovered = false;
+    bool m_GameViewFocused = false;
     bool m_PlayCursorLocked = false;
+    std::string m_PlaySetupError;
+    bool m_CursorOwnsUI = false;
+    int m_PreCaptureMouseFlags = 0;
+    void SetMouseCaptureUI(bool captured);
     bool m_PlayShortcutSuppressUntilRelease = false;
     uint32_t m_ActiveShotCameraEntityID = 0;
     bool m_ShotCameraStatePrimed = false;
@@ -324,26 +381,39 @@ private:
 
     std::string m_SceneFilePath; // absolute path under project root
     void SaveScene();
-    void LoadScene(bool restartPlayIfWasActive = false);
+    bool LoadScene(bool restartPlayIfWasActive = false);
+    void LoadSceneFromPathUnchecked(const std::string& absolutePath, bool restartPlayIfWasActive);
+    void FinishSceneLoad();
     void PersistEditorLastScene();
 
     void RefreshSavedSceneState();
     void UpdateSceneDirtyState();
-    void DrawSaveOnExitModal();
+    enum class SceneAction { None, Close, Restart, OpenScene, Play };
+    bool RequestSceneSaveConfirmation(SceneAction action, const std::string& path = {},
+                                      bool restartPlay = false);
+    void ExecuteConfirmedSceneAction();
+    void DrawSceneSaveConfirmation();
     void DrawFontRestartModal();
 
     std::string m_SceneSavedFingerprint;
     EditorUndoStack m_UndoStack;
     bool m_HadActiveEdit = false;
+    uint64_t m_HistoryRevision = 0;
+    uint64_t m_PointerEditGesture = 0;
     bool m_SceneDirtyCheckPending = false;
     bool m_SceneDirty = false;
-    bool m_OpenSaveOnExitModal = false;
+    SceneAction m_PendingSceneAction = SceneAction::None;
+    std::string m_PendingSceneActionPath;
+    std::string m_SceneSaveConfirmationError;
+    bool m_PendingSceneRestartPlay = false;
+    bool m_OpenSceneSaveConfirmation = false;
+    bool m_CloseSceneSaveConfirmation = false;
+    bool m_ExecuteConfirmedSceneAction = false;
     bool m_OpenFontRestartModal = false;
-    bool m_RequestQuitAfterSaveDialog = false;
-    bool m_RequestRestartAfterSaveDialog = false;
     void TriggerRestart();
 
     std::unique_ptr<AssetBrowserPanel> m_AssetBrowser;
+    EditorComponentPicker m_ComponentPicker;
     std::unique_ptr<EditorBuildSettings> m_BuildSettings;
     std::unique_ptr<Command::EditorCommandHost> m_CommandHost;
     char m_CommandInput[512]{};
@@ -370,6 +440,10 @@ private:
 
     // Font size / user preferences
     float m_FontSize = 0.0f; // 0 = not yet loaded
+    EditorPreferences m_Preferences;
+    EditorPreferencesWindow m_PreferencesWindow;
+    void ApplyEditorPreferences();
+    void DrawPreferencesWindow();
     void LoadEditorSettings();
     void SaveEditorSettings();
     void DrawPreferencesMenu();

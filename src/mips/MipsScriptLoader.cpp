@@ -2,6 +2,7 @@
 #include "Compiler.h"
 #include "Lexer.h"
 #include "Parser.h"
+#include "../core/AssetFiles.h"
 #include "../assets/AssetManager.h"
 #include <fstream>
 #include <sstream>
@@ -49,7 +50,7 @@ fs::path MipsScriptLoader::ResolvePath(const fs::path& projectRoot,
                 return {};
             }
         }
-        if (fs::is_regular_file(resolved, ec))
+        if (AssetFiles::Exists(resolved))
             return resolved;
         outError = "script file does not exist: " + PathUtf8::ToString(resolved);
         return {};
@@ -66,13 +67,13 @@ fs::path MipsScriptLoader::ResolvePath(const fs::path& projectRoot,
         outError = "script path escapes the project root: " + scriptPath;
         return {};
     }
-    if (fs::is_regular_file(direct, ec))
+    if (AssetFiles::Exists(direct))
         return direct;
 
     // Compatibility for legacy components that stored only "Player.mips".
     const fs::path scriptsCandidate = NormalizeExisting(
         root / "assets" / "scripts" / requested.filename());
-    if (IsWithinRoot(scriptsCandidate, root) && fs::is_regular_file(scriptsCandidate, ec))
+    if (IsWithinRoot(scriptsCandidate, root) && AssetFiles::Exists(scriptsCandidate))
         return scriptsCandidate;
 
     outError = "script file not found under project root: " + scriptPath;
@@ -89,16 +90,16 @@ std::shared_ptr<CompiledModule> MipsScriptLoader::CompileFile(
         return nullptr;
     }
 
-    std::ifstream file(resolved, std::ios::binary);
-    if (!file.is_open()) {
-        errors.push_back("failed to open script: " + PathUtf8::ToString(resolved));
-        return nullptr;
+    if(AssetFiles::IsPackedPath(resolved)) {
+        try{return DeserializePlayerModule(AssetFiles::Read(resolved));}
+        catch(const std::exception& e){errors.push_back(e.what());return nullptr;}
     }
-    std::ostringstream source;
-    source << file.rdbuf();
+    std::string source;
+    try { source = AssetFiles::ReadText(resolved); }
+    catch (const std::exception& ex) { errors.push_back(ex.what()); return nullptr; }
     const std::string fileName = PathUtf8::ToString(resolved);
 
-    Lexer lexer(source.str(), fileName);
+    Lexer lexer(source, fileName);
     const std::vector<Token>& tokens = lexer.Tokenize();
     errors.insert(errors.end(), lexer.GetErrors().begin(), lexer.GetErrors().end());
     if (!lexer.GetErrors().empty())
@@ -110,7 +111,13 @@ std::shared_ptr<CompiledModule> MipsScriptLoader::CompileFile(
     if (!program || program->classes.empty() || !parser.GetErrors().empty())
         return nullptr;
 
-    return CompileClass(*program->classes[0], program.get(), fileName, errors);
+    // The compiler may produce partial bytecode together with diagnostics.
+    // Never expose that module as runnable/exportable source.
+    std::vector<std::string> compileErrors;
+    auto module = CompileClass(*program->classes[0], program.get(), fileName, compileErrors);
+    errors.insert(errors.end(), compileErrors.begin(), compileErrors.end());
+    if (!compileErrors.empty()) return nullptr;
+    return module;
 }
 
 } // namespace MipsyncEngine::Mips

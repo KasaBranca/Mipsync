@@ -1,4 +1,7 @@
+#include "../core/PreparationCancellation.h"
 #include "AnimatorRuntime.h"
+#include "../core/AssetFiles.h"
+#include <sstream>
 #include "AnimationTypes.h"
 #include "AnimatorControllerIO.h"
 #include "SkeletalModel.h"
@@ -133,14 +136,14 @@ const TransformClipAsset* LoadTransformClip(const std::string& projectRelPath) {
         return it->second.valid ? &it->second : nullptr;
     }
 
-    std::ifstream file(absPath);
-    if (!file.is_open()) {
+    if (!AssetFiles::Exists(absPath)) {
         g_TransformClipCache[projectRelPath] = clip;
         return nullptr;
     }
 
     json j;
     try {
+        std::istringstream file(AssetFiles::ReadText(absPath));
         file >> j;
     } catch (...) {
         g_TransformClipCache[projectRelPath] = clip;
@@ -436,6 +439,23 @@ std::string FormatConditionFailure(const AnimatorComponent& anim,
 
 } // namespace
 
+float GetAnimatorNormalizedTime(const AnimatorComponent& animator, const std::string& stateName) {
+    if (!animator.controller || (!stateName.empty() && animator.currentState != stateName)) return -1.0f;
+    const auto* state = FindState(*animator.controller, animator.currentState);
+    if (!state) return -1.0f;
+    double normalized = 0.0;
+    if (const auto* clip = ResolveStateTransformClip(animator, *state)) {
+        normalized = TransformClipElapsedNormalizedTime(*clip, *state, animator.stateTime);
+    } else if (const auto model = ResolveStateClipModel(animator, *state)) {
+        if (ClipDurationForState(*model, *state) <= 0.0) return -1.0f;
+        normalized = ElapsedNormalizedStateTime(*model, *state, animator.stateTime);
+    } else return -1.0f;
+    normalized += NormalizedStartOffset(*state);
+    if (state->loop) normalized -= std::floor(normalized);
+    else normalized = std::clamp(normalized, 0.0, 1.0);
+    return static_cast<float>(normalized);
+}
+
 std::vector<AnimatorTransitionProbe> ProbeOutgoingTransitions(const AnimatorComponent& animator) {
     std::vector<AnimatorTransitionProbe> probes;
     if (!animator.controller)
@@ -595,7 +615,7 @@ void ReloadAnimatorsUsingController(Scene& scene, const std::string& controllerR
     if (controllerRelPath.empty())
         return;
     for (auto& entityPtr : scene.GetEntities()) {
-        if (!entityPtr)
+        if (!entityPtr || !scene.IsActiveInHierarchy(*entityPtr))
             continue;
         auto* animator = entityPtr->GetComponent<AnimatorComponent>();
         if (animator && animator->controllerPath == controllerRelPath)
@@ -606,6 +626,7 @@ void ReloadAnimatorsUsingController(Scene& scene, const std::string& controllerR
 void ReloadAllSceneAnimators(Scene& scene) {
     std::unordered_set<std::string> controllerPaths;
     for (auto& entityPtr : scene.GetEntities()) {
+        CheckPreparationCancelled();
         if (!entityPtr)
             continue;
         if (auto* animator = entityPtr->GetComponent<AnimatorComponent>()) {
@@ -618,6 +639,7 @@ void ReloadAllSceneAnimators(Scene& scene) {
         assets.DropAnimatorController(path);
 
     for (auto& entityPtr : scene.GetEntities()) {
+        CheckPreparationCancelled();
         if (!entityPtr)
             continue;
         if (auto* animator = entityPtr->GetComponent<AnimatorComponent>())

@@ -54,7 +54,7 @@ function handleRequest(message) {
         respond(id, {
           capabilities: {
             textDocumentSync: 2,
-            completionProvider: { triggerCharacters: ["."] },
+            completionProvider: { triggerCharacters: [".", "["] },
             hoverProvider: true,
             definitionProvider: true,
           },

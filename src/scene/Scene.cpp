@@ -23,6 +23,9 @@
 #include <utility>
 #include <cmath>
 #include <filesystem>
+#include <charconv>
+#include "SceneObjectReferences.h"
+#include <limits>
 
 namespace MipsyncEngine {
 
@@ -68,24 +71,6 @@ const Mesh* ResolveSubdivisionPreview(Entity& entity, const Mesh* source,
     return subdivider->previewMesh && subdivider->previewMesh->GetIndexCount() > 0
         ? subdivider->previewMesh.get()
         : source;
-}
-
-void EnsurePs1RigidPreview(SkinnedMeshRendererComponent& skinned) {
-    if (!skinned.mesh)
-        return;
-    if (skinned.ps1RigidPreviewMesh && skinned.ps1RigidPreviewVersion == kPs1PreviewMeshVersion)
-        return;
-
-    std::shared_ptr<SkeletalModelAsset> skel;
-    if (!skinned.modelPath.empty())
-        skel = AssetManager::Get().GetSkeletalModel(skinned.modelPath);
-    if (!skel || !skel->mesh || skel->mesh->GetIndexCount() == 0)
-        return;
-
-    skinned.ps1RigidPreviewMesh = Mips::BuildPs1RigidBonePreview(
-        *skel, skinned.meshPartIndex, skinned.ps1SeamFill,
-        skinned.ps1VertexAnimTargetTris, skinned.ps1VertexAnimTargetVerts);
-    skinned.ps1RigidPreviewVersion = kPs1PreviewMeshVersion;
 }
 
 uint8_t Expand5To8(uint16_t v) {
@@ -315,7 +300,7 @@ void MeshRendererComponent::RebuildMesh() {
     ps1PreviewTexturePath.clear();
     if (meshPrimitive == "File") {
         if (!meshPath.empty()) {
-            mesh = AssetManager::Get().GetMesh(meshPath);
+            mesh = AssetManager::Get().GetMesh(meshPath, meshPartIndex);
             if (mesh) {
                 ps1PreviewMesh = Mips::BuildPs1PreviewMesh(*mesh, true);
                 ps1PreviewMeshVersion = kPs1PreviewMeshVersion;
@@ -325,6 +310,7 @@ void MeshRendererComponent::RebuildMesh() {
     }
 
     meshPath.clear();
+    meshPartIndex = -1;
     if (meshPrimitive == "Sphere")
         mesh = std::make_shared<Mesh>(Mesh::CreateSphere(meshSize * 0.5f, 16, 12));
     else if (meshPrimitive == "Plane")
@@ -356,7 +342,7 @@ void MeshRendererComponent::SetMeshFile(const std::string& projectRelPath) {
     meshPrimitive = "File";
     ps1PreviewMesh.reset();
     ps1PreviewMeshVersion = 0;
-    mesh = AssetManager::Get().GetMesh(projectRelPath);
+    mesh = AssetManager::Get().GetMesh(projectRelPath, meshPartIndex);
     if (!mesh) {
         MIPSYNC_WARN("Failed to load mesh asset: {}", projectRelPath);
         mesh = std::make_shared<Mesh>(Mesh::CreateCube(1.0f));
@@ -1558,24 +1544,13 @@ void SkinnedMeshRendererComponent::SetModelFile(const std::string& projectRelPat
     modelPath = projectRelPath;
     ps1RigidPreviewMesh.reset();
     ps1RigidPreviewVersion = 0;
+    ps1VertexPreview.reset();
     AssetManager::Get().DropSkeletalModel(projectRelPath);
     AssetThumbnail::Get().DropMeshThumbnail(projectRelPath);
     auto model = AssetManager::Get().GetSkeletalModel(projectRelPath);
     mesh = model ? model->mesh : nullptr;
     if (!mesh)
         MIPSYNC_WARN("Failed to load skeletal model: {}", projectRelPath);
-}
-
-glm::mat4 TransformComponent::RotationMatrixFromEuler(const glm::vec3& eulerDegrees) {
-    // FPS / camera: yaw around world Y, then pitch around local X, then roll.
-    return glm::rotate(glm::mat4(1.0f), glm::radians(eulerDegrees.y), glm::vec3(0.0f, 1.0f, 0.0f))
-         * glm::rotate(glm::mat4(1.0f), glm::radians(eulerDegrees.x), glm::vec3(1.0f, 0.0f, 0.0f))
-         * glm::rotate(glm::mat4(1.0f), glm::radians(eulerDegrees.z), glm::vec3(0.0f, 0.0f, 1.0f));
-}
-
-glm::mat4 TransformComponent::GetTransform() const {
-    const glm::mat4 rot = RotationMatrixFromEuler(rotation);
-    return glm::translate(glm::mat4(1.0f), position) * rot * glm::scale(glm::mat4(1.0f), scale);
 }
 
 // ─────────────────────────────────────────────────
@@ -1643,6 +1618,31 @@ const Entity* Scene::FindEntity(uint32_t id) const {
     for (const auto& e : m_Entities)
         if (e->GetID() == id) return e.get();
     return nullptr;
+}
+
+bool Scene::IsActiveInHierarchy(const Entity& entity) const {
+    const Entity* cursor = &entity;
+    uint32_t visited[64];
+    size_t visitCount = 0;
+
+    while (cursor) {
+        if (!cursor->IsActive())
+            return false;
+
+        const uint32_t id = cursor->GetID();
+        for (size_t i = 0; i < visitCount; ++i) {
+            if (visited[i] == id) {
+                MIPSYNC_WARN("Active hierarchy parent cycle detected on entity {}", id);
+                return false;
+            }
+        }
+        if (visitCount >= sizeof(visited) / sizeof(visited[0]))
+            return false;
+        visited[visitCount++] = id;
+
+        cursor = FindEntity(cursor->GetParentID());
+    }
+    return true;
 }
 
 bool Scene::IsAncestor(uint32_t ancestorId, uint32_t descendantId) const {
@@ -1745,6 +1745,21 @@ bool Scene::ReorderEntity(Entity* child, Entity* parent, Entity* sibling, bool i
 
     const uint32_t oldParentId = child->GetParentID();
     const uint32_t newParentId = parent ? parent->GetID() : 0;
+    std::vector<uint32_t> oldRootOrder;
+    if (!parent) {
+        for (const auto& entity : m_Entities)
+            if (entity->GetParentID() == 0) oldRootOrder.push_back(entity->GetID());
+        if (oldParentId == 0) {
+            auto requestedOrder = oldRootOrder;
+            requestedOrder.erase(std::remove(requestedOrder.begin(), requestedOrder.end(), child->GetID()), requestedOrder.end());
+            auto position = sibling
+                ? std::find(requestedOrder.begin(), requestedOrder.end(), sibling->GetID())
+                : requestedOrder.end();
+            if (sibling && insertAfter && position != requestedOrder.end()) ++position;
+            requestedOrder.insert(position, child->GetID());
+            if (requestedOrder == oldRootOrder) return false;
+        }
+    }
     const glm::mat4 oldWorld = worldPositionStays
         ? GetWorldMatrix(*child) : glm::mat4(1.0f);
 
@@ -1782,7 +1797,10 @@ bool Scene::ReorderEntity(Entity* child, Entity* parent, Entity* sibling, bool i
         m_Entities.insert(insertIt, std::move(moved));
         if (worldPositionStays)
             ApplyLocalTransformMatrix(*child, oldWorld);
-        return oldParentId != newParentId || sibling != nullptr;
+        std::vector<uint32_t> newRootOrder;
+        for (const auto& entity : m_Entities)
+            if (entity->GetParentID() == 0) newRootOrder.push_back(entity->GetID());
+        return oldParentId != newParentId || oldRootOrder != newRootOrder;
     }
 
     auto& siblings = *targetList;
@@ -1849,11 +1867,38 @@ void Scene::SetWorldPosition(Entity& entity, const glm::vec3& worldPos) {
 }
 
 Entity* Scene::DuplicateEntity(Entity& source) {
+  const auto* sourceTag = source.GetComponent<TagComponent>();
+  std::string baseName = sourceTag ? sourceTag->tag : "Entity";
+  uint64_t number = 1;
+  // Continue the existing suffix instead of producing "Object (1) (1)".
+  const auto suffix = baseName.rfind(" (");
+  if (suffix != std::string::npos && suffix > 0 && baseName.back() == ')') {
+    const char* begin = baseName.data() + suffix + 2;
+    const char* end = baseName.data() + baseName.size() - 1;
+    uint64_t previous = 0;
+    const auto parsed = std::from_chars(begin, end, previous);
+    if (parsed.ec == std::errc{} && parsed.ptr == end) {
+      baseName.resize(suffix);
+      number = previous == std::numeric_limits<uint64_t>::max() ? 1 : previous + 1;
+    }
+  }
+  std::unordered_set<std::string> siblingNames;
+  for (const auto& entity : m_Entities) {
+    if (entity->GetParentID() != source.GetParentID()) continue;
+    if (const auto* tag = entity->GetComponent<TagComponent>()) siblingNames.insert(tag->tag);
+  }
+  std::string duplicateName;
+  do {
+    duplicateName = baseName + " (" + std::to_string(number) + ")";
+    number = number == std::numeric_limits<uint64_t>::max() ? 1 : number + 1;
+  } while (siblingNames.count(duplicateName));
+  std::unordered_map<uint32_t, uint32_t> copiedIds;
   std::function<Entity*(Entity*, Entity*)> cloneRecursive =
       [&](Entity* src, Entity* newParent) -> Entity* {
     const auto* srcTag = src->GetComponent<TagComponent>();
-    const std::string name = srcTag ? srcTag->tag + " (Copy)" : "Entity (Copy)";
+    const std::string name = src == &source ? duplicateName : srcTag ? srcTag->tag : "Entity";
     Entity* copy = CreateEntity(name);
+    copiedIds[src->GetID()] = copy->GetID();
     copy->SetActive(src->IsActive());
     copy->SetStatic(src->IsStatic());
     copy->SetEditorTag(src->GetEditorTag());
@@ -1879,6 +1924,8 @@ Entity* Scene::DuplicateEntity(Entity& source) {
       dstSk.materialPath = srcSk->materialPath;
       dstSk.textureTiling = srcSk->textureTiling;
       dstSk.textureOffset = srcSk->textureOffset;
+      dstSk.typePreset = srcSk->typePreset;
+      dstSk.renderType = srcSk->renderType;
       dstSk.color = srcSk->color;
       dstSk.ps1SeamFill = srcSk->ps1SeamFill;
       dstSk.SetModelFile(dstSk.modelPath);
@@ -1903,12 +1950,14 @@ Entity* Scene::DuplicateEntity(Entity& source) {
       dstMr.meshPrimitive = srcMr->meshPrimitive;
       dstMr.meshSize = srcMr->meshSize;
       dstMr.meshPath = srcMr->meshPath;
+      dstMr.meshPartIndex = srcMr->meshPartIndex;
       dstMr.texturePath = srcMr->texturePath;
       dstMr.materialPath = srcMr->materialPath;
       dstMr.textureTiling = srcMr->textureTiling;
       dstMr.textureOffset = srcMr->textureOffset;
       dstMr.color = srcMr->color;
       dstMr.typePreset = srcMr->typePreset;
+      dstMr.renderType = srcMr->renderType;
       dstMr.ps1SeamFill = srcMr->ps1SeamFill;
       dstMr.texture = srcMr->texture;
       dstMr.RebuildMesh();
@@ -1983,6 +2032,7 @@ Entity* Scene::DuplicateEntity(Entity& source) {
       auto& dstAudio = copy->AddComponent<AudioSourceComponent>();
       dstAudio.enabled = srcAudio->enabled;
       dstAudio.clipPath = srcAudio->clipPath;
+      dstAudio.type = srcAudio->type;
       dstAudio.playOnAwake = srcAudio->playOnAwake;
       dstAudio.loop = srcAudio->loop;
       dstAudio.mute = srcAudio->mute;
@@ -2098,6 +2148,8 @@ Entity* Scene::DuplicateEntity(Entity& source) {
       auto& dstGroup = copy->AddComponent<UIButtonGroupComponent>();
       dstGroup.enabled = srcGroup->enabled;
       dstGroup.selectedIndex = srcGroup->selectedIndex;
+      dstGroup.navigationAudioSourceId = srcGroup->navigationAudioSourceId;
+      dstGroup.confirmAudioSourceId = srcGroup->confirmAudioSourceId;
       dstGroup.wrapNavigation = srcGroup->wrapNavigation;
       dstGroup.keyboardNavigation = srcGroup->keyboardNavigation;
       dstGroup.gamepadNavigation = srcGroup->gamepadNavigation;
@@ -2148,11 +2200,23 @@ Entity* Scene::DuplicateEntity(Entity& source) {
     return copy;
   };
 
-  return cloneRecursive(&source, nullptr);
+  Entity* root = cloneRecursive(&source, FindEntity(source.GetParentID()));
+  for (const auto& [oldId, newId] : copiedIds) {
+    (void)oldId;
+    RemapScriptObjectReferences(*FindEntity(newId), copiedIds);
+    auto* group = FindEntity(newId)->GetComponent<UIButtonGroupComponent>();
+    if (!group) continue;
+    auto remap = [&](uint32_t& id) { auto found = copiedIds.find(id); if (found != copiedIds.end()) id = found->second; };
+    remap(group->navigationAudioSourceId); remap(group->confirmAudioSourceId);
+  }
+  ReorderEntity(root, FindEntity(source.GetParentID()), &source, true);
+  return root;
 }
 
 void Scene::SyncCamerasToWorldTransforms() {
     for (auto& entityPtr : m_Entities) {
+        if (!entityPtr || !IsActiveInHierarchy(*entityPtr))
+            continue;
         auto* cam = entityPtr->GetComponent<CameraComponent>();
         auto* tr  = entityPtr->GetComponent<TransformComponent>();
         if (!cam || !cam->enabled || !tr) continue;
@@ -2215,6 +2279,8 @@ void Scene::NormalizePrimaryCameras() {
 Entity* Scene::GetPrimaryCameraEntity() {
     Entity* bestPrimary = nullptr;
     for (auto& entity : m_Entities) {
+        if (!entity || !IsActiveInHierarchy(*entity))
+            continue;
         auto* cameraComp = entity->GetComponent<CameraComponent>();
         if (!cameraComp || !cameraComp->enabled || !cameraComp->primary)
             continue;
@@ -2225,6 +2291,8 @@ Entity* Scene::GetPrimaryCameraEntity() {
     if (bestPrimary)
         return bestPrimary;
     for (auto& entity : m_Entities) {
+        if (!entity || !IsActiveInHierarchy(*entity))
+            continue;
         auto* cameraComp = entity->GetComponent<CameraComponent>();
         if (cameraComp && cameraComp->enabled)
             return entity.get();
@@ -2257,7 +2325,7 @@ struct ActiveDistanceCull {
 std::vector<ActiveDistanceCull> CollectActiveDistanceCullers(const Scene& scene, bool editorSceneView = false) {
     std::vector<ActiveDistanceCull> cullers;
     for (const auto& entity : scene.GetEntities()) {
-        if (!entity || !entity->IsActive()) continue;
+        if (!entity || !scene.IsActiveInHierarchy(*entity)) continue;
         auto* cullComp = entity->GetComponent<DistanceCullComponent>();
         if (!cullComp || !cullComp->enabled || cullComp->cullDistance <= 0.0f)
             continue;
@@ -2340,7 +2408,7 @@ struct ActiveFrustumCull {
 std::vector<ActiveFrustumCull> CollectActiveFrustumCullers(const Scene& scene, bool editorSceneView = false) {
     std::vector<ActiveFrustumCull> cullers;
     for (const auto& entity : scene.GetEntities()) {
-        if (!entity || !entity->IsActive()) continue;
+        if (!entity || !scene.IsActiveInHierarchy(*entity)) continue;
         auto* fcull = entity->GetComponent<FrustumCullComponent>();
         if (!fcull || !fcull->enabled)
             continue;
@@ -2362,7 +2430,8 @@ std::vector<ActiveFrustumCull> CollectActiveFrustumCullers(const Scene& scene, b
             camEntity = entity.get();
         } else {
             for (const auto& other : scene.GetEntities()) {
-                if (other && other->IsActive() && other->GetComponent<CameraComponent>()) {
+                if (other && scene.IsActiveInHierarchy(*other) &&
+                    other->GetComponent<CameraComponent>()) {
                     camEntity = other.get();
                     break;
                 }
@@ -2430,6 +2499,8 @@ void Scene::UploadLightsToRenderer(Renderer& renderer, bool editorSceneView) con
     for (const auto& entityPtr : m_Entities) {
         if (!entityPtr || count >= kMaxSceneLights)
             break;
+        if (!IsActiveInHierarchy(*entityPtr))
+            continue;
         auto* light = entityPtr->GetComponent<LightComponent>();
         auto* transform = entityPtr->GetComponent<TransformComponent>();
         if (!light || !light->enabled || !transform)
@@ -2502,7 +2573,7 @@ void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* target
     // buffer with marked Unity geometry before drawing dynamic objects.
     if (backgroundTexture && !includeEditorOnlyMeshes) {
         for (auto& entity : m_Entities) {
-            if (!entity->IsActive()) continue;
+            if (!entity || !IsActiveInHierarchy(*entity)) continue;
             auto* transform = entity->GetComponent<TransformComponent>();
             auto* meshRenderer = entity->GetComponent<MeshRendererComponent>();
             if (!transform || !meshRenderer || !meshRenderer->enabled ||
@@ -2519,7 +2590,7 @@ void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* target
     }
 
     for (auto& entity : m_Entities) {
-        if (!entity->IsActive()) continue;
+        if (!entity || !IsActiveInHierarchy(*entity)) continue;
         auto* transform = entity->GetComponent<TransformComponent>();
         auto* meshRenderer = entity->GetComponent<MeshRendererComponent>();
         if (!transform || !meshRenderer || !meshRenderer->enabled || !meshRenderer->mesh)
@@ -2575,6 +2646,7 @@ void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* target
         }
 
         const Mesh* drawMesh = meshRenderer->mesh.get();
+        renderer.SetObjectUnlit(meshRenderer->renderType == RendererType::Unlit);
         float projectionDepthClamp = 0.0f;
         if (usePs1PreviewMeshes && meshRenderer->meshPrimitive == "File") {
             EnsurePs1PreviewMesh(*meshRenderer);
@@ -2591,10 +2663,15 @@ void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* target
             DrawProModelerWithFaceMaterials(renderer, *proModeler, *meshRenderer, *drawMesh,
                                             worldMatrix, projectionDepthClamp);
         } else {
+            const auto* subdivider = entity->GetComponent<MeshSubdividerComponent>();
             renderer.DrawMesh(*drawMesh, worldMatrix,
                               ResolveSceneViewTexture(*meshRenderer, usePs1PreviewMeshes), meshRenderer->color,
                               meshRenderer->textureTiling, meshRenderer->textureOffset,
-                              0, 0, projectionDepthClamp);
+                              0, 0, projectionDepthClamp, false,
+                              {meshRenderer->meshPrimitive == "File", true,
+                               meshRenderer->meshPrimitive == "Plane" &&
+                                   !(subdivider && subdivider->enabled && subdivider->maxLevels > 0),
+                               static_cast<uint8_t>(subdivider && subdivider->enabled ? std::clamp(subdivider->maxLevels, 0, 4) : 0)});
         }
 
         if (entity->GetID() == highlightEntityId) {
@@ -2627,6 +2704,8 @@ void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* target
     characterBones.reserve(8);
 
     for (auto& entity : m_Entities) {
+        if (!entity || !IsActiveInHierarchy(*entity))
+            continue;
         auto* skinned = entity->GetComponent<SkinnedMeshRendererComponent>();
         if (!skinned || !skinned->enabled || !skinned->mesh)
             continue;
@@ -2654,6 +2733,8 @@ void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* target
     }
 
     for (auto& entity : m_Entities) {
+        if (!entity || !IsActiveInHierarchy(*entity))
+            continue;
         auto* transform = entity->GetComponent<TransformComponent>();
         auto* skinned = entity->GetComponent<SkinnedMeshRendererComponent>();
         if (!transform || !skinned || !skinned->enabled || !skinned->mesh)
@@ -2666,6 +2747,7 @@ void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* target
             continue;
 
         const int partIndex = ResolveSkinnedMeshPartIndex(*entity, *skinned, *skel);
+        renderer.SetObjectUnlit(skinned->renderType == RendererType::Unlit);
         if (partIndex == -2)
             continue;
 
@@ -2725,12 +2807,33 @@ void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* target
 
         const int boneCount = static_cast<int>(skel->bones.size());
         const int drawPartFilter = partIndex >= 0 ? partIndex : -1;
-        if (usePs1PreviewMeshes && skinned->ps1ExportMode == SkinnedMeshRendererComponent::Ps1ExportMode::RigidBones) {
-            EnsurePs1RigidPreview(*skinned);
-            if (skinned->ps1RigidPreviewMesh) {
-                DrawSkeletalModelGpu(renderer, *skel, *skinned->ps1RigidPreviewMesh, worldMatrix, partGeo, boneIt->second.data(),
-                                      boneCount, useComponentMaterial, skinned->texture.get(), skinned->color,
+        // Rigid partitioning is not the vertex-animation path exported by
+        // mode 2. It assigns connected weighted faces to different bones and
+        // tears an ordinary character apart. Keep characters smoothly skinned;
+        // Viewmodels use the actual shared PS1 clustered topology below.
+        const bool reducedViewmodel = usePs1PreviewMeshes &&
+            skinned->typePreset == MeshTypePreset::Viewmodel &&
+            skinned->ps1ExportMode == SkinnedMeshRendererComponent::Ps1ExportMode::RigidBones;
+        if (reducedViewmodel) {
+            const std::string controller = drawAnimator ? drawAnimator->controllerPath : std::string{};
+            const std::string state = drawAnimator ? drawAnimator->currentState : std::string{};
+            auto& preview = skinned->ps1VertexPreview;
+            if (!preview || preview->sourceModel.get() != skel.get() || preview->meshPart != partIndex ||
+                preview->targetTris != skinned->ps1VertexAnimTargetTris ||
+                preview->targetVerts != skinned->ps1VertexAnimTargetVerts ||
+                preview->controllerPath != controller) {
+                preview = Mips::BuildPs1SkinnedPreview(skel, partIndex,
+                    skinned->ps1VertexAnimTargetTris, skinned->ps1VertexAnimTargetVerts, controller, state);
+            }
+            if (preview && preview->mesh) {
+                Mips::UpdatePs1SkinnedPreview(*preview, *skel, boneIt->second.data());
+                DrawSkeletalModelGpu(renderer, *skel, *preview->mesh, worldMatrix, glm::mat4(1.0f), nullptr,
+                                      0, useComponentMaterial, skinned->texture.get(), skinned->color,
                                       skinned->textureTiling, skinned->textureOffset, drawPartFilter, false);
+            } else {
+                DrawSkeletalModelGpu(renderer, *skel, *skel->mesh, worldMatrix, partGeo, boneIt->second.data(),
+                                      boneCount, useComponentMaterial, skinned->texture.get(), skinned->color,
+                                      skinned->textureTiling, skinned->textureOffset, drawPartFilter);
             }
         } else {
             DrawSkeletalModelGpu(renderer, *skel, *skel->mesh, worldMatrix, partGeo, boneIt->second.data(),

@@ -21,6 +21,8 @@ struct AnimatorTransitionProbe {
 std::vector<AnimatorTransitionProbe> ProbeOutgoingTransitions(const AnimatorComponent& animator);
 /// Jump to a state immediately (no blend); for editor clip/transition testing.
 void ForceAnimatorState(AnimatorComponent& animator, const std::string& stateName);
+/// Visible clip phase [0,1], including authored speed/start offset; -1 when absent or state mismatches.
+float GetAnimatorNormalizedTime(const AnimatorComponent& animator, const std::string& stateName = {});
 
 void SampleAnimatorBoneMatrices(const AnimatorComponent& animator, glm::mat4 out[kMaxBones]);
 /// Sample the controller default state's configured starting pose for edit-mode preview.

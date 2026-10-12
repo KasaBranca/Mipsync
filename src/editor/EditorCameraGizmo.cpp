@@ -2,6 +2,7 @@
 #include "../renderer/Camera.h"
 #include "../scene/Scene.h"
 #include <array>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -55,26 +56,53 @@ bool WorldToScreen(const glm::vec3& worldPos, const glm::mat4& view, const glm::
 void DrawWorldLine(ImDrawList* drawList, const glm::vec3& a, const glm::vec3& b,
                    const glm::mat4& view, const glm::mat4& proj,
                    const ImVec2& rectMin, const ImVec2& rectSize, ImU32 color, float thickness) {
-    ImVec2 sa, sb;
-    if (WorldToScreen(a, view, proj, rectMin, rectSize, sa) &&
-        WorldToScreen(b, view, proj, rectMin, rectSize, sb)) {
-        drawList->AddLine(sa, sb, color, thickness);
+    if (!drawList || rectSize.x <= 0 || rectSize.y <= 0) return;
+    const glm::mat4 vp = proj * view;
+    const glm::vec4 ca = vp * glm::vec4(a, 1.0f), cb = vp * glm::vec4(b, 1.0f);
+    for (int i = 0; i < 4; ++i)
+        if (!std::isfinite(ca[i]) || !std::isfinite(cb[i])) return;
+    // Clip the segment before dividing by w. Rejecting an entire line when
+    // one endpoint is behind the camera loses light rays and range rings.
+    float first = 0.0f, last = 1.0f;
+    const auto clip = [&](float da, float db) {
+        if (da < 0 && db < 0) return false;
+        if (da < 0) first = std::max(first, da / (da - db));
+        else if (db < 0) last = std::min(last, da / (da - db));
+        return first <= last;
+    };
+    if (!clip(ca.w - 0.0001f, cb.w - 0.0001f)) return;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!clip(ca.w + ca[axis], cb.w + cb[axis]) ||
+            !clip(ca.w - ca[axis], cb.w - cb[axis])) return;
     }
+    const auto screen = [&](float t) {
+        const glm::vec4 p = glm::mix(ca, cb, t);
+        return ImVec2(rectMin.x + (p.x / p.w * 0.5f + 0.5f) * rectSize.x,
+                      rectMin.y + (0.5f - p.y / p.w * 0.5f) * rectSize.y);
+    };
+    drawList->AddLine(screen(first), screen(last), color, thickness);
 }
 
 void DrawFrustum(const Camera& camera, const TransformComponent& transform, float aspect,
                  const glm::mat4& view, const glm::mat4& proj,
                  const ImVec2& rectMin, const ImVec2& rectSize, ImDrawList* drawList,
                  bool isSelected) {
+    const glm::mat4 world = glm::translate(glm::mat4(1.0f), transform.position) * GetCameraRotationMatrix(transform);
+    DrawFrustum(camera, world, aspect, view, proj, rectMin, rectSize, drawList, isSelected);
+}
+
+void DrawFrustum(const Camera& camera, const glm::mat4& worldMatrix, float aspect,
+                 const glm::mat4& view, const glm::mat4& proj,
+                 const ImVec2& rectMin, const ImVec2& rectSize, ImDrawList* drawList,
+                 bool isSelected) {
     std::array<glm::vec3, 8> localCorners{};
     BuildFrustumCorners(camera.fov, aspect, camera.nearClip, camera.farClip, localCorners);
 
-    const glm::mat4 worldMatrix = glm::translate(glm::mat4(1.0f), transform.position) * GetCameraRotationMatrix(transform);
     std::array<glm::vec3, 8> worldCorners{};
     for (size_t i = 0; i < worldCorners.size(); ++i)
         worldCorners[i] = TransformPoint(worldMatrix, localCorners[i]);
 
-    const glm::vec3 eye = transform.position;
+    const glm::vec3 eye = glm::vec3(worldMatrix[3]);
 
     // Distinctive color scheme for PS1 Camera Frustum & Far Clip
     const ImU32 bodyColor = isSelected ? IM_COL32(255, 255, 255, 180) : IM_COL32(180, 180, 180, 80);

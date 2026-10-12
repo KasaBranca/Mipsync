@@ -11,6 +11,7 @@ SkinnedMesh::~SkinnedMesh() { Cleanup(); }
 
 SkinnedMesh::SkinnedMesh(SkinnedMesh&& o) noexcept
     : m_VAO(o.m_VAO), m_VBO(o.m_VBO), m_EBO(o.m_EBO), m_IndexCount(o.m_IndexCount),
+      m_Vertices(std::move(o.m_Vertices)), m_Indices(std::move(o.m_Indices)),
       m_BoundsMin(o.m_BoundsMin), m_BoundsMax(o.m_BoundsMax) {
     o.m_VAO = o.m_VBO = o.m_EBO = 0;
     o.m_IndexCount = 0;
@@ -23,6 +24,8 @@ SkinnedMesh& SkinnedMesh::operator=(SkinnedMesh&& o) noexcept {
         m_VBO = o.m_VBO;
         m_EBO = o.m_EBO;
         m_IndexCount = o.m_IndexCount;
+        m_Vertices = std::move(o.m_Vertices);
+        m_Indices = std::move(o.m_Indices);
         m_BoundsMin = o.m_BoundsMin;
         m_BoundsMax = o.m_BoundsMax;
         o.m_VAO = o.m_VBO = o.m_EBO = 0;
@@ -32,6 +35,8 @@ SkinnedMesh& SkinnedMesh::operator=(SkinnedMesh&& o) noexcept {
 }
 
 void SkinnedMesh::Setup(const std::vector<SkinnedVertex>& vertices, const std::vector<uint32_t>& indices) {
+    m_Vertices = vertices;
+    m_Indices = indices;
     m_IndexCount = static_cast<uint32_t>(indices.size());
     if (vertices.empty()) {
         m_BoundsMin = m_BoundsMax = glm::vec3(0.0f);
@@ -89,5 +94,27 @@ void SkinnedMesh::Cleanup() {
 
 void SkinnedMesh::Bind() const { glBindVertexArray(m_VAO); }
 void SkinnedMesh::Unbind() const { glBindVertexArray(0); }
+
+void SkinnedMesh::UpdateVertexData(const std::vector<SkinnedVertex>& vertices) {
+    if (vertices.size() != m_Vertices.size()) {
+        const auto indices = m_Indices;
+        Cleanup();
+        Setup(vertices, indices);
+        return;
+    }
+    m_Vertices = vertices;
+    if (!vertices.empty()) {
+        m_BoundsMin = m_BoundsMax = vertices.front().position;
+        for (const auto& vertex : vertices) {
+            m_BoundsMin = glm::min(m_BoundsMin, vertex.position);
+            m_BoundsMax = glm::max(m_BoundsMax, vertex.position);
+        }
+    }
+    if (m_VBO) {
+        glBindBuffer(GL_ARRAY_BUFFER, m_VBO);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, vertices.size() * sizeof(SkinnedVertex), vertices.data());
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+}
 
 } // namespace MipsyncEngine

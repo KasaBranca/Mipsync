@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
-project(MipsyncEngine VERSION 2026.9.1 LANGUAGES CXX C)
+if(CMAKE_GENERATOR MATCHES "Ninja" AND NOT CMAKE_MAKE_PROGRAM)
+    find_program(CMAKE_MAKE_PROGRAM NAMES ninja ninja.exe
+        HINTS "${CMAKE_CURRENT_SOURCE_DIR}/tools"
+              "${CMAKE_CURRENT_SOURCE_DIR}/third_party/.cache/ninja")
+endif()
+project(MipsyncEngine VERSION 2026.10.12 LANGUAGES CXX C)
 enable_testing()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,44 +22,50 @@ set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(glfw
     GIT_REPOSITORY https://github.com/glfw/glfw.git
-    GIT_TAG        3.4
-    GIT_SHALLOW    TRUE
+    GIT_TAG        7b6aead9fb88b3623e3b3725ebb42670cbe4c579
+    GIT_SHALLOW    FALSE
+    GIT_CONFIG core.longpaths=true
 )
 
 # GLM
 FetchContent_Declare(glm
     GIT_REPOSITORY https://github.com/g-truc/glm.git
-    GIT_TAG        1.0.1
-    GIT_SHALLOW    TRUE
+    GIT_TAG        0af55ccecd98d4e5a8d1fad7de25ba429d60e863
+    GIT_SHALLOW    FALSE
+    GIT_CONFIG core.longpaths=true
 )
 
 # spdlog
 FetchContent_Declare(spdlog
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG        v1.15.3
-    GIT_SHALLOW    TRUE
+    GIT_TAG        6fa36017cfd5731d617e1a934f0e5ea9c4445b13
+    GIT_SHALLOW    FALSE
+    GIT_CONFIG core.longpaths=true
 )
 
 # nlohmann/json
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(json
     GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG        v3.11.3
-    GIT_SHALLOW    TRUE
+    GIT_TAG        9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03
+    GIT_SHALLOW    FALSE
+    GIT_CONFIG core.longpaths=true
 )
 
 # Dear ImGui (docking branch)
 FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG        docking
-    GIT_SHALLOW    TRUE
+    GIT_TAG        5098ce161db7f3919630b2b575347fc3b2ce5c62
+    GIT_SHALLOW    FALSE
+    GIT_CONFIG core.longpaths=true
 )
 
 # ImGuizmo
 FetchContent_Declare(imguizmo
     GIT_REPOSITORY https://github.com/CedricGuillemet/ImGuizmo.git
-    GIT_TAG        master
-    GIT_SHALLOW    TRUE
+    GIT_TAG        a712ea83e937cc6f11e22c3b2c82920857ae13df
+    GIT_SHALLOW    FALSE
+    GIT_CONFIG core.longpaths=true
 )
 
 FetchContent_MakeAvailable(glfw glm spdlog json imgui)
@@ -75,12 +86,13 @@ target_include_directories(glad PUBLIC ${CMAKE_SOURCE_DIR}/extern/glad/include)
 # 髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可
 # Dear ImGui library (manual build)
 # 髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可
+include(cmake/ImGuiTabBackground.cmake)
 add_library(imgui_lib STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_demo.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
-    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${CMAKE_BINARY_DIR}/generated/imgui/imgui_widgets.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
 )
@@ -88,6 +100,7 @@ target_include_directories(imgui_lib PUBLIC
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
 )
+target_include_directories(imgui_lib PRIVATE "${CMAKE_SOURCE_DIR}/src")
 target_link_libraries(imgui_lib PUBLIC glfw)
 target_compile_definitions(imgui_lib PUBLIC IMGUI_IMPL_OPENGL_LOADER_GLAD)
 
@@ -122,8 +135,9 @@ target_include_directories(tinyobjloader INTERFACE ${CMAKE_SOURCE_DIR}/extern/ti
 # 髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可
 FetchContent_Declare(ufbx
     GIT_REPOSITORY https://github.com/ufbx/ufbx.git
-    GIT_TAG        v0.14.1
-    GIT_SHALLOW    TRUE
+    GIT_TAG        2aef1971276442f9f6ce14c42b37deb8da9f4d3d
+    GIT_SHALLOW    FALSE
+    GIT_CONFIG core.longpaths=true
 )
 FetchContent_GetProperties(ufbx)
 if(NOT ufbx_POPULATED)
@@ -148,21 +162,20 @@ set(JPH_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(JoltPhysics
     GIT_REPOSITORY https://github.com/jrouwe/JoltPhysics.git
-    GIT_TAG        v5.2.0
-    GIT_SHALLOW    TRUE
+    GIT_TAG        a63aa3b8e24cf95f3fab2613f9a3015b164ef62c
+    GIT_SHALLOW    FALSE
+    GIT_CONFIG core.longpaths=true
 )
 FetchContent_GetProperties(JoltPhysics)
 if(NOT joltphysics_POPULATED)
     FetchContent_Populate(JoltPhysics)
-    add_subdirectory(${joltphysics_SOURCE_DIR}/Build ${joltphysics_BINARY_DIR}/jolt-build)
+    add_subdirectory("${joltphysics_SOURCE_DIR}/Build" "${joltphysics_BINARY_DIR}/jolt-build")
 endif()
 
 # 髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可
 # Main executable
 # 髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可髫ｨ貂可
 add_subdirectory(src)
-
-
 
 
 

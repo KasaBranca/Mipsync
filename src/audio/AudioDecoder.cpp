@@ -1,3 +1,4 @@
+#include "../core/AssetFiles.h"
 #include "AudioDecoder.h"
 #include "../assets/AssetManager.h"
 
@@ -15,6 +16,7 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <objbase.h>
+#include <shlwapi.h>
 #endif
 
 namespace MipsyncEngine {
@@ -29,18 +31,22 @@ uint32_t ReadBe32(const unsigned char* p) {
 bool DecodeVag(const std::string& path, DecodedAudio& out, std::string& error) {
     FILE* file = nullptr;
 #ifdef _WIN32
-    _wfopen_s(&file, PathUtf8::FromString(path).c_str(), L"rb");
+    if(!AssetFiles::IsPackedPath(PathUtf8::FromString(path))) _wfopen_s(&file, PathUtf8::FromString(path).c_str(), L"rb");
 #else
     file = std::fopen(path.c_str(), "rb");
 #endif
-    if (!file) { error = "cannot open VAG"; return false; }
+    if (!file && !AssetFiles::IsPackedPath(PathUtf8::FromString(path))) { error = "cannot open VAG"; return false; }
+    std::vector<unsigned char> bytes;
+    bool readOk=false;
+    if(AssetFiles::IsPackedPath(PathUtf8::FromString(path))) {bytes=AssetFiles::Read(PathUtf8::FromString(path));readOk=true;} else {
     std::fseek(file, 0, SEEK_END);
     const long length = std::ftell(file);
     std::fseek(file, 0, SEEK_SET);
-    std::vector<unsigned char> bytes(length > 0 ? static_cast<size_t>(length) : 0);
-    const bool readOk = !bytes.empty() &&
+    bytes.resize(length > 0 ? static_cast<size_t>(length) : 0);
+    readOk = !bytes.empty() &&
         std::fread(bytes.data(), 1, bytes.size(), file) == bytes.size();
     std::fclose(file);
+    }
     if (!readOk) { error = "cannot read VAG"; return false; }
     if (bytes.size() < 48 || std::memcmp(bytes.data(), "VAGp", 4) != 0) {
         error = "invalid VAG header"; return false;
@@ -87,7 +93,18 @@ bool DecodeMediaFoundation(const std::string& path, DecodedAudio& out, std::stri
     IMFSourceReader* reader = nullptr;
     IMFMediaType* requested = nullptr;
     IMFMediaType* actual = nullptr;
-    hr = MFCreateSourceReaderFromURL(PathUtf8::FromString(path).c_str(), nullptr, &reader);
+    IStream* stream=nullptr;IMFByteStream* byteStream=nullptr;
+    std::vector<uint8_t> encoded;
+    if(AssetFiles::IsPackedPath(PathUtf8::FromString(path))) {
+        encoded=AssetFiles::Read(PathUtf8::FromString(path));
+        stream=SHCreateMemStream(encoded.data(),static_cast<UINT>(encoded.size()));
+        // Older MinGW headers omit this Windows 7 API declaration.
+        using WrapStream=HRESULT (WINAPI*)(IStream*,IMFByteStream**);
+        auto wrap=reinterpret_cast<WrapStream>(GetProcAddress(GetModuleHandleW(L"mfplat.dll"),"MFCreateMFByteStreamOnStream"));
+        hr=stream && wrap?wrap(stream,&byteStream):E_FAIL;
+        if(SUCCEEDED(hr))hr=MFCreateSourceReaderFromByteStream(byteStream,nullptr,&reader);
+    }else hr = MFCreateSourceReaderFromURL(PathUtf8::FromString(path).c_str(), nullptr, &reader);
+    ReleaseCom(byteStream);ReleaseCom(stream);
     if (SUCCEEDED(hr)) hr = MFCreateMediaType(&requested);
     if (SUCCEEDED(hr)) hr = requested->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
     if (SUCCEEDED(hr)) hr = requested->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
@@ -103,6 +120,7 @@ bool DecodeMediaFoundation(const std::string& path, DecodedAudio& out, std::stri
         return false;
     }
     out.sampleRate = sampleRate;
+    out.channels = channels;
     while (true) {
         DWORD flags = 0;
         IMFSample* sample = nullptr;
@@ -116,6 +134,7 @@ bool DecodeMediaFoundation(const std::string& path, DecodedAudio& out, std::stri
                 if (SUCCEEDED(buffer->Lock(&data, nullptr, &length))) {
                     const int16_t* pcm = reinterpret_cast<const int16_t*>(data);
                     const size_t frames = length / (sizeof(int16_t) * channels);
+                    out.playbackSamples.insert(out.playbackSamples.end(),pcm,pcm+frames*channels);
                     out.monoSamples.reserve(out.monoSamples.size() + frames);
                     for (size_t frame = 0; frame < frames; ++frame) {
                         int sum = 0;

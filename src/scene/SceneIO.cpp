@@ -1,5 +1,11 @@
+#include "../core/PreparationCancellation.h"
+#include "../core/AssetFiles.h"
+#include <sstream>
 #include "SceneIO.h"
+#include "SceneObjectReferences.h"
+#include "SceneChildOrder.h"
 #include "Scene.h"
+#include "ComponentCopy.h"
 #include "../mips/MipsRuntime.h"
 #include "../renderer/Mesh.h"
 #include "../renderer/Texture.h"
@@ -13,6 +19,8 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdint>
+#include <unordered_set>
+#include <limits>
 
 namespace fs = std::filesystem;
 
@@ -103,25 +111,26 @@ const char* MeshRendererPresetName(MeshRendererComponent::TypePreset preset) {
     }
 }
 
-MeshRendererComponent::TypePreset MeshRendererPresetFromJson(const json& mr) {
+MeshTypePreset MeshRendererPresetFromJson(
+    const json& mr, MeshTypePreset defaultPreset = MeshTypePreset::Prop) {
     // Legacy scenes used a standalone checkbox. Preserve it during migration.
     if (!mr.contains("typePreset"))
         return mr.value("viewModel", false)
-            ? MeshRendererComponent::TypePreset::Viewmodel
-            : MeshRendererComponent::TypePreset::Prop;
+            ? MeshTypePreset::Viewmodel
+            : defaultPreset;
     if (mr["typePreset"].is_number_integer()) {
         const int value = std::clamp(mr["typePreset"].get<int>(), 0, 4);
-        return static_cast<MeshRendererComponent::TypePreset>(value);
+        return static_cast<MeshTypePreset>(value);
     }
     std::string value = mr.value("typePreset", std::string{"Prop"});
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    if (value == "corridor") return MeshRendererComponent::TypePreset::Corridor;
-    if (value == "character") return MeshRendererComponent::TypePreset::Character;
+    if (value == "corridor") return MeshTypePreset::Corridor;
+    if (value == "character") return MeshTypePreset::Character;
     if (value == "viewmodel" || value == "view-model")
-        return MeshRendererComponent::TypePreset::Viewmodel;
-    if (value == "floor") return MeshRendererComponent::TypePreset::Floor;
-    return MeshRendererComponent::TypePreset::Prop;
+        return MeshTypePreset::Viewmodel;
+    if (value == "floor") return MeshTypePreset::Floor;
+    return defaultPreset;
 }
 
 bool IsCameraTriggerTag(const json& ent) {
@@ -142,7 +151,7 @@ bool AssetFileExists(const AssetManager& assets, const std::string& projectRelPa
     if (projectRelPath.empty())
         return false;
     std::error_code ec;
-    return fs::exists(PathUtf8::FromString(assets.ToAbsolute(projectRelPath)), ec);
+    return AssetFiles::Exists(PathUtf8::FromString(assets.ToAbsolute(projectRelPath)));
 }
 
 std::string ResolveAssetPathWithAssetsFallback(const AssetManager& assets,
@@ -174,6 +183,7 @@ uint64_t HashLegacyMaterial(const Material& material, const char* rendererKind) 
     addBytes(&material.color, sizeof(material.color));
     addBytes(&material.mainTextureTiling, sizeof(material.mainTextureTiling));
     addBytes(&material.mainTextureOffset, sizeof(material.mainTextureOffset));
+    addBytes(&material.ps1TextureMaxSize, sizeof(material.ps1TextureMaxSize));
     return hash;
 }
 
@@ -261,6 +271,7 @@ json EntityComponentsToJson(const Entity& entity) {
             { "rotation", Vec3ToJson(transform->rotation) },
             { "scale",    Vec3ToJson(transform->scale) },
         };
+        if (!transform->enabled) ent["transform"]["enabled"] = false;
     }
 
     if (const auto* mesh = const_cast<Entity&>(entity).GetComponent<MeshRendererComponent>()) {
@@ -270,6 +281,7 @@ json EntityComponentsToJson(const Entity& entity) {
         mr["primitive"] = mesh->meshPrimitive;
         mr["size"] = mesh->meshSize;
         mr["typePreset"] = MeshRendererPresetName(mesh->typePreset);
+        mr["renderType"] = mesh->renderType == RendererType::Unlit ? "Unlit" : "Lit";
         if (!mesh->materialPath.empty()) mr["material"] = mesh->materialPath;
         if (mesh->editorOnly)
             mr["editorOnly"] = true;
@@ -278,6 +290,7 @@ json EntityComponentsToJson(const Entity& entity) {
         if (mesh->ps1SeamFill)
             mr["ps1SeamFill"] = true;
         if (!mesh->meshPath.empty()) mr["mesh"] = mesh->meshPath;
+        if (mesh->meshPartIndex >= 0) mr["meshPart"] = mesh->meshPartIndex;
         ent["meshRenderer"] = mr;
     }
 
@@ -358,6 +371,8 @@ json EntityComponentsToJson(const Entity& entity) {
         if (!skinned->enabled)
             sm["enabled"] = false;
         sm["color"] = Vec4ToJson(skinned->color);
+        sm["typePreset"] = MeshRendererPresetName(skinned->typePreset);
+        sm["renderType"] = skinned->renderType == RendererType::Unlit ? "Unlit" : "Lit";
         if (!skinned->modelPath.empty()) sm["model"] = skinned->modelPath;
         if (!skinned->materialPath.empty()) sm["material"] = skinned->materialPath;
         if (skinned->meshPartIndex >= 0) sm["meshPart"] = skinned->meshPartIndex;
@@ -547,6 +562,7 @@ json EntityComponentsToJson(const Entity& entity) {
     if (const auto* audio = const_cast<Entity&>(entity).GetComponent<AudioSourceComponent>()) {
         json audioJson = {
             { "clip", audio->clipPath },
+            { "type", static_cast<int>(audio->type) },
             { "playOnAwake", audio->playOnAwake },
             { "loop", audio->loop },
             { "mute", audio->mute },
@@ -628,6 +644,8 @@ json EntityComponentsToJson(const Entity& entity) {
     if (const auto* group = const_cast<Entity&>(entity).GetComponent<UIButtonGroupComponent>()) {
         json groupJson = {
             { "selectedIndex", group->selectedIndex },
+            { "navigationAudioSource", group->navigationAudioSourceId },
+            { "confirmAudioSource", group->confirmAudioSourceId },
             { "wrapNavigation", group->wrapNavigation },
             { "keyboardNavigation", group->keyboardNavigation },
             { "gamepadNavigation", group->gamepadNavigation },
@@ -689,6 +707,21 @@ json EntityComponentsToJson(const Entity& entity) {
         ent["uiAudioSpectrum"] = spectrumJson;
     }
 
+    // The legacy named fields describe the first component of each type.
+    // Preserve further instances created by component paste without changing
+    // existing scenes or the Mips# array representation.
+    std::unordered_set<std::string> seen;
+    for (const Component* component : entity.GetComponentsInOrder()) {
+        const char* key = ComponentOrderKey(component);
+        if (!key || std::string(key) == "mipsScript" || seen.insert(key).second)
+            continue;
+        Entity single(0, "");
+        single.RemoveComponent<TagComponent>();
+        single.RemoveComponent<TransformComponent>();
+        single.AdoptComponent(CloneComponentValue(*component));
+        if (!ent.contains("additionalComponents")) ent["additionalComponents"] = json::array();
+        ent["additionalComponents"].push_back({{"type", key}, {"data", EntityComponentsToJson(single)}});
+    }
     return ent;
 }
 
@@ -697,6 +730,7 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         auto* transform = entity.GetComponent<TransformComponent>();
         const json& t = ent["transform"];
         if (transform) {
+            transform->enabled = t.value("enabled", true);
             if (t.contains("position")) Vec3FromJson(t["position"], transform->position);
             if (t.contains("rotation")) Vec3FromJson(t["rotation"], transform->rotation);
             if (t.contains("scale"))    Vec3FromJson(t["scale"],    transform->scale);
@@ -722,7 +756,9 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         const std::string legacyTexturePath = ResolveAssetPathWithAssetsFallback(
             assets, mr.value("texture", std::string{}));
         meshComp.meshPath     = mr.value("mesh",     std::string{});
+        meshComp.meshPartIndex = mr.value("meshPart", -1);
         meshComp.typePreset   = MeshRendererPresetFromJson(mr);
+        meshComp.renderType = mr.value("renderType", std::string{"Lit"}) == "Unlit" ? RendererType::Unlit : RendererType::Lit;
         meshComp.editorOnly   = mr.value("editorOnly", false);
         meshComp.prerenderOccluder = mr.value("prerenderOccluder", false);
         meshComp.ps1SeamFill  = mr.value("ps1SeamFill", false);
@@ -903,6 +939,9 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         skinComp.materialPath = ResolveAssetPathWithAssetsFallback(
             assets, sm.value("material", std::string{}));
         skinComp.meshPartIndex = sm.value("meshPart", -1);
+        skinComp.renderType = sm.value("renderType", std::string{"Lit"}) == "Unlit" ? RendererType::Unlit : RendererType::Lit;
+        skinComp.typePreset = MeshRendererPresetFromJson(
+            sm, SkinnedMeshRendererComponent::TypePreset::Character);
         skinComp.ps1ExportMode = static_cast<SkinnedMeshRendererComponent::Ps1ExportMode>(
             std::clamp(sm.value("ps1ExportMode", static_cast<int>(skinComp.ps1ExportMode)), 0, 2));
         skinComp.ps1SeamFill = sm.value("ps1SeamFill", false);
@@ -1032,6 +1071,7 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         auto& audio = entity.AddComponent<AudioSourceComponent>();
         audio.enabled = audioJson.value("enabled", true);
         audio.clipPath = audioJson.value("clip", std::string{});
+        audio.type = static_cast<AudioSourceType>(std::clamp(audioJson.value("type", 0), 0, 2));
         audio.playOnAwake = audioJson.value("playOnAwake", true);
         audio.loop = audioJson.value("loop", false);
         audio.mute = audioJson.value("mute", false);
@@ -1202,6 +1242,8 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         auto& group = entity.AddComponent<UIButtonGroupComponent>();
         group.enabled = groupJson.value("enabled", true);
         group.selectedIndex = groupJson.value("selectedIndex", group.selectedIndex);
+        group.navigationAudioSourceId = groupJson.value("navigationAudioSource", 0u);
+        group.confirmAudioSourceId = groupJson.value("confirmAudioSource", 0u);
         group.wrapNavigation = groupJson.value("wrapNavigation", group.wrapNavigation);
         group.keyboardNavigation = groupJson.value("keyboardNavigation", group.keyboardNavigation);
         group.gamepadNavigation = groupJson.value("gamepadNavigation", group.gamepadNavigation);
@@ -1268,6 +1310,26 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         spectrum.smoothing = spectrumJson.value("smoothing", spectrum.smoothing);
     }
 
+    if (ent.contains("additionalComponents") && ent["additionalComponents"].is_array()) {
+        for (const json& entry : ent["additionalComponents"]) {
+            if (!entry.is_object() || !entry.contains("data") || !entry["data"].is_object()) continue;
+            const std::string key = entry.value("type", std::string{});
+            // Entries contain a single component; nested containers cannot
+            // recursively manufacture entities/components from malformed data.
+            json data = entry["data"];
+            data.erase("additionalComponents");
+            Entity single(0, data.value("name", std::string{}));
+            ApplyEntityJson(single, data, name);
+            for (Component* component : single.GetComponentsInOrder()) {
+                const char* candidate = ComponentOrderKey(component);
+                if (candidate && key == candidate) {
+                    entity.AdoptComponent(CloneComponentValue(*component));
+                    break;
+                }
+            }
+        }
+    }
+
     if (ent.contains("componentOrder") && ent["componentOrder"].is_array()) {
         std::vector<Component*> remaining = entity.GetComponentsInOrder();
         std::vector<Component*> ordered;
@@ -1300,6 +1362,7 @@ bool BuildSceneJson(Scene& scene, json& root, std::string& outError) {
         root["entities"] = json::array();
 
         for (const auto& entityPtr : scene.GetEntities()) {
+            CheckPreparationCancelled();
             Entity* entity = entityPtr.get();
           for (auto* script : entity->GetComponents<MipsScriptComponent>()) {
             if (!script->scriptPath.empty()) {
@@ -1312,6 +1375,10 @@ bool BuildSceneJson(Scene& scene, json& root, std::string& outError) {
             ent["id"] = entity->GetID();
             if (entity->GetParentID() != 0)
                 ent["parent"] = entity->GetParentID();
+            // Child display order is independent of the global entity array.
+            // Include it in both disk saves and undo/dirty fingerprints.
+            if (!entity->GetChildIDs().empty())
+                ent["childOrder"] = entity->GetChildIDs();
             root["entities"].push_back(ent);
         }
         return true;
@@ -1340,11 +1407,16 @@ bool SaveToFile(Scene& scene, const std::string& path, std::string& outError) {
             fs::create_directories(filePath.parent_path());
 
         std::ofstream file(filePath);
-        if (!file.is_open()) {
+        if (!file) {
             outError = "failed to open file for writing: " + path;
             return false;
         }
         file << root.dump(2);
+        file.flush();
+        if (!file) {
+            outError = "failed to write scene file: " + path;
+            return false;
+        }
         return true;
     } catch (const std::exception& ex) {
         outError = ex.what();
@@ -1383,6 +1455,16 @@ bool LoadSceneFromJsonRoot(Scene& scene, const json& root, std::string& outError
             scene.SetParent(child, parent);
     }
 
+    for (const json& ent : root["entities"]) {
+        const auto order = ent.find("childOrder");
+        if (order == ent.end() || !order->is_array())
+            continue; // Legacy scenes keep their existing entity-array order.
+        Entity* parent = scene.FindEntity(ent.value("id", 0u));
+        if (!parent)
+            continue;
+        ApplySceneChildOrder(parent->GetChildIDs(), *order);
+    }
+
     scene.NormalizePrimaryCameras();
     return true;
 }
@@ -1401,8 +1483,8 @@ bool LoadFromJsonString(Scene& scene, const std::string& jsonText, std::string& 
 
 bool LoadFromFile(Scene& scene, const std::string& path, std::string& outError) {
     try {
-        std::ifstream file(PathUtf8::FromString(path));
-        if (!file.is_open()) {
+        std::istringstream file(AssetFiles::ReadText(PathUtf8::FromString(path)));
+        if (!file) {
             outError = "failed to open file: " + path;
             return false;
         }
@@ -1428,6 +1510,7 @@ json EntityToJsonRecursive(const Entity& entity, const Scene& scene) {
   }
 
     json ent = EntityComponentsToJson(entity);
+    ent["id"] = entity.GetID();
 
     const std::vector<uint32_t>& childIds = entity.GetChildIDs();
     if (!childIds.empty()) {
@@ -1455,7 +1538,7 @@ bool SaveEntityToFile(const Entity& entity, const Scene& scene,
             fs::create_directories(filePath.parent_path());
 
         std::ofstream file(filePath);
-        if (!file.is_open()) {
+        if (!file) {
             outError = "failed to open file for writing: " + path;
             return false;
         }
@@ -1500,6 +1583,19 @@ Entity* SpawnModelFromAsset(Scene& scene, const std::string& projectRelPath, std
     }
 
     Entity* entity = scene.CreateEntity(entityName);
+    if (meshPtr->GetParts().size() > 1) {
+        for (size_t i = 0; i < meshPtr->GetParts().size(); ++i) {
+            const auto& part = meshPtr->GetParts()[i];
+            Entity* child = scene.CreateEntity(part.name.empty() ? "Mesh " + std::to_string(i + 1) : part.name);
+            scene.SetParent(child, entity);
+            child->GetComponent<TransformComponent>()->position = part.origin;
+            auto& renderer = child->AddComponent<MeshRendererComponent>();
+            renderer.meshPartIndex = static_cast<int>(i);
+            renderer.SetMeshFile(projectRelPath);
+            renderer.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
+        }
+        return entity;
+    }
     auto& meshComp = entity->AddComponent<MeshRendererComponent>();
     meshComp.SetMeshFile(projectRelPath);
     meshComp.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
@@ -1532,8 +1628,8 @@ Entity* InstantiateEntityJsonRecursive(Scene& scene, const json& ent,
 
 Entity* InstantiateFromFile(Scene& scene, const std::string& path, std::string& outError) {
     try {
-        std::ifstream file(PathUtf8::FromString(path));
-        if (!file.is_open()) {
+        std::istringstream file(AssetFiles::ReadText(PathUtf8::FromString(path)));
+        if (!file) {
             outError = "failed to open file: " + path;
             return nullptr;
         }
@@ -1545,7 +1641,23 @@ Entity* InstantiateFromFile(Scene& scene, const std::string& path, std::string& 
             return nullptr;
         }
 
-        return InstantiateEntityJsonRecursive(scene, root["entity"], nullptr, path);
+        Entity* instance = InstantiateEntityJsonRecursive(scene, root["entity"], nullptr, path);
+        std::unordered_map<uint32_t, uint32_t> ids;
+        std::function<void(const json&, Entity&)> collect = [&](const json& original, Entity& created) {
+            ids[original.value("id", 0u)] = created.GetID();
+            if (original.contains("children")) {
+                for (size_t i=0;i<original["children"].size() && i<created.GetChildIDs().size();++i)
+                    if (auto* child=scene.FindEntity(created.GetChildIDs()[i])) collect(original["children"][i],*child);
+            }
+        };
+        collect(root["entity"],*instance);
+        for (const auto& [oldId,newId] : ids) {
+            RemapScriptObjectReferences(*scene.FindEntity(newId), ids);
+            (void)oldId; auto* group=scene.FindEntity(newId)->GetComponent<UIButtonGroupComponent>(); if(!group)continue;
+            auto remap=[&](uint32_t& id){if(!id)return;auto found=ids.find(id);if(found!=ids.end())id=found->second;};
+            remap(group->navigationAudioSourceId);remap(group->confirmAudioSourceId);
+        }
+        return instance;
     } catch (const std::exception& ex) {
         outError = ex.what();
         return nullptr;

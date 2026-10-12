@@ -132,6 +132,8 @@ static inline void mipsync_gte_set_trans_matrix(const MATRIX* matrix) {
 
 static inline void mipsync_gte_cmd_rtps(void) { __asm__ volatile("nop\nnop\ncop2 0x0180001\n"); }
 static inline void mipsync_gte_cmd_rtpt(void) { __asm__ volatile("nop\nnop\ncop2 0x0280030\n"); }
+/* MVMVA: rotation matrix, V0, translation, Q12 shift; retain signed MAC XYZ. */
+static inline void mipsync_gte_cmd_transform(void) { __asm__ volatile("nop\nnop\ncop2 0x0480012\n"); }
 static inline void mipsync_gte_cmd_ncs(void)  { __asm__ volatile("nop\nnop\ncop2 0x0c8041e\n"); }
 static inline void mipsync_gte_cmd_nclip(void){ __asm__ volatile("nop\nnop\ncop2 0x1400006\n"); }
 static inline void mipsync_gte_cmd_avsz3(void){ __asm__ volatile("nop\nnop\ncop2 0x158002d\n"); }
@@ -149,6 +151,10 @@ static inline void mipsync_gte_store_sz3(void* a, void* b, void* c) {
 static inline void mipsync_gte_store_otz(void* out)  { __asm__ volatile("swc2 $7,0(%0)\n" : : "r"(out) : "memory"); }
 static inline void mipsync_gte_store_opz(void* out)  { __asm__ volatile("swc2 $24,0(%0)\n" : : "r"(out) : "memory"); }
 static inline void mipsync_gte_store_rgb(void* out)  { __asm__ volatile("swc2 $22,0(%0)\n" : : "r"(out) : "memory"); }
+static inline void mipsync_gte_store_camera(VECTOR* out) {
+    __asm__ volatile("swc2 $25,0(%0)\nswc2 $26,4(%0)\nswc2 $27,8(%0)\n"
+                     : : "r"(out) : "memory");
+}
 
 #define gte_ldv0(v)             mipsync_gte_load_v0((v))
 #define gte_ldv3(a,b,c)         mipsync_gte_load_v3((a),(b),(c))
@@ -162,6 +168,8 @@ static inline void mipsync_gte_store_rgb(void* out)  { __asm__ volatile("swc2 $2
 #define gte_SetColorMatrix(m)   mipsync_gte_set_color_matrix((m))
 #define gte_rtps()              mipsync_gte_cmd_rtps()
 #define gte_rtpt()              mipsync_gte_cmd_rtpt()
+#define gte_rtv0tr()            mipsync_gte_cmd_transform()
+#define gte_stlvnl(p)           mipsync_gte_store_camera((p))
 #define gte_ncs()               mipsync_gte_cmd_ncs()
 #define gte_nclip()             mipsync_gte_cmd_nclip()
 #define gte_avsz3()             mipsync_gte_cmd_avsz3()

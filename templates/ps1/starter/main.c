@@ -15,6 +15,7 @@
 
 
 #include <stdint.h>
+#include <stdio.h>
 
 #include <psxgpu.h>
 
@@ -23,6 +24,8 @@
 
 
 #include "runtime/fixedp.h"
+#include "runtime/frame_timing.h"
+#include "runtime/boot_brand.h"
 
 #include "runtime/host.h"
 
@@ -35,6 +38,8 @@
 #include "runtime/ui.h"
 
 #include "runtime/scene.h"
+#include "runtime/scene_loader.h"
+#include "generated/scene_catalog.h"
 
 
 #include "runtime/textures.h"
@@ -137,13 +142,10 @@ static void SetupDisplay(void) {
 
     /* Match the clear color to distance fog so geometry disappears into the
      * scene background instead of exposing a differently colored horizon. */
-    if (g_ps1_scene.fog_enabled) {
-        setRGB0(&draw[0], g_ps1_scene.fog_r, g_ps1_scene.fog_g, g_ps1_scene.fog_b);
-        setRGB0(&draw[1], g_ps1_scene.fog_r, g_ps1_scene.fog_g, g_ps1_scene.fog_b);
-    } else {
-        setRGB0(&draw[0], 48, 50, 54);
-        setRGB0(&draw[1], 48, 50, 54);
-    }
+    /* The Editor uses the authored fog color for clearing even when fog is
+     * disabled. Keep that color on PS1 instead of substituting a gray sky. */
+    setRGB0(&draw[0], g_ps1_scene.fog_r, g_ps1_scene.fog_g, g_ps1_scene.fog_b);
+    setRGB0(&draw[1], g_ps1_scene.fog_r, g_ps1_scene.fog_g, g_ps1_scene.fog_b);
     draw[0].isbg = 1;
     draw[0].dtd = 0;
     draw[1].isbg = 1;
@@ -217,7 +219,7 @@ static void PresentFrame(void) {
 
     s_nextpri = s_packet[db];
 
-    DrawOTag(s_ot[1 - db] + OT_LEN - 1);
+    ps1_render_submit(s_ot[1 - db], draw[db].clip.x, draw[db].clip.y, SCREEN_W, SCREEN_H, g_ps1_scene.color_grading_lut);
 
 }
 
@@ -254,6 +256,7 @@ static mbc_module* FindModule(unsigned int index) {
 
 
 static void BindSceneScripts(void) {
+    ps1_ui_reset();
 
     g_instance_count = 0;
 
@@ -356,10 +359,13 @@ int main(void) {
     uint32_t frame = 0;
     int last_vblank;
 
+    ps1_boot_brand_show();
     SetupDisplay();
+    printf("MIPSYNC_BOOT display\n");
 
     host_init();
     ps1_input_init();
+    printf("MIPSYNC_BOOT input\n");
 
 #if PS1_DRAW_DEBUG_HUD
     FntLoad(960, 0);
@@ -367,9 +373,12 @@ int main(void) {
 #endif
 
     ps1_render_init(SCREEN_W, SCREEN_H);
+    printf("MIPSYNC_BOOT renderer\n");
     ps1_textures_init();
+    printf("MIPSYNC_BOOT textures\n");
 
     ps1_scene_init();
+    printf("MIPSYNC_BOOT scene\n");
 
     /* Load initial background texture to VRAM to prevent race conditions on the first frame */
     {
@@ -396,6 +405,8 @@ int main(void) {
     ps1_audio_begin_scene();
 
     host_log("MIPSYNC PS1 ENGINE");
+    printf("MIPSYNC_SCENE_READY %d %s\n", MIPSYNC_CURRENT_SCENE_INDEX,
+           k_mipsync_scene_paths[MIPSYNC_CURRENT_SCENE_INDEX]);
 
     DecodeModules();
 
@@ -417,10 +428,8 @@ int main(void) {
         int current_vblank = VSync(-1);
         int elapsed_vblanks = current_vblank - last_vblank;
         fix16_t delta_time;
-        if (elapsed_vblanks < 1) elapsed_vblanks = 1;
-        if (elapsed_vblanks > 4) elapsed_vblanks = 4;
         last_vblank = current_vblank;
-        delta_time = fix16_div(FIX16_FROM_INT(elapsed_vblanks), FIX16_FROM_INT(60));
+        delta_time = (fix16_t)ps1_frame_delta_q16(elapsed_vblanks);
 
         ps1_input_poll();
         ps1_ui_update();
@@ -432,9 +441,10 @@ int main(void) {
         /* Update/coroutines may move kinematic platforms and carry their
          * passengers. Follow cameras run afterwards so they use the final
          * character position from this frame rather than lagging one step. */
+        /* LateUpdate observes the pose rendered this frame, matching desktop. */
+        ps1_scene_update_vertex_anims(delta_time);
         RunLateUpdates();
         ps1_audio_update();
-        ps1_scene_update_vertex_anims(delta_time);
         ps1_scene_resolve_hierarchy();
         ps1_scene_begin_frame();
 
@@ -446,6 +456,10 @@ int main(void) {
 #endif
 
         PresentFrame();
+
+        /* Scene requests from UI/scripts run after the frame, outside VM and
+         * renderer stacks that will be replaced by the next executable. */
+        ps1_scene_process_load();
 
         ++frame;
 

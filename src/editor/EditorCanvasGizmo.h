@@ -19,7 +19,8 @@ Entity* FindCanvasEntity(Scene& scene, Entity* entity);
 void DrawSceneCanvases(Scene& scene, const Camera& editorSceneCamera, const glm::mat4& view,
                        const glm::mat4& proj, const ImVec2& rectMin, const ImVec2& rectSize,
                        ImDrawList* drawList, uint32_t selectedEntityId, int layoutViewportWidth,
-                       int layoutViewportHeight);
+                       int layoutViewportHeight, bool sceneViewPreview = true,
+                       uint32_t activeCameraEntityId = 0);
 
 } // namespace EditorCanvasGizmo
 } // namespace MipsyncEngine

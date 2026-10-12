@@ -32,6 +32,9 @@ function Test-IsDateVersion {
 
 $tag = "v$Version"
 $repository = "KasaBranca/Mipsync"
+if ($Version -notmatch '^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}$') {
+  throw "Release version must use YYYY.M.D: $Version"
+}
 
 $root = (Resolve-Path "$PSScriptRoot\\..").Path
 $outDir = Join-Path $root "release"
@@ -51,6 +54,7 @@ if (Test-Path $cmakeRoot) {
 # Build engine so the embedded version string matches this release.
 Write-Host "Building Engine (cmake build)..."
 & cmake --build (Join-Path $root "build") --config Release | Out-Host
+if ($LASTEXITCODE -ne 0) { throw "Engine build failed ($LASTEXITCODE)." }
 
 $engineExe = Join-Path $root "build\\src\\MipsyncEngine.exe"
 $cliExe = Join-Path $root "build\\src\\mipsync.exe"
@@ -85,6 +89,13 @@ try {
     [System.IO.File]::WriteAllText($tauriConf, ($conf | ConvertTo-Json -Depth 20), $utf8NoBom)
   }
   npm run tauri build | Out-Host
+  if ($LASTEXITCODE -ne 0) { throw "Hub build failed ($LASTEXITCODE)." }
+  # Tauri's default-run binary does not guarantee a fresh updater executable.
+  Push-Location (Join-Path $root "hub-tauri\\src-tauri")
+  try {
+    cargo build --release --locked --bin MipsyncHubUpdater | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "Hub updater build failed ($LASTEXITCODE)." }
+  } finally { Pop-Location }
 } finally {
   Pop-Location
 }
@@ -92,21 +103,32 @@ try {
 if (!(Test-Path $hubExe)) { throw "Hub exe not found: $hubExe" }
 if (!(Test-Path $hubUpdaterExe)) { throw "Hub updater exe not found: $hubUpdaterExe" }
 
-function New-Zip($stagingDir, $zipPath) {
-  if (Test-Path $stagingDir) { Remove-Item $stagingDir -Recurse -Force }
-  New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
-  if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-  Compress-Archive -Path "$stagingDir\\*" -DestinationPath $zipPath
+function Assert-ReleasePath([string]$Path) {
+  $absolute = [IO.Path]::GetFullPath($Path)
+  $prefix = [IO.Path]::GetFullPath($outDir).TrimEnd('\') + '\'
+  if (-not $absolute.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Release output is outside the release directory: $absolute"
+  }
 }
 
 Write-Host "Staging Engine zip..."
 $engineStage = Join-Path $outDir "engine-$Version"
 $engineZip = Join-Path $outDir "MipsyncEngine_Windows_x64.zip"
+Assert-ReleasePath $engineStage
+Assert-ReleasePath $engineZip
 
 if (Test-Path $engineStage) { Remove-Item $engineStage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $engineStage | Out-Null
 Copy-Item $engineExe $engineStage -Force
 Copy-Item $cliExe $engineStage -Force
+foreach ($notice in @("LICENSE", "THIRD_PARTY_NOTICES.md")) {
+  $noticePath = Join-Path $root $notice
+  if (Test-Path $noticePath) { Copy-Item $noticePath $engineStage -Force }
+}
+if (Test-Path (Join-Path $root "third_party\licenses")) {
+  New-Item -ItemType Directory -Force -Path (Join-Path $engineStage "third_party") | Out-Null
+  Copy-Item (Join-Path $root "third_party\licenses") (Join-Path $engineStage "third_party\licenses") -Recurse -Force
+}
 
 New-Item -ItemType Directory -Force -Path (Join-Path $engineStage "resources\\icons") | Out-Null
 Copy-Item (Join-Path $root "resources\\icons\\app_icon.png") (Join-Path $engineStage "resources\\icons\\app_icon.png") -Force
@@ -177,10 +199,20 @@ Compress-Archive -Path "$engineStage\\*" -DestinationPath $engineZip
 Write-Host "Staging Hub zip..."
 $hubStage = Join-Path $outDir "hub-$Version"
 $hubZip = Join-Path $outDir "MipsyncHub_Windows_x64.zip"
+Assert-ReleasePath $hubStage
+Assert-ReleasePath $hubZip
 if (Test-Path $hubStage) { Remove-Item $hubStage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $hubStage | Out-Null
 Copy-Item $hubExe (Join-Path $hubStage "MipsyncHub.exe") -Force
 Copy-Item $hubUpdaterExe (Join-Path $hubStage "MipsyncHubUpdater.exe") -Force
+foreach ($notice in @("LICENSE", "THIRD_PARTY_NOTICES.md")) {
+  $noticePath = Join-Path $root $notice
+  if (Test-Path $noticePath) { Copy-Item $noticePath $hubStage -Force }
+}
+if (Test-Path (Join-Path $root "third_party\licenses")) {
+  New-Item -ItemType Directory -Force -Path (Join-Path $hubStage "third_party") | Out-Null
+  Copy-Item (Join-Path $root "third_party\licenses") (Join-Path $hubStage "third_party\licenses") -Recurse -Force
+}
 if (Test-Path $hubZip) { Remove-Item $hubZip -Force }
 Compress-Archive -Path "$hubStage\\*" -DestinationPath $hubZip
 
@@ -305,6 +337,7 @@ if ($SkipPublish) {
     --title "Mipsync $Version" `
     --notes-file $notesFile `
     $engineZip $hubZip $manifestPath
+  if ($LASTEXITCODE -ne 0) { throw "GitHub release publishing failed ($LASTEXITCODE)." }
 }
 
 Write-Host "Done."

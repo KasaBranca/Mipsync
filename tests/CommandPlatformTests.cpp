@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <chrono>
 
 using namespace MipsyncEngine::Command;
 
@@ -36,8 +37,52 @@ int main() {
     context.commands = &commands;
     context.symbols = &symbols;
     CommandExecutor executor(commands);
+    {
+        const auto root=std::filesystem::temp_directory_path()/("mipsync-cli-report-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(root);
+        auto run=[&](std::string command,Json arguments=Json::object()){CommandRequest request;request.command=std::move(command);request.arguments=std::move(arguments);return executor.Execute(request,context);};
+        auto compile=[&](const char* name,const std::string& source){auto path=root/(std::string(name)+".mips");std::ofstream(path)<<source;return run("language.compile",{{"file",path.string()}});};
+        auto large=compile("Large","class Large : MipsBehaviour { public int[] board; void Start() { board = new int[200]; } }");
+        const auto literalSource=std::string("class Literal : MipsBehaviour { public int[] cells; void Start() { cells = [")+[] {std::string values;for(int i=0;i<112;++i){if(i)values+=",";values+=std::to_string(i%28);}return values;}()+"]; } }";
+        const auto literal=compile("Literal",literalSource);
+        const auto limits=run("language.limits");
+        if(!large.success||large.value["ps1Compatible"]!=false||large.value["modules"][0]["ps1Diagnostics"].empty()||
+            !literal.success||literal.value["ps1Compatible"]!=false||limits.value["arrayElements"]!=32||limits.value["methodBytecodeBytes"]!=4096)return 1;
+        std::string big="class Big : MipsBehaviour { public int score; void Update() {";for(int i=0;i<900;++i)big+="score = score + 1;";big+="} }";
+        const auto bytes=compile("Big",big);if(!bytes.success||bytes.value["ps1Compatible"]!=false)return 1;
+        std::string constants="class Constants : MipsBehaviour { public int score; void Update() {";for(int i=0;i<140;++i)constants+="score = "+std::to_string(i)+";";constants+="} }";
+        const auto pool=compile("Constants",constants);if(!pool.success||pool.value["ps1Compatible"]!=false)return 1;
+        Json files=Json::array();for(int i=0;i<5;++i){auto name="Module"+std::to_string(i);compile(name.c_str(),"class "+name+" : MipsBehaviour { void Update() {} }");files.push_back((root/(name+".mips")).string());}
+        const auto aggregate=run("language.validate",{{"files",files},{"bindings",33}});if(aggregate.value["ps1Compatible"]!=false)return 1;
+        const auto located=compile("Unsupported","class Unsupported : MipsBehaviour {\n void Helper() {}\n void Start() { Helper(); }\n }");
+        if(located.success||located.diagnostics.empty()||located.diagnostics.front().location.value("line",0)!=3)return 1;
+        const auto properties=run("describe",{{"symbol","Transform"}});if(properties.value["properties"].size()<3)return 1;
+        const auto catalog=run("component.list");if(catalog.value["components"].size()!=20)return 1;
+        const auto target=run("language.compile",{{"file",(root/"Large.mips").string()},{"target","ps1"}});if(target.success)return 1;
+        const auto ui=compile("Score","class Score : MipsBehaviour { void Update() { UI.SetTextNumber(12, 100); UI.SetText(12, \"READY\"); UI.SetColor(12, 1, 0, 0, 1); } }");
+        if(!ui.success||ui.value["ps1Compatible"]!=true)return 1;
+        std::filesystem::remove_all(root);
+        std::cout<<"Report regression: array/literal/constant/code/module/instance limits, source diagnostics, discovery and common UI APIs passed\n";
+    }
 
     bool ok = true;
+    for(const char* id:{"model.inspect","animation.list","model.extract","animator.set","skinned-mesh.set","component.set",
+        "animator.controller.inspect","animator.controller.validate","animator.controller.schema",
+        "animator.controller.set","animator.controller.state.set","animator.controller.parameter.set","animator.controller.transition.set","runtime.animator"})
+        ok &= Check(commands.Find(id)!=nullptr,"animation authoring command is discoverable");
+    {
+        CommandRequest schema;schema.command="animator.controller.schema";
+        const auto result=executor.Execute(schema,context);
+        ok &= Check(result.success&&result.value["properties"]["states"]["items"]["properties"].contains("stack"),"public controller schema includes clip stack references");
+        CommandRequest query;query.command="search";query.arguments={{"query","animation bones layers mask punch"},{"kind","command"},{"namespace","model"}};
+        const auto found=executor.Execute(query,context);
+        ok &= Check(found.success&&found.value["matches"].size()>=2,"filtered multiword search discovers model metadata and region extraction");
+        CommandRequest catalog;catalog.command="component.list";
+        const auto listed=executor.Execute(catalog,context);
+        for(const auto& c:listed.value["components"])
+            if(c["name"]=="Animator"||c["name"]=="SkinnedMeshRenderer")
+                ok &= Check(!c["properties"].empty(),"animation component properties are discoverable");
+    }
     ok &= Check(commands.Find("entity.inspect") != nullptr, "editor command is discoverable");
     ok &= Check(commands.Find("entity.create") != nullptr, "entity creation command is discoverable");
     ok &= Check(commands.Find("entity.select") != nullptr, "entity selection command is discoverable");
@@ -49,6 +94,16 @@ int main() {
     ok &= Check(commands.Find("material.apply") != nullptr, "material assignment command is discoverable");
     ok &= Check(commands.Find("scene.get-json") != nullptr, "scene serialization command is discoverable");
     ok &= Check(commands.Find("scene.patch") != nullptr, "generic scene patch command is discoverable");
+    ok &= Check(commands.Find("scene.open") != nullptr, "scene open command is discoverable");
+    ok &= Check(commands.Find("editor.dialog.inspect") != nullptr && commands.Find("editor.dialog.respond") != nullptr,
+                "pending dialog inspection and responses are discoverable");
+    ok &= Check(commands.Find("build.cancel") != nullptr, "build cancellation is discoverable");
+    const auto buildParsed = ParseCommandLine({"build", "start", "ps1", "--save-current", "true"}, commands);
+    ok &= Check(buildParsed.valid && buildParsed.request.arguments.value("save-current", false),
+                "build parses explicit save policy");
+    const auto dialogParsed = ParseCommandLine({"editor", "dialog", "respond", "scene_save", "cancel"}, commands);
+    ok &= Check(dialogParsed.valid && dialogParsed.request.arguments.value("dialog", "") == "scene_save" &&
+                dialogParsed.request.arguments.value("action", "") == "cancel", "dialog response parses nested command and action");
     ok &= Check(commands.Find("ide.open") != nullptr, "IDE open command is discoverable");
     ok &= Check(symbols.Find("Transform.position") != nullptr, "Mips# symbol is discoverable");
 
@@ -73,6 +128,12 @@ int main() {
     ok &= Check(parsed.valid && parsed.request.command == "entity.inspect", "hierarchical CLI command parses");
     ok &= Check(parsed.request.arguments.value("entity", "") == "Player", "positional argument maps from metadata");
     ok &= Check(parsed.json, "global JSON option parses");
+    const auto openParsed = ParseCommandLine(
+        {"scene", "open", "scenes/Title.nscene", "--save-current", "true", "--json"}, commands);
+    ok &= Check(openParsed.valid && openParsed.request.command == "scene.open" &&
+                openParsed.request.arguments.value("path", "") == "scenes/Title.nscene" &&
+                openParsed.request.arguments.value("save-current", false),
+                "scene open parses destination and save policy");
 
     const auto createParsed = ParseCommandLine(
         {"entity", "create", "CLI Cube", "--primitive", "cube", "--x", "2", "--y", "1.5"},
@@ -139,7 +200,8 @@ int main() {
     {
         const std::string source =
             "class ButtonHandlers : MipsBehaviour { "
-            "public void HandleClick() {} "
+            "public AudioSource sound; "
+            "public void HandleClick() { sound.Play(); var phase = Animator.GetNormalizedTime(\"Walk\"); } "
             "void HiddenHelper() {} "
             "public void WithArgument(float value) {} "
             "}";
@@ -156,6 +218,9 @@ int main() {
         const auto* hidden = module ? module->FindMethod("HiddenHelper") : nullptr;
         const auto* withArgument = module ? module->FindMethod("WithArgument") : nullptr;
         ok &= Check(module && compilerErrors.empty(), "button handler fixture compiles");
+        ok &= Check(module && module->fields.size() == 1 &&
+                    module->fields[0].valueKind == MipsyncEngine::Mips::FieldValueKind::EntityReference,
+                    "AudioSource inspector fields carry entity references rather than raw numeric fields");
         ok &= Check(click && click->isPublic && click->parameterCount == 0 &&
                     click->returnType == "void", "public no-argument button method metadata is preserved");
         ok &= Check(hidden && !hidden->isPublic, "non-public method metadata is preserved");
@@ -182,6 +247,17 @@ int main() {
             root, "../outside.mips", resolveError);
         ok &= Check(escaped.empty() && !resolveError.empty(),
                     "script resolver rejects project-root traversal");
+        {
+            std::ofstream script(scripts / "Broken.mips");
+            script << "class Broken : MipsBehaviour { void Update() { UnsupportedCall(); } }";
+        }
+        std::vector<std::string> compileErrors;
+        const auto brokenModule = MipsyncEngine::Mips::MipsScriptLoader::CompileFile(root, "Broken.mips", compileErrors);
+        ok &= Check(!brokenModule && !compileErrors.empty(),
+                    "script loader rejects partial bytecode after compiler errors");
+        compileErrors.clear();
+        const auto safeModule = MipsyncEngine::Mips::MipsScriptLoader::CompileFile(root, "Safe.mips", compileErrors);
+        ok &= Check(safeModule && compileErrors.empty(), "script loader still accepts valid source");
         std::filesystem::remove_all(root, ec);
     }
 
