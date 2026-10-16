@@ -176,6 +176,7 @@ typedef struct ps1_entity {
     uint8_t animator_action_condition; /* 0: trigger; 1..6: AnimatorConditionMode + 1 */
     fix16_t animator_action_threshold;
     uint8_t render_unlit;
+    uint32_t source_entity_id; /* editor ID for UI visibility, zero for generated mesh parts */
 } ps1_entity;
 
 typedef struct ps1_rigid_anim_frame {
@@ -255,6 +256,7 @@ typedef struct ps1_ui_button_rect {
     uint16_t action_offset;
     uint8_t action_count;
     uint8_t interactable;
+    uint32_t source_entity_id;
 } ps1_ui_button_rect;
 
 typedef struct ps1_ui_button_action {
@@ -322,6 +324,11 @@ extern const ps1_mesh  g_ps1_meshes[];
 extern const unsigned int g_ps1_mesh_count;
 
 void ps1_scene_init(void);
+void ps1_scene_request_destroy(unsigned int index);
+int ps1_scene_destroy_pending(unsigned int index);
+int ps1_scene_next_destroy(void);
+void ps1_scene_finish_destroy(unsigned int index);
+int ps1_scene_source_id_destroyed(uint32_t source_id);
 /* Apply runtime parent transform deltas to flattened descendants. */
 void ps1_scene_resolve_hierarchy(void);
 void ps1_scene_begin_frame(void);

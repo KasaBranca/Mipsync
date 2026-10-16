@@ -4,6 +4,7 @@
 #include "../core/Log.h"
 #include "../assets/AssetManager.h"
 #include "../scene/Scene.h"
+#include "../physics/PhysicsWorld.h"
 #include <filesystem>
 #include <vector>
 #include <unordered_set>
@@ -263,8 +264,10 @@ void MipsRuntime::RefreshPlayInstances(Scene& scene, bool addNew) {
     m_VM.SetActiveInstances(&m_Instances); m_VM.SetDeltaTime(0.0f);
     std::vector<std::string> errors;
     for (size_t index : newInstances) {
+        if (m_VM.IsDestroyPending(m_Instances[index].entityId)) continue;
         InvokeLifecycle(m_VM, m_Instances[index], "Awake", errors);
-        InvokeLifecycle(m_VM, m_Instances[index], "Start", errors);
+        if (!m_VM.IsDestroyPending(m_Instances[index].entityId))
+            InvokeLifecycle(m_VM, m_Instances[index], "Start", errors);
     }
     for (const auto& error : errors) MIPSYNC_CONSOLE_WARN("{}", error);
 }
@@ -331,7 +334,8 @@ void MipsRuntime::InvokeLifecycleAll(const char* method, MipsyncEngine::Scene& s
     m_VM.SetActiveInstances(&m_Instances);
     std::vector<std::string> errors;
     for (auto& instance : m_Instances) {
-        if (instance.entity->IsActive() && instance.sourceComponent->enabled &&
+        if (!m_VM.IsDestroyPending(instance.entityId) &&
+            scene.IsActiveInHierarchy(*instance.entity) && instance.sourceComponent->enabled &&
             instance.module && instance.module->FindMethod(method))
             m_VM.RunMethod(instance, method, errors);
     }
@@ -342,6 +346,8 @@ void MipsRuntime::InvokeLifecycleAll(const char* method, MipsyncEngine::Scene& s
 }
 
 void MipsRuntime::OnPlayStarted(Scene& scene) {
+    m_VM.ClearDestroyRequests();
+    m_PhysicsEvents.Clear();
     m_ScriptFileTimes.clear();
     std::vector<std::string> compileErrors;
     if (!ReloadScripts(scene, {}, compileErrors)) {
@@ -364,14 +370,17 @@ void MipsRuntime::OnPlayStarted(Scene& scene) {
     m_VM.SetDeltaTime(0.0f);
     for (auto& instance : m_Instances) {
         CheckPreparationCancelled();
+        if (m_VM.IsDestroyPending(instance.entityId)) continue;
         InvokeLifecycle(m_VM, instance, "Awake", errors);
-        InvokeLifecycle(m_VM, instance, "Start", errors);
+        if (!m_VM.IsDestroyPending(instance.entityId))
+            InvokeLifecycle(m_VM, instance, "Start", errors);
     }
     for (const auto& e : errors)
         MIPSYNC_CONSOLE_WARN("{}", e);
 
     m_ExecutionErrors=errors;
     if(!errors.empty())throw std::runtime_error("Awake/Start failed: "+errors.front());
+    FlushDestroyRequests(scene);
     MIPSYNC_INFO("[Mips#] Play started ({} script instance(s))", m_Instances.size());
 }
 
@@ -444,6 +453,8 @@ void MipsRuntime::OnPlayStopped(Scene& scene) {
     m_EditSnapshot.Capture(scene);
 
     m_Instances.clear();
+    m_VM.ClearDestroyRequests();
+    m_PhysicsEvents.Clear();
     m_Playing = false;
     m_Paused = false;
     MIPSYNC_INFO("[Mips#] Play stopped");
@@ -460,7 +471,9 @@ void MipsRuntime::DispatchPhysicsEvents(Scene& scene) {
 
     for (const MipsPhysicsEvent& ev : m_PhysicsEvents.Events()) {
         Entity* self = scene.FindEntity(ev.selfEntityId);
-        if (!self)
+        if (!self || !scene.IsActiveInHierarchy(*self) ||
+            !scene.FindEntity(ev.otherEntityId) || m_VM.IsDestroyPending(ev.selfEntityId) ||
+            m_VM.IsDestroyPending(ev.otherEntityId))
             continue;
 
         const char* methodName = nullptr;
@@ -475,7 +488,8 @@ void MipsRuntime::DispatchPhysicsEvents(Scene& scene) {
             continue;
 
         for (auto& instance : m_Instances) {
-            if (instance.entity != self || !instance.module)
+            if (instance.entity != self || !instance.module || !instance.sourceComponent->enabled ||
+                m_VM.IsDestroyPending(instance.entityId))
                 continue;
             if (!instance.module->FindMethod(methodName))
                 continue;
@@ -487,6 +501,8 @@ void MipsRuntime::DispatchPhysicsEvents(Scene& scene) {
     for (const auto& e : errors)
         MIPSYNC_CONSOLE_WARN("{}", e);
     m_PhysicsEvents.Clear();
+    m_VM.SetPhysicsOtherEntityId(0);
+    FlushDestroyRequests(scene);
 }
 
 bool MipsRuntime::InvokeButtonEvent(Scene& scene, uint32_t targetEntityId,
@@ -521,7 +537,9 @@ bool MipsRuntime::InvokeButtonEvent(Scene& scene, uint32_t targetEntityId,
         if (!method || !method->isPublic || method->parameterCount != 0 ||
             method->returnType != "void")
             continue;
-        return m_VM.RunMethod(instance, methodName, errors);
+        const bool ok = m_VM.RunMethod(instance, methodName, errors);
+        FlushDestroyRequests(scene);
+        return ok;
     }
 
     errors.push_back("Button On Click method is unavailable on target: " + methodName);
@@ -537,16 +555,51 @@ void MipsRuntime::Update(Scene& scene, float deltaTime) {
     InvokeLifecycleAll("Update", scene, deltaTime);
     std::vector<std::string> coroutineErrors;
     for (auto& instance : m_Instances)
-        if (instance.entity->IsActive() && instance.sourceComponent->enabled)
+        if (!m_VM.IsDestroyPending(instance.entityId) &&
+            scene.IsActiveInHierarchy(*instance.entity) && instance.sourceComponent->enabled)
             m_VM.ResumeCoroutines(instance, deltaTime, coroutineErrors);
     for (const auto& error : coroutineErrors)
         MIPSYNC_CONSOLE_WARN("{}", error);
+    FlushDestroyRequests(scene);
 }
 
 void MipsRuntime::LateUpdate(Scene& scene, float deltaTime) {
     if (!m_Playing || m_Paused)
         return;
     InvokeLifecycleAll("LateUpdate", scene, deltaTime);
+    FlushDestroyRequests(scene);
+}
+
+void MipsRuntime::FlushDestroyRequests(Scene& scene) {
+    std::unordered_set<uint32_t> destroyed;
+    std::vector<uint32_t> ordered;
+    std::vector<std::string> errors;
+    // Complete all OnDestroy callbacks (including requests they enqueue) while
+    // every entity and script instance still exists. Never erase inside VM loops.
+    auto collect = [&](auto&& self, uint32_t id) -> void {
+        Entity* entity = scene.FindEntity(id);
+        if (!entity || !destroyed.insert(id).second) return;
+        for (uint32_t child : entity->GetChildIDs()) self(self, child);
+        ordered.push_back(id);
+    };
+    while (true) {
+        auto requests = m_VM.TakeDestroyRequests();
+        if (requests.empty()) break;
+        const size_t first = ordered.size();
+        for (uint32_t id : requests) collect(collect, id);
+        for (size_t i = first; i < ordered.size(); ++i)
+            for (auto& instance : m_Instances)
+                if (instance.entityId == ordered[i])
+                    InvokeLifecycle(m_VM, instance, "OnDestroy", errors);
+    }
+    if (ordered.empty()) return;
+    for (uint32_t id : ordered) {
+        if (m_PhysicsWorld) m_PhysicsWorld->RemoveEntity(id);
+        scene.DestroyEntity(scene.FindEntity(id));
+    }
+    RefreshPlayInstances(scene, false); // invalidate script/entity/transform references
+    m_ExecutionErrors.insert(m_ExecutionErrors.end(), errors.begin(), errors.end());
+    for (const auto& error : errors) MIPSYNC_CONSOLE_WARN("{}", error);
 }
 
 } // namespace MipsyncEngine::Mips

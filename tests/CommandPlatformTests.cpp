@@ -61,6 +61,8 @@ int main() {
         const auto target=run("language.compile",{{"file",(root/"Large.mips").string()},{"target","ps1"}});if(target.success)return 1;
         const auto ui=compile("Score","class Score : MipsBehaviour { void Update() { UI.SetTextNumber(12, 100); UI.SetText(12, \"READY\"); UI.SetColor(12, 1, 0, 0, 1); } }");
         if(!ui.success||ui.value["ps1Compatible"]!=true)return 1;
+        const auto destroy=compile("DestroyTarget","class DestroyTarget : MipsBehaviour { void OnTriggerEnter() { Destroy(gameObject); Destroy(Physics.otherEntityId); } void OnTriggerExit() {} void OnDestroy() {} }");
+        if(!destroy.success||destroy.value["ps1Compatible"]!=true)return 1;
         std::filesystem::remove_all(root);
         std::cout<<"Report regression: array/literal/constant/code/module/instance limits, source diagnostics, discovery and common UI APIs passed\n";
     }

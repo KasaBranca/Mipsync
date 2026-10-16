@@ -53,6 +53,9 @@ public:
     void SetPhysicsWorld(MipsyncEngine::PhysicsWorld* world) { m_PhysicsWorld = world; }
     void SetActiveInstances(std::vector<ScriptInstance>* instances) { m_ActiveInstances = instances; }
     void SetPhysicsOtherEntityId(uint32_t entityId) { m_PhysicsOtherEntityId = entityId; }
+    bool IsDestroyPending(uint32_t entityId) const;
+    std::vector<uint32_t> TakeDestroyRequests();
+    void ClearDestroyRequests() { m_DestroyRequests.clear(); }
     void SetExecutionLimits(const VMExecutionLimits& limits) { m_Limits = limits; }
     const VMExecutionLimits& GetExecutionLimits() const { return m_Limits; }
     size_t GetLastInvocationInstructions() const { return m_LastInvocationInstructions; }
@@ -76,6 +79,7 @@ private:
 
     float m_DeltaTime = 0.0f;
     uint32_t m_PhysicsOtherEntityId = 0;
+    std::vector<uint32_t> m_DestroyRequests;
     size_t m_LastInvocationInstructions = 0;
     Scene* m_Scene = nullptr;
     PhysicsWorld* m_PhysicsWorld = nullptr;

@@ -20,6 +20,9 @@ static int16_t s_runtime_lookup[4096];
 static const ps1_mesh* s_meshes = 0;
 static unsigned int s_mesh_count = 0;
 static int s_active_camera_index = -1;
+/* Keep immutable scene arrays and cached indices stable; dead entities are
+ * tombstones, excluded by the public scene accessors on every runtime path. */
+static uint8_t s_destroy_state[4096];
 static int s_pending_camera_index = -1;
 static uint8_t s_pending_camera_frames = 0;
 
@@ -278,6 +281,7 @@ void ps1_scene_init(void) {
 
     for (unsigned int i = 0; i < 4096; ++i) {
         s_runtime_lookup[i] = -1;
+        s_destroy_state[i] = 0;
     }
 
     /* Identify and promote entities that actually require runtime mutability */
@@ -932,6 +936,7 @@ void ps1_scene_release_animator_trigger(unsigned int root_index, const char* nam
 }
 
 ps1_entity* ps1_scene_mutable_entity(unsigned int index) {
+    if (index >= 4096u || s_destroy_state[index] == 3) return 0;
     if (index < g_ps1_scene.entity_count) {
         int16_t runtime_idx = s_runtime_lookup[index];
         if (runtime_idx >= 0) {
@@ -942,6 +947,7 @@ ps1_entity* ps1_scene_mutable_entity(unsigned int index) {
 }
 
 const ps1_entity* ps1_scene_entity(unsigned int index) {
+    if (index >= 4096u || s_destroy_state[index] == 3) return 0;
     if (index < g_ps1_scene.entity_count) {
         int16_t runtime_idx = s_runtime_lookup[index];
         if (runtime_idx >= 0) {
@@ -961,6 +967,48 @@ unsigned int ps1_scene_entity_count(void) {
     return g_ps1_scene.entity_count;
 }
 
+void ps1_scene_request_destroy(unsigned int index) {
+    unsigned int i, depth;
+    if (index >= g_ps1_scene.entity_count || index >= 4096u || s_destroy_state[index]) return;
+    s_destroy_state[index] = 1;
+    for (i = 0; i < g_ps1_scene.entity_count && i < 4096u; ++i) {
+        int parent = (int)i;
+        for (depth = 0; parent >= 0 && (unsigned int)parent < g_ps1_scene.entity_count &&
+             depth <= g_ps1_scene.entity_count; ++depth) {
+            const ps1_entity* source = &g_ps1_scene.entities[(unsigned int)parent];
+            if ((unsigned int)parent == index || source->rigid_root_entity_index == (int)index) {
+                if (!s_destroy_state[i]) s_destroy_state[i] = 1;
+                break;
+            }
+            parent = source->parent_entity_index;
+        }
+    }
+}
+
+int ps1_scene_destroy_pending(unsigned int index) {
+    return index >= 4096u || index >= g_ps1_scene.entity_count || s_destroy_state[index] != 0;
+}
+
+int ps1_scene_next_destroy(void) {
+    unsigned int i;
+    for (i = 0; i < g_ps1_scene.entity_count && i < 4096u; ++i)
+        if (s_destroy_state[i] == 1) { s_destroy_state[i] = 2; return (int)i; }
+    return -1;
+}
+
+void ps1_scene_finish_destroy(unsigned int index) {
+    if (index < g_ps1_scene.entity_count && index < 4096u) s_destroy_state[index] = 3;
+}
+
+int ps1_scene_source_id_destroyed(uint32_t source_id) {
+    unsigned int i;
+    if (!source_id) return 0;
+    for (i = 0; i < g_ps1_scene.entity_count && i < 4096u; ++i)
+        if (g_ps1_scene.entities[i].source_entity_id == source_id && s_destroy_state[i] == 3)
+            return 1;
+    return 0;
+}
+
 void ps1_scene_begin_frame(void) {
     int best = -1;
     int best_priority = -32768;
@@ -969,7 +1017,7 @@ void ps1_scene_begin_frame(void) {
         const ps1_entity* trigger = &s_runtime_entities[trigger_idx];
         int target_camera_idx;
         const ps1_entity* target_camera;
-        if (trigger->collider_shape == -1 ||
+        if (ps1_scene_source_id_destroyed(trigger->source_entity_id) || trigger->collider_shape == -1 ||
             !trigger->collider_camera_shot_trigger ||
             trigger->collider_camera_target_index < 0)
             continue;

@@ -89,8 +89,6 @@ const char* UnsupportedHostReason(HostFunc func) {
     case HostFunc::Save_Write:
     case HostFunc::Save_Read:
         return "Save API is not available on the PS1 runtime yet";
-    case HostFunc::Physics_OtherEntityId:
-        return "collision/trigger callback context is not available on the PS1 runtime yet";
     case HostFunc::AudioSource_SetClip:
         return "AudioSource.clip runtime assignment is not available on PS1; configure the clip in scene/build data";
     default:
@@ -109,8 +107,7 @@ bool IsKnownHostFunction(uint16_t id) {
 
 bool IsUnsupportedLifecycle(const std::string& name) {
     static const std::unordered_set<std::string> unsupported = {
-        "OnDestroy", "OnCollisionEnter", "OnCollisionExit",
-        "OnTriggerEnter", "OnTriggerExit"
+        "OnCollisionEnter", "OnCollisionExit"
     };
     return unsupported.find(name) != unsupported.end();
 }

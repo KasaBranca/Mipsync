@@ -3,6 +3,7 @@
 
 #include "fixedp.h"
 #include <stdint.h>
+void host_set_physics_other_entity_id(uint32_t id);
 
 /*
  * Host-function dispatch for the PS1 mini-VM. Mirrors HostFunc enum from

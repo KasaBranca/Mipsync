@@ -104,6 +104,7 @@ static int              g_start_pending[MAX_INSTANCES];
 static int              g_instance_count;
 
 static vm_state         g_vm;
+static uint8_t g_trigger_contacts[MIPSYNC_PS1_INSTANCE_CAP][4096 / 8];
 
 void mipsync_ui_invoke(uint16_t entity_index, uint8_t module_index, const char* method_name) {
     int i;
@@ -117,6 +118,7 @@ void mipsync_ui_invoke(uint16_t entity_index, uint8_t module_index, const char* 
         return;
     for (i = 0; i < g_instance_count; ++i) {
         script_instance* instance = &g_instances[i];
+        if (ps1_scene_destroy_pending(instance->entity_index)) continue;
         if (instance->entity_index == entity_index && instance->module == module) {
             vm_run_method(&g_vm, module, instance, method);
             return;
@@ -295,7 +297,8 @@ static void BindSceneScripts(void) {
 
         const mbc_method* awake = mbc_find_method(mod, "Awake");
 
-        if (awake) vm_run_method(&g_vm, mod, inst, awake);
+        if (awake && !ps1_scene_destroy_pending(inst->entity_index))
+            vm_run_method(&g_vm, mod, inst, awake);
 
 
 
@@ -316,7 +319,7 @@ static void RunPendingStarts(void) {
 
     for (int i = 0; i < g_instance_count; ++i) {
 
-        if (!g_start_pending[i]) continue;
+        if (!g_start_pending[i] || ps1_scene_destroy_pending(g_instances[i].entity_index)) continue;
 
         const mbc_method* start = mbc_find_method(g_instances[i].module, "Start");
 
@@ -333,12 +336,14 @@ static void RunPendingStarts(void) {
 static void RunUpdates(fix16_t delta_time) {
 
     for (int i = 0; i < g_instance_count; ++i) {
+        if (ps1_scene_destroy_pending(g_instances[i].entity_index)) continue;
 
         if (g_update[i])
 
             vm_run_method(&g_vm, g_instances[i].module, &g_instances[i], g_update[i]);
 
-        vm_resume_coroutines(&g_vm, g_instances[i].module, &g_instances[i], delta_time);
+        if (!ps1_scene_destroy_pending(g_instances[i].entity_index))
+            vm_resume_coroutines(&g_vm, g_instances[i].module, &g_instances[i], delta_time);
 
     }
 
@@ -346,10 +351,61 @@ static void RunUpdates(fix16_t delta_time) {
 
 static void RunLateUpdates(void) {
     for (int i = 0; i < g_instance_count; ++i) {
+        if (ps1_scene_destroy_pending(g_instances[i].entity_index)) continue;
         if (g_late_update[i])
             vm_run_method(&g_vm, g_instances[i].module, &g_instances[i],
                           g_late_update[i]);
     }
+}
+
+static void ProcessDestroyRequests(void) {
+    int index;
+    host_set_physics_other_entity_id(0);
+    while ((index = ps1_scene_next_destroy()) >= 0) {
+        int i;
+        const ps1_entity* entity = ps1_scene_entity((unsigned int)index);
+        for (i = 0; i < g_instance_count; ++i) {
+            script_instance* instance = &g_instances[i];
+            if (instance->entity_index == (unsigned int)index) {
+                const mbc_method* method = mbc_find_method(instance->module, "OnDestroy");
+                if (method) vm_run_method(&g_vm, instance->module, instance, method);
+                for (int c = 0; c < VM_COROUTINE_CAP; ++c) instance->coroutines[c].active = 0;
+            }
+        }
+        ps1_audio_stop((unsigned int)index);
+        if (entity && entity->source_entity_id) {
+            ps1_ui_set_text_visible(entity->source_entity_id, 0);
+            ps1_ui_set_image_visible(entity->source_entity_id, 0);
+        }
+        ps1_scene_finish_destroy((unsigned int)index);
+    }
+}
+
+static void DispatchTriggerEvents(void) {
+    int i;
+    unsigned int other;
+    for (i = 0; i < g_instance_count; ++i) {
+        script_instance* instance = &g_instances[i];
+        const mbc_method* enter = mbc_find_method(instance->module, "OnTriggerEnter");
+        const mbc_method* exit = mbc_find_method(instance->module, "OnTriggerExit");
+        if ((!enter && !exit) || ps1_scene_destroy_pending(instance->entity_index)) continue;
+        for (other = 0; other < ps1_scene_entity_count() && other < 4096u; ++other) {
+            uint8_t* bits = &g_trigger_contacts[i][other >> 3];
+            const uint8_t mask = (uint8_t)(1u << (other & 7));
+            const int previous = (*bits & mask) != 0;
+            const int touching = ps1_physics_trigger_overlap(instance->entity_index, other);
+            const mbc_method* method = touching ? enter : exit;
+            const ps1_entity* entity = ps1_scene_entity(other);
+            if (touching) *bits |= mask; else *bits &= (uint8_t)~mask;
+            if (touching != previous && method && entity && !ps1_scene_destroy_pending(other)) {
+                host_set_physics_other_entity_id(entity->id);
+                vm_run_method(&g_vm, instance->module, instance, method);
+            }
+            if (ps1_scene_destroy_pending(instance->entity_index)) break;
+        }
+    }
+    host_set_physics_other_entity_id(0);
+    ProcessDestroyRequests();
 }
 
 
@@ -413,6 +469,7 @@ int main(void) {
     BindSceneScripts();
 
     RunPendingStarts();
+    ProcessDestroyRequests();
     ps1_scene_resolve_hierarchy();
     last_vblank = VSync(-1);
 
@@ -438,12 +495,15 @@ int main(void) {
 
         ps1_physics_begin_frame();
         RunUpdates(delta_time);
+        ProcessDestroyRequests();
+        DispatchTriggerEvents();
         /* Update/coroutines may move kinematic platforms and carry their
          * passengers. Follow cameras run afterwards so they use the final
          * character position from this frame rather than lagging one step. */
         /* LateUpdate observes the pose rendered this frame, matching desktop. */
         ps1_scene_update_vertex_anims(delta_time);
         RunLateUpdates();
+        ProcessDestroyRequests();
         ps1_audio_update();
         ps1_scene_resolve_hierarchy();
         ps1_scene_begin_frame();

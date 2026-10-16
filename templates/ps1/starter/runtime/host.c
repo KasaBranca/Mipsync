@@ -23,8 +23,12 @@ static char     s_log[LOG_LINES][LOG_COLS + 1];
 static uint32_t s_log_head;   /* next write slot */
 static uint32_t s_log_count;
 static fix16_t  s_delta_q16_16 = FIX16_ONE / 60; /* assume 60 Hz field rate */
+static uint32_t s_other_entity_id;
+
+void host_set_physics_other_entity_id(uint32_t id) { s_other_entity_id = id; }
 
 void host_init(void) {
+    s_other_entity_id = 0;
     s_log_head = 0;
     s_log_count = 0;
     for (int i = 0; i < LOG_LINES; ++i) s_log[i][0] = 0;
@@ -408,10 +412,30 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
             push_nil(vm);
             return 1;
         }
-        case HF_ENTITY_GETID:
-            push_number(vm, argc >= 1 && a[0].tag == HOST_VAL_HOST
-                ? FIX16_FROM_INT((int32_t)a[0].ref.entity_idx) : 0);
+        case HF_ENTITY_DESTROY: {
+            if (argc == 1 && a[0].tag == HOST_VAL_HOST && a[0].ref.kind == HOST_REF_ENTITY)
+                ps1_scene_request_destroy(a[0].ref.entity_idx);
+            else if (argc == 1 && a[0].tag == HOST_VAL_NUMBER && a[0].ival > 0 &&
+                     a[0].ival % FIX16_ONE == 0) {
+                unsigned int i;
+                uint32_t id = (uint32_t)(a[0].ival / FIX16_ONE);
+                for (i = 0; i < ps1_scene_entity_count(); ++i) {
+                    const ps1_entity* entity = ps1_scene_entity(i);
+                    if (entity && entity->id == id) { ps1_scene_request_destroy(i); break; }
+                }
+            }
+            push_nil(vm);
             return 1;
+        }
+        case HF_PHYSICS_OTHER_ENTITY_ID:
+            push_number(vm, FIX16_FROM_INT((int32_t)s_other_entity_id));
+            return 1;
+        case HF_ENTITY_GETID: {
+            const ps1_entity* entity = argc >= 1 && a[0].tag == HOST_VAL_HOST
+                ? ps1_scene_entity(a[0].ref.entity_idx) : 0;
+            push_number(vm, entity ? FIX16_FROM_INT((int32_t)entity->id) : 0);
+            return 1;
+        }
         case HF_ENTITY_GETNAME:
             push_nil(vm);
             return 1;

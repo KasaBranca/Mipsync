@@ -488,6 +488,7 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
             {"controlFlow","if/else, while, for, break, continue, return; arithmetic and comparison operators; typed locals and var."},
             {"arrays","new int[20], [1,2,3], indexing, Length, Count, Add, RemoveAt, Clear. PS1 arrays are bounded."},
             {"methods","Awake, Start, Update, LateUpdate; coroutines using yield return null or WaitForSeconds. Custom method calls are not currently supported; compiler errors identify the source location."},
+            {"destruction","Destroy(gameObject) or Destroy(entityId), including Physics.otherEntityId in void OnTriggerEnter(). Removes descendants after callbacks finish and invokes OnDestroy once. null, zero, invalid IDs and repeated requests are harmless. PC and PS1 supported; no delayed overload."},
             {"input","Use Input.GetButton/GetButtonDown/GetButtonUp with PS1 names and Input.GetAxis with LeftStickX/Y, RightStickX/Y. Editor mappings are in Preferences."},
             {"examples",{"class Counter : MipsBehaviour { [Header(\"Score\")] public int score = 0; void Update() { if (Input.GetButtonDown(\"Cross\")) score = score + 1; } }",
                 "class Board : MipsBehaviour { public int[] rows; void Start() { rows = new int[20]; rows[0] = 1; } }"}},

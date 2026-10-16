@@ -1,0 +1,9 @@
+// Attach to a trigger object with a Collider whose Is Trigger setting is enabled.
+// The entering player needs a physics body/controller and a Collider.
+class DestroyOnTrigger : MipsBehaviour {
+    void OnTriggerEnter() {
+        Destroy(gameObject);
+        // To remove the entering object instead, use:
+        // Destroy(Physics.otherEntityId);
+    }
+}

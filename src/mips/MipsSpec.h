@@ -78,6 +78,10 @@
 //
 // gameObject:
 //   gameObject.id, gameObject.name
+//   Destroy(gameObject) — remove this object and all descendants after callbacks finish
+//   Destroy(Physics.otherEntityId) — remove the other object from a physics callback
+//   Destroy(entityId) — zero, null, missing IDs and repeated requests are harmless
+//   OnDestroy runs once per attached script before removal; no delayed overload yet
 //
 // Strings:
 //   "a" + "b", "hp=" + value  (concatenation)

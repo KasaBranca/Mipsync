@@ -1,55 +1,34 @@
-/* Stub scene_data.c — replaced by Build PS1 export. */
+/* Stub scene_data.c — replaced by Build PS1 export.
+ * Named fields keep the bundled starter compatible with runtime ABI additions. */
 #include "../runtime/scene.h"
 
 static const ps1_entity k_ps1_entities[] = {
-    { 1u, "Placeholder", {0,0,0}, {0,0,0}, {65536,65536,65536},
-      PS1_MESH_CUBE, 0u, 65536, 80, 120, 200, 0, 256, 256, 0, 0, 1, 0, 0u, 0u, 0, 1, 1,
-      3932160 /*60 deg*/, 6553 /*0.1*/, 6553600 /*100*/ },
-};
-
-static const ps1_script_binding k_ps1_bindings[] = {
-    { 0u, 0u, 0u, { 0 } },
-};
-
-static const char k_ps1_ui_text[] = "";
-
-static const ps1_ui_element k_ps1_ui_elements[] = {
-};
-
-static const ps1_ui_glyph k_ps1_ui_glyphs[] = {
-};
-
-static const uint16_t k_ps1_ui_glyph_rows[] = {
-};
-
-static const ps1_ui_button_group k_ps1_ui_button_groups[] = {
-};
-
-static const ps1_ui_button_rect k_ps1_ui_button_rects[] = {
+    {
+        .id = 1u, .name = "Placeholder", .parent_entity_index = -1,
+        .position = {0, 0, 5 * FIX16_ONE}, .scale = {FIX16_ONE, FIX16_ONE, FIX16_ONE},
+        .mesh = PS1_MESH_CUBE, .mesh_size = FIX16_ONE, .mesh_enabled = 1,
+        .color_r = 80, .color_g = 120, .color_b = 200,
+        .texture_tiling_u_q8 = 256, .texture_tiling_v_q8 = 256,
+        .rigid_root_entity_index = -1, .collider_shape = -1,
+        .camera_shot_trigger_index = -1, .collider_camera_target_index = -1
+    },
+    {
+        .id = 2u, .name = "Camera", .parent_entity_index = -1,
+        .scale = {FIX16_ONE, FIX16_ONE, FIX16_ONE},
+        .rigid_root_entity_index = -1, .collider_shape = -1,
+        .has_camera = 1, .camera_primary = 1, .camera_fov = 60 * FIX16_ONE,
+        .camera_near = FIX16_ONE / 10, .camera_far = 100 * FIX16_ONE,
+        .camera_shot_trigger_index = -1, .collider_camera_target_index = -1
+    }
 };
 
 const ps1_scene g_ps1_scene = {
-    k_ps1_entities,
-    1u,
-    0,
-    k_ps1_bindings,
-    0u,
-    { 0, 0, 0, 0, 255, 255, 255, 32, 32, 32 },
-    0, 13, 13, 20,
-    655360, 2621440,
-    g_ps1_meshes,
-    0u,
-    k_ps1_ui_elements,
-    0u,
-    k_ps1_ui_text,
-    0u,
-    k_ps1_ui_glyphs,
-    0u,
-    k_ps1_ui_glyph_rows,
-    0u,
-    k_ps1_ui_button_groups,
-    0u,
-    k_ps1_ui_button_rects,
-    0u,
-    0u
+    .entities = k_ps1_entities,
+    .entity_count = 2u,
+    .camera_entity_index = 1,
+    .light = {.color_r = 255, .color_g = 255, .color_b = 255,
+              .ambient_r = 32, .ambient_g = 32, .ambient_b = 32},
+    .fog_r = 13, .fog_g = 13, .fog_b = 20,
+    .fog_start = 10 * FIX16_ONE, .fog_end = 40 * FIX16_ONE,
+    .meshes = g_ps1_meshes
 };

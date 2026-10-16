@@ -74,6 +74,7 @@ private:
     void CollectInstances(MipsyncEngine::Scene& scene);
     bool AddInstance(Entity* entity, MipsScriptComponent& script);
     void InvokeLifecycleAll(const char* method, MipsyncEngine::Scene& scene, float deltaTime);
+    void FlushDestroyRequests(MipsyncEngine::Scene& scene);
 
     VM m_VM;
     MipsPhysicsEventQueue m_PhysicsEvents;

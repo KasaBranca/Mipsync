@@ -184,6 +184,9 @@ class Rotator : MipsBehaviour
 
 Mips# intentionally targets a practical gameplay subset instead of pretending to be the full .NET runtime, keeping the language and engine API practical for both editor and console execution.
 
+To remove an object from a trigger callback, use `Destroy(gameObject)` or
+`Destroy(Physics.otherEntityId)`. See [object destruction and trigger examples](docs/ObjectDestruction.md).
+
 ## Live command platform
 
 Keep the editor open while using the CLI from a terminal—or an AI coding agent. Commands run through the editor's typed command registry, appear immediately in the UI, integrate with Undo, and support structured JSON output.

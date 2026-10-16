@@ -285,6 +285,14 @@ add_executable(MipsyncPs1AnimationPhaseTests
 target_include_directories(MipsyncPs1AnimationPhaseTests PRIVATE
     ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime)
 add_test(NAME MipsyncPs1AnimationPhase COMMAND MipsyncPs1AnimationPhaseTests)
+add_executable(MipsyncPs1DestroyTests
+    ${CMAKE_SOURCE_DIR}/tests/Ps1DestroyTests.cpp
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/scene.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/physics.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/fixedp.c)
+target_include_directories(MipsyncPs1DestroyTests PRIVATE
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime)
+add_test(NAME MipsyncPs1Destroy COMMAND MipsyncPs1DestroyTests)
 add_executable(MipsyncPs1ViewmodelProjectionTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1ViewmodelProjectionTests.c)
 add_test(NAME MipsyncPs1ViewmodelProjection COMMAND MipsyncPs1ViewmodelProjectionTests)

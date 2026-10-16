@@ -308,6 +308,23 @@ Entity* AudioEntityFromHost(const Value& v, Entity* fallback) {
 
 } // namespace
 
+bool VM::IsDestroyPending(uint32_t entityId) const {
+    if (m_DestroyRequests.empty()) return false;
+    // Destroying a parent also cancels subsequent callbacks on its descendants.
+    for (size_t depth = 0; m_Scene && entityId && depth <= m_Scene->GetEntities().size(); ++depth) {
+        if (std::find(m_DestroyRequests.begin(), m_DestroyRequests.end(), entityId) != m_DestroyRequests.end())
+            return true;
+        const Entity* entity = m_Scene->FindEntity(entityId);
+        if (!entity) break;
+        entityId = entity->GetParentID();
+    }
+    return false;
+}
+
+std::vector<uint32_t> VM::TakeDestroyRequests() {
+    return std::exchange(m_DestroyRequests, {});
+}
+
 Value VM::Pop() {
     if (m_Stack.empty())
         return Value{};
@@ -1252,6 +1269,25 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                         hitId = static_cast<double>(hit.entity->GetID());
                 }
                 pushNumber(hitId);
+                break;
+            }
+            case HostFunc::Entity_Destroy: {
+                uint32_t id = 0;
+                if (m_Scene && argc == 1) {
+                    const auto& value = args[0];
+                    if (value.tag == Value::Tag::Host && value.host.kind == HostKind::Entity) {
+                        // Compare identity before dereferencing a potentially stale host reference.
+                        for (const auto& entity : m_Scene->GetEntities())
+                            if (entity.get() == value.host.entity) { id = entity->GetID(); break; }
+                    } else if (value.tag == Value::Tag::Number && std::isfinite(value.number) &&
+                               value.number > 0 && value.number <= UINT32_MAX &&
+                               std::floor(value.number) == value.number) {
+                        id = static_cast<uint32_t>(value.number);
+                    }
+                    if (m_Scene->FindEntity(id) && !IsDestroyPending(id))
+                        m_DestroyRequests.push_back(id);
+                }
+                Push(Value{});
                 break;
             }
             case HostFunc::Entity_GetId:

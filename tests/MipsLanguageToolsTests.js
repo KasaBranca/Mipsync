@@ -4,6 +4,7 @@ const path = require('path');
 const root=path.resolve(__dirname,'..');
 const {lex, analyze, codeOnly}=require('../tools/mips-language-server/lib/language');
 const api=require('../tools/mips-language-server/lib/api');
+assert(api.GLOBALS.Destroy && api.GLOBALS.Destroy.detail.includes('Destroy'), 'Destroy completion/hover missing');
 const analyzer=require('../tools/mips-language-server/lib/analyzer');
 const read=p=>fs.readFileSync(path.join(root,p),'utf8');
 const lexer=read('src/mips/Lexer.cpp');

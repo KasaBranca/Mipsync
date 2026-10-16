@@ -140,7 +140,8 @@
     X(CAMERA_ROTATEPITCH, Camera_RotatePitch, 83) \
     X(UI_SET_TEXT, UI_SetText, 84) \
     X(UI_SET_TEXT_NUMBER, UI_SetTextNumber, 85) \
-    X(UI_SET_COLOR, UI_SetColor, 86)
+    X(UI_SET_COLOR, UI_SetColor, 86) \
+    X(ENTITY_DESTROY, Entity_Destroy, 87)
 
 /* PS1 runtime capacities. The exporter validates these before emitting C. */
 #define MIPSYNC_PS1_MODULE_CAP      4

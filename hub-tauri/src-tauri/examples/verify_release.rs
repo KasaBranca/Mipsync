@@ -1,23 +1,26 @@
 //! Verify a staged or published release with the Hub's production manifest reader.
-//! cargo run --release --example verify_release -- v2026.10.12 [manifest.json]
+//! cargo run --release --example verify_release -- <editor-tag> [manifest.json|--live] [hub-tag]
 #[path = "../src/manifest.rs"]
 mod manifest;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let expected = args.next().ok_or("expected release tag is required")?;
-    let feed: manifest::Manifest = if let Some(path) = args.next() {
+    let source = args.next();
+    let expected_hub = args.next().unwrap_or_else(|| expected.clone());
+    let feed: manifest::Manifest = if let Some(path) = source.filter(|path| path != "--live") {
         let bytes = std::fs::read(path)?;
         serde_json::from_slice(&bytes)?
     } else {
         manifest::fetch_latest()?
     };
     assert_eq!(feed.schema_version, 1, "unsupported feed schema");
-    assert_eq!(feed.hub.version, expected, "Hub update points at another version");
+    assert_eq!(feed.hub.version, expected_hub, "Hub update points at another version");
     assert_eq!(feed.hub.asset_name, "MipsyncHub_Windows_x64.zip");
     assert_eq!(feed.editor.asset_name, "MipsyncEngine_Windows_x64.zip");
     let base = format!("https://github.com/{}/releases/download/{expected}", manifest::repo());
-    assert_eq!(feed.hub.download_url, format!("{base}/{}", feed.hub.asset_name));
+    let hub_base = format!("https://github.com/{}/releases/download/{expected_hub}", manifest::repo());
+    assert_eq!(feed.hub.download_url, format!("{hub_base}/{}", feed.hub.asset_name));
     let releases = feed.editor.releases.into_vec();
     assert_eq!(releases.first().map(|r| r.version.as_str()), Some(expected.as_str()), "latest editor must be first");
     assert_eq!(releases.iter().filter(|r| r.version == expected).count(), 1);

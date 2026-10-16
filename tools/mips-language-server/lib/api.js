@@ -44,6 +44,11 @@ const TYPES = [
 ];
 
 const GLOBALS = {
+  Destroy: {
+    detail: "void Destroy(Entity objectOrEntityId)",
+    documentation: "Destroy an entity and its descendants after callbacks finish. Accepts gameObject or a numeric entity ID such as Physics.otherEntityId. OnDestroy runs once. null, zero, missing IDs and repeated requests are harmless. Supported on PC and PS1; no delayed overload.",
+    members: {},
+  },
   transform: {
     detail: "Transform transform",
     documentation: "現在のオブジェクトの Transform。",
@@ -245,6 +250,11 @@ const INSTANCE_MEMBERS = {
 };
 
 const SNIPPETS = [
+  {
+    label: "Destroy on trigger",
+    insertText: "void OnTriggerEnter() {\n    Destroy(${1:gameObject});\n}",
+    documentation: "Destroy this object on contact. Use Physics.otherEntityId to destroy the entering object instead.",
+  },
   {
     label: "MipsBehaviour class",
     insertText:

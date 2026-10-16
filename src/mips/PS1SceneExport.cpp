@@ -4280,6 +4280,7 @@ static void ExtractUiElements(const json& root, Ps1SceneExportResult& outResult)
                         if (ConvertPs1UiRect(buttonChildren[bi].second, layoutW, layoutH,
                                              rr.x, rr.y, rr.w, rr.h)) {
                             rr.interactable = buttonNode.buttonInteractable ? 1 : 0;
+                            rr.sourceEntityId = buttonNode.id;
                             rr.actionOffset = static_cast<uint16_t>(
                                 std::min<size_t>(outResult.uiButtonActions.size(), 65535));
                             rr.actionCount = static_cast<uint8_t>(
@@ -4800,6 +4801,7 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                 << "," << e.animatorStateHashes[2] << "," << e.animatorStateHashes[3] << "}"
                 << ", " << unsigned(e.animatorActionCondition) << ", " << ToFixed16(e.animatorActionThreshold)
                 << ", " << (e.renderUnlit ? 1 : 0)
+                << ", " << e.sourceEntityId << "u"
                 << " },\n";
         }
         out << "};\n\n";
@@ -4911,7 +4913,7 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
             out << "    { " << rect.x << ", " << rect.y << ", "
                 << rect.w << ", " << rect.h << ", " << rect.actionOffset << "u, "
                 << static_cast<int>(rect.actionCount) << ", "
-                << static_cast<int>(rect.interactable) << " },\n";
+                << static_cast<int>(rect.interactable) << ", " << rect.sourceEntityId << "u },\n";
         }
         out << "};\n\n";
 

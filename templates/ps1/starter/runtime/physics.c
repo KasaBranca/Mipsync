@@ -1288,6 +1288,7 @@ static void follow_nonconvex_ground(ps1_entity* active, fix16_t max_step) {
                                 cached->rigid_root_entity_index))
             continue;
         mesh_entity = ps1_scene_entity(cached->entity_index);
+        if (!mesh_entity) continue;
         if (!nonconvex_mesh_data(mesh_entity))
             continue;
         cached_collider_bounds(cached, min_b, max_b);
@@ -1488,6 +1489,7 @@ static void recover_initial_penetration(ps1_entity* entity,
                                     other->rigid_root_entity_index))
                 continue;
             other_entity = ps1_scene_entity(other->entity_index);
+            if (!other_entity) continue;
             if (nonconvex_mesh_data(other_entity))
                 continue;
             cached_collider_bounds(other, min_b, max_b);
@@ -1539,6 +1541,7 @@ static int ground_within_distance(const ps1_entity* e, fix16_t distance) {
                                 cached->rigid_root_entity_index))
             continue;
         other = ps1_scene_entity(cached->entity_index);
+        if (!other) continue;
         cached_collider_bounds(cached, min_b, max_b);
         if (!bounds_overlap_xz(min_a, max_a, min_b, max_b) ||
             max_b[1] < fix16_sub(min_a[1], distance) ||
@@ -1735,6 +1738,7 @@ void ps1_physics_move(fix16_t vx, fix16_t vy, fix16_t vz, fix16_t dt) {
                 {
                     const ps1_entity* mesh_entity =
                         ps1_scene_entity(other->entity_index);
+                    if (!mesh_entity) continue;
                     if (nonconvex_mesh_data(mesh_entity)) {
                         if (resolve_nonconvex_mesh_axis(
                                 e, mesh_entity, axis, disp,
@@ -1856,6 +1860,7 @@ int ps1_physics_is_grounded(void) {
         {
             const ps1_entity* mesh_entity =
                 ps1_scene_entity(other->entity_index);
+            if (!mesh_entity) continue;
             cached_collider_bounds(other, min_b, max_b);
             if (!bounds_overlap_xz(min_a, max_a, min_b, max_b) ||
                 max_b[1] < fix16_sub(min_a[1], FIX16_ONE / 10) ||
@@ -1971,4 +1976,18 @@ int ps1_physics_is_trigger(unsigned int entity_index) {
     const ps1_entity* e = ps1_scene_entity(entity_index);
     if (!e) return 0;
     return e->collider_is_trigger;
+}
+
+int ps1_physics_trigger_overlap(unsigned int self, unsigned int other) {
+    const ps1_entity* a = ps1_scene_entity(self);
+    const ps1_entity* b = ps1_scene_entity(other);
+    fix16_t min_a[3], max_a[3], min_b[3], max_b[3];
+    if (self == other || !a || !b || ps1_scene_destroy_pending(self) ||
+        ps1_scene_destroy_pending(other) || a->collider_shape < 0 || b->collider_shape < 0 ||
+        (!a->collider_is_trigger && !b->collider_is_trigger) ||
+        b->rigid_root_entity_index == (int)self || a->rigid_root_entity_index == (int)other ||
+        (a->rigid_root_entity_index >= 0 && a->rigid_root_entity_index == b->rigid_root_entity_index)) return 0;
+    get_world_aabb(a, min_a, max_a);
+    get_world_aabb(b, min_b, max_b);
+    return aabb_overlaps(min_a, max_a, min_b, max_b);
 }

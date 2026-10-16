@@ -394,6 +394,29 @@ void PhysicsWorld::RefreshBodies(Scene& scene) {
     RebuildBodies(scene);
 }
 
+void PhysicsWorld::RemoveEntity(uint32_t entityId) {
+    auto character = m_Impl->entityToCharacter.find(entityId);
+    if (character != m_Impl->entityToCharacter.end()) {
+        m_Impl->characterEntityIds.erase(character->second.GetPtr());
+        m_Impl->entityToCharacter.erase(character);
+    }
+    m_Impl->characterDesiredVelocity.erase(entityId);
+    auto body = m_Impl->entityToBody.find(entityId);
+    if (body != m_Impl->entityToBody.end()) {
+        if (m_Impl->bodyInterface->IsAdded(body->second))
+            m_Impl->bodyInterface->RemoveBody(body->second);
+        m_Impl->bodyInterface->DestroyBody(body->second);
+        m_Impl->entityToBody.erase(body);
+    }
+    std::erase_if(m_Impl->subShapeContacts, [entityId](const auto& item) {
+        return item.second.id1 == entityId || item.second.id2 == entityId;
+    });
+    std::erase_if(m_Impl->activeEntityContactPairs, [entityId](uint64_t pair) {
+        return static_cast<uint32_t>(pair >> 32) == entityId ||
+               static_cast<uint32_t>(pair) == entityId;
+    });
+}
+
 // ─────────────────────────────────────────────────
 // Body / character creation
 // ─────────────────────────────────────────────────

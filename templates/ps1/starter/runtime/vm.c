@@ -345,7 +345,7 @@ static int vm_execute(vm_state* vm, mbc_module* module, script_instance* inst,
                 } else if (obj.tag == HOST_VAL_HOST && obj.ref.kind == HOST_REF_ENTITY) {
                     if (name_equals(member, "id")) {
                         const ps1_entity* ent = ps1_scene_entity(obj.ref.entity_idx);
-                        vm_push(vm, make_num(ent ? (fix16_t)ent->id : 0));
+                        vm_push(vm, make_num(ent ? FIX16_FROM_INT((int32_t)ent->id) : 0));
                     } else {
                         vm_push(vm, make_nil());
                     }

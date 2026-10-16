@@ -906,6 +906,10 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
 
     if (call.callee->kind == Ast::Expr::Kind::Identifier) {
         const std::string& name = call.callee->identifier->name;
+        if (name == "Destroy" && argc == 1) {
+            emit(HostFunc::Entity_Destroy, 1);
+            return true;
+        }
         if (name == "StartCoroutine" && argc == 1 && call.arguments[0] &&
             call.arguments[0]->kind == Ast::Expr::Kind::Call && call.arguments[0]->call &&
             call.arguments[0]->call->callee &&

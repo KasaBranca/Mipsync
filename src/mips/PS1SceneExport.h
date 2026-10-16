@@ -194,6 +194,7 @@ struct Ps1ExportedUiElement {
 };
 
 struct Ps1ExportedUiButtonRect {
+    uint32_t sourceEntityId = 0;
     int16_t x = 0;
     int16_t y = 0;
     int16_t w = 0;

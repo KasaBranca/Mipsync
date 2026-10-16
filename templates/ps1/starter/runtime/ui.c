@@ -72,6 +72,7 @@ int ps1_ui_set_image_visible(uint32_t entity_id, int visible) {
 
 static int element_visible(const ps1_ui_element* ui) {
     unsigned int i;
+    if (ps1_scene_source_id_destroyed(ui->entity_id)) return 0;
     for (i = 0; i < s_text_override_count; ++i)
         if (s_text_override_ids[i] == ui->entity_id && s_text_override_kind[i] == ui->kind)
             return s_text_override_visible[i];
@@ -538,7 +539,7 @@ void ps1_ui_update(void) {
             if (rect_index < g_ps1_scene.ui_button_rect_count) {
                 const ps1_ui_button_rect* rect = &g_ps1_scene.ui_button_rects[rect_index];
                 unsigned int action_index;
-                if (!rect->interactable)
+                if (!rect->interactable || ps1_scene_source_id_destroyed(rect->source_entity_id))
                     continue;
                 if (group->confirm_audio_source) ps1_audio_play(group->confirm_audio_source - 1u);
                 for (action_index = 0; action_index < rect->action_count; ++action_index) {
@@ -581,6 +582,7 @@ static void draw_button_group_cursors(uint32_t* ot, char** pri, const char* pack
         if (rect_index >= g_ps1_scene.ui_button_rect_count)
             continue;
         rect = &g_ps1_scene.ui_button_rects[rect_index];
+        if (ps1_scene_source_id_destroyed(rect->source_entity_id)) continue;
         w = group->cursor_w;
         h = group->cursor_h;
         if (w < 1) w = 1;

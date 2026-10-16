@@ -29,6 +29,8 @@ public:
 
     /// Rebuild Jolt bodies/characters from the scene (play mode only).
     void RefreshBodies(Scene& scene);
+    /// Remove one body/controller without resetting velocities of surviving bodies.
+    void RemoveEntity(uint32_t entityId);
 
     /// Step physics: characters move + slide, dynamic bodies simulate, transforms write back.
     void Simulate(Scene& scene, float deltaTime, float maxFrameDeltaTime = 1.0f / 20.0f);
