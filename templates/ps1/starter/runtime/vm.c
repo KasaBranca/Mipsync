@@ -53,6 +53,40 @@ static host_value make_host(host_ref_kind kind, uint16_t entity_idx, uint8_t vec
     return v;
 }
 
+int vm_entity_index(host_value value) {
+    unsigned int i;
+    if (value.tag == HOST_VAL_HOST && value.ref.kind != HOST_REF_NONE)
+        return ps1_scene_entity(value.ref.entity_idx) ? (int)value.ref.entity_idx : -1;
+    if (value.tag == HOST_VAL_NUMBER && value.ival > 0 && value.ival % FIX16_ONE == 0)
+        for (i = 0; i < ps1_scene_entity_count(); ++i) {
+            const ps1_entity* e = ps1_scene_entity(i);
+            if (e && e->id == (uint32_t)(value.ival / FIX16_ONE)) return (int)i;
+        }
+    return -1;
+}
+
+host_value vm_make_vec3(fix16_t x, fix16_t y, fix16_t z) {
+    host_value value = {0}; value.tag = HOST_VAL_VEC3;
+    value.vector[0] = x; value.vector[1] = y; value.vector[2] = z; return value;
+}
+
+int vm_read_vec3(host_value value, fix16_t out[3]) {
+    const ps1_entity* entity;
+    const fix16_t* vector;
+    unsigned int axis;
+    if (value.tag == HOST_VAL_VEC3) { for (axis=0;axis<3;++axis) out[axis]=value.vector[axis]; return 1; }
+    if (value.tag != HOST_VAL_HOST || (value.ref.kind != HOST_REF_VEC3 && value.ref.kind != HOST_REF_WORLD_VEC3)) return 0;
+    entity = ps1_scene_entity(value.ref.entity_idx);
+    if (!entity) return 0;
+    vector = value.ref.vec_member == 1 ? entity->rotation : value.ref.vec_member == 2 ? entity->scale : entity->position;
+    for (axis=0;axis<3;++axis) out[axis]=vector[axis]; return 1;
+}
+
+const char* vm_value_string(const vm_state* vm, host_value value) {
+    return value.tag == HOST_VAL_NATIVE_STRING ? (value.text ? value.text : "") :
+        value.tag == HOST_VAL_STRING ? vm_module_string(vm,value.str_idx) : "";
+}
+
 static int name_equals(const char* a, const char* b) {
     if (!a || !b) return 0;
     while (*a && *b) {
@@ -197,7 +231,8 @@ static int val_as_bool(host_value v) {
     if (v.tag == HOST_VAL_BOOL)   return v.ival ? 1 : 0;
     if (v.tag == HOST_VAL_NUMBER) return v.ival != 0;
     if (v.tag == HOST_VAL_STRING) return 1;
-    if (v.tag == HOST_VAL_HOST)   return 1;
+    if (v.tag == HOST_VAL_HOST)   return vm_entity_index(v) >= 0;
+    if (v.tag == HOST_VAL_VEC3 || v.tag == HOST_VAL_NATIVE_STRING) return 1;
     if (v.tag == HOST_VAL_ARRAY)  return 1;
     return 0;
 }
@@ -313,23 +348,32 @@ static int vm_execute(vm_state* vm, mbc_module* module, script_instance* inst,
                     vm_push(vm, make_nil());
                 break;
             }
-            case OP_GET_COMPONENT: {
+            case OP_GET_COMPONENT:
+            case OP_GET_COMPONENT_ON: {
                 uint16_t nameIdx = rd_u16(code + pc); pc += 2;
                 const char* className = vm_module_name(vm, nameIdx);
-                if (vm->module && name_equals(className, vm->module->class_name))
-                    vm_push(vm, make_host(HOST_REF_ENTITY, vm->instance->entity_index, 0));
-                else if (name_equals(className, "Transform"))
-                    vm_push(vm, make_host(HOST_REF_TRANSFORM, vm->instance->entity_index, 0));
-                else if (name_equals(className, "AudioSource"))
-                    vm_push(vm, make_host(HOST_REF_AUDIO_SOURCE, vm->instance->entity_index, 0));
-                else
-                    vm_push(vm, make_nil());
-                break;
+                int target = op == OP_GET_COMPONENT_ON ? vm_entity_index(vm_pop(vm)) : (int)inst->entity_index;
+                host_value result = make_nil();
+                unsigned int i;
+                if (target >= 0 && ps1_scene_entity((unsigned)target)) {
+                    if (name_equals(className, "Transform")) result = make_host(HOST_REF_TRANSFORM,(uint16_t)target,0);
+                    else if (name_equals(className, "AudioSource")) result = make_host(HOST_REF_AUDIO_SOURCE,(uint16_t)target,0);
+                    else for (i=0;i<vm->instance_count;++i)
+                        if (vm->instances[i].entity_index == target && name_equals(vm->instances[i].module->class_name,className)) {
+                            result = make_host(HOST_REF_SCRIPT,(uint16_t)target,(uint8_t)i); break;
+                        }
+                }
+                vm_push(vm,result); break;
             }
             case OP_GET_MEMBER: {
                 uint16_t memberIdx = rd_u16(code + pc); pc += 2;
                 const char* member = vm_module_name(vm, memberIdx);
                 host_value obj = vm_pop(vm);
+                if(obj.tag==HOST_VAL_HOST && (name_equals(member,"gameObject")||name_equals(member,"transform")) &&
+                   ps1_scene_entity(obj.ref.entity_idx)) {
+                    vm_push(vm,make_host(name_equals(member,"gameObject")?HOST_REF_ENTITY:HOST_REF_TRANSFORM,obj.ref.entity_idx,0));
+                    break;
+                }
                 if (obj.tag == HOST_VAL_HOST && obj.ref.kind == HOST_REF_TRANSFORM) {
                     if (name_equals(member, "position")) {
                         vm_push(vm, make_host(HOST_REF_VEC3, obj.ref.entity_idx, 0));
@@ -346,9 +390,24 @@ static int vm_execute(vm_state* vm, mbc_module* module, script_instance* inst,
                     if (name_equals(member, "id")) {
                         const ps1_entity* ent = ps1_scene_entity(obj.ref.entity_idx);
                         vm_push(vm, make_num(ent ? FIX16_FROM_INT((int32_t)ent->id) : 0));
+                    } else if (name_equals(member,"transform") && ps1_scene_entity(obj.ref.entity_idx)) {
+                        vm_push(vm,make_host(HOST_REF_TRANSFORM,obj.ref.entity_idx,0));
+                    } else if (name_equals(member,"name")) {
+                        const ps1_entity* e=ps1_scene_entity(obj.ref.entity_idx); host_value value=make_nil();
+                        if(e){value.tag=HOST_VAL_NATIVE_STRING;value.text=e->name;} vm_push(vm,value);
                     } else {
                         vm_push(vm, make_nil());
                     }
+                } else if (obj.tag == HOST_VAL_HOST && obj.ref.kind == HOST_REF_SCRIPT) {
+                    host_value result=make_nil();
+                    if (obj.ref.vec_member < vm->instance_count && ps1_scene_entity(obj.ref.entity_idx)) {
+                        script_instance* target=&vm->instances[obj.ref.vec_member]; unsigned int i;
+                        if(name_equals(member,"transform")) result=make_host(HOST_REF_TRANSFORM,obj.ref.entity_idx,0);
+                        else if(name_equals(member,"gameObject")) result=make_host(HOST_REF_ENTITY,obj.ref.entity_idx,0);
+                        else for(i=0;i<target->module->field_count;++i)
+                            if(name_equals(member,target->module->fields[i].name)){result=target->runtime_fields[i];break;}
+                    }
+                    vm_push(vm,result);
                 } else if (obj.tag == HOST_VAL_HOST && obj.ref.kind == HOST_REF_AUDIO_SOURCE) {
                     const ps1_entity* ent = ps1_scene_entity(obj.ref.entity_idx);
                     if (!ent) {
@@ -374,17 +433,16 @@ static int vm_execute(vm_state* vm, mbc_module* module, script_instance* inst,
                 break;
             }
             case OP_GET_VEC3_AXIS: {
-                uint8_t axis = code[pc++];
-                host_value obj = vm_pop(vm);
-                fix16_t val = 0;
-                if (obj.tag == HOST_VAL_HOST &&
-                    (obj.ref.kind == HOST_REF_VEC3 || obj.ref.kind == HOST_REF_WORLD_VEC3)) {
-                    ps1_entity* ent = ps1_scene_mutable_entity(obj.ref.entity_idx);
-                    fix16_t* vec = entity_vec3(ent, obj.ref.vec_member);
-                    if (vec && axis < 3) val = vec[axis];
+                uint8_t axis=code[pc++]; fix16_t vector[3]={0,0,0};
+                host_value value=vm_pop(vm);
+                if(value.tag==HOST_VAL_HOST && value.ref.kind==HOST_REF_SCRIPT && value.ref.vec_member<vm->instance_count &&
+                   ps1_scene_entity(value.ref.entity_idx)) {
+                    script_instance* target=&vm->instances[value.ref.vec_member];unsigned int i;host_value result=make_nil();
+                    for(i=0;i<target->module->field_count;++i)
+                        if(name_equals(target->module->fields[i].name,axis==0?"x":axis==1?"y":"z")){result=target->runtime_fields[i];break;}
+                    vm_push(vm,result);break;
                 }
-                vm_push(vm, make_num(val));
-                break;
+                vm_read_vec3(value,vector); vm_push(vm,make_num(axis<3?vector[axis]:0)); break;
             }
             case OP_SET_VEC3_AXIS: {
                 /* Stack: [value, vec3Host] (vec3Host on top). Matches desktop VM. */
@@ -397,14 +455,20 @@ static int vm_execute(vm_state* vm, mbc_module* module, script_instance* inst,
                     ps1_entity* ent = ps1_scene_mutable_entity(vecHost.ref.entity_idx);
                     fix16_t* vec = entity_vec3(ent, vecHost.ref.vec_member);
                     if (vec) vec[axis] = val_as_num(val);
+                    else { host_log("[VM] mutable entity capacity exhausted"); vm->error=1; }
                 }
                 break;
             }
-            case OP_SET_VEC3_FROM_VALUE:
-                /* Full vec3 assign (transform.position = Vector3...) — not used yet on PS1. */
-                (void)vm_pop(vm);
-                (void)vm_pop(vm);
+            case OP_SET_VEC3_FROM_VALUE: {
+                host_value target=vm_pop(vm), source=vm_pop(vm); fix16_t vector[3];
+                if(target.tag==HOST_VAL_HOST && vm_read_vec3(source,vector)) {
+                    ps1_entity* entity=ps1_scene_mutable_entity(target.ref.entity_idx); unsigned int axis;
+                    fix16_t* dest=entity?(target.ref.vec_member==1?entity->rotation:target.ref.vec_member==2?entity->scale:entity->position):0;
+                    if(dest)for(axis=0;axis<3;++axis)dest[axis]=vector[axis];
+                    else { host_log("[VM] mutable entity capacity exhausted"); vm->error=1; }
+                }
                 break;
+            }
             case OP_ADD: { host_value b = vm_pop(vm); host_value a = vm_pop(vm); vm_push(vm, make_num(fix16_add(val_as_num(a), val_as_num(b)))); break; }
             case OP_SUB: { host_value b = vm_pop(vm); host_value a = vm_pop(vm); vm_push(vm, make_num(fix16_sub(val_as_num(a), val_as_num(b)))); break; }
             case OP_MUL: { host_value b = vm_pop(vm); host_value a = vm_pop(vm); vm_push(vm, make_num(fix16_mul(val_as_num(a), val_as_num(b)))); break; }
@@ -417,8 +481,22 @@ static int vm_execute(vm_state* vm, mbc_module* module, script_instance* inst,
             }
             case OP_NEG: { host_value a = vm_pop(vm); vm_push(vm, make_num(fix16_neg(val_as_num(a)))); break; }
             case OP_NOT: { host_value a = vm_pop(vm); vm_push(vm, make_bool(!val_as_bool(a))); break; }
-            case OP_EQ:  { host_value b = vm_pop(vm); host_value a = vm_pop(vm); vm_push(vm, make_bool(val_as_num(a) == val_as_num(b))); break; }
-            case OP_NE:  { host_value b = vm_pop(vm); host_value a = vm_pop(vm); vm_push(vm, make_bool(val_as_num(a) != val_as_num(b))); break; }
+            case OP_EQ: {
+                host_value b=vm_pop(vm), a=vm_pop(vm); int equal;
+                if(a.tag==HOST_VAL_HOST || b.tag==HOST_VAL_HOST) equal=vm_entity_index(a)==vm_entity_index(b);
+                else if((a.tag==HOST_VAL_STRING||a.tag==HOST_VAL_NATIVE_STRING) && (b.tag==HOST_VAL_STRING||b.tag==HOST_VAL_NATIVE_STRING))
+                    equal=strcmp(vm_value_string(vm,a),vm_value_string(vm,b))==0;
+                else equal=val_as_num(a)==val_as_num(b);
+                vm_push(vm,make_bool(equal));break;
+            }
+            case OP_NE: {
+                host_value b=vm_pop(vm), a=vm_pop(vm); int equal;
+                if(a.tag==HOST_VAL_HOST || b.tag==HOST_VAL_HOST) equal=vm_entity_index(a)==vm_entity_index(b);
+                else if((a.tag==HOST_VAL_STRING||a.tag==HOST_VAL_NATIVE_STRING) && (b.tag==HOST_VAL_STRING||b.tag==HOST_VAL_NATIVE_STRING))
+                    equal=strcmp(vm_value_string(vm,a),vm_value_string(vm,b))==0;
+                else equal=val_as_num(a)==val_as_num(b);
+                vm_push(vm,make_bool(!equal));break;
+            }
             case OP_LT:  { host_value b = vm_pop(vm); host_value a = vm_pop(vm); vm_push(vm, make_bool(val_as_num(a) <  val_as_num(b))); break; }
             case OP_GT:  { host_value b = vm_pop(vm); host_value a = vm_pop(vm); vm_push(vm, make_bool(val_as_num(a) >  val_as_num(b))); break; }
             case OP_LE:  { host_value b = vm_pop(vm); host_value a = vm_pop(vm); vm_push(vm, make_bool(val_as_num(a) <= val_as_num(b))); break; }

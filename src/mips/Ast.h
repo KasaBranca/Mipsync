@@ -166,6 +166,7 @@ struct MemberExpr {
 };
 
 struct GenericCallExpr {
+    std::unique_ptr<Expr> target; // optional receiver: object.GetComponent<T>()
     std::string calleeName; // e.g. GetComponent
     std::string typeArgument;
     std::vector<std::unique_ptr<Expr>> arguments;

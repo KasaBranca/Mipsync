@@ -73,11 +73,16 @@
 //   Vector3(x, y, z)
 //   Vector3.up / forward / right
 //   Vector3.Add(a, b), Sub, Scale, Length, Normalize
+//   Vector3.Distance(a, b) — use worldPosition to compare world-space positions
 //   transform.position = Vector3(...)  (whole-vector assign)
 //   v.x, v.y, v.z on transform members and stack vectors
 //
 // gameObject:
 //   gameObject.id, gameObject.name
+//   gameObject.transform; public Entity target; public Transform targetTransform;
+//   Scene.Find("Door") / Scene.FindById(Physics.otherEntityId) — Entity or null
+//   target.GetComponent<Health>().hp — read another object's script fields
+//   GetComponent<Transform>(target) — equivalent explicit-target form
 //   Destroy(gameObject) — remove this object and all descendants after callbacks finish
 //   Destroy(Physics.otherEntityId) — remove the other object from a physics callback
 //   Destroy(entityId) — zero, null, missing IDs and repeated requests are harmless
@@ -140,7 +145,7 @@
 //
 // Planned:
 //   struct, properties with custom get/set bodies
-//   Animator.GetFloat, Entity host for Physics.otherEntityId
+//   Animator.GetFloat
 
 namespace MipsyncEngine::Mips {
 

@@ -1,0 +1,28 @@
+class ObjectReferences : MipsBehaviour {
+    public Entity target;
+    public Transform targetTransform;
+    public Entity cached;
+    public float before;
+    public float after;
+    public float health;
+    public float healthX;
+    public bool referencesOK;
+    public bool cleared;
+    void Start() {
+        cached = Scene.Find("Target");
+        referencesOK = target != null && cached == target && Scene.FindById(target.id) == target
+            && Scene.Find("Missing") == null && Scene.FindById(0) == null && target.name == "Target"
+            && GetComponent<Transform>(null) == null && target.GetComponent<Transform>().gameObject == target;
+        before = Vector3.Distance(transform.worldPosition, target.transform.worldPosition);
+        health = target.GetComponent<Health>().hp;
+        healthX = target.GetComponent<Health>().x;
+        target.GetComponent<Transform>().rotation.y = 45;
+        target.transform.worldPosition = Vector3(16, 8, 0);
+        after = Vector3.Length(Vector3.Sub(targetTransform.worldPosition, transform.worldPosition));
+        var value = Vector3.Normalize(Vector3(3, 4, 0));
+        referencesOK = referencesOK && value.x > 0.59 && value.x < 0.61
+            && GetComponent<Transform>(target).rotation.y == 45 && target.GetComponent<Health>().x == 3;
+    }
+    void Update() { cleared = cached == null; }
+    void OnTriggerEnter() { Destroy(Physics.otherEntityId); }
+}

@@ -77,8 +77,9 @@ int host_value_to_string(struct vm_state* vm, host_value v, char* out, int cap) 
         }
         case HOST_VAL_NUMBER:
             return fix16_format((fix16_t)v.ival, out, cap);
-        case HOST_VAL_STRING: {
-            const char* s = vm_module_string(vm, v.str_idx);
+        case HOST_VAL_STRING:
+        case HOST_VAL_NATIVE_STRING: {
+            const char* s = vm_value_string(vm,v);
             if (!s) { out[0] = 0; return 0; }
             int i = 0; while (i < cap - 1 && s[i]) { out[i] = s[i]; ++i; }
             out[i] = 0; return i;
@@ -161,6 +162,14 @@ static fix16_t host_atan2(fix16_t y, fix16_t x) {
         angle = three_pi_over_4 - fix16_mul(pi_over_4, ratio);
     }
     return y < 0 ? fix16_neg(angle) : angle;
+}
+
+static fix16_t vector_length(int64_t x, int64_t y, int64_t z) {
+    uint64_t square, result=0, bit=(uint64_t)1<<62;
+    x/=4;y/=4;z/=4;square=(uint64_t)(x*x+y*y+z*z);
+    while(bit>square)bit>>=2;
+    while(bit){if(square>=result+bit){square-=result+bit;result=(result>>1)+bit;}else result>>=1;bit>>=2;}
+    result*=4;return result>0x7fffffffULL?0x7fffffff:(fix16_t)result;
 }
 
 static void active_camera_planar_axes(fix16_t* right_x, fix16_t* right_z,
@@ -361,21 +370,6 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
         case HF_INPUT_GETCURSORLOCK:
             push_number(vm, FIX16_ONE);
             return 1;
-        case HF_VEC3_LENGTH:
-        case HF_VEC3_UP:
-        case HF_VEC3_FORWARD:
-        case HF_VEC3_RIGHT:
-            /* Vec3 ops collapse to a scalar on the PS1 in Milestone A; the
-             * full struct lives in a follow-up milestone. */
-            push_number(vm, 0);
-            return 1;
-        case HF_VEC3_CREATE:
-        case HF_VEC3_ADD:
-        case HF_VEC3_SUB:
-        case HF_VEC3_SCALE:
-        case HF_VEC3_NORMALIZE:
-            push_nil(vm);
-            return 1;
         case HF_PHYSICS_RAYCAST:
             push_number(vm, 0);
             return 1;
@@ -412,6 +406,46 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
             push_nil(vm);
             return 1;
         }
+        case HF_ENTITY_FROM_ID:
+        case HF_SCENE_FIND: {
+            int index=-1; unsigned int i; host_value value={0};
+            if(argc==1) {
+                if(host_id==HF_ENTITY_FROM_ID) index=vm_entity_index(a[0]);
+                else if(a[0].tag==HOST_VAL_STRING||a[0].tag==HOST_VAL_NATIVE_STRING)
+                    for(i=0;i<ps1_scene_entity_count();++i) {
+                        const ps1_entity* e=ps1_scene_entity(i);
+                        if(e && e->name && !strcmp(e->name,vm_value_string(vm,a[0]))){index=(int)i;break;}
+                    }
+            }
+            if(index>=0 && !ps1_scene_destroy_pending((unsigned)index)) {
+                value.tag=HOST_VAL_HOST;value.ref.kind=HOST_REF_ENTITY;value.ref.entity_idx=(uint16_t)index;
+            }
+            vm_push(vm,value);return 1;
+        }
+        case HF_VEC3_CREATE:
+            vm_push(vm,vm_make_vec3(argc>0?a[0].ival:0,argc>1?a[1].ival:0,argc>2?a[2].ival:0));return 1;
+        case HF_VEC3_UP: vm_push(vm,vm_make_vec3(0,FIX16_ONE,0));return 1;
+        case HF_VEC3_FORWARD: vm_push(vm,vm_make_vec3(0,0,-FIX16_ONE));return 1;
+        case HF_VEC3_RIGHT: vm_push(vm,vm_make_vec3(FIX16_ONE,0,0));return 1;
+        case HF_VEC3_ADD:
+        case HF_VEC3_SUB:
+        case HF_VEC3_SCALE:
+        case HF_VEC3_LENGTH:
+        case HF_VEC3_NORMALIZE:
+        case HF_VEC3_DISTANCE: {
+            fix16_t v[3]={0,0,0},w[3]={0,0,0},out[3]={0,0,0},length; unsigned int axis;
+            if(argc<1||!vm_read_vec3(a[0],v)) { host_log("[VM] invalid Vector3 argument");push_nil(vm);return 0; }
+            if(host_id==HF_VEC3_DISTANCE||host_id==HF_VEC3_ADD||host_id==HF_VEC3_SUB)
+                if(argc<2||!vm_read_vec3(a[1],w)){host_log("[VM] invalid Vector3 argument");push_nil(vm);return 0;}
+            if(host_id==HF_VEC3_LENGTH||host_id==HF_VEC3_NORMALIZE||host_id==HF_VEC3_DISTANCE) {
+                length=vector_length((int64_t)v[0]-w[0],(int64_t)v[1]-w[1],(int64_t)v[2]-w[2]);
+                if(host_id!=HF_VEC3_NORMALIZE){push_number(vm,length);return 1;}
+                for(axis=0;axis<3;++axis)out[axis]=length?fix16_div(v[axis],length):0;
+            } else for(axis=0;axis<3;++axis)
+                out[axis]=host_id==HF_VEC3_SCALE?fix16_mul(v[axis],argc>1?a[1].ival:FIX16_ONE):
+                    host_id==HF_VEC3_ADD?fix16_add(v[axis],w[axis]):fix16_sub(v[axis],w[axis]);
+            vm_push(vm,vm_make_vec3(out[0],out[1],out[2]));return 1;
+        }
         case HF_ENTITY_DESTROY: {
             if (argc == 1 && a[0].tag == HOST_VAL_HOST && a[0].ref.kind == HOST_REF_ENTITY)
                 ps1_scene_request_destroy(a[0].ref.entity_idx);
@@ -436,9 +470,11 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
             push_number(vm, entity ? FIX16_FROM_INT((int32_t)entity->id) : 0);
             return 1;
         }
-        case HF_ENTITY_GETNAME:
-            push_nil(vm);
-            return 1;
+        case HF_ENTITY_GETNAME: {
+            int index=argc?vm_entity_index(a[0]):-1; host_value result={0};
+            const ps1_entity* e=index>=0?ps1_scene_entity((unsigned)index):0;
+            if(e){result.tag=HOST_VAL_NATIVE_STRING;result.text=e->name;}vm_push(vm,result);return 1;
+        }
         case HF_ANIMATOR_SETFLOAT:
         case HF_ANIMATOR_SETBOOL:
         case HF_ANIMATOR_SETINT: {

@@ -51,7 +51,8 @@
     X(STOP_ALL_COROUTINES, StopAllCoroutines, 42) \
     X(YIELD_NEXT, YieldNext, 43) \
     X(YIELD_SECONDS, YieldSeconds, 44) \
-    X(YIELD_BREAK, YieldBreak, 45)
+    X(YIELD_BREAK, YieldBreak, 45) \
+    X(GET_COMPONENT_ON, GetComponentOn, 46)
 
 #define MIPSYNC_HOST_FUNC_LIST(X) \
     X(LOG_INFO, Log_Info, 0) \
@@ -141,7 +142,10 @@
     X(UI_SET_TEXT, UI_SetText, 84) \
     X(UI_SET_TEXT_NUMBER, UI_SetTextNumber, 85) \
     X(UI_SET_COLOR, UI_SetColor, 86) \
-    X(ENTITY_DESTROY, Entity_Destroy, 87)
+    X(ENTITY_DESTROY, Entity_Destroy, 87) \
+    X(ENTITY_FROM_ID, Entity_FromId, 88) \
+    X(SCENE_FIND, Scene_Find, 89) \
+    X(VEC3_DISTANCE, Vector3_Distance, 90)
 
 /* PS1 runtime capacities. The exporter validates these before emitting C. */
 #define MIPSYNC_PS1_MODULE_CAP      4

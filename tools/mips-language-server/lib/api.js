@@ -65,6 +65,8 @@ const GLOBALS = {
     members: {
       id: "int id",
       name: "string name",
+      transform: "Transform transform",
+      GetComponent: "T GetComponent<T>()",
     },
   },
   Time: {
@@ -135,6 +137,7 @@ const GLOBALS = {
       Sub: "Vector3 Sub(Vector3 a, Vector3 b)",
       Scale: "Vector3 Scale(Vector3 a, float s)",
       Length: "float Length(Vector3 v)",
+      Distance: "float Distance(Vector3 a, Vector3 b)",
       Normalize: "Vector3 Normalize(Vector3 v)",
       x: "float x",
       y: "float y",
@@ -205,6 +208,8 @@ const GLOBALS = {
     detail: "Scene",
     documentation: "シーン遷移 API。",
     members: {
+      Find: "Entity Find(string name)",
+      FindById: "Entity FindById(int entityId)",
       Load: "void Load(string scenePath)",
       LoadBuildIndex: "void LoadBuildIndex(int index)",
     },

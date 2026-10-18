@@ -36,7 +36,6 @@ for destruction. Stopping Editor Play restores the original edit scene.
 There is no `Destroy(object, delay)` overload yet. For a delay, use a coroutine
 with `yield return new WaitForSeconds(...)`, followed by `Destroy(gameObject)`.
 
-PS1 trigger contacts use the runtime's world-space collider bounding boxes.
-`OnTriggerEnter`, `OnTriggerExit` and `OnDestroy` are supported. Solid-collision
-callbacks (`OnCollisionEnter`/`OnCollisionExit`) remain unsupported on PS1 and
-are rejected at export.
+Since Mipsync 2026.10.18, PS1 also dispatches
+`OnCollisionEnter`/`OnCollisionExit`. Contacts use world-space collider bounding
+boxes, with skin tolerance for solid collisions. See [object references](ObjectReferences.md).

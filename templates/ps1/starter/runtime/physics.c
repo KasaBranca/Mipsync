@@ -27,6 +27,7 @@ static uint16_t s_move_candidates[PS1_MOVE_CANDIDATE_MAX];
 static uint16_t s_static_collider_count = 0;
 static uint16_t s_dynamic_collider_count = 0;
 static unsigned int s_cached_scene_entity_count = 0;
+static unsigned int s_cached_runtime_revision;
 static fix16_t s_static_nonconvex_world_vertices
     [PS1_STATIC_NONCONVEX_VERTEX_TOTAL][3];
 static uint16_t s_static_nonconvex_vertex_used = 0;
@@ -1137,6 +1138,7 @@ static void rebuild_collider_cache(void) {
     s_dynamic_collider_count = 0;
     s_static_nonconvex_vertex_used = 0;
     s_cached_scene_entity_count = count;
+    s_cached_runtime_revision=ps1_scene_runtime_revision();
 
     for (i = 0; i < count; ++i) {
         const ps1_entity* entity = ps1_scene_entity(i);
@@ -1192,7 +1194,7 @@ static void rebuild_collider_cache(void) {
 }
 
 static void ensure_collider_cache(void) {
-    if (s_cached_scene_entity_count != ps1_scene_entity_count())
+    if (s_cached_scene_entity_count != ps1_scene_entity_count() || s_cached_runtime_revision != ps1_scene_runtime_revision())
         rebuild_collider_cache();
 }
 
@@ -1979,15 +1981,23 @@ int ps1_physics_is_trigger(unsigned int entity_index) {
 }
 
 int ps1_physics_trigger_overlap(unsigned int self, unsigned int other) {
+    return ps1_physics_contact_kind(self,other) == 2;
+}
+
+int ps1_physics_contact_kind(unsigned int self, unsigned int other) {
     const ps1_entity* a = ps1_scene_entity(self);
     const ps1_entity* b = ps1_scene_entity(other);
     fix16_t min_a[3], max_a[3], min_b[3], max_b[3];
     if (self == other || !a || !b || ps1_scene_destroy_pending(self) ||
         ps1_scene_destroy_pending(other) || a->collider_shape < 0 || b->collider_shape < 0 ||
-        (!a->collider_is_trigger && !b->collider_is_trigger) ||
         b->rigid_root_entity_index == (int)self || a->rigid_root_entity_index == (int)other ||
         (a->rigid_root_entity_index >= 0 && a->rigid_root_entity_index == b->rigid_root_entity_index)) return 0;
     get_world_aabb(a, min_a, max_a);
     get_world_aabb(b, min_b, max_b);
-    return aabb_overlaps(min_a, max_a, min_b, max_b);
+    if (a->collider_is_trigger || b->collider_is_trigger)
+        return aabb_overlaps(min_a,max_a,min_b,max_b) ? 2 : 0;
+    for (unsigned int axis=0;axis<3;++axis)
+        if ((int64_t)min_a[axis] > (int64_t)max_b[axis]+PS1_COLLISION_SKIN ||
+            (int64_t)min_b[axis] > (int64_t)max_a[axis]+PS1_COLLISION_SKIN) return 0;
+    return 1;
 }

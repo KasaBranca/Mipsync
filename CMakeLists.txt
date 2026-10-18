@@ -4,7 +4,7 @@ if(CMAKE_GENERATOR MATCHES "Ninja" AND NOT CMAKE_MAKE_PROGRAM)
         HINTS "${CMAKE_CURRENT_SOURCE_DIR}/tools"
               "${CMAKE_CURRENT_SOURCE_DIR}/third_party/.cache/ninja")
 endif()
-project(MipsyncEngine VERSION 2026.10.16 LANGUAGES CXX C)
+project(MipsyncEngine VERSION 2026.10.18 LANGUAGES CXX C)
 enable_testing()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

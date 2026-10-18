@@ -72,6 +72,7 @@ std::string PrintExpr(const Ast::Expr& expr, int indent) {
     case Ast::Expr::Kind::GenericCall:
         out << pad << "GenericCall(" << expr.genericCall->calleeName
             << "<" << expr.genericCall->typeArgument << ">)\n";
+        if (expr.genericCall->target) out << PrintExpr(*expr.genericCall->target, indent + 1);
         for (const auto& arg : expr.genericCall->arguments)
             out << PrintExpr(*arg, indent + 1);
         break;

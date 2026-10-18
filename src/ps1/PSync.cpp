@@ -96,7 +96,7 @@ PSyncEstimate EstimatePSync(const PSyncWorkload& w) {
         switch (static_cast<OpCode>(i)) {
             case OpCode::Mul: cost = 62; break;
             case OpCode::Div: case OpCode::Mod: cost = 100; break;
-            case OpCode::GetComponent: case OpCode::GetGlobal: cost = 90; break;
+            case OpCode::GetComponent: case OpCode::GetComponentOn: case OpCode::GetGlobal: cost = 90; break;
             case OpCode::GetMember: case OpCode::SetVec3Axis:
             case OpCode::SetVec3FromValue: cost = 110; break;
             case OpCode::CallHost: cost = 80; break;

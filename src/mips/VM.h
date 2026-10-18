@@ -98,7 +98,8 @@ private:
     const std::string& ResolveString(const Value& value) const;
     Value MakeRuntimeString(const std::string& text);
     static Value MakeValueVec3(double x, double y, double z);
-    static bool ReadVec3(const Value& value, double& x, double& y, double& z);
+    bool ReadVec3(const Value& value, double& x, double& y, double& z) const;
+    Entity* ResolveEntity(const Value& value) const;
 };
 
 } // namespace Mips

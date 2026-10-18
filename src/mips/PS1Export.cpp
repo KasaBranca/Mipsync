@@ -62,20 +62,8 @@ void AddUniqueError(std::vector<std::string>& errors, const std::string& error) 
 
 const char* UnsupportedHostReason(HostFunc func) {
     switch (func) {
-    case HostFunc::Vector3_Create:
-    case HostFunc::Vector3_Add:
-    case HostFunc::Vector3_Sub:
-    case HostFunc::Vector3_Scale:
-    case HostFunc::Vector3_Length:
-    case HostFunc::Vector3_Normalize:
-    case HostFunc::Vector3_Up:
-    case HostFunc::Vector3_Forward:
-    case HostFunc::Vector3_Right:
-        return "Vector3 value operations are not available on the PS1 runtime yet";
     case HostFunc::Physics_Raycast:
         return "Physics.Raycast is not available on the PS1 runtime yet (Physics.Move and Physics.IsGrounded are supported)";
-    case HostFunc::Entity_GetName:
-        return "Entity.name is not available on the PS1 runtime yet";
     case HostFunc::Application_Quit:
         return "Application.Quit is not available on the PS1 runtime";
     case HostFunc::Save_GetInt:
@@ -107,7 +95,6 @@ bool IsKnownHostFunction(uint16_t id) {
 
 bool IsUnsupportedLifecycle(const std::string& name) {
     static const std::unordered_set<std::string> unsupported = {
-        "OnCollisionEnter", "OnCollisionExit"
     };
     return unsupported.find(name) != unsupported.end();
 }
@@ -142,7 +129,7 @@ void ValidateMethodBytecode(const CompiledModule& module,
     while (pc < code.size()) {
         const size_t opOffset = pc;
         const uint8_t raw = code[pc++];
-        if (raw > static_cast<uint8_t>(OpCode::YieldBreak)) {
+        if (raw > static_cast<uint8_t>(OpCode::GetComponentOn)) {
             AddUniqueError(errors, where + ": unknown opcode " + std::to_string(raw) +
                                    " at offset " + std::to_string(opOffset));
             break;
@@ -184,6 +171,7 @@ void ValidateMethodBytecode(const CompiledModule& module,
         }
         case OpCode::GetGlobal:
         case OpCode::GetComponent:
+        case OpCode::GetComponentOn:
         case OpCode::GetMember:
         case OpCode::StartCoroutine: {
             if (!need(2)) break;
@@ -214,8 +202,6 @@ void ValidateMethodBytecode(const CompiledModule& module,
             break;
         }
         case OpCode::SetVec3FromValue:
-            AddUniqueError(errors, where +
-                                   ": whole Vector3 assignment is not available on the PS1 runtime yet; assign x/y/z separately");
             break;
         case OpCode::NewArray: {
             if (!need(2)) break;

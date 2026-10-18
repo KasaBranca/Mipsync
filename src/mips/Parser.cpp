@@ -693,11 +693,11 @@ std::unique_ptr<Ast::Expr> Parser::ParseCallOrPrimary() {
             node->index->index = ParseExpression();
             Consume(TokenType::RBracket, "expected ']' after index");
             expr = std::move(node);
-        } else if (Check(TokenType::Less) && expr->kind == Ast::Expr::Kind::Identifier &&
+        } else if (Check(TokenType::Less) && (expr->kind == Ast::Expr::Kind::Identifier || expr->kind == Ast::Expr::Kind::Member) &&
                    Peek(1).type == TokenType::Identifier && Peek(2).type == TokenType::Greater &&
                    Peek(3).type == TokenType::LParen) {
             // GetComponent<Rotator>() — must not steal comparison like `speed < 0.0`
-            const std::string calleeName = expr->identifier->name;
+            const std::string calleeName = expr->kind == Ast::Expr::Kind::Member ? expr->member->member : expr->identifier->name;
             Advance(); // <
             const Token typeArg = Consume(TokenType::Identifier, "expected type name inside <>");
             Consume(TokenType::Greater, "expected '>' after type argument");
@@ -707,6 +707,8 @@ std::unique_ptr<Ast::Expr> Parser::ParseCallOrPrimary() {
             node->location = expr->location;
             node->genericCall = std::make_unique<Ast::GenericCallExpr>();
             node->genericCall->calleeName = calleeName;
+            if (expr->kind == Ast::Expr::Kind::Member)
+                node->genericCall->target = std::move(expr->member->object);
             node->genericCall->typeArgument = typeArg.lexeme;
             if (!Check(TokenType::RParen)) {
                 do {

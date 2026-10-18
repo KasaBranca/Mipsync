@@ -324,6 +324,7 @@ extern const ps1_mesh  g_ps1_meshes[];
 extern const unsigned int g_ps1_mesh_count;
 
 void ps1_scene_init(void);
+unsigned int ps1_scene_runtime_revision(void);
 void ps1_scene_request_destroy(unsigned int index);
 int ps1_scene_destroy_pending(unsigned int index);
 int ps1_scene_next_destroy(void);

@@ -16,6 +16,8 @@ static fix16_t s_previous_position[128][3];
 static fix16_t s_previous_rotation[128][3];
 static fix16_t s_previous_scale[128][3];
 static unsigned int s_runtime_count = 0;
+static unsigned int s_runtime_revision;
+unsigned int ps1_scene_runtime_revision(void) { return s_runtime_revision; }
 static int16_t s_runtime_lookup[4096];
 static const ps1_mesh* s_meshes = 0;
 static unsigned int s_mesh_count = 0;
@@ -276,6 +278,7 @@ static void rotate_half_extents(const ps1_entity* e, fix16_t half[3]) {
 }
 
 void ps1_scene_init(void) {
+    ++s_runtime_revision;
     unsigned int entity_count = g_ps1_scene.entity_count;
     unsigned int r_count = 0;
 
@@ -308,27 +311,6 @@ void ps1_scene_init(void) {
         }
 
         if (need_runtime && r_count < 128u) {
-            s_runtime_entities[r_count] = *src;
-            s_vertex_anim_time_q16[r_count] = 0;
-            s_rigid_anim_time_q16[r_count] = 0;
-            s_transform_anim_time_q16[r_count] = 0;
-            s_animator_trigger_time_q16[r_count] = 0;
-            s_animator_transition_time_q16[r_count] = 0;
-            s_animator_trigger_holding[r_count] = 0;
-            s_animator_transition_active[r_count] = 0;
-            s_animator_trigger_manual_hold[r_count] = 0;
-            s_animator_trigger_release_requested[r_count] = 0;
-            s_animator_action_active[r_count] = 0;
-            s_runtime_lookup[i] = (int16_t)r_count;
-            r_count++;
-        }
-    }
-
-    /* Fill remaining slots with the standard entities from the start of the list */
-    for (unsigned int i = 0; i < entity_count; ++i) {
-        if (r_count >= 128u) break;
-        if (s_runtime_lookup[i] < 0) {
-            const ps1_entity* src = &g_ps1_scene.entities[i];
             s_runtime_entities[r_count] = *src;
             s_vertex_anim_time_q16[r_count] = 0;
             s_rigid_anim_time_q16[r_count] = 0;
@@ -939,9 +921,21 @@ ps1_entity* ps1_scene_mutable_entity(unsigned int index) {
     if (index >= 4096u || s_destroy_state[index] == 3) return 0;
     if (index < g_ps1_scene.entity_count) {
         int16_t runtime_idx = s_runtime_lookup[index];
-        if (runtime_idx >= 0) {
-            return &s_runtime_entities[runtime_idx];
+        if(runtime_idx<0 && s_runtime_count<128u) {
+            unsigned int axis; runtime_idx=(int16_t)s_runtime_count++;
+            s_runtime_lookup[index]=runtime_idx;s_runtime_entities[runtime_idx]=g_ps1_scene.entities[index];
+            s_vertex_anim_time_q16[runtime_idx]=s_rigid_anim_time_q16[runtime_idx]=s_transform_anim_time_q16[runtime_idx]=0;
+            s_animator_trigger_time_q16[runtime_idx]=s_animator_transition_time_q16[runtime_idx]=0;
+            s_animator_trigger_holding[runtime_idx]=s_animator_transition_active[runtime_idx]=0;
+            s_animator_trigger_manual_hold[runtime_idx]=s_animator_trigger_release_requested[runtime_idx]=s_animator_action_active[runtime_idx]=0;
+            for(axis=0;axis<3;++axis){
+                s_previous_position[runtime_idx][axis]=s_runtime_entities[runtime_idx].position[axis];
+                s_previous_rotation[runtime_idx][axis]=s_runtime_entities[runtime_idx].rotation[axis];
+                s_previous_scale[runtime_idx][axis]=s_runtime_entities[runtime_idx].scale[axis];
+            }
+            ++s_runtime_revision;
         }
+        if (runtime_idx >= 0) return &s_runtime_entities[runtime_idx];
     }
     return 0;
 }

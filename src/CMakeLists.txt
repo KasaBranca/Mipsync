@@ -293,6 +293,20 @@ add_executable(MipsyncPs1DestroyTests
 target_include_directories(MipsyncPs1DestroyTests PRIVATE
     ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime)
 add_test(NAME MipsyncPs1Destroy COMMAND MipsyncPs1DestroyTests)
+add_executable(MipsyncPs1ObjectApiTests
+    ${CMAKE_SOURCE_DIR}/tests/Ps1ObjectApiTests.cpp
+    mips/Lexer.cpp mips/Parser.cpp mips/Compiler.cpp mips/Bytecode.cpp mips/PS1Export.cpp
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/vm.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/host.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/scene.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/physics.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/fixedp.c)
+target_compile_features(MipsyncPs1ObjectApiTests PRIVATE cxx_std_20)
+target_include_directories(MipsyncPs1ObjectApiTests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests/stubs/ps1_host
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime)
+target_link_libraries(MipsyncPs1ObjectApiTests PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog glm::glm)
+add_test(NAME MipsyncPs1ObjectApi COMMAND MipsyncPs1ObjectApiTests ${CMAKE_SOURCE_DIR}/tests/mips/ObjectReferences.mips)
 add_executable(MipsyncPs1ViewmodelProjectionTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1ViewmodelProjectionTests.c)
 add_test(NAME MipsyncPs1ViewmodelProjection COMMAND MipsyncPs1ViewmodelProjectionTests)
@@ -406,6 +420,9 @@ endif()
 add_test(NAME MipsyncRuntimeRegression
     COMMAND $<TARGET_FILE:MipsyncEngine>
             --test-mips-runtime "${CMAKE_SOURCE_DIR}/tests/mips/ArraysCoroutines.mips")
+# Both entries execute the same round-trip tests with shared legacy temp paths.
+set_tests_properties(MipsyncPSyncVM MipsyncRuntimeRegression PROPERTIES
+    RESOURCE_LOCK MipsyncRuntimeFixtures)
 add_test(NAME MipsyncSilentHillControllerValidation
     COMMAND $<TARGET_FILE:MipsyncEngine>
             --validate-mips "${CMAKE_SOURCE_DIR}/tests/mips/SilentHillController.mips")

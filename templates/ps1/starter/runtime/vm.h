@@ -78,6 +78,8 @@ typedef struct script_instance {
 } script_instance;
 
 typedef struct vm_state {
+    script_instance* instances;
+    unsigned int instance_count;
     mbc_module*       module;
     script_instance*  instance;
     host_value        stack[VM_STACK_CAP];
@@ -111,5 +113,9 @@ uint32_t    vm_stack_size(const vm_state* vm);
 const char* vm_module_string(const vm_state* vm, uint16_t idx);
 const char* vm_module_name(const vm_state* vm, uint16_t idx);
 int         vm_instance_entity_index(const vm_state* vm);
+int vm_entity_index(host_value value);
+int vm_read_vec3(host_value value, fix16_t out[3]);
+host_value vm_make_vec3(fix16_t x, fix16_t y, fix16_t z);
+const char* vm_value_string(const vm_state* vm, host_value value);
 
 #endif /* MIPSYNC_VM_H */

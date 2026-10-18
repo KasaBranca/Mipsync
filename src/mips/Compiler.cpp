@@ -82,6 +82,7 @@ bool ContainsStringLiteral(const Ast::Expr& expr) {
         return expr.member && expr.member->object && ContainsStringLiteral(*expr.member->object);
     case Ast::Expr::Kind::GenericCall:
         if (!expr.genericCall) return false;
+        if (expr.genericCall->target && ContainsStringLiteral(*expr.genericCall->target)) return true;
         for (const auto& arg : expr.genericCall->arguments)
             if (arg && ContainsStringLiteral(*arg)) return true;
         return false;
@@ -287,7 +288,7 @@ std::unique_ptr<CompiledModule> Compiler::Compile() {
             cf.valueKind = FieldValueKind::Bool;
         else if (field->typeName == "AudioClip")
             cf.valueKind = FieldValueKind::AudioClip;
-        else if (field->typeName == "Entity" || field->typeName == "Camera" || field->typeName == "AudioSource")
+        else if (field->typeName == "Entity" || field->typeName == "Transform" || field->typeName == "Camera" || field->typeName == "AudioSource")
             cf.valueKind = FieldValueKind::EntityReference;
         else if (field->typeName.size() >= 2 &&
                  field->typeName.compare(field->typeName.size() - 2, 2, "[]") == 0)
@@ -571,6 +572,21 @@ void Compiler::CompileLValueStore(const Ast::Expr& lhs) {
         }
     }
 
+    if (lhs.kind == Ast::Expr::Kind::Member && lhs.member) {
+        const auto& member = lhs.member->member;
+        if (member == "x" || member == "y" || member == "z") {
+            CompileExpression(*lhs.member->object);
+            m_Writer.EmitOp(OpCode::SetVec3Axis);
+            m_Writer.EmitU8(member == "x" ? 0 : member == "y" ? 1 : 2);
+            return;
+        }
+        if (member == "position" || member == "worldPosition" || member == "rotation" || member == "scale") {
+            CompileExpression(lhs);
+            m_Writer.EmitOp(OpCode::SetVec3FromValue);
+            return;
+        }
+    }
+
     m_CurrentLocation=lhs.location;AddLocatedError("unsupported assignment target; assign local/own fields, array elements or transform axes. Direct writes to another script's fields are not supported.");
     m_Writer.EmitOp(OpCode::Pop);
 }
@@ -615,6 +631,16 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
             }
             m_Writer.EmitOp(OpCode::PushField);
             m_Writer.EmitU16(static_cast<uint16_t>(fieldIdx));
+            const auto& field = m_Module->fields[static_cast<size_t>(fieldIdx)];
+            if (field.typeName == "Entity" || field.typeName == "Transform") {
+                m_Writer.EmitOp(OpCode::CallHost);
+                m_Writer.EmitU16(static_cast<uint16_t>(HostFunc::Entity_FromId));
+                m_Writer.EmitU8(1);
+                if (field.typeName == "Transform") {
+                    m_Writer.EmitOp(OpCode::GetMember);
+                    m_Writer.EmitU16(AddNameConstant("transform"));
+                }
+            }
             break;
         }
         if (const auto enumIt = m_EnumConstants.find(name); enumIt != m_EnumConstants.end()) {
@@ -773,6 +799,12 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
             m_Writer.EmitU16(AddNameConstant(vecMember));
             break;
         }
+        if (expr.member->member == "x" || expr.member->member == "y" || expr.member->member == "z") {
+            CompileExpression(*expr.member->object);
+            m_Writer.EmitOp(OpCode::GetVec3Axis);
+            m_Writer.EmitU8(expr.member->member == "x" ? 0 : expr.member->member == "y" ? 1 : 2);
+            break;
+        }
         CompileExpression(*expr.member->object);
         m_Writer.EmitOp(OpCode::GetMember);
         m_Writer.EmitU16(AddNameConstant(expr.member->member));
@@ -780,9 +812,12 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
     }
 
     case Ast::Expr::Kind::GenericCall: {
-        if (expr.genericCall->calleeName == "GetComponent" &&
-            expr.genericCall->arguments.empty()) {
-            m_Writer.EmitOp(OpCode::GetComponent);
+        if (expr.genericCall->calleeName == "GetComponent" && expr.genericCall->arguments.size() <= 1 &&
+            !(expr.genericCall->target && !expr.genericCall->arguments.empty())) {
+            const bool targeted = expr.genericCall->target || !expr.genericCall->arguments.empty();
+            if (expr.genericCall->target) CompileExpression(*expr.genericCall->target);
+            else if (targeted) CompileExpression(*expr.genericCall->arguments[0]);
+            m_Writer.EmitOp(targeted ? OpCode::GetComponentOn : OpCode::GetComponent);
             m_Writer.EmitU16(AddNameConstant(expr.genericCall->typeArgument));
             break;
         }
@@ -970,6 +1005,16 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
     }
 
     const std::string& targetName = member.object->identifier->name;
+
+    if (targetName == "Scene" && methodName == "FindById" && argc == 1) {
+        emit(HostFunc::Entity_FromId, 1); return true;
+    }
+    if (targetName == "Scene" && methodName == "Find" && argc == 1) {
+        emit(HostFunc::Scene_Find, 1); return true;
+    }
+    if (targetName == "Vector3" && methodName == "Distance" && argc == 2) {
+        emit(HostFunc::Vector3_Distance, 2); return true;
+    }
 
     if (tryAudioSourceMethods(*member.object, methodName))
         return true;

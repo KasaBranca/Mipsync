@@ -6,6 +6,14 @@ const {lex, analyze, codeOnly}=require('../tools/mips-language-server/lib/langua
 const api=require('../tools/mips-language-server/lib/api');
 assert(api.GLOBALS.Destroy && api.GLOBALS.Destroy.detail.includes('Destroy'), 'Destroy completion/hover missing');
 const analyzer=require('../tools/mips-language-server/lib/analyzer');
+for (const [source, member] of [
+ ['class Test : MipsBehaviour { void Start() { var other = Scene.Find("Target"); other.', 'transform'],
+ ['class Test : MipsBehaviour { public Entity target; void Start() { var pose = target.GetComponent<Transform>(); pose.', 'worldPosition'],
+]) {
+ assert(analyzer.getCompletions(source,analyzer.positionAt(source,source.length)).some(item=>item.label===member),`Missing inferred reference completion ${member}`);
+}
+assert(api.GLOBALS.Vector3.members.Distance && api.GLOBALS.Scene.members.FindById,'Object reference API metadata missing');
+assert(analyze('class Test : MipsBehaviour { void Start() { target.GetComponent<Transform>(); } }').tokens.some(t=>t.value==='GetComponent' && t.type==='method'),'Targeted GetComponent must be colored as a method');
 const read=p=>fs.readFileSync(path.join(root,p),'utf8');
 const lexer=read('src/mips/Lexer.cpp');
 for(const m of lexer.matchAll(/\{ "(\w+)", TokenType::Kw/g))assert(api.KEYWORDS.includes(m[1]),`Missing lexer keyword ${m[1]}`);

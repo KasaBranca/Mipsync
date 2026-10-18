@@ -87,7 +87,7 @@ function analyze(text) {
     if(t.kind==="identifier" && !t.type) {
       if(primitives.has(t.value)||types.has(t.value)) t.type=enumTypes.has(t.value)?"enum":"type";
       else if(keywords.has(t.value))t.type="keyword";
-      else if(prev?.value===".")t.type=next?.value==="("?"method":enumTypes.has(tokens[i-2]?.value)?"enumMember":"property";
+      else if(prev?.value===".")t.type=(next?.value==="(" || (next?.value==="<" && t.value==="GetComponent"))?"method":enumTypes.has(tokens[i-2]?.value)?"enumMember":"property";
       else if(GLOBALS[t.value] && /^[A-Z]/.test(t.value) && Object.keys(GLOBALS[t.value].members || {}).length){t.type="class";t.modifiers=["static"];}
       else if(next?.value==="(" || (next?.value==="<" && t.value==="GetComponent")) t.type="function";
       else t.type=symbols.get(t.value)||"variable";

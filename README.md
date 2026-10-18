@@ -186,6 +186,8 @@ Mips# intentionally targets a practical gameplay subset instead of pretending to
 
 To remove an object from a trigger callback, use `Destroy(gameObject)` or
 `Destroy(Physics.otherEntityId)`. See [object destruction and trigger examples](docs/ObjectDestruction.md).
+See [object references and distance](docs/ObjectReferences.md) for Inspector references,
+`Scene.Find`, `target.GetComponent<T>()`, and `Vector3.Distance`.
 
 ## Live command platform
 

@@ -16,6 +16,7 @@
 #include "../../tests/MipsFieldReloadTests.h"
 #include "../../tests/FPSControllerInputTests.h"
 #include "../../tests/MipsDestroyTests.h"
+#include "../../tests/MipsObjectReferenceTests.h"
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -37,6 +38,9 @@ void RunMipsPhase1Tests() {
 bool RunMipsRuntimeRegressionTests(const char* scriptPath,
                                    std::vector<std::string>& errors) {
     std::string hierarchyError;
+    if (!RunMipsObjectReferenceTests(hierarchyError)) {
+        errors.push_back(hierarchyError); return false;
+    }
     if (!RunMipsDestroyTests(hierarchyError)) {
         errors.push_back(hierarchyError); return false;
     }

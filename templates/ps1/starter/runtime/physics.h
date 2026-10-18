@@ -31,5 +31,6 @@ fix16_t ps1_physics_get_collider_radius(unsigned int entity_index);
 fix16_t ps1_physics_get_collider_capsule_height(unsigned int entity_index);
 int     ps1_physics_is_trigger(unsigned int entity_index);
 int ps1_physics_trigger_overlap(unsigned int self, unsigned int other);
+int ps1_physics_contact_kind(unsigned int self, unsigned int other); /* 0 none, 1 collision, 2 trigger */
 
 #endif /* MIPSYNC_PHYSICS_H */

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-10-16T01:50:38.087578+00:00",
+  "generatedAt": "2026-10-18T12:38:20.318887+00:00",
   "hub": {
     "version": "v2026.10.12",
     "assetName": "MipsyncHub_Windows_x64.zip",
@@ -10,6 +10,12 @@
   "editor": {
     "assetName": "MipsyncEngine_Windows_x64.zip",
     "releases": [
+      {
+        "version": "v2026.10.18",
+        "title": "Mipsync Engine 2026.10.18",
+        "downloadUrl": "https://github.com/KasaBranca/Mipsync/releases/download/v2026.10.18/MipsyncEngine_Windows_x64.zip",
+        "publishedAt": "2026-10-18T12:38:20.318887+00:00"
+      },
       {
         "version": "v2026.10.16",
         "title": "Mipsync Engine 2026.10.16",

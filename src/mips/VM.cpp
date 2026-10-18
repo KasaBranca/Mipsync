@@ -325,6 +325,23 @@ std::vector<uint32_t> VM::TakeDestroyRequests() {
     return std::exchange(m_DestroyRequests, {});
 }
 
+Entity* VM::ResolveEntity(const Value& value) const {
+    if (!m_Scene) return nullptr;
+    if (value.tag == Value::Tag::Number && std::isfinite(value.number) && value.number > 0 &&
+        value.number <= UINT32_MAX && std::floor(value.number) == value.number)
+        return m_Scene->FindEntity(static_cast<uint32_t>(value.number));
+    if (value.tag != Value::Tag::Host) return nullptr;
+    for (const auto& entity : m_Scene->GetEntities()) {
+        if (value.host.entity == entity.get()) return entity.get();
+        if (value.host.kind == HostKind::Transform && value.host.transform && value.host.transform == entity->GetComponent<TransformComponent>())
+            return entity.get();
+    }
+    if (value.host.kind == HostKind::MipsScript && m_ActiveInstances)
+        for (const auto& instance : *m_ActiveInstances)
+            if (&instance == value.host.script) return instance.entity;
+    return nullptr;
+}
+
 Value VM::Pop() {
     if (m_Stack.empty())
         return Value{};
@@ -344,6 +361,8 @@ bool VM::IsTruthy(const Value& value) const {
         case Value::Tag::Number: return value.number != 0.0;
         case Value::Tag::String: return true;
         case Value::Tag::Host:
+            if (value.host.kind == HostKind::Entity || value.host.kind == HostKind::Transform || value.host.kind == HostKind::MipsScript)
+                return ResolveEntity(value) != nullptr;
             if (value.host.kind == HostKind::AudioSource) return value.host.entity != nullptr;
             return value.host.kind != HostKind::None;
         case Value::Tag::Array: return value.array != nullptr;
@@ -476,6 +495,11 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
         case OpCode::SetField: {
             const uint16_t idx = ReadU16(code, ip);
             Value val = Pop();
+            if (idx < m_Module->fields.size() && m_Module->fields[idx].valueKind == FieldValueKind::EntityReference &&
+                val.tag == Value::Tag::Host) {
+                const Entity* entity = ResolveEntity(val);
+                val = {}; val.tag = Value::Tag::Number; val.number = entity ? entity->GetID() : 0;
+            }
             if (idx < m_Module->fields.size() &&
                 m_Module->fields[idx].valueKind == FieldValueKind::AudioClip) {
                 if (idx < instance.assetFields.size() && val.tag == Value::Tag::String)
@@ -532,13 +556,16 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
             Push(v);
             break;
         }
-        case OpCode::GetComponent: {
+        case OpCode::GetComponent:
+        case OpCode::GetComponentOn: {
             const uint16_t nameIdx = ReadU16(code, ip);
             const std::string& className = m_Module->nameConstants[nameIdx];
+            Entity* receiver = op == OpCode::GetComponentOn ? ResolveEntity(Pop()) : instance.entity;
+            if (!receiver) { Push(Value{}); break; }
             ScriptInstance* found = nullptr;
-            if (m_ActiveInstances && instance.entity) {
+            if (m_ActiveInstances && receiver) {
                 for (ScriptInstance& inst : *m_ActiveInstances) {
-                    if (inst.entity == instance.entity && inst.module &&
+                    if (inst.entity == receiver && inst.module &&
                         inst.module->className == className) {
                         found = &inst;
                         break;
@@ -550,20 +577,20 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
             if (found) {
                 v.host.kind = HostKind::MipsScript;
                 v.host.script = found;
-            } else if (className == "Animator" && instance.entity) {
+            } else if (className == "Animator" && receiver->GetComponent<AnimatorComponent>()) {
                 v.host.kind = HostKind::Animator;
-                v.host.entity = instance.entity;
-            } else if (className == "AudioSource" && instance.entity) {
+                v.host.entity = receiver;
+            } else if (className == "AudioSource" && receiver->GetComponent<AudioSourceComponent>()) {
                 v.host.kind = HostKind::AudioSource;
-                v.host.entity = instance.entity;
-            } else if (className == "Collider" && instance.entity) {
+                v.host.entity = receiver;
+            } else if (className == "Collider" && receiver->GetComponent<ColliderComponent>()) {
                 v.host.kind = HostKind::Collider;
-                v.host.entity = instance.entity;
-            } else if (className == "Rigidbody" && instance.entity) {
+                v.host.entity = receiver;
+            } else if (className == "Rigidbody" && receiver->GetComponent<RigidbodyComponent>()) {
                 v.host.kind = HostKind::Rigidbody;
-                v.host.entity = instance.entity;
-            } else if (className == "Transform" && instance.entity) {
-                if (TransformComponent* t = GetTransform(instance.entity)) {
+                v.host.entity = receiver;
+            } else if (className == "Transform" && receiver) {
+                if (TransformComponent* t = GetTransform(receiver)) {
                     v.host.kind = HostKind::Transform;
                     v.host.transform = t;
                 }
@@ -575,6 +602,21 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
             const uint16_t memberIdx = ReadU16(code, ip);
             const std::string& member = m_Module->nameConstants[memberIdx];
             Value obj = Pop();
+            if (obj.tag == Value::Tag::Host &&
+                (obj.host.kind == HostKind::Entity || obj.host.kind == HostKind::MipsScript ||
+                 obj.host.kind == HostKind::Transform || obj.host.kind == HostKind::AudioSource ||
+                 obj.host.kind == HostKind::Animator || obj.host.kind == HostKind::Collider || obj.host.kind == HostKind::Rigidbody) &&
+                (member == "transform" || member == "gameObject")) {
+                Entity* entity = ResolveEntity(obj);
+                Value v;
+                if (entity) {
+                    v.tag = Value::Tag::Host;
+                    v.host.kind = member == "transform" ? HostKind::Transform : HostKind::Entity;
+                    v.host.entity = entity;
+                    v.host.transform = entity->GetComponent<TransformComponent>();
+                }
+                Push(v); break;
+            }
             if (obj.tag == Value::Tag::Host && obj.host.kind == HostKind::MipsScript && obj.host.script) {
                 const int fieldIdx = obj.host.script->module->FindFieldIndex(member);
                 if (fieldIdx >= 0 && static_cast<size_t>(fieldIdx) < obj.host.script->runtimeFields.size())
@@ -670,6 +712,12 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
         case OpCode::GetVec3Axis: {
             const uint8_t axis = ReadU8(code, ip);
             Value obj = Pop();
+            if (obj.tag == Value::Tag::Host && obj.host.kind == HostKind::MipsScript && obj.host.script) {
+                const int field=obj.host.script->module->FindFieldIndex(axis==0?"x":axis==1?"y":"z");
+                Push(field>=0 && static_cast<size_t>(field)<obj.host.script->runtimeFields.size()
+                    ? obj.host.script->runtimeFields[field] : Value{});
+                break;
+            }
             Value v;
             v.tag = Value::Tag::Number;
             if (obj.tag == Value::Tag::Host && obj.host.kind == HostKind::Vec3) {
@@ -717,6 +765,9 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                 if (target.host.vec3.x) *target.host.vec3.x = static_cast<float>(sx);
                 if (target.host.vec3.y) *target.host.vec3.y = static_cast<float>(sy);
                 if (target.host.vec3.z) *target.host.vec3.z = static_cast<float>(sz);
+            } else if (target.tag == Value::Tag::Host && target.host.kind == HostKind::WorldVec3 &&
+                       m_Scene && target.host.transform && target.host.transform->entity) {
+                m_Scene->SetWorldPosition(*target.host.transform->entity, glm::vec3(sx,sy,sz));
             }
             break;
         }
@@ -813,6 +864,21 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                 case OpCode::Le: result = av <= bv; break;
                 case OpCode::Ge: result = av >= bv; break;
                 default: break;
+            }
+            if (op == OpCode::Eq || op == OpCode::Ne) {
+                const auto reference = [](const Value& value) {
+                    return value.tag == Value::Tag::Host && (value.host.kind == HostKind::Entity ||
+                        value.host.kind == HostKind::Transform || value.host.kind == HostKind::MipsScript ||
+                        value.host.kind == HostKind::AudioSource || value.host.kind == HostKind::Animator ||
+                        value.host.kind == HostKind::Collider || value.host.kind == HostKind::Rigidbody);
+                };
+                if (reference(a) || reference(b)) {
+                    result = ResolveEntity(a) == ResolveEntity(b);
+                    if (op == OpCode::Ne) result = !result;
+                } else if (a.tag == Value::Tag::String && b.tag == Value::Tag::String) {
+                    result = ResolveString(a) == ResolveString(b);
+                    if (op == OpCode::Ne) result = !result;
+                }
             }
             Value r;
             r.tag = Value::Tag::Number;
@@ -1018,6 +1084,30 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                 const double value = argc >= 1 ? NumberValue(args[0]) : 0.0;
                 pushNumber(value < 0.0 ? -1.0 : (value > 0.0 ? 1.0 : 0.0));
                 break;
+            }
+            case HostFunc::Entity_FromId:
+            case HostFunc::Scene_Find: {
+                Entity* entity = nullptr;
+                if (argc == 1 && m_Scene) {
+                    if (func == HostFunc::Entity_FromId) entity = ResolveEntity(args[0]);
+                    else if (args[0].tag == Value::Tag::String)
+                        for (const auto& candidate : m_Scene->GetEntities()) {
+                            const auto* tag = candidate->GetComponent<TagComponent>();
+                            if (tag && tag->tag == ResolveString(args[0])) { entity = candidate.get(); break; }
+                        }
+                }
+                Value value;
+                if (entity && !IsDestroyPending(entity->GetID())) {
+                    value.tag = Value::Tag::Host; value.host.kind = HostKind::Entity; value.host.entity = entity;
+                }
+                Push(value); break;
+            }
+            case HostFunc::Vector3_Distance: {
+                double ax=0,ay=0,az=0,bx=0,by=0,bz=0;
+                if (argc != 2 || !ReadVec3(args[0],ax,ay,az) || !ReadVec3(args[1],bx,by,bz)) {
+                    outErrors.push_back("Vector3.Distance requires two valid vectors"); Push(Value{}); break;
+                }
+                pushNumber(std::hypot(ax-bx, ay-by, az-bz)); break;
             }
             case HostFunc::Vector3_Create: {
                 const double x = argc >= 1 ? NumberValue(args[0]) : 0.0;
@@ -1793,7 +1883,7 @@ Value VM::MakeValueVec3(double x, double y, double z) {
     return v;
 }
 
-bool VM::ReadVec3(const Value& value, double& x, double& y, double& z) {
+bool VM::ReadVec3(const Value& value, double& x, double& y, double& z) const {
     if (value.tag != Value::Tag::Host)
         return false;
     if (value.host.kind == HostKind::ValueVec3) {
@@ -1807,6 +1897,10 @@ bool VM::ReadVec3(const Value& value, double& x, double& y, double& z) {
         y = value.host.vec3.y ? *value.host.vec3.y : 0.0;
         z = value.host.vec3.z ? *value.host.vec3.z : 0.0;
         return true;
+    }
+    if (value.host.kind == HostKind::WorldVec3 && m_Scene && value.host.transform && value.host.transform->entity) {
+        const auto position = m_Scene->GetWorldPosition(*value.host.transform->entity);
+        x = position.x; y = position.y; z = position.z; return true;
     }
     return false;
 }

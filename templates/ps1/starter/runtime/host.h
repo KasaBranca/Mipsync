@@ -21,7 +21,9 @@ typedef enum {
     HOST_VAL_NUMBER = 2,
     HOST_VAL_STRING = 3,
     HOST_VAL_HOST   = 4,
-    HOST_VAL_ARRAY  = 5
+    HOST_VAL_ARRAY  = 5,
+    HOST_VAL_VEC3   = 6,
+    HOST_VAL_NATIVE_STRING = 7
 } host_val_tag;
 
 typedef enum {
@@ -31,6 +33,7 @@ typedef enum {
     HOST_REF_VEC3,
     HOST_REF_WORLD_VEC3,
     HOST_REF_AUDIO_SOURCE,
+    HOST_REF_SCRIPT,
 } host_ref_kind;
 
 typedef struct host_ref {
@@ -43,7 +46,11 @@ typedef struct host_value {
     host_val_tag tag;
     int32_t      ival;
     uint16_t     str_idx;
-    host_ref     ref;
+    union {
+        host_ref ref;
+        fix16_t vector[3];
+        const char* text;
+    };
 } host_value;
 
 /* Forward decl from vm.h. */

@@ -179,8 +179,10 @@ function inferLocalTypes(text) {
     if (symbol.type && symbol.kind !== "method" && symbol.kind !== "class" && symbol.kind !== "enum")
       types[symbol.name] = symbol.type.endsWith("[]") ? "Array" : symbol.type;
   const source = codeOnly(text);
-  for (const match of source.matchAll(/\bvar\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*GetComponent\s*<\s*([A-Za-z_][A-Za-z0-9_]*)\s*>/g))
+  for (const match of source.matchAll(/\bvar\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?GetComponent\s*<\s*([A-Za-z_][A-Za-z0-9_]*)\s*>/g))
     types[match[1]] = match[2];
+  for (const match of source.matchAll(/\bvar\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*Scene\s*\.\s*Find(?:ById)?\s*\(/g))
+    types[match[1]] = "Entity";
   for (const match of source.matchAll(/\bvar\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:new\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(\(|\[)/g))
     if (match[3] === "[") types[match[1]] = "Array";
     else if (TYPES.includes(match[2])) types[match[1]] = match[2];
