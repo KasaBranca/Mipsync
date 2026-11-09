@@ -2273,6 +2273,8 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
         x[i] = (int16_t)(sxy[i] & 0xffff);
         y[i] = (int16_t)(sxy[i] >> 16);
     }
+    if (!ps1_polygon_fits_gpu(x, y, 4))
+        return 2;
     if (!screen_front_facing_strict(x[0], y[0], x[1], y[1], x[2], y[2]) ||
         !screen_front_facing_strict(x[2], y[2], x[1], y[1], x[3], y[3]))
         return 2;
@@ -3041,10 +3043,13 @@ static void __attribute__((noinline)) cache_world_visibility(
                             const int32_t xy=s_static_screen_cache[static_vertex_offset+vi];
                             const int32_t z=s_static_depth_cache[static_vertex_offset+vi];
                             const int x=(int16_t)xy, y=(int16_t)(xy>>16);
+                            /* The GPU clips safe native polygons to the draw
+                             * area. Crossing a viewport edge alone does not
+                             * require a CPU polygon clip. */
                             s_static_projection_flags[static_vertex_offset+vi] =
                                 (ps1_projection_vertex_needs_clip(xy,z,entity_near_z,INT32_MAX,s_geom_screen) ? 1 : 0) |
                                 (s_static_camera_cache[static_vertex_offset+vi].vz>s_far_z ? 2 : 0) |
-                                (x < -2 || x>s_screen_w+1 || y < -2 || y>s_screen_h+1 ? 4 : 0);
+                                (x < -1020 || x > 1019 || y < -1020 || y > 1019 ? 4 : 0);
                         }
                         static_cache->visible_triangle_count = 0;
                         for(unsigned bi=0;bi<batch_count;++bi) {
@@ -3095,7 +3100,7 @@ static void __attribute__((noinline)) cache_world_visibility(
                                     &s_static_camera_cache[static_vertex_offset + p2]))
                                 continue;
                             int needs_clip = projection_flags != 0;
-                            if (!needs_clip && (!authored_floor_face(ent,face) || s_screen_w>1020 || s_screen_h>508)) {
+                            if (!needs_clip) {
                                 int min_x=(int16_t)xy0,max_x=min_x,min_y=(int16_t)(xy0>>16),max_y=min_y;
                                 const int x1=(int16_t)xy1,x2=(int16_t)xy2,y1=(int16_t)(xy1>>16),y2=(int16_t)(xy2>>16);
                                 if(x1<min_x)min_x=x1;if(x2<min_x)min_x=x2;

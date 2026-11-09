@@ -313,6 +313,9 @@ add_test(NAME MipsyncPs1ViewmodelProjection COMMAND MipsyncPs1ViewmodelProjectio
 add_executable(MipsyncPs1ClipMathTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1ClipMathTests.c)
 add_test(NAME MipsyncPs1ClipMath COMMAND MipsyncPs1ClipMathTests)
+add_executable(MipsyncPs1GpuClippingTests
+    ${CMAKE_SOURCE_DIR}/tests/Ps1GpuClippingTests.c)
+add_test(NAME MipsyncPs1GpuClipping COMMAND MipsyncPs1GpuClippingTests)
 add_executable(MipsyncPs1TextureResolutionTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1TextureResolutionTests.cpp
     mips/PS1TextureExport.cpp assets/Material.cpp core/Log.cpp)
