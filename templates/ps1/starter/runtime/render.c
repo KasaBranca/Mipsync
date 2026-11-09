@@ -504,7 +504,10 @@ static void rebuild_render_entity_lists(void) {
 
     for (i = 0; i < count && i < PS1_RENDER_ENTITY_LIST_MAX; ++i) {
         const ps1_entity* ent = ps1_scene_entity(i);
-        if (!ent || ent->has_camera || !ent->mesh_enabled)
+        /* Keep disabled entities indexed: a runtime may page or reveal them
+         * later without changing the scene's entity count. Draw submission
+         * still checks mesh_enabled before doing any geometry work. */
+        if (!ent || ent->has_camera)
             continue;
         if (ent->prerender_occluder) {
             s_occluder_entities[s_occluder_count++] = (uint16_t)i;
