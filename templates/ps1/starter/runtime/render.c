@@ -6146,6 +6146,17 @@ void ps1_render_frame(uint32_t* ot, char** nextpri, const char* packet_end) {
     count = g_ps1_scene.entity_count;
     if (s_indexed_entity_count != count)
         rebuild_render_entity_lists();
+    /* Paged scenes can disable a previously cached entity without changing
+     * entity_count. Its arena reservation must not permanently displace the
+     * newly visible page. Reclaim at the frame boundary, before any draw holds
+     * pointers into the shared projection or topology arenas. */
+    for (i = 0; i < PS1_STATIC_ENTITY_CACHE_MAX; ++i) {
+        const ps1_entity* cached = s_static_entity_caches[i].entity;
+        if (cached && !cached->mesh_enabled) {
+            reset_static_entity_caches();
+            break;
+        }
+    }
     actor_mask = build_occluder_actor_mask();
     background_index = active_background_texture_index();
     /* With the flat fog-color background, a polygon whose every vertex has
