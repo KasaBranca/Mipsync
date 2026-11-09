@@ -709,10 +709,13 @@ static uint8_t s_static_safe_clip_cache[PS1_STATIC_TRI_CACHE_TOTAL];
 typedef struct {
     uint32_t vertex_offset;
     uint16_t vertex_count, triangle_begin, triangle_end;
+    uint16_t center_alignment_padding;
     SVECTOR center;
     uint16_t extent[3];
     int8_t plane_winding;
 } ps1_visibility_batch;
+_Static_assert(offsetof(ps1_visibility_batch, center) % 4 == 0,
+               "GTE LWC2 requires a four-byte-aligned visibility center");
 typedef struct {
     const ps1_mesh* mesh;
     uint16_t batch_offset, batch_count;
