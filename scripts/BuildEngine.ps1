@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 $source = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 # Resolve tools before configuring so missing prerequisites produce an actionable
 # error instead of CMake's cascading "compiler not set" diagnostics.
-$cmakeCommand = Get-Command cmake -CommandType Application -ErrorAction SilentlyContinue
+$cmakeCommand = Get-Command cmake -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 if (!$cmakeCommand) { throw 'CMake 3.25 or newer is required. Install CMake and add its bin directory to PATH.' }
 $cmake = $cmakeCommand.Source
 $ctest = Join-Path (Split-Path $cmake -Parent) 'ctest.exe'
@@ -18,7 +18,7 @@ $compilerCandidates = @()
 if ($CompilerRoot) {
     $compilerCandidates = @([IO.Path]::GetFullPath($CompilerRoot))
 } else {
-    $gccCommand = Get-Command gcc -CommandType Application -ErrorAction SilentlyContinue
+    $gccCommand = Get-Command gcc -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($gccCommand) { $compilerCandidates += Split-Path $gccCommand.Source -Parent }
     $compilerCandidates += @('C:\msys64\mingw64\bin', 'C:\msys64\ucrt64\bin')
 }
@@ -57,7 +57,7 @@ if (Test-Path -LiteralPath $alias) {
 }
 $ninja = Join-Path $alias 'tools/ninja.exe'
 if (!(Test-Path -LiteralPath $ninja)) {
-    $ninjaCommand = Get-Command ninja -CommandType Application -ErrorAction SilentlyContinue
+    $ninjaCommand = Get-Command ninja -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if (!$ninjaCommand) { throw 'Ninja is missing. Restore the bundled tools/ninja.exe or install Ninja and add it to PATH.' }
     $ninja = $ninjaCommand.Source
 }
