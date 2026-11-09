@@ -53,10 +53,18 @@ static void add_world_primitive(uint32_t* bucket, void* primitive) {
 #define PSX_UNITS_PER_WORLD 64
 /* PSX fpscam default forward is +Z; Unity cameras look down -Z. */
 #define PSX_YAW_UNITY_OFFSET 2048
+#ifndef PS1_VIEWMODEL_VERTEX_CACHE_MAX
 #define PS1_VIEWMODEL_VERTEX_CACHE_MAX 2048
+#endif
+#ifndef PS1_VIEWMODEL_TRI_CACHE_MAX
 #define PS1_VIEWMODEL_TRI_CACHE_MAX 4096
+#endif
+#ifndef PS1_RIGID_VERTEX_CACHE_MAX
 #define PS1_RIGID_VERTEX_CACHE_MAX 2048
+#endif
+#ifndef PS1_STATIC_VERTEX_CACHE_MAX
 #define PS1_STATIC_VERTEX_CACHE_MAX 4096
+#endif
 /* New exports size these pools for the scene's instances and largest clip
  * frames. Keep the full capacity for older generated data without limits. */
 #ifndef PS1_STATIC_VERTEX_CACHE_TOTAL
@@ -65,13 +73,35 @@ static void add_world_primitive(uint32_t* bucket, void* primitive) {
 #ifndef PS1_STATIC_TRI_CACHE_TOTAL
 #define PS1_STATIC_TRI_CACHE_TOTAL 16384
 #endif
+#ifndef PS1_STATIC_ENTITY_CACHE_MAX
 #define PS1_STATIC_ENTITY_CACHE_MAX 64
+#endif
+#ifndef PS1_STATIC_TOPOLOGY_CACHE_MAX
 #define PS1_STATIC_TOPOLOGY_CACHE_MAX 32
+#endif
+#ifndef PS1_UI_PACKET_RESERVE
 #define PS1_UI_PACKET_RESERVE 4096
+#endif
+#ifndef PS1_OCCLUDER_CACHE_MAX
 #define PS1_OCCLUDER_CACHE_MAX 256
+#endif
+#ifndef PS1_OCCLUDER_PROJECTED_VERTEX_MAX
 #define PS1_OCCLUDER_PROJECTED_VERTEX_MAX 2048
+#endif
+#ifndef PS1_OCCLUDER_PROJECTED_TRI_MAX
 #define PS1_OCCLUDER_PROJECTED_TRI_MAX 2048
+#endif
+#ifndef PS1_RENDER_ENTITY_LIST_MAX
 #define PS1_RENDER_ENTITY_LIST_MAX 2048
+#endif
+#if PS1_VIEWMODEL_VERTEX_CACHE_MAX < 1 || PS1_VIEWMODEL_TRI_CACHE_MAX < 1 || \
+    PS1_RIGID_VERTEX_CACHE_MAX < 1 || PS1_STATIC_VERTEX_CACHE_MAX < 1 || \
+    PS1_STATIC_ENTITY_CACHE_MAX < 1 || PS1_STATIC_TOPOLOGY_CACHE_MAX < 1 || \
+    PS1_UI_PACKET_RESERVE < 1 || PS1_OCCLUDER_CACHE_MAX < 1 || \
+    PS1_OCCLUDER_PROJECTED_VERTEX_MAX < 1 || \
+    PS1_OCCLUDER_PROJECTED_TRI_MAX < 1 || PS1_RENDER_ENTITY_LIST_MAX < 1
+#error "PS1 renderer cache capacities must be positive"
+#endif
 #ifndef PS1_PROJECTION_DEBUG
 #define PS1_PROJECTION_DEBUG 0
 #endif
