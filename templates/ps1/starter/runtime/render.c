@@ -978,10 +978,33 @@ static ps1_static_entity_cache* static_entity_cache_for(
     }
     static_entity_cache_capacity(
         entity, mesh, &vertex_capacity, &triangle_capacity);
+    if (vertex_capacity > PS1_STATIC_VERTEX_CACHE_TOTAL ||
+        triangle_capacity > PS1_STATIC_TRI_CACHE_TOTAL)
+        return 0;
     if (!free_entry ||
         s_static_vertex_cache_used + vertex_capacity > PS1_STATIC_VERTEX_CACHE_TOTAL ||
-        s_static_triangle_cache_used + triangle_capacity > PS1_STATIC_TRI_CACHE_TOTAL)
-        return 0;
+        s_static_triangle_cache_used + triangle_capacity > PS1_STATIC_TRI_CACHE_TOTAL) {
+        int reclaimable = 0;
+        /* A disabled entity can become visible again without changing its
+         * mesh. Keep its reservation until another draw actually needs space;
+         * eagerly clearing the arena also discards every live page's cached
+         * projection, lighting and topology on each subsequent frame.
+         *
+         * This allocation happens before draw_entity holds arena pointers.
+         * Earlier draws have returned and their GPU packets contain copied
+         * values, so reclaiming here cannot invalidate an in-flight draw. */
+        for (i = 0; i < PS1_STATIC_ENTITY_CACHE_MAX; ++i) {
+            const ps1_entity* cached = s_static_entity_caches[i].entity;
+            if (cached && !cached->mesh_enabled) {
+                reclaimable = 1;
+                break;
+            }
+        }
+        if (!reclaimable)
+            return 0;
+        reset_static_entity_caches();
+        free_entry = &s_static_entity_caches[0];
+    }
     free_entry->entity = entity;
     free_entry->mesh = 0;
     free_entry->next_mesh = 0;
@@ -6157,13 +6180,6 @@ void ps1_render_frame(uint32_t* ot, char** nextpri, const char* packet_end) {
      * entity_count. Its arena reservation must not permanently displace the
      * newly visible page. Reclaim at the frame boundary, before any draw holds
      * pointers into the shared projection or topology arenas. */
-    for (i = 0; i < PS1_STATIC_ENTITY_CACHE_MAX; ++i) {
-        const ps1_entity* cached = s_static_entity_caches[i].entity;
-        if (cached && !cached->mesh_enabled) {
-            reset_static_entity_caches();
-            break;
-        }
-    }
     actor_mask = build_occluder_actor_mask();
     background_index = active_background_texture_index();
     /* With the flat fog-color background, a polygon whose every vertex has
