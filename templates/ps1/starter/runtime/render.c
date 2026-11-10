@@ -12,6 +12,7 @@
 #include "projection_safety.h"
 #include "watertight_projection.h"
 #include "affine_subdivision.h"
+#include "world_projection.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -6111,6 +6112,17 @@ void ps1_render_init(int screen_w, int screen_h) {
     s_light_mtx.t[0] = s_light_mtx.t[1] = s_light_mtx.t[2] = 0;
     apply_scene_lighting();
     s_initialized = 1;
+}
+
+int ps1_render_project_world(int32_t x_q16, int32_t y_q16, int32_t z_q16,
+        int16_t* screen_x, int16_t* screen_y, int32_t* depth) {
+    const int32_t translation[3] = {
+        s_cam_mtx.t[0], s_cam_mtx.t[1], s_cam_mtx.t[2]
+    };
+    if (!s_initialized) return 0;
+    return ps1_project_world_point(s_cam_mtx.m, translation,
+        s_screen_w, s_screen_h, s_geom_screen, s_near_z, s_far_z,
+        x_q16, y_q16, z_q16, screen_x, screen_y, depth);
 }
 
 void ps1_render_frame(uint32_t* ot, char** nextpri, const char* packet_end) {
