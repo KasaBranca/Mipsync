@@ -25,7 +25,9 @@ std::vector<std::string> Words(const std::string& value) {
 int Score(const SymbolDescriptor& symbol, const std::vector<std::string>& words) {
     const std::string id = Lower(symbol.id);
     const std::string name = Lower(symbol.name);
-    const std::string body = Lower(symbol.summary + " " + symbol.description + " " + symbol.signature);
+    std::string body = Lower(symbol.summary + " " + symbol.description + " " + symbol.signature);
+    for(const auto& p:symbol.parameters)body+=" "+Lower(p.name+" "+p.summary+" "+ToString(p.type));
+    for(const auto& example:symbol.examples)body+=" "+Lower(example);
     int score = 0;
     int matched = 0;
     for (const auto& word : words) {

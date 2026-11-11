@@ -34,6 +34,9 @@ typedef enum {
     HOST_REF_WORLD_VEC3,
     HOST_REF_AUDIO_SOURCE,
     HOST_REF_SCRIPT,
+    HOST_REF_ANIMATOR,
+    HOST_REF_COLLIDER,
+    HOST_REF_RIGIDBODY,
 } host_ref_kind;
 
 typedef struct host_ref {

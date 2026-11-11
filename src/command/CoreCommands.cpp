@@ -197,15 +197,15 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
     commands.Register({
         "help", "List commands or inspect a command namespace.",
         "Returns command metadata from the shared Command Registry.",
-        {Param("path", ValueType::String, false, "Optional command namespace.")}, "command_list",
+        {Param("path", ValueType::String, false, "Optional command namespace."),Param("summary",ValueType::Boolean,false,"Return IDs and summaries only.",true),Param("details",ValueType::Boolean,false,"Include full command parameter metadata.",false)}, "command_list",
         ExecutionMode::Local, {SideEffect::ReadOnly}, {"mipsync help", "mipsync help entity"},
         [](const CommandRequest& request, CommandContext& context) {
             const std::string path = request.arguments.value("path", std::string{});
             Json items = Json::array();
             for (const auto* descriptor : context.commands->Under(path))
-                items.push_back(descriptor->ToJson(false));
+                items.push_back(request.arguments.value("details",false)||!request.arguments.value("summary",true)?descriptor->ToJson(false):Json{{"id",descriptor->id},{"summary",descriptor->summary}});
             if (items.empty()) return CommandResult::Fail("MIPSYNC_HELP_NOT_FOUND", "No commands under: " + path);
-            return CommandResult::Ok({{"commands", std::move(items)}});
+            return CommandResult::Ok({{"commands", std::move(items)},{"hint","describe <id> or help <namespace> --details; output: --fields, --select, --out, --quiet, --max-depth, --output-format compact|pretty"}});
         }});
     commands.Register({
         "capabilities", "Describe this command endpoint.",
@@ -247,7 +247,17 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
             for (const auto* symbol : context.symbols->Search(query, 10000)) {
                 if(!kind.empty()&&symbol->kind!=kind)continue;
                 if(!prefix.empty()&&symbol->id!=prefix&&!symbol->id.starts_with(prefix+"."))continue;
-                matches.push_back(symbol->ToJson(false));if(matches.size()>=limit)break;
+                auto match=symbol->ToJson(false);Json reasons=Json::array();
+                auto lower=[](std::string s){std::transform(s.begin(),s.end(),s.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});return s;};
+                std::istringstream terms(lower(query));std::string term;std::set<std::string> matched;
+                while(terms>>term) {
+                    if(lower(symbol->id+" "+symbol->name).find(term)!=std::string::npos)matched.insert("id/name: "+term);
+                    if(lower(symbol->summary+" "+symbol->description+" "+symbol->signature).find(term)!=std::string::npos)matched.insert("description/signature: "+term);
+                    for(const auto& p:symbol->parameters)if(lower(p.name+" "+p.summary).find(term)!=std::string::npos)matched.insert("parameter "+p.name+": "+term);
+                    for(const auto& example:symbol->examples)if(lower(example).find(term)!=std::string::npos)matched.insert("example: "+term);
+                }
+                for(const auto& reason:matched)reasons.push_back(reason);match["matchedOn"]=reasons;
+                matches.push_back(std::move(match));if(matches.size()>=limit)break;
             }
             return CommandResult::Ok({{"query", query}, {"matches", std::move(matches)}});
         }});
@@ -344,8 +354,8 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
             {Param("dialog", ValueType::String, true, "scene_save or build_progress."), Param("action", ValueType::String, true, "save, discard, cancel or close, as returned by inspect.")},
             "editor_dialog_response", ExecutionMode::Editor, {SideEffect::ProjectMutation, SideEffect::FilesystemWrite, SideEffect::RuntimeMutation, SideEffect::ExternalProcess},
             {"mipsync editor dialog respond scene_save cancel --json", "mipsync editor dialog respond build_progress close --json"}, ForwardEditor},
-        {"entity.list", "List entities in the current scene.", "Returns stable entity IDs, hierarchy and component names.", {}, "entity_list", ExecutionMode::Editor, {SideEffect::ReadOnly}, {"mipsync entity list --json"}, ForwardEditor},
-        {"entity.inspect", "Inspect an entity by ID or name.", "Returns transform, hierarchy and optional serialized component information.", {Param("entity", ValueType::String, true, "Entity ID or exact name."),Param("include-components",ValueType::Boolean,false,"Include all serialized component properties.",false)}, "entity", ExecutionMode::Editor, {SideEffect::ReadOnly}, {"mipsync entity inspect Player"}, ForwardEditor},
+        {"entity.list", "List entities in the current scene.", "Returns stable IDs, hierarchy, component names and optional local transform/world AABB.", {Param("with-transform",ValueType::Boolean,false,"Include local transforms.",false),Param("with-bounds",ValueType::Boolean,false,"Include world render geometry AABB.",false)}, "entity_list", ExecutionMode::Editor, {SideEffect::ReadOnly}, {"mipsync entity list --with-transform --with-bounds --json"}, ForwardEditor},
+        {"entity.inspect", "Inspect an entity by ID or name.", "Mesh buffers are omitted by default; opt in for raw vertices/indices.", {Param("entity", ValueType::String, true, "Entity ID or exact name."),Param("include-components",ValueType::Boolean,false,"Include serialized component properties.",false),Param("include-mesh-data",ValueType::Boolean,false,"Include raw mesh buffers (implies include-components).",false),Param("compact",ValueType::Boolean,false,"Include component properties without mesh buffers.",false)}, "entity", ExecutionMode::Editor, {SideEffect::ReadOnly}, {"mipsync entity inspect Player --compact --json"}, ForwardEditor},
         {"entity.select", "Select and reveal an entity in the Editor.", "Selects an entity in Hierarchy and Inspector, switches to Scene View and frames it.", {Param("entity", ValueType::String, true, "Entity ID or exact name.")}, "entity", ExecutionMode::Editor, {SideEffect::EditorMutation}, {"mipsync entity select Player"}, ForwardEditor},
         {"entity.set", "Edit common entity properties.", "Renames an entity or changes active, static, Tag and Layer metadata.",
             {Param("entity", ValueType::String, true, "Entity ID or exact name."),
@@ -374,6 +384,7 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
              Param("sy", ValueType::Number, false, "Local scale Y.", 1.0),
              Param("sz", ValueType::Number, false, "Local scale Z.", 1.0),
              Param("material", ValueType::Path, false, "Optional project-relative .nmat material."),
+             Param("render-type",ValueType::String,false,"Lit or Unlit.","Lit"),
              Param("parent", ValueType::String, false, "Optional parent entity ID or name.")},
             "entity", ExecutionMode::Editor, {SideEffect::EditorMutation},
             {"mipsync entity create Crate --primitive cube --x 2 --y 1 --z -3 --sx 2 --material assets/materials/Crate.nmat"}, ForwardEditor},
@@ -434,6 +445,7 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
              Param("material", ValueType::Path, false, "Project-relative .nmat material, or none."),
              Param("enabled", ValueType::Boolean, false, "Renderer enabled state."),
              Param("editor-only", ValueType::Boolean, false, "Only draw in Scene View."),
+             Param("render-type",ValueType::String,false,"Lit or Unlit."),
              Param("type-preset", ValueType::String, false,
                    "prop, corridor, character, viewmodel or floor."),
              Param("view-model", ValueType::Boolean, false,
@@ -532,12 +544,15 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
     editorCommand("script.reload","Force recompilation of scene scripts without relying on timestamps.",{Param("file",ValueType::Path,false,"Optional script path; omit to reload all attached scripts.")});
     editorCommand("entity.order","Set sibling order, which controls UI drawing order.",{Param("entity",ValueType::String,true,"Entity ID/name."),Param("index",ValueType::Integer,true,"Zero-based sibling order; zero is first.")});
     editorCommand("entity.grid","Duplicate an entity hierarchy into a grid in row-major drawing order.",{Param("entity",ValueType::String,true,"Template ID/name."),Param("rows",ValueType::Integer,true,"Rows, 1..4096."),Param("columns",ValueType::Integer,true,"Columns; total cells at most 4096."),Param("dx",ValueType::Number,false,"Column spacing.",100.0),Param("dy",ValueType::Number,false,"Row spacing.",-100.0),Param("name",ValueType::String,false,"Base name; each copy gets row/column suffix.")});
-    editorCommand("batch.run","Execute authoring commands in one Undo transaction; failure rolls back the complete scene batch.",{Param("operations",ValueType::Json,false,"Array of {command,arguments}. Authoring commands only."),Param("file",ValueType::Path,false,"Project-relative JSON file containing the array.")});
+    commands.Register({"batch.run","Execute authoring commands in one Undo transaction; failure rolls back the complete scene batch.",
+        "Example input: [{\"command\":\"entity.create\",\"arguments\":{\"name\":\"Start Roof\",\"primitive\":\"empty\"}}]. dry-run validates and executes on an isolated copy without changing the editor scene or Undo history. IDs in a dry-run are provisional.",
+        {Param("operations",ValueType::Json,false,"Array of {command,arguments}. Authoring commands only."),Param("file",ValueType::Path,false,"Project-relative JSON file, or - for CLI stdin."),Param("dry-run",ValueType::Boolean,false,"Execute on an isolated scene copy.",false),Param("summary",ValueType::Boolean,false,"Return entity IDs/names instead of full results.",false)},
+        "batch_result",ExecutionMode::Editor,{SideEffect::EditorMutation},{"mipsync batch run --file - --summary --json","mipsync batch run --file tools/roof.json --dry-run --json"},ForwardEditor});
     editorCommand("runtime.fields","Read actual script runtime variables, including arrays.",{Param("entity",ValueType::String,true,"Entity ID/name."),Param("index",ValueType::Integer,false,"Zero-based script index.",0)},false);
     editorCommand("runtime.pause","Set runtime pause state.",{Param("paused",ValueType::Boolean,false,"Pause or resume.",true)},false);
     editorCommand("runtime.step","Queue deterministic gameplay frames while paused.",{Param("frames",ValueType::Integer,false,"Frames, 1..600.",1),Param("delta",ValueType::Number,false,"Seconds per frame.",1.0/60.0),Param("buttons",ValueType::Json,false,"Optional PS1 button names to set atomically before stepping."),Param("axes",ValueType::Json,false,"Optional PS1 stick axes to set atomically before stepping.")},false);
     editorCommand("runtime.input","Inject virtual PS1 input for queued runtime.step frames.",{Param("buttons",ValueType::Json,false,"Held PS1 button names.",Json::array()),Param("axes",ValueType::Json,false,"Object containing LeftStickX/Y and RightStickX/Y, -1..1.",Json::object())},false);
-    editorCommand("runtime.capture","Save the last rendered Game View as a PNG.",{Param("file",ValueType::Path,true,"Project-relative output PNG path.")},false);
+    editorCommand("runtime.capture","Save Game View, or render a custom camera when position/target are supplied.",{Param("file",ValueType::Path,true,"Project-relative output PNG path."),Param("position",ValueType::String,false,"Camera x,y,z."),Param("target",ValueType::String,false,"Look-at x,y,z."),Param("width",ValueType::Integer,false,"PNG width, 16..4096.",960),Param("height",ValueType::Integer,false,"PNG height, 16..4096.",720)},false);
 
     editorCommand("model.inspect","Inspect model mesh parts, bones, animation clip IDs/stacks/durations and target channels.",{Param("model",ValueType::Path,true,"Project model path.")},false);
     editorCommand("animation.list","List animation clips, stack indices, durations and animated bone targets.",{Param("model",ValueType::Path,true,"Project model path.")},false);
@@ -557,6 +572,7 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
     assetCommand("animator.controller.transition.set","Append or replace an animation transition with validated conditions.",{Param("path",ValueType::Path,true,"Controller path."),Param("transition",ValueType::Json,true,"Transition object."),Param("index",ValueType::Integer,false,"-1 appends; otherwise existing zero-based index.",-1)});
     assetCommand("model.extract","Extract mesh parts or dominant bone regions for independent animations; original model is preserved. Use instead of unsupported animation layers/masks.",{Param("model",ValueType::Path,true,"Original model path."),Param("path",ValueType::Path,true,"Output .nmodel descriptor."),Param("bone-roots",ValueType::Json,false,"Bone names including descendants.",Json::array()),Param("mesh-parts",ValueType::Json,false,"Mesh part indices.",Json::array())});
 
+    #include "WorkflowCommandCatalog.inl"
     RegisterLanguageSymbols(symbols);
     for (const auto* command : commands.All()) {
         symbols.Register({command->id, "command", command->id, command->summary, command->description,

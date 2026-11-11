@@ -5,6 +5,9 @@
 #include <array>
 #include <iostream>
 #include <stdexcept>
+#include <filesystem>
+#include <fstream>
+#include <thread>
 
 using namespace MipsyncEngine;
 static void Require(bool condition, const char* message) {
@@ -121,6 +124,37 @@ int main() {
             skin.UpdateVertexData(skinnedVertices);
             Require(render(true, true, red) == beforeUpdate && skin.GetIndexCount() == 3,
                     "Updating a preview must preserve topology and restore the pose");
+            namespace fs = std::filesystem;
+            const auto project = fs::absolute("Testing/project-renderer-pixels");
+            fs::create_directories(project / "renderer/pc");
+            auto shader = [&](const char* name, const char* source) {
+                std::ofstream(project / "renderer/pc" / name, std::ios::binary) << source;
+            };
+            const char* redShader = "#version 330 core\nout vec4 FragColor; void main(){FragColor=vec4(1,0,0,1);}";
+            const char* greenShader = "#version 330 core\nout vec4 FragColor; void main(){FragColor=vec4(0,1,0,1);}";
+            shader("mesh.frag", redShader);
+            renderer.SetProjectRoot(project, true);
+            Require(renderer.ReloadProjectShaders(), "Valid project shader did not compile");
+            const auto customRed = render(false, true, red);
+            Require(customRed[0] == 255 && customRed[1] == 0, "Custom fragment did not change actual pixels");
+            Require(render(true, true, red) == customRed, "Custom fragment did not reach skinned mesh");
+            shader("mesh.frag", "invalid GLSL");
+            Require(!renderer.ReloadProjectShaders(), "Invalid project shader accepted");
+            Require(render(false, true, red) == customRed, "Shader failure lost the last valid rendering");
+            shader("mesh.frag", greenShader);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+            const auto customGreen = render(false, true, red);
+            Require(customGreen[0] == 0 && customGreen[1] == 255, "Corrected shader not applied");
+            shader("screen.frag", redShader);
+            Require(renderer.ReloadProjectShaders(), "Custom screen pass did not compile");
+            render(false, true, red);
+            renderer.GetRenderTarget(nullptr).Bind();
+            Require(pixel() == customRed, "Screen shader did not process final scene pixels");
+            renderer.GetRenderTarget(nullptr).Unbind();
+            fs::remove(project / "renderer/pc/mesh.frag");
+            fs::remove(project / "renderer/pc/screen.frag");
+            Require(renderer.ReloadProjectShaders(), "Deleted overrides did not restore defaults");
+            Require(render(false, true, red) != customGreen, "Deleted shader remains active");
             std::cout << "Unlit mesh/skinned pixels, fog, Lit toggles and lazy light uploads passed\n";
         }
         glfwDestroyWindow(window);

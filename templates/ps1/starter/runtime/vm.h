@@ -24,6 +24,28 @@
  *   code    : 4 KiB per method
  */
 
+#ifdef MIPSYNC_SCRIPT_AOT
+/* Immutable descriptors for native C functions. No bytecode or decoded pools. */
+struct vm_state;
+struct script_instance;
+struct vm_coroutine;
+typedef struct mbc_method {
+    const char* name;
+    int (*entry)(struct vm_state*, struct script_instance*, struct vm_coroutine*);
+    uint16_t local_count;
+} mbc_method;
+typedef struct mbc_field {
+    const char* name;
+    uint8_t value_kind;
+} mbc_field;
+typedef struct mbc_module {
+    const char* class_name;
+    uint16_t field_count;
+    const mbc_field* fields;
+    uint16_t method_count;
+    const mbc_method* methods;
+} mbc_module;
+#else
 typedef struct mbc_method {
     char            name[VM_METHOD_NAME_LEN];
     const uint8_t*  code;
@@ -50,6 +72,8 @@ typedef struct mbc_module {
     uint16_t    method_count;
     mbc_method  methods[VM_METHOD_CAP];
 } mbc_module;
+
+#endif
 
 typedef struct vm_array {
     uint8_t length;
@@ -86,6 +110,9 @@ typedef struct vm_state {
     uint32_t          sp;
     host_value        locals[VM_LOCAL_CAP];
     int               error;
+    /* Immutable runtime strings; reclaimed by scanning live script roots. */
+    char              runtime_strings[64][VM_STRING_LEN];
+    uint8_t           runtime_string_used[64];
 } vm_state;
 
 /*
@@ -117,5 +144,8 @@ int vm_entity_index(host_value value);
 int vm_read_vec3(host_value value, fix16_t out[3]);
 host_value vm_make_vec3(fix16_t x, fix16_t y, fix16_t z);
 const char* vm_value_string(const vm_state* vm, host_value value);
+host_value vm_allocate_array(vm_state* vm,script_instance* inst,int length);
+host_value vm_make_string(vm_state* vm, const char* text);
+host_value vm_add_values(vm_state* vm, host_value a, host_value b);
 
 #endif /* MIPSYNC_VM_H */

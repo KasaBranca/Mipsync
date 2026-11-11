@@ -5795,7 +5795,9 @@ bool EmitAudioDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
     std::unordered_map<std::string, uint8_t> clipIndex;
     size_t totalSpuBytes = 0;
 
-    auto ensureClip = [&](const std::string& path, bool sfx, bool sample, uint8_t& outIndex) -> bool {
+    auto ensureClip = [&](const std::string& sourcePath, bool sfx, bool sample, uint8_t& outIndex) -> bool {
+        std::string path=sourcePath;
+        std::replace(path.begin(),path.end(),'\\','/');
         outIndex = 0;
         if (path.empty()) return true;
         const std::string key = (sample ? "SAMPLE:" : sfx ? "SFX:" : "BGM:") + path;
@@ -5848,7 +5850,7 @@ bool EmitAudioDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
     };
 
     for (auto& entity : data.entities) {
-        if (entity.audioEnabled && !ensureClip(entity.audioClipPath, entity.audioSfx, entity.audioSample, entity.audioClipIndex))
+        if (!ensureClip(entity.audioClipPath, entity.audioSfx, entity.audioSample, entity.audioClipIndex))
             return false;
       for (auto& script : entity.scripts) {
         for (size_t i = 0; i < script.assetFieldPaths.size(); ++i) {
@@ -5859,6 +5861,28 @@ bool EmitAudioDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
                 script.fieldValuesQ16[i] = ToFixed16(static_cast<double>(index));
         }
       }
+    }
+
+    // Computed clip paths need the same project audio catalog as literal paths.
+    // Include it only when scripts actually assign AudioSource.clip at runtime.
+    if (std::any_of(data.modules.begin(), data.modules.end(), [](const auto& module) {
+            return ModuleUsesHostFunction(module, HostFunc::AudioSource_SetClip);
+        })) {
+        std::vector<std::string> paths;
+        const fs::path base=PathUtf8::FromString(projectRoot);
+        for(const char* folder:{"assets","scripts"}) {
+            const fs::path dir=base/folder;
+            if(!fs::exists(dir))continue;
+            for(const auto& entry:fs::recursive_directory_iterator(dir))if(entry.is_regular_file()){
+                std::string ext=PathUtf8::ToString(entry.path().extension());
+                std::transform(ext.begin(),ext.end(),ext.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
+                if(ext==".wav"||ext==".mp3"||ext==".vag"||ext==".mid"||ext==".midi")
+                    paths.push_back(PathUtf8::ToString(fs::relative(entry.path(),base)));
+            }
+        }
+        std::sort(paths.begin(),paths.end());
+        for(auto& path:paths){std::replace(path.begin(),path.end(),'\\','/');uint8_t index=0;
+            if(!ensureClip(path,IsMidiPath(path),false,index))return false;}
     }
 
     /* Audio is streamed through two 32 KiB SPU buffers at runtime, so clips
@@ -5970,14 +5994,14 @@ bool EmitAudioDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
     } else {
         for (size_t i = 0; i < data.audioClips.size(); ++i) {
             if (data.audioClips[i].sample) {
-                out << "    {0," << data.audioClips[i].data.size() << "u," << data.audioClips[i].sampleRate << "u,0,sample_" << i << "},\n"; continue;
+                out << "    {0," << data.audioClips[i].data.size() << "u," << data.audioClips[i].sampleRate << "u,0,sample_" << i << "," << json(data.audioClips[i].path).dump() << "},\n"; continue;
             }
             if (data.audioClips[i].sfx) {
-                out << "    {0, 0u, 0u, &midi_" << i << "},\n"; continue;
+                out << "    {0, 0u, 0u, &midi_" << i << ",0," << json(data.audioClips[i].path).dump() << "},\n"; continue;
             }
             out << "    { \"\\\\" << cdFileNames[i] << "\", "
                 << data.audioClips[i].data.size()
-                << "u, " << data.audioClips[i].sampleRate << "u, 0 },\n";
+                << "u, " << data.audioClips[i].sampleRate << "u, 0, 0," << json(data.audioClips[i].path).dump() << " },\n";
         }
     }
     out << "};\nconst unsigned int g_ps1_audio_clip_count = "
@@ -7785,6 +7809,7 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
                    "#define MIPSYNC_GENERATED_SCENE_CATALOG_H\n"
                    "#define MIPSYNC_BUILD_SCENE_COUNT " << bootManifest.scenesInBuild.size() << "\n"
                    "#define MIPSYNC_CURRENT_SCENE_INDEX " << outResult.buildSceneIndex << "\n"
+                   "#define MIPSYNC_SAVE_GAME_ID " << json(bootManifest.companyName+"/"+bootManifest.productName).dump() << "\n"
                    "static const char* const k_mipsync_scene_paths[] = {\n";
         for (std::string path : bootManifest.scenesInBuild) {
             std::replace(path.begin(), path.end(), '\\', '/');
@@ -8001,10 +8026,6 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
                         outError = "PS1 script field '" + field.name +
                                    "' requires an object with a Camera component";
                         return false;
-                    }
-                    if (field.typeName == "AudioSource" && !outResult.entities[referencedIndex].audioEnabled) {
-                        // A disabled source is a valid optional reference, but does not play.
-                        script.fieldValuesQ16[fi] = 0; continue;
                     }
                     script.fieldValuesQ16[fi] = ToFixed16(
                         static_cast<double>(referencedIndex + 1));

@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <iostream>
+#include <fstream>
+#include <sstream>
 #include <optional>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -71,11 +73,16 @@ std::optional<EditorInstanceInfo> SelectInstance(const ParsedCommandLine& parsed
 }
 
 int Print(const ParsedCommandLine& parsed, const CommandResult& result) {
-    if (parsed.json) std::cout << result.ToJson(parsed.request.requestId).dump(2) << '\n';
-    else {
-        std::ostream& stream = result.success ? std::cout : std::cerr;
-        stream << RenderHuman(parsed.request.command, result);
+    auto projected=result;
+    projected.value=ProjectOutput(result.value,parsed.fields,parsed.maxDepth);
+    const std::string output=parsed.json ? projected.ToJson(parsed.request.requestId).dump(parsed.compact?-1:2)+"\n"
+                                        : RenderHuman(parsed.request.command,projected);
+    if (!parsed.outputPath.empty()) {
+        std::ofstream file(fs::u8path(parsed.outputPath),std::ios::binary);
+        file << output; file.close();
+        if(!file) { std::cerr << "mipsync: cannot write --out file: " << parsed.outputPath << '\n'; return 1; }
     }
+    if ((!parsed.quiet && parsed.outputPath.empty()) || !result.success) (parsed.json||result.success?std::cout:std::cerr) << output;
     return result.success ? 0 : 1;
 }
 
@@ -132,6 +139,15 @@ int main(int argc, char** argv) {
     }
     if (parsed.projectPath.empty()) parsed.projectPath = DetectProject();
     parsed.request.projectPath = parsed.projectPath;
+
+    if(parsed.request.command=="batch.run" && parsed.request.arguments.value("file",std::string{})=="-") {
+        if(parsed.request.arguments.contains("operations"))return Print(parsed,CommandResult::Fail("MIPSYNC_BATCH_ARGUMENT","Supply exactly one of operations or file."));
+        try {
+            std::ostringstream input; input<<std::cin.rdbuf();
+            parsed.request.arguments["operations"]=Json::parse(input.str());
+            parsed.request.arguments.erase("file");
+        } catch(const std::exception& error) {return Print(parsed,CommandResult::Fail("MIPSYNC_BATCH_FORMAT",error.what()));}
+    }
 
     const CommandDescriptor* descriptor = commands.Find(parsed.request.command);
     if (!descriptor) return Print(parsed, CommandResult::Fail("MIPSYNC_COMMAND_NOT_FOUND", parsed.request.command));

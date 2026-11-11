@@ -40,6 +40,20 @@ static int ps1_texture_get_tim(unsigned int texture_index, TIM_IMAGE* tim) {
     return 1;
 }
 
+/* Resolve descriptor metadata rather than partially initialized s_cluts.
+ * A shared palette owner may appear later in the generated table. */
+static uint16_t ps1_texture_resolve_clut(unsigned int texture_index) {
+    unsigned int remaining = g_ps1_texture_count < 256u ? g_ps1_texture_count : 256u;
+    while (remaining-- && texture_index) {
+        TIM_IMAGE tim;
+        if (!ps1_texture_get_tim(texture_index, &tim)) return 0;
+        if ((tim.mode & 0x8u) && tim.crect)
+            return getClut(tim.crect->x, tim.crect->y);
+        texture_index = g_ps1_textures[texture_index - 1u].clut_texture_index;
+    }
+    return 0;
+}
+
 void ps1_texture_load_to_vram(unsigned int texture_index) {
     TIM_IMAGE tim;
     const ps1_texture_desc* t;
@@ -56,11 +70,7 @@ void ps1_texture_load_to_vram(unsigned int texture_index) {
     s_vram_y[texture_index - 1u] = (uint16_t)tim.prect->y;
     s_modes[texture_index - 1u] = (uint8_t)(tim.mode & 3u);
     s_widths[texture_index - 1u] = ps1_texture_pixel_width(&tim);
-    s_cluts[texture_index - 1u] = (tim.mode & 0x8u) && tim.crect
-        ? getClut(tim.crect->x, tim.crect->y) : 0;
-    if (!s_cluts[texture_index - 1u] && t->clut_texture_index > 0 &&
-        t->clut_texture_index <= g_ps1_texture_count)
-        s_cluts[texture_index - 1u] = s_cluts[t->clut_texture_index - 1u];
+    s_cluts[texture_index - 1u] = ps1_texture_resolve_clut(texture_index);
     s_slot_texture[(t->residency_slot ? t->residency_slot : texture_index) - 1u] =
         (uint16_t)texture_index;
 }
@@ -114,11 +124,7 @@ void ps1_textures_init(void) {
             s_vram_x[i] = (uint16_t)tim.prect->x;
             s_vram_y[i] = (uint16_t)tim.prect->y;
             s_modes[i] = (uint8_t)tp;
-            s_cluts[i] = (tim.mode & 0x8u) && tim.crect
-                ? getClut(tim.crect->x, tim.crect->y) : 0;
-            if (!s_cluts[i] && t->clut_texture_index > 0 &&
-                t->clut_texture_index <= g_ps1_texture_count)
-                s_cluts[i] = s_cluts[t->clut_texture_index - 1u];
+            s_cluts[i] = ps1_texture_resolve_clut(i + 1u);
         }
     }
 

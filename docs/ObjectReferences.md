@@ -48,8 +48,9 @@ legacy `position` remains world-space; `worldPosition` is consistent across targ
 `target.GetComponent<Health>().hp` reads a numeric or boolean script field from the target.
 `GetComponent<Health>(target)` is equivalent. Script fields are read-only through
 another object's component reference; arbitrary user-defined method calls remain
-unsupported. PS1 component lookup supports Transform, AudioSource, and bound
-script instances. PC also exposes Animator, Collider and Rigidbody references.
+unsupported. The released PS1 component lookup supports Transform, AudioSource and bound
+script instances. The [native PS1 development build](NativePS1.md) also exposes
+Animator, Collider and Rigidbody references, matching PC.
 
 Vector3 construction, Add/Sub/Scale, Length, Normalize and Distance work on both
 targets. PS1 uses Q16.16 numbers and saturates distances outside its numeric range.

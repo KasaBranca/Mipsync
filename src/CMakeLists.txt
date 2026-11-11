@@ -38,6 +38,7 @@ set(MIPSYNC_ENGINE_SOURCES
     audio/AudioSystem.cpp
     audio/MidiFile.cpp
     audio/Ps1VagEncoder.cpp
+    renderer/ProjectRenderer.cpp
     bootstrap/AgentIntegration.cpp
     bootstrap/ProjectBootstrap.cpp
     build/BuildManifest.cpp
@@ -139,6 +140,7 @@ set(MIPSYNC_ENGINE_SOURCES
 add_executable(MipsyncEngine ${MIPSYNC_ENGINE_SOURCES})
 
 set(MIPSYNC_COMMAND_SOURCES
+    renderer/ProjectRenderer.cpp
     bootstrap/AgentIntegration.cpp
     command/CommandTypes.cpp
     command/CommandRegistry.cpp
@@ -244,6 +246,15 @@ if(WIN32)
 endif()
 add_test(NAME MipsyncPlayerPackage COMMAND MipsyncPlayerPackageTests $<TARGET_FILE:MipsyncEngine>)
 add_test(NAME MipsyncCommandPlatform COMMAND MipsyncCommandTests)
+add_executable(MipsyncProjectRendererTests
+    ${CMAKE_SOURCE_DIR}/tests/ProjectRendererTests.cpp renderer/ProjectRenderer.cpp)
+target_include_directories(MipsyncProjectRendererTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(MipsyncProjectRendererTests PRIVATE MipsyncAssetFiles)
+add_test(NAME MipsyncProjectRenderer COMMAND MipsyncProjectRendererTests)
+add_test(NAME MipsyncAgentSkillAssets COMMAND ${CMAKE_COMMAND}
+    "-DWORK_DIR=${CMAKE_BINARY_DIR}/Testing/agent-skill-assets"
+    "-DSYNC_SCRIPT=${CMAKE_SOURCE_DIR}/cmake/SyncAgentSkills.cmake"
+    -P "${CMAKE_SOURCE_DIR}/tests/AgentSkillAssets.cmake")
 add_executable(MipsyncPs1LightingTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1LightingTests.cpp
     ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/lighting.c)
@@ -252,7 +263,7 @@ target_include_directories(MipsyncPs1LightingTests PRIVATE
 add_test(NAME MipsyncPs1Lighting COMMAND MipsyncPs1LightingTests)
 add_executable(MipsyncUnlitRendererTests
     ${CMAKE_SOURCE_DIR}/tests/UnlitRendererTests.cpp
-    renderer/Renderer.cpp renderer/Shader.cpp renderer/Mesh.cpp
+    renderer/ProjectRenderer.cpp renderer/Renderer.cpp renderer/Shader.cpp renderer/Mesh.cpp
     renderer/Camera.cpp renderer/Texture.cpp renderer/Framebuffer.cpp
     animation/SkinnedMesh.cpp scene/Transform.cpp core/Log.cpp ps1/PSync.cpp)
 target_include_directories(MipsyncUnlitRendererTests PRIVATE
@@ -298,6 +309,10 @@ add_executable(MipsyncPs1ObjectApiTests
     mips/Lexer.cpp mips/Parser.cpp mips/Compiler.cpp mips/Bytecode.cpp mips/PS1Export.cpp
     ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/vm.c
     ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/host.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/strings.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/audio_catalog.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/save.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/application.c
     ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/scene.c
     ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/physics.c
     ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/fixedp.c)
@@ -307,6 +322,42 @@ target_include_directories(MipsyncPs1ObjectApiTests PRIVATE
     ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime)
 target_link_libraries(MipsyncPs1ObjectApiTests PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog glm::glm)
 add_test(NAME MipsyncPs1ObjectApi COMMAND MipsyncPs1ObjectApiTests ${CMAKE_SOURCE_DIR}/tests/mips/ObjectReferences.mips)
+add_executable(MipsyncPs1SaveTests
+    ${CMAKE_SOURCE_DIR}/tests/Ps1SaveTests.cpp
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/save.c)
+target_include_directories(MipsyncPs1SaveTests PRIVATE ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime)
+add_test(NAME MipsyncPs1Save COMMAND MipsyncPs1SaveTests)
+add_executable(MipsyncPs1AotEmitter
+    ${CMAKE_SOURCE_DIR}/tests/Ps1AotEmitter.cpp
+    mips/Lexer.cpp mips/Parser.cpp mips/Compiler.cpp mips/Bytecode.cpp mips/PS1Export.cpp)
+target_include_directories(MipsyncPs1AotEmitter PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(MipsyncPs1AotEmitter PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog glm::glm)
+set(MIPSYNC_AOT_TEST_C "${CMAKE_CURRENT_BINARY_DIR}/aot-tests/scripts_data.c")
+add_custom_command(OUTPUT "${MIPSYNC_AOT_TEST_C}"
+    COMMAND $<TARGET_FILE:MipsyncPs1AotEmitter> "${MIPSYNC_AOT_TEST_C}" "${CMAKE_SOURCE_DIR}/tests/mips"
+    DEPENDS MipsyncPs1AotEmitter
+        ${CMAKE_SOURCE_DIR}/tests/mips/ObjectReferences.mips
+        ${CMAKE_SOURCE_DIR}/tests/mips/ArraysCoroutines.mips
+        ${CMAKE_SOURCE_DIR}/tests/mips/NativeParity.mips
+    VERBATIM)
+add_executable(MipsyncPs1NativeTests
+    ${CMAKE_SOURCE_DIR}/tests/Ps1ObjectApiTests.cpp "${MIPSYNC_AOT_TEST_C}"
+    mips/Lexer.cpp mips/Parser.cpp mips/Compiler.cpp mips/Bytecode.cpp mips/PS1Export.cpp
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/native.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/host.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/strings.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/audio_catalog.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/save.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/application.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/scene.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/physics.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/fixedp.c)
+target_compile_definitions(MipsyncPs1NativeTests PRIVATE MIPSYNC_SCRIPT_AOT=1)
+target_include_directories(MipsyncPs1NativeTests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests/stubs/ps1_host
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime)
+target_link_libraries(MipsyncPs1NativeTests PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog glm::glm)
+add_test(NAME MipsyncPs1Native COMMAND MipsyncPs1NativeTests ${CMAKE_SOURCE_DIR}/tests/mips/ObjectReferences.mips)
 add_executable(MipsyncPs1ViewmodelProjectionTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1ViewmodelProjectionTests.c)
 add_test(NAME MipsyncPs1ViewmodelProjection COMMAND MipsyncPs1ViewmodelProjectionTests)
@@ -316,6 +367,15 @@ add_test(NAME MipsyncPs1ClipMath COMMAND MipsyncPs1ClipMathTests)
 add_executable(MipsyncPs1GpuClippingTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1GpuClippingTests.c)
 add_test(NAME MipsyncPs1GpuClipping COMMAND MipsyncPs1GpuClippingTests)
+add_executable(MipsyncPs1WorldProjectionTests
+    ${CMAKE_SOURCE_DIR}/tests/Ps1WorldProjectionTests.c)
+add_test(NAME MipsyncPs1WorldProjection COMMAND MipsyncPs1WorldProjectionTests)
+add_executable(MipsyncPs1TexturePaletteTests
+    ${CMAKE_SOURCE_DIR}/tests/Ps1TexturePaletteTests.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/textures.c)
+target_include_directories(MipsyncPs1TexturePaletteTests PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests/stubs/ps1_textures)
+add_test(NAME MipsyncPs1TexturePalette COMMAND MipsyncPs1TexturePaletteTests)
 add_executable(MipsyncPs1TextureResolutionTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1TextureResolutionTests.cpp
     mips/PS1TextureExport.cpp assets/Material.cpp core/Log.cpp)
@@ -572,12 +632,23 @@ endif()
 # Ship reusable Agent Skills next to the editor so coding agents can install
 # the version that matches the bundled CLI protocol and command surface.
 if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/skills")
-    add_custom_command(TARGET MipsyncEngine POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_SOURCE_DIR}/skills"
-            "$<TARGET_FILE_DIR:MipsyncEngine>/skills"
-        COMMENT "Copying Mipsync Agent Skills next to executable"
-    )
+    # A documentation-only update must propagate even when neither executable
+    # needs relinking. CLI-only builds also need their matching bundled Skill.
+    add_custom_target(MipsyncAgentSkillAssets
+        COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=${CMAKE_SOURCE_DIR}/skills"
+            "-DDESTINATION_DIR=$<TARGET_FILE_DIR:MipsyncCLI>/skills"
+            -P "${CMAKE_SOURCE_DIR}/cmake/SyncAgentSkills.cmake"
+        COMMENT "Synchronizing bundled Mipsync Agent Skills")
+    add_dependencies(MipsyncEngine MipsyncAgentSkillAssets)
+    add_dependencies(MipsyncCLI MipsyncAgentSkillAssets)
+    if(WIN32 AND MIPSYNC_DEPLOY_LATEST_INSTALL)
+        add_custom_command(TARGET MipsyncAgentSkillAssets POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                "-DBUILD_DIR=$<TARGET_FILE_DIR:MipsyncCLI>"
+                -DSKILLS_ONLY=ON
+                -P "${CMAKE_SOURCE_DIR}/cmake/DeployLatestInstalledEditor.cmake")
+    endif()
 endif()
 
 # Copy Hub artifacts next to the engine so double-clicking the engine

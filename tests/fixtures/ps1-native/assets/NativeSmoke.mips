@@ -1,0 +1,31 @@
+class NativeSmoke : MipsBehaviour {
+    public int frame = 0;
+    public bool coreOK;
+    public bool cardOK;
+    public AudioSource source;
+    void Start() {
+        Save.SetInt("coins", 7);
+        Save.SetFloat("speed", 1.5);
+        Save.SetString("note", "native" + ":mips");
+        var prior = source.clip;
+        source.enabled = true;
+        source.clip = "assets/audio/two.wav";
+        coreOK = prior == "assets/audio/one.wav" && source.clip == "assets/audio/two.wav" && Save.GetString("note", "bad") == "native:mips";
+        if (coreOK)
+            Log.Info("NATIVE_CORE_OK");
+        else Log.Info("NATIVE_CORE_FAIL");
+    }
+    void Update() {
+        frame = frame + 1;
+        if (frame == 8) {
+            var saved = Save.Write("slot1.json");
+            Save.SetInt("coins", 0);
+            var read = Save.Read("slot1.json");
+            cardOK = saved && read && Save.GetInt("coins", 0) == 7;
+            if (cardOK) Log.Info("NATIVE_CARD_OK");
+            else Log.Info("NATIVE_CARD_FAIL");
+            Save.SetInt("handoff", 9);
+            Scene.LoadBuildIndex(1);
+        }
+    }
+}

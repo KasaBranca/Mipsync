@@ -4,6 +4,7 @@
 #include "ResultRenderer.h"
 #include "AuthoringCatalog.h"
 #include "AnimationAuthoring.h"
+#include "WorkflowGeometry.h"
 #include <stb_image_write.h>
 #include <fstream>
 #include <sstream>
@@ -339,7 +340,7 @@ void EditorCommandHost::Pump(bool preparationOnly) {
         MIPSYNC_INFO("[CLI] {} {}", request->request.command,
                      request->request.arguments.empty() ? std::string{} : request->request.arguments.dump());
         const auto* descriptor = m_Commands.Find(request->request.command);
-        const bool mutation = descriptor && std::find(descriptor->effects.begin(),descriptor->effects.end(),
+        const bool mutation = !(request->request.command=="batch.run"&&request->request.arguments.value("dry-run",false)) && descriptor && std::find(descriptor->effects.begin(),descriptor->effects.end(),
             SideEffect::EditorMutation) != descriptor->effects.end();
         if (mutation) m_Engine.GetEditor().CommitUndoTransaction();
         const auto result = m_Executor.Execute(request->request, m_Context);
@@ -359,7 +360,7 @@ std::string EditorCommandHost::ExecuteConsoleLine(const std::string& line) {
     if (!parsed.valid) return "error: " + parsed.error;
     parsed.request.projectPath = m_Engine.GetProjectPath();
     const auto* descriptor = m_Commands.Find(parsed.request.command);
-    const bool mutation = descriptor && std::find(descriptor->effects.begin(),descriptor->effects.end(),
+    const bool mutation = !(parsed.request.command=="batch.run"&&parsed.request.arguments.value("dry-run",false)) && descriptor && std::find(descriptor->effects.begin(),descriptor->effects.end(),
         SideEffect::EditorMutation) != descriptor->effects.end();
     if (mutation) m_Engine.GetEditor().CommitUndoTransaction();
     const auto result = m_Executor.Execute(parsed.request,m_Context);
@@ -498,7 +499,8 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
     if (request.command == "scene.inspect") {
         return CommandResult::Ok({
             {"path", editor.GetSceneFilePath()}, {"entityCount", scene.GetEntities().size()},
-            {"dirty", editor.IsSceneDirty()}, {"playing", editor.IsPlaying()}, {"paused", editor.IsPaused()},
+            {"dirty", editor.IsSceneDirty()}, {"dirtyReason",editor.IsSceneDirty()?Json("scene_differs_from_saved_snapshot"):Json(nullptr)},
+            {"playing", editor.IsPlaying()}, {"paused", editor.IsPaused()},
         });
     }
     if (request.command == "scene.get-json") {
@@ -575,10 +577,13 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
     if (request.command == "entity.list") {
         Json entities = Json::array();
         for (const auto& entity : scene.GetEntities()) {
-            entities.push_back({
+            Json item{
                 {"id", entity->GetID()}, {"name", EntityName(*entity)}, {"active", entity->IsActive()},
                 {"parentId", entity->GetParentID()}, {"components", ComponentNames(*entity)},
-            });
+            };
+            if(request.arguments.value("with-transform",false))item["transform"]=DescribeEntity(*entity).value("transform",Json(nullptr));
+            if(request.arguments.value("with-bounds",false))item["bounds"]=EntityRenderBounds(scene,*entity).ToJson();
+            entities.push_back(std::move(item));
         }
         return CommandResult::Ok({{"entities", std::move(entities)}, {"count", scene.GetEntities().size()}});
     }
@@ -588,9 +593,11 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         Entity* entity = FindEntity(scene, query, &lookupError);
         if (!entity) return CommandResult::Fail("MIPSYNC_ENTITY_NOT_FOUND", lookupError);
         auto value=DescribeEntity(*entity);
-        if(request.arguments.value("include-components",false)) {
+        value["bounds"]=EntityRenderBounds(scene,*entity).ToJson();
+        if(request.arguments.value("include-components",false)||request.arguments.value("compact",false)||request.arguments.value("include-mesh-data",false)) {
             const auto serialized=sceneJson(scene);
             for(const auto& item:serialized["entities"])if(item["id"]==entity->GetID())value["serialized"]=item;
+            if(!request.arguments.value("include-mesh-data",false)||request.arguments.value("compact",false))CompactMeshData(value["serialized"]);
         }
         return CommandResult::Ok(value);
     }
@@ -715,6 +722,8 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         const std::string name = request.arguments.at("name").get<std::string>();
         if (name.empty()) return CommandResult::Fail("MIPSYNC_ENTITY_NAME", "Entity name cannot be empty.");
         const std::string primitive = Lower(request.arguments.value("primitive", std::string{"empty"}));
+        const auto renderType=Lower(request.arguments.value("render-type",std::string("Lit")));
+        if(renderType!="lit"&&renderType!="unlit")return CommandResult::Fail("MIPSYNC_RENDER_TYPE","render-type must be Lit or Unlit.");
         if (primitive != "empty" && primitive != "cube" && primitive != "sphere" && primitive != "plane")
             return CommandResult::Fail("MIPSYNC_ENTITY_PRIMITIVE", "Primitive must be empty, cube, sphere or plane.");
         Entity* parent = nullptr;
@@ -748,6 +757,7 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
             std::string display = primitive;
             display.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(display.front())));
             renderer.SetPrimitive(display, 1.0f);
+            renderer.renderType=renderType=="unlit"?RendererType::Unlit:RendererType::Lit;
             if (request.arguments.contains("material")) {
                 std::string materialError;
                 if (!ApplyMaterial(*entity, request.arguments.at("material").get<std::string>(), materialError)) {
@@ -892,10 +902,12 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         if (!entity) return CommandResult::Fail("MIPSYNC_ENTITY_NOT_FOUND", lookupError);
         auto* renderer = entity->GetComponent<MeshRendererComponent>();
         if (!renderer) return CommandResult::Fail("MIPSYNC_COMPONENT_NOT_FOUND", "Entity has no MeshRenderer component.");
-        const char* properties[] = {"primitive", "size", "material", "enabled", "editor-only", "type-preset", "view-model"};
+        const char* properties[] = {"primitive", "size", "material", "enabled", "editor-only", "type-preset", "view-model", "render-type"};
         bool hasValue = false;
         for (const char* property : properties) hasValue |= request.arguments.contains(property);
         if (!hasValue) return CommandResult::Fail("MIPSYNC_MESH_SET_EMPTY", "Supply at least one renderer property.");
+        const auto renderType=Lower(request.arguments.value("render-type",std::string("Lit")));
+        if(renderType!="lit"&&renderType!="unlit")return CommandResult::Fail("MIPSYNC_RENDER_TYPE","render-type must be Lit or Unlit.");
         editor.RecordUndoSnapshot();
         if (request.arguments.contains("primitive") || request.arguments.contains("size")) {
             std::string primitive = request.arguments.value("primitive", renderer->meshPrimitive);
@@ -912,6 +924,7 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         }
         if (request.arguments.contains("enabled")) renderer->enabled = request.arguments.at("enabled").get<bool>();
         if (request.arguments.contains("editor-only")) renderer->editorOnly = request.arguments.at("editor-only").get<bool>();
+        if (request.arguments.contains("render-type"))renderer->renderType=renderType=="unlit"?RendererType::Unlit:RendererType::Lit;
         if (request.arguments.contains("type-preset")) {
             const std::string preset = Lower(request.arguments.at("type-preset").get<std::string>());
             if (preset == "prop") renderer->typePreset = MeshRendererComponent::TypePreset::Prop;

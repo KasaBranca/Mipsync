@@ -1,0 +1,1 @@
+{"name": "NativeAotQA", "defaultScene": "scenes/default.nscene", "playerSettings": {"productName": "NativeAotQA", "companyName": "Mipsync QA", "scenesInBuild": ["scenes/default.nscene", "scenes/second.nscene"]}}

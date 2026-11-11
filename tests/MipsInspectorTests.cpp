@@ -44,7 +44,7 @@ static void CheckCompiler() {
     auto concatenation=Compile(R"(class Invalid : MipsBehaviour {
         void Update() { Log.Info("hello" + Input.GetAxis("RightStickX")); }
     })");
-    Require(!concatenation->ps1CompatibilityErrors.empty(),"real string concatenation lost diagnostics");
+    Require(concatenation->ps1CompatibilityErrors.empty(),"PS1 native string concatenation rejected");
     const std::string source = R"(class Demo : MipsBehaviour {
         [Header("Movement"), Tooltip("Speed in m/s"), Range(-2, 10), Min(0), InspectorName("Move Speed"), Order(-2)]
         public float speed = 3;

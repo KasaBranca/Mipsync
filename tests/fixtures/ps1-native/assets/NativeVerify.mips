@@ -1,0 +1,28 @@
+class NativeVerify : MipsBehaviour {
+    public int frame = 0;
+    public int result = 0;
+    public bool handoffOK;
+    public bool passed;
+    void Start() {
+        handoffOK = Save.GetInt("handoff", 0) == 9;
+        if (handoffOK) Log.Info("NATIVE_HANDOFF_OK");
+        else Log.Info("NATIVE_HANDOFF_FAIL");
+        StartCoroutine(Pulse());
+    }
+    public IEnumerator Pulse() {
+        int size = 2;
+        int[] a = new int[size];
+        a[0] = 3;
+        yield return new WaitForSeconds(0.05);
+        result = a[0] * 4;
+    }
+    void Update() {
+        frame = frame + 1;
+        if (frame == 12) {
+            var distance = Vector3.Distance(transform.worldPosition, Vector3(3, 4, 0));
+            passed = result == 12 && distance > 4.99 && distance < 5.01;
+            if (passed) Log.Info("NATIVE_AOT_OK");
+            else Log.Info("NATIVE_AOT_FAIL");
+        }
+    }
+}

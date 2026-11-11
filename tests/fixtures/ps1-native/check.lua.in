@@ -1,0 +1,29 @@
+local ffi = require('ffi')
+local memory = PCSX.getMemPtr()
+local frames = 0
+local core, card = false, false
+local result = [=[@RESULT@]=]
+local function word(address) return tonumber(ffi.cast('const uint32_t*', memory + (address % 0x200000))[0]) end
+local function field(instance,index) return word(instance + @FIELD_OFFSET@ + index * @VALUE_SIZE@) end
+local function finish(message,code)
+    local f = assert(io.open(result,'w'));f:write(message .. '\n');f:close()
+    PCSX.quit(code)
+end
+local initial = assert(io.open(result,'w'));initial:write('RUNNING\n');initial:close()
+aotListener = PCSX.Events.createEventListener('GPU::Vsync', function()
+    PCSX.nextTick(function()
+        frames = frames + 1
+        if word(@INSTANCE0@) == @MODULE0@ then
+            if field(@INSTANCE0@,1) == 1 then core = true end
+            if field(@INSTANCE0@,0) >= 8*65536 and field(@INSTANCE0@,2) == 1 then card = true end
+        end
+        if word(@INSTANCE1@) == @MODULE1@ and field(@INSTANCE1@,0) >= 12*65536 then
+            local handoff = field(@INSTANCE1@,2) == 1
+            local passed = field(@INSTANCE1@,3) == 1
+            local ok = core and card and handoff and passed
+            finish(string.format('%s core=%s card=%s handoff=%s native=%s frames=%d', ok and 'PASS' or 'FAIL', tostring(core),tostring(card),tostring(handoff),tostring(passed),frames),ok and 0 or 2)
+        elseif frames > 1800 then
+            finish(string.format('TIMEOUT core=%s card=%s pc=%08x s0=%08x f0=%08x s1=%08x f1=%08x',tostring(core),tostring(card),tonumber(PCSX.getRegisters().pc),word(@INSTANCE0@),field(@INSTANCE0@,0),word(@INSTANCE1@),field(@INSTANCE1@,0)),3)
+        end
+    end)
+end)

@@ -1,0 +1,74 @@
+class NativeParity : MipsBehaviour {
+    public float result = 0;
+    public bool predicates;
+    public bool apiOK;
+    public string held;
+    public int repeats = 0;
+    public AudioSource source;
+    void Start() {
+        int[] a = new int[3];
+        a[0] = 9;
+        a[1] = 3;
+        a[2] = -2;
+        for (int i = 0; i < a.Length; i = i + 1) {
+            if (i == 1) continue;
+            result = result + a[i];
+        }
+        int j = 0;
+        while (j < 5) {
+            j = j + 1;
+            if (j > 3) break;
+            result = result + 1;
+        }
+        result = result + (9 % 4) + 6 / 2 - 2 * 3;
+        predicates = !(result != 8) && result <= 8 && result >= 8 && (false || result > 0);
+        transform.scale = Vector3(2, 3, 4);
+        transform.position.x = 1;
+        transform.position.y = 2;
+        transform.position.z = 3;
+    }
+    void OnDestroy() { result = result + 100; }
+    void ApiParity() {
+        Save.SetInt("coins", 7);
+        Save.SetFloat("speed", 1.5);
+        Save.SetBool("door", true);
+        Save.SetString("note", "hello");
+        var label = Save.GetString("note", "missing") + ":ok";
+        var written = Save.Write("slot1.json");
+        Save.SetInt("coins", 99);
+        var read = Save.Read("slot1.json");
+        var anim = GetComponent<Animator>();
+        anim.SetFloat("Speed", 2);
+        source.enabled = true;
+        source.clip = "assets/audio/one.wav";
+        apiOK = written && read && Save.GetInt("coins", 0) == 7
+            && Save.GetFloat("speed", 0) == 1.5 && Save.GetFloat("coins", 0) == 7
+            && Save.GetInt("speed", 99) == 99 && Save.GetBool("door", false)
+            && Save.GetString("missing", "fallback") == "fallback" && label == "hello:ok"
+            && "score=" + Save.GetInt("coins", 0) == "score=7.000000"
+            && anim != null && GetComponent<Collider>() != null && GetComponent<Rigidbody>() != null
+            && anim.gameObject == gameObject && source.clip == "assets/audio/one.wav" && source.enabled;
+        AudioSource.clip = "assets/audio/missing.wav";
+        apiOK = apiOK && AudioSource.clip == "assets/audio/one.wav";
+        Input.SetCursorLocked(false);
+        apiOK = apiOK && !Input.cursorLocked;
+        Input.SetCursorLocked(true);
+        apiOK = apiOK && Input.cursorLocked;
+        Log.Info("native", 1, 2, 3, 4, 5, 6, 7, 8, 9);
+        var hit = Physics.Raycast(0, 0, 0, 0, 0, 1, 10);
+        Application.Quit();
+    }
+    void AllocationStep() {
+        int size = 2;
+        int[] scratch = new int[size];
+        scratch[0] = 3;
+        var text = "tick=" + repeats;
+        if (repeats == 0) held = text;
+        Save.SetString("moving", text);
+        apiOK = apiOK && scratch[0] == 3 && Save.GetString("moving", "missing") == text;
+        repeats = repeats + 1;
+    }
+    void AllocationCheck() {
+        apiOK = apiOK && held == "tick=0.000000" && repeats == 200;
+    }
+}

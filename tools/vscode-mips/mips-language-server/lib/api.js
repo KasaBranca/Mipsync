@@ -223,7 +223,7 @@ const GLOBALS = {
   },
   Save: {
     detail: "Save",
-    documentation: "JSON セーブデータ API。",
+    documentation: "セーブデータ API。PC は JSON、ネイティブ PS1 ビルドはメモリーカードを使用します。",
     members: {
       SetInt: "void SetInt(string key, int value)",
       GetInt: "int GetInt(string key, int defaultValue)",

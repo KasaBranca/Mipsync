@@ -72,6 +72,8 @@ int main(int argc,char** argv) {
         Write(project/"assets/tool.exe","excluded executable");
         Write(project/"assets/secret.env","excluded credentials");
         Write(project/"assets/icon.png","runtime texture sentinel");
+        Write(project/"renderer/pc/mesh.frag","project fragment sentinel");
+        Write(project/"renderer/ps1/runtime/render.c","excluded PS1 source");
         std::vector<std::string> errors;
         auto module=Mips::MipsScriptLoader::CompileFile(project,"assets/scripts/Player.mips",errors);
         Check(module && errors.empty(),"Script fixture did not compile");
@@ -97,6 +99,8 @@ int main(int argc,char** argv) {
         }
         Check(mounted,"Bound player key could not authenticate");auto virtualRoot=output/"PackageTest_Data/Project";
         Check(AssetFiles::Exists(virtualRoot/"assets/icon.png"),"Runtime asset missing");
+        Check(AssetFiles::ReadText(virtualRoot/"renderer/pc/mesh.frag")=="project fragment sentinel","Project shader missing from protected PC package");
+        Check(!AssetFiles::Exists(virtualRoot/"renderer/ps1/runtime/render.c"),"PS1 authoring source packaged into PC player");
         for(const char* excluded:{"assets/authoring.blend","assets/tool.exe","assets/secret.env"})Check(!AssetFiles::Exists(virtualRoot/excluded),"Excluded content packaged");
         errors.clear();auto compiled=Mips::MipsScriptLoader::CompileFile(virtualRoot,"assets/scripts/Player.mips",errors);
         Check(compiled && errors.empty() && compiled->methods.front().code==module->methods.front().code,"Packed script load failed");AssetFiles::Unmount();

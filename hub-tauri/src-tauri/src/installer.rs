@@ -89,7 +89,15 @@ pub fn list_installed(settings: &HubSettings) -> Result<Vec<InstalledEditor>, St
         }
     }
     let mut result: Vec<_> = by_version.into_values().collect();
-    result.sort_by(|a, b| a.version.cmp(&b.version));
+    result.sort_by(|a, b| {
+        if crate::version::is_less(&a.version, &b.version) {
+            std::cmp::Ordering::Greater
+        } else if crate::version::is_less(&b.version, &a.version) {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
     Ok(result)
 }
 

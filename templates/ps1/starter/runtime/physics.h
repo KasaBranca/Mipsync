@@ -23,6 +23,8 @@ int ps1_physics_camera_sweep(unsigned int target_entity_index,
                              fix16_t radius,
                              fix16_t out_position[3]);
 
+uint32_t ps1_physics_raycast(const fix16_t origin[3],const fix16_t direction[3],fix16_t max_distance);
+
 /* Collider details getters. */
 int16_t ps1_physics_get_collider_shape(unsigned int entity_index);
 void    ps1_physics_get_collider_center(unsigned int entity_index, fix16_t out_center[3]);

@@ -7,14 +7,9 @@
 
 namespace MipsyncEngine::Mips {
 
-/// Mipsync PS1 runtime data exporter (Milestone A of the on-device VM).
-///
-/// On PC, Mipsync scripts compile into `CompiledModule` instances whose
-/// numeric constant pool uses `double`. The PS1 has no FPU, so we cannot
-/// ship those modules to the bundled PSn00bSDK runtime as-is. This file
-/// converts them to a flat, little-endian, Q16.16-fixed-point binary blob
-/// (`.mbc`, "Mipsync Byte Code") that mirrors the PC `CompiledModule`
-/// layout but is friendly to a minimal C interpreter.
+/// PS1 native script exporter: shared compiler IR -> C -> PSn00bSDK GCC/MIPS.
+/// Production output contains native functions and method descriptors; no VM.
+/// The MBC encoding helpers below remain available for interpreter-oracle tests.
 ///
 /// Binary layout (.mbc, version 1):
 ///
@@ -63,8 +58,7 @@ std::vector<uint8_t> EncodeMbc(const CompiledModule& module);
 bool WriteMbcFile(const CompiledModule& module, const std::string& path,
                   std::string& outError);
 
-/// Reject bytecode that the current PS1 mini-VM cannot execute with desktop
-/// semantics, and data that exceeds its fixed runtime capacities.
+/// Check compiler IR and native target runtime capacities before export.
 bool ValidatePs1Target(const std::vector<CompiledModule>& modules,
                        uint32_t bindingCount,
                        std::string& outError);
@@ -76,11 +70,10 @@ struct ScriptsDataEmit {
     uint32_t totalBytes  = 0;
 };
 
-/// Write `scripts_data.c` describing every supplied module as embedded byte
-/// arrays plus a `g_mipsync_scripts[]` table that the runtime walks.
-///
-/// `outCFile` should typically be `<productRoot>/ps1_src/generated/scripts_data.c`.
-/// The corresponding header `scripts_data.h` is generated next to it.
+/// Query host API usage in shared compiler IR (for runtime asset catalogs).
+bool ModuleUsesHostFunction(const CompiledModule& module, HostFunc function);
+
+/// Emit native C functions and metadata to generated/scripts_data.c.
 bool EmitScriptsDataC(const std::vector<CompiledModule>& modules,
                       const std::string& outCFile,
                       ScriptsDataEmit& outStats,

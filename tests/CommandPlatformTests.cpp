@@ -3,6 +3,7 @@
 #include "command/CoreCommands.h"
 #include "command/IpcTransport.h"
 #include "command/SymbolRegistry.h"
+#include "command/ResultRenderer.h"
 #include "EngineVersion.h"
 #include "mips/Compiler.h"
 #include "mips/Lexer.h"
@@ -47,13 +48,14 @@ int main() {
         const auto literal=compile("Literal",literalSource);
         const auto limits=run("language.limits");
         if(!large.success||large.value["ps1Compatible"]!=false||large.value["modules"][0]["ps1Diagnostics"].empty()||
-            !literal.success||literal.value["ps1Compatible"]!=false||limits.value["arrayElements"]!=32||limits.value["methodBytecodeBytes"]!=4096)return 1;
+            !literal.success||literal.value["ps1Compatible"]!=false||limits.value["arrayElements"]!=32||!limits.value["methodBytecodeBytes"].is_null()||limits.value["backend"]!="native-mips-aot")return 1;
         std::string big="class Big : MipsBehaviour { public int score; void Update() {";for(int i=0;i<900;++i)big+="score = score + 1;";big+="} }";
-        const auto bytes=compile("Big",big);if(!bytes.success||bytes.value["ps1Compatible"]!=false)return 1;
+        const auto bytes=compile("Big",big);if(!bytes.success||bytes.value["ps1Compatible"]!=true)return 1;
         std::string constants="class Constants : MipsBehaviour { public int score; void Update() {";for(int i=0;i<140;++i)constants+="score = "+std::to_string(i)+";";constants+="} }";
-        const auto pool=compile("Constants",constants);if(!pool.success||pool.value["ps1Compatible"]!=false)return 1;
+        const auto pool=compile("Constants",constants);if(!pool.success||pool.value["ps1Compatible"]!=true)return 1;
         Json files=Json::array();for(int i=0;i<5;++i){auto name="Module"+std::to_string(i);compile(name.c_str(),"class "+name+" : MipsBehaviour { void Update() {} }");files.push_back((root/(name+".mips")).string());}
         const auto aggregate=run("language.validate",{{"files",files},{"bindings",33}});if(aggregate.value["ps1Compatible"]!=false)return 1;
+        const auto nativeAggregate=run("language.validate",{{"files",files},{"bindings",5}});if(nativeAggregate.value["ps1Compatible"]!=true)return 1;
         const auto located=compile("Unsupported","class Unsupported : MipsBehaviour {\n void Helper() {}\n void Start() { Helper(); }\n }");
         if(located.success||located.diagnostics.empty()||located.diagnostics.front().location.value("line",0)!=3)return 1;
         const auto properties=run("describe",{{"symbol","Transform"}});if(properties.value["properties"].size()<3)return 1;
@@ -68,6 +70,20 @@ int main() {
     }
 
     bool ok = true;
+    {
+        const auto options=ParseCommandLine({"entity","list","--with-transform","--with-bounds","--fields","entities.id,entities.bounds","--max-depth","3","--output-format","compact","--out","report.json","--quiet"},commands);
+        ok &= Check(options.valid&&options.json&&options.compact&&options.quiet&&options.maxDepth==3&&options.request.arguments.value("with-bounds",false),"workflow flags parse without consuming adjacent options");
+        ok &= Check(!ParseCommandLine({"scene","capture","--position","nan,0,0","--width","bad"},commands).valid,"capture rejects malformed dimensions");
+        const Json input={{"entities",Json::array({{{"id",1},{"name","A"},{"bounds",{{"min",{0,0,0}}}}},{{"id",2},{"name","B"},{"bounds",nullptr}}})},{"large","omitted"}};
+        const auto selected=ProjectOutput(input,"entities.id,entities.bounds");
+        ok &= Check(selected["entities"].size()==2&&selected["entities"][0]["id"]==1&&selected["entities"][1]["id"]==2&&!selected.contains("large")&&!selected["entities"][0].contains("name"),"field projection merges columns in arrays without changing rows");
+        ok &= Check(ProjectOutput(input,"",0).value("omitted",false),"depth limit marks omitted structures");
+        for(const char* id:{"scene.capture","scene.summary","entity.frame","entity.bounds","entity.overlap","scene.raycast","material.list","material.inspect","asset.list","promodeler.create","promodeler.set","promodeler.describe","commands"})
+            ok &= Check(commands.Find(id)!=nullptr,"workflow commands are discoverable");
+        CommandRequest help;help.command="help";help.arguments={{"path","promodeler"}};
+        const auto listed=executor.Execute(help,context);
+        ok &= Check(listed.success&&listed.value["commands"].size()==3,"help filters workflow namespace");
+    }
     for(const char* id:{"model.inspect","animation.list","model.extract","animator.set","skinned-mesh.set","component.set",
         "animator.controller.inspect","animator.controller.validate","animator.controller.schema",
         "animator.controller.set","animator.controller.state.set","animator.controller.parameter.set","animator.controller.transition.set","runtime.animator"})
@@ -333,6 +349,31 @@ int main() {
         const auto second = MipsyncEngine::EnsureAgentIntegration(root, installRoot);
         ok &= Check(second.success && !second.skillUpdated && !second.instructionsUpdated,
                     "project Agent Skill setup is idempotent");
+        runtimeBinding.close();
+        instructions.close();
+        const auto skill = root / ".agents/skills/mipsync-cli";
+        // Simulate switching an existing project to another Editor version,
+        // including same-size changed documentation and a retired reference.
+        {
+            std::ofstream(installRoot / "skills/mipsync-cli/SKILL.md", std::ios::binary) << "new bundled skill";
+            std::ofstream(skill / "SKILL.md", std::ios::binary) << "old bundled skill";
+            std::ofstream(skill / "references/retired.md") << "old command API";
+        }
+        const auto newInstall = root / "next_editor_version";
+        fs::copy(installRoot, newInstall, fs::copy_options::recursive, ec);
+        const auto upgraded = MipsyncEngine::EnsureAgentIntegration(root, newInstall);
+        ok &= Check(upgraded.success && upgraded.skillUpdated, ("existing project Skill upgrades with Editor version: " + upgraded.error).c_str());
+        std::ifstream upgradedFile(skill / "SKILL.md", std::ios::binary);
+        const std::string upgradedText((std::istreambuf_iterator<char>(upgradedFile)), {});
+        ok &= Check(upgradedText == "new bundled skill", "Skill replaces even same-size old content");
+        ok &= Check(!fs::exists(skill / "references/retired.md"), "retired Skill references are removed");
+        std::ifstream newBinding(skill / "references/runtime.md");
+        const std::string bindingText((std::istreambuf_iterator<char>(newBinding)), {});
+        ok &= Check(bindingText.find((newInstall / "mipsync.exe").string()) != std::string::npos,
+                    "upgraded Skill binds to new Editor CLI");
+        const auto reopened = MipsyncEngine::EnsureAgentIntegration(root, newInstall);
+        ok &= Check(reopened.success && !reopened.skillUpdated && !reopened.instructionsUpdated,
+                    "reopening upgraded project is idempotent");
         fs::remove_all(root, ec);
     }
 

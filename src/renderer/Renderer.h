@@ -12,6 +12,9 @@
 #include <memory>
 #include "../ps1/PSync.h"
 #include <unordered_map>
+#include <chrono>
+#include <filesystem>
+#include <map>
 
 namespace MipsyncEngine {
 
@@ -87,6 +90,10 @@ public:
     void Init();
     void Shutdown();
 
+    void SetProjectRoot(const std::filesystem::path& root, bool autoReload = false);
+    // Compile all passes together. A failure keeps the preceding valid set.
+    bool ReloadProjectShaders();
+
     // Begin/End frame
     void BeginScene(const Camera& camera, Framebuffer* targetFBO = nullptr,
                     const Texture* backgroundTexture = nullptr);
@@ -150,12 +157,22 @@ public:
 
 private:
     void CreateShaders();
+    bool ApplyShaderSources(const std::map<std::string, std::string>& sources);
     void CreateDefaultResources();
     void UploadLightingUniforms(Shader& shader, bool& uploaded);
 
     Shader m_PS1Shader;
+    std::filesystem::path m_ProjectRoot;
+    bool m_AutoReloadShaders = false;
+    bool m_LastShaderReloadSucceeded = true;
+    std::chrono::steady_clock::time_point m_NextShaderPoll{};
+    std::chrono::steady_clock::time_point m_ShaderClockStart = std::chrono::steady_clock::now();
+    std::map<std::string, std::string> m_LastShaderSources;
     Shader m_PS1SkinnedShader;
     Shader m_ScreenShader;
+    Shader m_BackgroundShader;
+    bool m_CustomScreenPass = false;
+    Framebuffer m_PostProcessFramebuffer;
     Shader m_SkyboxShader;
     Shader m_OutlineMaskShader;     // Renders silhouette to mask FBO
     Shader m_OutlineComposeShader;  // Edge-detects mask and writes outline pixels

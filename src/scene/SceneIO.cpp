@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <unordered_set>
 #include <limits>
+#include <map>
 
 namespace fs = std::filesystem;
 
@@ -357,7 +358,9 @@ json EntityComponentsToJson(const Entity& entity) {
         pbJson["faceIds"] = pb->triangleFaceIds;
         pbJson["nextFaceId"] = pb->nextFaceId;
         pbJson["faceMaterials"] = json::array();
-        for (const auto& [faceId, materialPath] : pb->faceMaterialPaths) {
+        // Stable order is required by dirty fingerprints and Play restoration.
+        const std::map<uint32_t,std::string> orderedMaterials(pb->faceMaterialPaths.begin(),pb->faceMaterialPaths.end());
+        for (const auto& [faceId, materialPath] : orderedMaterials) {
             if (!materialPath.empty())
                 pbJson["faceMaterials"].push_back({
                     { "faceId", faceId }, { "material", materialPath }
@@ -869,7 +872,7 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         auto& pb = entity.AddComponent<ProModelerComponent>();
         pb.enabled = pj.value("enabled", true);
         pb.shape = static_cast<ProModelerComponent::Shape>(
-            std::clamp(pj.value("shape", static_cast<int>(pb.shape)), 0, 5));
+            std::clamp(pj.value("shape", static_cast<int>(pb.shape)), 0, 7));
         if (pj.contains("size"))
             Vec3FromJson(pj["size"], pb.size);
         pb.steps = std::clamp(pj.value("steps", pb.steps), 1, 32);
@@ -923,7 +926,9 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         auto* mr = entity.GetComponent<MeshRendererComponent>();
         if (!mr)
             mr = &entity.AddComponent<MeshRendererComponent>();
-        pb.RebuildMesh(*mr);
+        // Serialized UVs/normals are authored data. Recalculating on load
+        // changes fingerprints (and custom UVs) after an otherwise empty Play.
+        pb.RebuildMesh(*mr, true);
     }
 
     if (ent.contains("skinnedMeshRenderer")) {

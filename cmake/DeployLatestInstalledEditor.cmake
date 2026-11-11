@@ -36,6 +36,11 @@ endif()
 list(SORT _version_dirs COMPARE NATURAL ORDER DESCENDING)
 list(GET _version_dirs 0 _latest_install)
 
+if(SKILLS_ONLY)
+    include("${CMAKE_CURRENT_LIST_DIR}/DeployLatestInstalledSkills.cmake")
+    return()
+endif()
+
 # Template-only builds must reach the installed PS1 worker even when no native
 # source changed and the editor's POST_BUILD command therefore does not run.
 if(PS1_TEMPLATES_ONLY)
@@ -59,29 +64,60 @@ if(NOT EXISTS "${_editor_exe}")
     message(FATAL_ERROR "Built editor executable not found: ${_editor_exe}")
 endif()
 
-execute_process(
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${_editor_exe}" "${_latest_install}/MipsyncEngine.exe"
-    RESULT_VARIABLE _copy_exe_result
-)
-if(NOT _copy_exe_result EQUAL 0)
-    message(FATAL_ERROR
-        "Failed to deploy MipsyncEngine.exe to ${_latest_install}. Close the installed editor and rebuild.")
-endif()
+function(_deploy_verified_executable source destination)
+    file(SHA256 "${source}" _source_hash)
+    if(EXISTS "${destination}")
+        file(SHA256 "${destination}" _destination_hash)
+        if(_source_hash STREQUAL _destination_hash)
+            return()
+        endif()
+    endif()
+    # Stage before replacing anything. Windows can rename a running executable;
+    # keep it alive under a backup name so unsaved editor sessions need not close.
+    string(TIMESTAMP _stamp "%Y%m%d-%H%M%S" UTC)
+    string(RANDOM LENGTH 8 ALPHABET 0123456789abcdef _suffix)
+    set(_staged "${destination}.update-${_stamp}-${_suffix}")
+    set(_backup "${destination}.previous-${_stamp}-${_suffix}")
+    file(COPY_FILE "${source}" "${_staged}" RESULT _copy)
+    if(NOT _copy STREQUAL "0")
+        message(FATAL_ERROR "Could not stage ${destination}: ${_copy}")
+    endif()
+    file(SHA256 "${_staged}" _staged_hash)
+    if(NOT _source_hash STREQUAL _staged_hash)
+        message(FATAL_ERROR "Staged executable hash mismatch: ${destination}")
+    endif()
+    set(_had_previous FALSE)
+    if(EXISTS "${destination}")
+        file(RENAME "${destination}" "${_backup}" RESULT _rename NO_REPLACE)
+        if(NOT _rename STREQUAL "0")
+            message(FATAL_ERROR "Could not preserve installed executable ${destination}: ${_rename}")
+        endif()
+        set(_had_previous TRUE)
+    endif()
+    file(RENAME "${_staged}" "${destination}" RESULT _rename NO_REPLACE)
+    if(NOT _rename STREQUAL "0")
+        if(_had_previous)
+            file(RENAME "${_backup}" "${destination}" RESULT _rollback NO_REPLACE)
+        endif()
+        message(FATAL_ERROR "Executable deployment failed: ${_rename}; rollback: ${_rollback}")
+    endif()
+    file(SHA256 "${destination}" _installed_hash)
+    if(NOT _source_hash STREQUAL _installed_hash)
+        message(FATAL_ERROR "Installed executable hash mismatch: ${destination}")
+    endif()
+    if(_had_previous)
+        message(STATUS "Previous executable preserved: ${_backup}")
+    endif()
+endfunction()
+
+_deploy_verified_executable("${_editor_exe}" "${_latest_install}/MipsyncEngine.exe")
 
 # Keep the CLI compiler and command descriptors in step with the editor.
 if(EXISTS "${BUILD_DIR}/mipsync.exe")
-    execute_process(
-        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                "${BUILD_DIR}/mipsync.exe" "${_latest_install}/mipsync.exe"
-        RESULT_VARIABLE _copy_cli_result
-    )
-    if(NOT _copy_cli_result EQUAL 0)
-        message(FATAL_ERROR "Failed to deploy mipsync.exe to ${_latest_install}")
-    endif()
+    _deploy_verified_executable("${BUILD_DIR}/mipsync.exe" "${_latest_install}/mipsync.exe")
 endif()
 
-foreach(_runtime_dir IN ITEMS resources templates ps1_runtime tools skills)
+foreach(_runtime_dir IN ITEMS resources templates ps1_runtime tools)
     if(IS_DIRECTORY "${BUILD_DIR}/${_runtime_dir}")
         set(_copy_directory_command copy_directory)
         if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.26)
@@ -99,5 +135,7 @@ foreach(_runtime_dir IN ITEMS resources templates ps1_runtime tools skills)
         endif()
     endif()
 endforeach()
+
+include("${CMAKE_CURRENT_LIST_DIR}/DeployLatestInstalledSkills.cmake")
 
 message(STATUS "Deployed editor build to latest install: ${_latest_install}")

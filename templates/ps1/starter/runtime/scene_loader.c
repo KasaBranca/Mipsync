@@ -3,6 +3,8 @@
 #include "audio.h"
 #include "host.h"
 #include "boot_brand.h"
+#include "application.h"
+#include "save.h"
 #include "../generated/scene_catalog.h"
 #include <psxapi.h>
 #include <psxetc.h>
@@ -51,6 +53,7 @@ void ps1_scene_process_load(void) {
     unsigned int i;
     if (index < 0) return;
     s_pending_scene = -1;
+    if(!ps1_save_prepare_handoff()){host_log("Not enough kernel memory to preserve Save state");return;}
     printf("MIPSYNC_SCENE_LOAD %d %s\n", index, k_mipsync_scene_paths[index]);
     for (i = 0; i < g_ps1_scene.entity_count; ++i)
         ps1_audio_stop(i);
@@ -58,6 +61,7 @@ void ps1_scene_process_load(void) {
      * all SDK/BIOS drivers first; the next main() installs fresh handlers. */
     CdControlB(CdlPause, 0, 0);
     DrawSync(0);
+    StopCARD();
     StopPAD();
     StopCallback();
     /* The SDK CD driver and BIOS file driver use separate interrupt/event
@@ -70,8 +74,17 @@ void ps1_scene_process_load(void) {
     LoadExec(k_mipsync_scene_executables[index], 0, 0);
     /* A successful load never returns. Restore the old scene on failure. */
     ps1_boot_brand_cancel_scene_load();
+    ps1_save_cancel_handoff();
     RestartCallback();
     StartPAD();
     host_log("Could not load scene from CD");
     printf("MIPSYNC_SCENE_LOAD_FAILED %d\n", index);
+}
+
+void ps1_platform_quit(void){
+    unsigned i;for(i=0;i<g_ps1_scene.entity_count;++i)ps1_audio_stop(i);
+    CdControlB(CdlPause,0,0);DrawSync(0);SetDispMask(0);
+    StopCARD();StopPAD();StopCallback();_boot();
+    /* BIOS implementations should not return; recover drivers if they do. */
+    RestartCallback();StartPAD();host_log("BIOS quit returned");
 }

@@ -1,5 +1,6 @@
 #include "AssetFiles.h"
 #include "Engine.h"
+#include "../renderer/ProjectRenderer.h"
 #include "Log.h"
 #include "mips/MipsTest.h"
 #include "mips/MipsRuntime.h"
@@ -60,6 +61,13 @@ Engine::Engine(const std::string& projectPath, EngineLaunchMode launchMode,
     Time::Init();
 
     m_Renderer = std::make_unique<Renderer>();
+    if (!IsPlayerMode()) {
+        std::string rendererError;
+        if (!ProjectRenderer::Ensure(PathUtf8::FromString(m_ProjectPath),
+                GetExeDirectory() / "templates/ps1/starter", rendererError))
+            MIPSYNC_WARN("Project renderer setup failed: {}", rendererError);
+    }
+    m_Renderer->SetProjectRoot(PathUtf8::FromString(m_ProjectPath), !IsPlayerMode());
     m_Renderer->Init();
 
     m_UIRenderer = std::make_unique<UIRenderer>();

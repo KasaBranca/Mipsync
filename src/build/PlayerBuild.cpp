@@ -73,6 +73,13 @@ AssetFiles::Entries Collect(const fs::path& root,const PlayerSettings& settings)
             if(it->is_regular_file() && RuntimeAsset(it->path()))add(NativePaths::OrdinaryPath(it->path()).lexically_relative(root));
         }
     }
+    // Custom GLSL is runtime content and stays inside the protected package.
+    const auto shaders = root / "renderer/pc";
+    if (fs::is_directory(NativePaths::FilePath(shaders))) {
+        for (const auto& entry : fs::recursive_directory_iterator(NativePaths::FilePath(shaders)))
+            if (entry.is_regular_file() && (entry.path().extension()==".vert" || entry.path().extension()==".frag"))
+                add(NativePaths::OrdinaryPath(entry.path()).lexically_relative(root));
+    }
     Json boot={{"version",2},{"productName",settings.productName},{"companyName",settings.companyName},{"startupSceneIndex",settings.startupSceneIndex},{"scenesInBuild",settings.scenesInBuild}};
     files.emplace("boot.json",TextBytes(boot));
     Json project={{"name",settings.productName},{"defaultScene",BuildManifestIO::FromPlayerSettings(settings).StartupScenePath()},{"playerSettings",boot}};

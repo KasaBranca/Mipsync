@@ -45,6 +45,7 @@
 #include "runtime/textures.h"
 
 #include "runtime/scripts_data.h"
+#include "runtime/application.h"
 
 #include "runtime/vm.h"
 
@@ -90,7 +91,7 @@ static unsigned int s_loaded_background_index;
 
 
 
-static mbc_module       g_modules[MAX_MODULES];
+static mbc_module*      g_modules = g_mipsync_scripts;
 
 static int              g_module_count;
 
@@ -227,25 +228,10 @@ static void PresentFrame(void) {
 
 
 
-static void DecodeModules(void) {
-
-    g_module_count = 0;
-
-    for (unsigned int i = 0; i < g_mipsync_script_count && g_module_count < MAX_MODULES; ++i) {
-
-        const mipsync_script_blob* blob = &g_mipsync_scripts[i];
-
-        if (!blob->data || !blob->size) continue;
-
-        if (mbc_decode(blob->data, blob->size, &g_modules[g_module_count]))
-
-            ++g_module_count;
-
-    }
-
+static void LoadNativeModules(void) {
+    g_module_count = g_mipsync_script_count < MAX_MODULES
+        ? (int)g_mipsync_script_count : MAX_MODULES;
 }
-
-
 
 static mbc_module* FindModule(unsigned int index) {
 
@@ -291,6 +277,10 @@ static void BindSceneScripts(void) {
         {
             inst->fields[f] = binding->fields[f];
             inst->runtime_fields[f].ival = binding->fields[f];
+            if(f<mod->field_count && mod->fields[f].value_kind==1){
+                inst->runtime_fields[f].tag=HOST_VAL_BOOL;
+                inst->runtime_fields[f].ival=binding->fields[f]!=0;
+            }
         }
 
 
@@ -467,7 +457,7 @@ int main(void) {
     printf("MIPSYNC_SCENE_READY %d %s\n", MIPSYNC_CURRENT_SCENE_INDEX,
            k_mipsync_scene_paths[MIPSYNC_CURRENT_SCENE_INDEX]);
 
-    DecodeModules();
+    LoadNativeModules();
 
     BindSceneScripts();
     g_vm.instances=g_instances;g_vm.instance_count=(unsigned)g_instance_count;
@@ -528,6 +518,7 @@ int main(void) {
 
         /* Scene requests from UI/scripts run after the frame, outside VM and
          * renderer stacks that will be replaced by the next executable. */
+        ps1_application_process_quit();
         ps1_scene_process_load();
 
         ++frame;

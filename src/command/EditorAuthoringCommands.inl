@@ -27,6 +27,7 @@ auto projectPath=[&](const std::string& input,const char* extension="") {
     return path;
 };
 #include "EditorAnimationCommands.inl"
+#include "EditorWorkflowCommands.inl"
 if(request.command=="component.describe") {
     const auto name=request.arguments.at("component").get<std::string>();
     Json descriptor=ComponentSchema(name);
@@ -45,6 +46,7 @@ if(request.command=="component.describe") {
         if(it.key()=="alignment"||it.key()=="renderMode"){p["min"]=0;p["max"]=2;}
         if(it.key()=="scaleMode"){p["min"]=0;p["max"]=1;}
     }
+    if(name=="ProModeler")descriptor["properties"]["shape"]["enumNames"]=ProModelerShapes()["shapeEnum"];
     return CommandResult::Ok(descriptor);
 }
 if(request.command=="component.get") {
@@ -224,14 +226,31 @@ if(request.command=="batch.run") {
     if(request.arguments.contains("file")){std::ifstream file(projectPath(request.arguments.at("file").get<std::string>(),".json"));if(!file)return CommandResult::Fail("MIPSYNC_BATCH_FILE","Cannot open batch JSON.");file>>ops;}
     else ops=request.arguments.at("operations");
     if(!ops.is_array()||ops.empty()||ops.size()>4096)return CommandResult::Fail("MIPSYNC_BATCH_FORMAT","Expected 1..4096 operations.");
-    const std::set<std::string> allowed={"entity.create","entity.duplicate","entity.set","entity.transform","entity.set-parent","entity.order","entity.grid","entity.delete","component.add","component.remove","component.set-enabled","component.set","animator.set","skinned-mesh.set","ui.rect","ui.text","ui.image","canvas.set","script.attach","script.fields","mesh.set","material.apply","audio.set","ui.button-group-sounds"};
+    const std::set<std::string> allowed={"entity.create","entity.duplicate","entity.set","entity.transform","entity.set-parent","entity.order","entity.grid","entity.delete","component.add","component.remove","component.set-enabled","component.set","animator.set","skinned-mesh.set","ui.rect","ui.text","ui.image","canvas.set","script.attach","script.fields","mesh.set","material.apply","audio.set","ui.button-group-sounds","promodeler.create","promodeler.set"};
     for(const auto& op:ops)if(!op.is_object()||!op.contains("command")||!op["command"].is_string()||!allowed.contains(op["command"].get<std::string>())||!op.value("arguments",Json::object()).is_object())return CommandResult::Fail("MIPSYNC_BATCH_COMMAND","Batch permits only scene authoring commands with argument objects.");
-    const auto original=sceneJson(scene);const auto dirty=editor.IsSceneDirty();Json results=Json::array();editor.RecordUndoSnapshot();
+    const auto original=sceneJson(scene);const auto dirty=editor.IsSceneDirty();Json results=Json::array();
+    const bool preview=request.arguments.value("dry-run",false),summary=request.arguments.value("summary",false);
+    struct PreviewScope {
+        Scene& scene;EditorApp& editor;Scene original;bool active=false;
+        ~PreviewScope(){if(active){scene=std::move(original);editor.CommandSetPreview(false);}}
+    } scope{scene,editor};
+    if(preview) {
+        Scene copy;std::string error;
+        if(!SceneIO::LoadFromJsonString(copy,original.dump(),error))return CommandResult::Fail("MIPSYNC_BATCH_PREVIEW",error);
+        scope.original=std::move(scene);scene=std::move(copy);scope.active=true;editor.CommandSetPreview(true);
+    } else editor.RecordUndoSnapshot();
     for(size_t i=0;i<ops.size();++i){CommandRequest sub=request;sub.command=ops[i]["command"];sub.arguments=ops[i].value("arguments",Json::object());auto result=m_Executor.Execute(sub,m_Context);
-        if(!result.success){std::string error;if(!SceneIO::LoadFromJsonString(scene,original.dump(),error))throw std::runtime_error("Batch rollback failed: "+error);editor.AfterSceneRestoredFromHistory(false);if(dirty)editor.CommandMarkSceneDirty();result.value={{"rolledBack",true},{"failedIndex",i},{"command",sub.command}};return result;}
-        results.push_back(result.value);
+        if(!result.success){
+            if(!preview){std::string error;if(!SceneIO::LoadFromJsonString(scene,original.dump(),error))throw std::runtime_error("Batch rollback failed: "+error);editor.AfterSceneRestoredFromHistory(false);if(dirty)editor.CommandMarkSceneDirty();}
+            result.value={{"rolledBack",true},{"dryRun",preview},{"failedIndex",i},{"command",sub.command},{"completedCount",results.size()},{"results",results}};return result;
+        }
+        if(summary) {
+            Json item={{"command",sub.command}};
+            for(const char* key:{"id","name","ids","count","entity"})if(result.value.contains(key))item[key]=result.value[key];
+            results.push_back(std::move(item));
+        } else results.push_back(result.value);
     }
-    editor.CommandMarkSceneDirty();return CommandResult::Ok({{"results",results},{"count",results.size()}});
+    if(!preview)editor.CommandMarkSceneDirty();return CommandResult::Ok({{"results",results},{"count",results.size()},{"dryRun",preview},{"rolledBack",preview}});
 }
 if(request.command=="runtime.fields") {
     if(!editor.IsPlaying())return CommandResult::Fail("MIPSYNC_RUNTIME_INACTIVE","Start Play first.");

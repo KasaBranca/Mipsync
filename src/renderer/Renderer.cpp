@@ -1,4 +1,8 @@
 #include "Renderer.h"
+#include "ProjectRenderer.h"
+#include "../core/AssetFiles.h"
+#include <chrono>
+#include <stdexcept>
 #include "../ps1/PSyncGeometry.h"
 #include "../ps1/Ps1ColorGrading.h"
 #include "../animation/AnimationTypes.h"
@@ -41,514 +45,6 @@ uint64_t PSyncLightSignature(const SceneLightGpu* lights, int count, const glm::
 }
 
 // ─────────────────────────────────────────────
-// PS1-style vertex shader (embedded GLSL)
-// ─────────────────────────────────────────────
-static const char* PS1_VERTEX_SHADER = R"(
-#version 330 core
-
-layout(location = 0) in vec3 aPosition;
-layout(location = 1) in vec3 aNormal;
-layout(location = 2) in vec2 aUV;
-layout(location = 3) in vec4 aColor;
-
-out vec2 vUV;                    // perspective-correct UV
-noperspective out vec2 vUVAffine; // PS1-style affine UV (× clip w)
-noperspective out float vAffineW;
-out vec3 vNormal;
-out vec4 vColor;
-out float vFogFactor;
-out float vDepth;
-uniform int uRenderMode;
-
-uniform mat4 uModel;
-uniform mat4 uView;
-uniform mat4 uProjection;
-uniform float uVertexJitter;    // Snapping resolution
-uniform float uProjectionDepthClamp;
-
-// Lighting (legacy single directional when uLightCount == 0)
-uniform int uLightCount;
-#define MAX_LIGHTS 8
-uniform vec4 uLightPosType[MAX_LIGHTS];
-uniform vec4 uLightDirRange[MAX_LIGHTS];
-uniform vec4 uLightColorIntensity[MAX_LIGHTS];
-uniform vec4 uLightSpot[MAX_LIGHTS];
-uniform vec3 uLightDir;
-uniform vec3 uLightColor;
-uniform float uAmbient;
-
-vec3 EvaluateVertexLighting(vec3 worldPos, vec3 worldNormal) {
-    if (uLightCount <= 0) {
-        float diff = max(dot(worldNormal, -normalize(uLightDir)), 0.0);
-        return uAmbient * uLightColor + diff * uLightColor;
-    }
-
-    vec3 accum = vec3(0.0);
-    for (int i = 0; i < uLightCount; ++i) {
-        int typ = int(uLightPosType[i].w + 0.5);
-        vec3 L;
-        float atten = 1.0;
-        if (typ == 0) {
-            L = normalize(-uLightDirRange[i].xyz);
-        } else {
-            vec3 toLight = uLightPosType[i].xyz - worldPos;
-            float dist = length(toLight);
-            L = dist > 0.0001 ? normalize(toLight) : vec3(0.0, 1.0, 0.0);
-            float range = uLightDirRange[i].w;
-            if (range > 0.0) {
-                float t = clamp(1.0 - dist / range, 0.0, 1.0);
-                atten = t * t;
-            }
-            if (typ == 2) {
-                vec3 spotDir = normalize(uLightDirRange[i].xyz);
-                float cosTheta = dot(spotDir, -L);
-                atten *= smoothstep(uLightSpot[i].x, uLightSpot[i].y, cosTheta);
-            }
-        }
-        float diff = max(dot(worldNormal, L), 0.0);
-        accum += uLightColorIntensity[i].rgb * uLightColorIntensity[i].a * diff * atten;
-    }
-    return accum + uAmbient * vec3(0.12);
-}
-
-// Fog
-uniform float uFogStart;
-uniform float uFogEnd;
-uniform int uFogEnabled;
-
-// Main texture ST (Unity _MainTex_ST): xy = tiling, zw = offset
-uniform vec4 uMainTexST;
-
-vec4 ClampProjectionDepthPreserveRay(vec4 viewPos) {
-    if (uProjectionDepthClamp <= 0.0) {
-        return viewPos;
-    }
-
-    float depth = -viewPos.z;
-    if (depth <= 0.0 || depth >= uProjectionDepthClamp) {
-        return viewPos;
-    }
-
-    float scale = uProjectionDepthClamp / max(depth, 0.0001);
-    return vec4(viewPos.xyz * scale, viewPos.w);
-}
-
-void main() {
-    vec4 worldPos = uModel * vec4(aPosition, 1.0);
-    vec4 viewPos  = uView * worldPos;
-    vec4 projectedViewPos = ClampProjectionDepthPreserveRay(viewPos);
-    vec4 clipPos  = uProjection * projectedViewPos;
-
-    // ★ PS1 Vertex Snapping (Jitter)
-    if (uVertexJitter > 0.0) {
-        vec2 snapped = clipPos.xy / clipPos.w;
-        snapped = floor(snapped * uVertexJitter) / uVertexJitter;
-        clipPos.xy = snapped * clipPos.w;
-    }
-
-    gl_Position = clipPos;
-
-    vec2 tiledUV = aUV * uMainTexST.xy + uMainTexST.zw;
-    vUV = tiledUV;
-    vAffineW = clipPos.w;
-    vUVAffine = tiledUV * clipPos.w;
-
-    // Gouraud lighting (per-vertex)
-    vNormal = vec3(0.0, 1.0, 0.0);
-    vColor = aColor;
-    if (uRenderMode != 1) {
-        vNormal = normalize(mat3(transpose(inverse(uModel))) * aNormal);
-        if (uRenderMode == 0) vColor *= vec4(EvaluateVertexLighting(worldPos.xyz, vNormal), 1.0);
-    }
-
-    // Fog (distance-based in view space)
-    float dist = length(projectedViewPos.xyz);
-    vFogFactor = clamp((uFogEnd - dist) / (uFogEnd - uFogStart), 0.0, 1.0);
-    vDepth = dist;
-}
-)";
-
-static const char* PS1_SKINNED_VERTEX_SHADER = R"(
-#version 330 core
-
-layout(location = 0) in vec3 aPosition;
-layout(location = 1) in vec3 aNormal;
-layout(location = 2) in vec2 aUV;
-layout(location = 3) in vec4 aColor;
-layout(location = 4) in vec4 aBoneIndices;
-layout(location = 5) in vec4 aBoneWeights;
-
-out vec2 vUV;
-noperspective out vec2 vUVAffine;
-noperspective out float vAffineW;
-out vec3 vNormal;
-out vec4 vColor;
-out float vFogFactor;
-out float vDepth;
-uniform int uRenderMode;
-
-uniform mat4 uEntityWorld;
-uniform mat4 uPartGeometryToWorld;
-uniform vec3 uDisplayCenter;
-uniform float uDisplayScale;
-uniform mat4 uView;
-uniform mat4 uProjection;
-uniform float uVertexJitter;
-
-uniform mat4 uBones[128];
-
-uniform int uLightCount;
-#define MAX_LIGHTS 8
-uniform vec4 uLightPosType[MAX_LIGHTS];
-uniform vec4 uLightDirRange[MAX_LIGHTS];
-uniform vec4 uLightColorIntensity[MAX_LIGHTS];
-uniform vec4 uLightSpot[MAX_LIGHTS];
-uniform vec3 uLightDir;
-uniform vec3 uLightColor;
-uniform float uAmbient;
-
-vec3 EvaluateVertexLighting(vec3 worldPos, vec3 worldNormal) {
-    if (uLightCount <= 0) {
-        float diff = max(dot(worldNormal, -normalize(uLightDir)), 0.0);
-        return uAmbient * uLightColor + diff * uLightColor;
-    }
-    vec3 accum = vec3(0.0);
-    for (int i = 0; i < uLightCount; ++i) {
-        int typ = int(uLightPosType[i].w + 0.5);
-        vec3 L;
-        float atten = 1.0;
-        if (typ == 0) {
-            L = normalize(-uLightDirRange[i].xyz);
-        } else {
-            vec3 toLight = uLightPosType[i].xyz - worldPos;
-            float dist = length(toLight);
-            L = dist > 0.0001 ? normalize(toLight) : vec3(0.0, 1.0, 0.0);
-            float range = uLightDirRange[i].w;
-            if (range > 0.0) {
-                float t = clamp(1.0 - dist / range, 0.0, 1.0);
-                atten = t * t;
-            }
-            if (typ == 2) {
-                vec3 spotDir = normalize(uLightDirRange[i].xyz);
-                float cosTheta = dot(spotDir, -L);
-                atten *= smoothstep(uLightSpot[i].x, uLightSpot[i].y, cosTheta);
-            }
-        }
-        float diff = max(dot(worldNormal, L), 0.0);
-        accum += uLightColorIntensity[i].rgb * uLightColorIntensity[i].a * diff * atten;
-    }
-    return accum + uAmbient * vec3(0.12);
-}
-
-uniform float uFogStart;
-uniform float uFogEnd;
-uniform int uFogEnabled;
-uniform vec4 uMainTexST;
-
-void main() {
-    float weightSum = aBoneWeights.x + aBoneWeights.y + aBoneWeights.z + aBoneWeights.w;
-
-    vec4 skinnedPos = vec4(aPosition, 1.0);
-    vec3 skinnedNormal = aNormal;
-
-    if (weightSum > 1e-6) {
-        int bi0 = clamp(int(aBoneIndices.x + 0.5), 0, 127);
-        int bi1 = clamp(int(aBoneIndices.y + 0.5), 0, 127);
-        int bi2 = clamp(int(aBoneIndices.z + 0.5), 0, 127);
-        int bi3 = clamp(int(aBoneIndices.w + 0.5), 0, 127);
-
-        skinnedPos =
-            (uBones[bi0] * vec4(aPosition, 1.0)) * aBoneWeights.x +
-            (uBones[bi1] * vec4(aPosition, 1.0)) * aBoneWeights.y +
-            (uBones[bi2] * vec4(aPosition, 1.0)) * aBoneWeights.z +
-            (uBones[bi3] * vec4(aPosition, 1.0)) * aBoneWeights.w;
-        skinnedPos /= weightSum;
-
-        if (uRenderMode != 1) {
-        vec3 n0 = mat3(transpose(inverse(uBones[bi0]))) * aNormal;
-        vec3 n1 = mat3(transpose(inverse(uBones[bi1]))) * aNormal;
-        vec3 n2 = mat3(transpose(inverse(uBones[bi2]))) * aNormal;
-        vec3 n3 = mat3(transpose(inverse(uBones[bi3]))) * aNormal;
-        skinnedNormal =
-            n0 * aBoneWeights.x + n1 * aBoneWeights.y + n2 * aBoneWeights.z + n3 * aBoneWeights.w;
-        skinnedNormal = normalize(skinnedNormal);
-        }
-    }
-
-    vec4 geoPos = uPartGeometryToWorld * skinnedPos;
-    vec3 fittedPos = (geoPos.xyz - uDisplayCenter) * uDisplayScale;
-    vec4 worldPos = uEntityWorld * vec4(fittedPos, 1.0);
-    vec4 viewPos  = uView * worldPos;
-    vec4 clipPos  = uProjection * viewPos;
-
-    if (uVertexJitter > 0.0) {
-        vec2 snapped = clipPos.xy / clipPos.w;
-        snapped = floor(snapped * uVertexJitter) / uVertexJitter;
-        clipPos.xy = snapped * clipPos.w;
-    }
-
-    gl_Position = clipPos;
-
-    vec2 tiledUV = aUV * uMainTexST.xy + uMainTexST.zw;
-    vUV = tiledUV;
-    vAffineW = clipPos.w;
-    vUVAffine = tiledUV * clipPos.w;
-
-    vNormal = vec3(0.0, 1.0, 0.0);
-    vColor = aColor;
-    if (uRenderMode != 1) {
-        vec3 geoNormal = mat3(transpose(inverse(uPartGeometryToWorld))) * skinnedNormal;
-        vNormal = normalize(mat3(transpose(inverse(uEntityWorld))) * geoNormal);
-        if (uRenderMode == 0) vColor *= vec4(EvaluateVertexLighting(worldPos.xyz, vNormal), 1.0);
-    }
-
-    float dist = length(viewPos.xyz);
-    vFogFactor = clamp((uFogEnd - dist) / (uFogEnd - uFogStart), 0.0, 1.0);
-    vDepth = dist;
-}
-)";
-
-// ─────────────────────────────────────────────
-// PS1-style fragment shader (embedded GLSL)
-// ─────────────────────────────────────────────
-static const char* PS1_FRAGMENT_SHADER = R"(
-#version 330 core
-
-in vec2 vUV;
-noperspective in vec2 vUVAffine;
-noperspective in float vAffineW;
-in vec3 vNormal;
-in vec4 vColor;
-in float vFogFactor;
-in float vDepth;
-
-out vec4 fragColor;
-
-uniform sampler2D uAlbedo;
-uniform vec4 uMaterialColor;
-uniform vec3 uFogColor;
-uniform bool uAffineMapping;
-uniform bool uColorDepthLimit;
-uniform bool uDitheringEnabled;
-uniform int uFogEnabled;
-uniform int uColorGradingEnabled;
-uniform mat3 uColorGradingMatrix;
-uniform vec3 uColorGradingOffset;
-uniform int uVignetteEnabled;
-uniform vec3 uVignetteColor;
-uniform float uVignetteIntensity;
-uniform float uVignetteSmoothness;
-uniform vec2 uViewportSize;
-
-// Render mode: 0=Shaded, 1=Unlit, 2=Normals, 3=WireOverlay (flat color)
-uniform int uRenderMode;
-uniform vec3 uOverrideColor;
-
-// 4x4 Bayer dithering matrix
-const float bayerMatrix[16] = float[16](
-     0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
-    12.0/16.0,  4.0/16.0, 14.0/16.0,  6.0/16.0,
-     3.0/16.0, 11.0/16.0,  1.0/16.0,  9.0/16.0,
-    15.0/16.0,  7.0/16.0, 13.0/16.0,  5.0/16.0
-);
-
-vec3 ApplyColorGrading(vec3 color) {
-    return clamp(uColorGradingMatrix * color + uColorGradingOffset, 0.0, 1.0);
-}
-
-vec3 ApplyVignette(vec3 color) {
-    vec2 uv = gl_FragCoord.xy / max(uViewportSize, vec2(1.0));
-    vec2 centered = uv * 2.0 - 1.0;
-    centered.x *= uViewportSize.x / max(uViewportSize.y, 1.0);
-    float dist = length(centered);
-    float inner = max(0.0, 1.0 - uVignetteIntensity);
-    float outer = max(inner + 0.001, inner + max(uVignetteSmoothness, 0.001));
-    float mask = smoothstep(inner, outer, dist);
-    return mix(color, uVignetteColor, clamp(mask * uVignetteIntensity, 0.0, 1.0));
-}
-
-void main() {
-    if (uRenderMode == 3) {
-        fragColor = vec4(uOverrideColor, 1.0);
-        return;
-    }
-
-    if (uRenderMode == 2) {
-        vec3 n = normalize(vNormal) * 0.5 + 0.5;
-        fragColor = vec4(n, 1.0);
-        return;
-    }
-
-    vec2 sampleUV = vUV;
-    if (uAffineMapping) {
-        float w = max(abs(vAffineW), 1e-5);
-        sampleUV = vUVAffine / w;
-    }
-    vec4 texColor = texture(uAlbedo, sampleUV);
-    if (texColor.a < 0.5) {
-        discard;
-    }
-    vec3 color = texColor.rgb * vColor.rgb * uMaterialColor.rgb;
-
-    // Color depth limit + dither only apply to lit/unlit textured modes
-    if (uColorDepthLimit) {
-        float levels = 31.0;
-
-        if (uDitheringEnabled) {
-            int x = int(gl_FragCoord.x) % 4;
-            int y = int(gl_FragCoord.y) % 4;
-            float dither = bayerMatrix[y * 4 + x] - 0.5;
-            color += dither / levels;
-        }
-
-        color = floor(color * levels + 0.5) / levels;
-    }
-
-    if (uRenderMode == 0) {
-        color = mix(uFogColor, color, vFogFactor);
-    }
-
-    if (uColorGradingEnabled != 0) {
-        color = ApplyColorGrading(color);
-    }
-
-    if (uVignetteEnabled != 0) {
-        color = ApplyVignette(color);
-    }
-
-    float alpha = texColor.a * uMaterialColor.a * vColor.a;
-    fragColor = vec4(color, alpha);
-}
-)";
-
-// ─────────────────────────────────────────────
-// Selection outline (post-process, Unity-style)
-//   1) Render mesh silhouette to a mask FBO (white)
-//   2) Edge-detect: any pixel outside the mesh whose neighbour is inside
-//      becomes outline-colored, blended on top of the scene.
-// ─────────────────────────────────────────────
-static const char* OUTLINE_MASK_VERTEX_SHADER = R"(
-#version 330 core
-layout(location = 0) in vec3 aPosition;
-uniform mat4 uModel;
-uniform mat4 uView;
-uniform mat4 uProjection;
-void main() {
-    gl_Position = uProjection * uView * uModel * vec4(aPosition, 1.0);
-}
-)";
-
-static const char* OUTLINE_MASK_FRAGMENT_SHADER = R"(
-#version 330 core
-out vec4 fragColor;
-void main() {
-    fragColor = vec4(1.0);
-}
-)";
-
-static const char* OUTLINE_COMPOSE_VERTEX_SHADER = R"(
-#version 330 core
-layout(location = 0) in vec3 aPosition;
-layout(location = 2) in vec2 aUV;
-out vec2 vUV;
-void main() {
-    gl_Position = vec4(aPosition, 1.0);
-    vUV = aUV;
-}
-)";
-
-static const char* OUTLINE_COMPOSE_FRAGMENT_SHADER = R"(
-#version 330 core
-in vec2 vUV;
-out vec4 fragColor;
-
-uniform sampler2D uMask;
-uniform vec2  uTexelSize;
-uniform float uOutlinePixels;
-uniform vec3  uOutlineColor;
-
-void main() {
-    float center = texture(uMask, vUV).r;
-    if (center > 0.5) discard; // inside the silhouette → no outline drawn
-
-    int radius = int(ceil(uOutlinePixels));
-    float maxNeighbour = 0.0;
-    float r2 = uOutlinePixels * uOutlinePixels;
-
-    for (int x = -radius; x <= radius; ++x) {
-        for (int y = -radius; y <= radius; ++y) {
-            if (float(x*x + y*y) > r2) continue;            // circular kernel
-            vec2 offset = vec2(float(x), float(y)) * uTexelSize;
-            maxNeighbour = max(maxNeighbour, texture(uMask, vUV + offset).r);
-        }
-    }
-
-    if (maxNeighbour < 0.5) discard; // not on silhouette edge
-
-    fragColor = vec4(uOutlineColor, 1.0);
-}
-)";
-
-// ─────────────────────────────────────────────
-// Screen quad shaders (for upscaling the PS1 FBO)
-// ─────────────────────────────────────────────
-static const char* SCREEN_VERTEX_SHADER = R"(
-#version 330 core
-layout(location = 0) in vec3 aPosition;
-layout(location = 2) in vec2 aUV;
-out vec2 vUV;
-void main() {
-    gl_Position = vec4(aPosition, 1.0);
-    vUV = aUV;
-}
-)";
-
-static const char* SCREEN_FRAGMENT_SHADER = R"(
-#version 330 core
-in vec2 vUV;
-out vec4 fragColor;
-uniform sampler2D uScreen;
-void main() {
-    fragColor = texture(uScreen, vUV);
-}
-)";
-
-static const char* SKYBOX_FRAGMENT_SHADER = R"(
-#version 330 core
-in vec2 vUV;
-out vec4 fragColor;
-uniform sampler2D uSkybox;
-uniform mat4 uInvView;
-uniform mat4 uInvProjection;
-uniform vec3 uTint;
-uniform float uExposure;
-uniform float uRotationRadians;
-
-const float PI = 3.14159265359;
-
-vec3 rotateY(vec3 v, float angle) {
-    float s = sin(angle);
-    float c = cos(angle);
-    return vec3(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
-}
-
-void main() {
-    vec2 ndc = vUV * 2.0 - 1.0;
-    vec4 clip = vec4(ndc, 1.0, 1.0);
-    vec4 view = uInvProjection * clip;
-    view = vec4(normalize(view.xyz / max(view.w, 0.0001)), 0.0);
-    vec3 dir = normalize((uInvView * view).xyz);
-    dir = rotateY(dir, uRotationRadians);
-
-    float u = atan(dir.z, dir.x) / (2.0 * PI) + 0.5;
-    float v = 0.5 - asin(clamp(dir.y, -1.0, 1.0)) / PI;
-    vec3 color = texture(uSkybox, vec2(u, v)).rgb;
-    color *= exp2(uExposure) * uTint;
-    fragColor = vec4(color, 1.0);
-}
-)";
-
-// ─────────────────────────────────────────────
 // Implementation
 // ─────────────────────────────────────────────
 
@@ -579,39 +75,65 @@ void Renderer::Shutdown() {
 }
 
 void Renderer::CreateShaders() {
-    m_PS1Shader = Shader(PS1_VERTEX_SHADER, PS1_FRAGMENT_SHADER);
-    if (!m_PS1Shader.IsValid()) {
-        MIPSYNC_FATAL("Failed to create PS1 shader!");
-    }
+    const auto& defaults = ProjectRenderer::DefaultShaders();
+    m_BackgroundShader = Shader(defaults.at("screen.vert"), defaults.at("screen.frag"));
+    if (!ApplyShaderSources(ProjectRenderer::DefaultShaders()))
+        throw std::runtime_error("Failed to create built-in renderer shaders");
+    ReloadProjectShaders();
+}
 
-    m_PS1SkinnedShader = Shader(PS1_SKINNED_VERTEX_SHADER, PS1_FRAGMENT_SHADER);
-    if (!m_PS1SkinnedShader.IsValid()) {
-        MIPSYNC_FATAL("Failed to create PS1 skinned shader!");
-    }
-    if (const GLint boneLoc =
-            glGetUniformLocation(m_PS1SkinnedShader.GetID(), "uBones[0]");
-        boneLoc < 0) {
-        MIPSYNC_ERROR("Skinned shader: uBones[] uniform array not found (GPU skinning will fail)");
-    }
+void Renderer::SetProjectRoot(const std::filesystem::path& root, bool autoReload) {
+    m_ProjectRoot = root;
+    m_AutoReloadShaders = autoReload;
+    m_LastShaderSources.clear();
+    m_NextShaderPoll = {};
+}
 
-    m_OutlineMaskShader = Shader(OUTLINE_MASK_VERTEX_SHADER, OUTLINE_MASK_FRAGMENT_SHADER);
-    if (!m_OutlineMaskShader.IsValid()) {
-        MIPSYNC_FATAL("Failed to create outline mask shader!");
-    }
+bool Renderer::ApplyShaderSources(const std::map<std::string, std::string>& sources) {
+    auto make = [&](const char* vertex, const char* fragment) {
+        return Shader(sources.at(vertex), sources.at(fragment));
+    };
+    Shader mesh = make("mesh.vert", "mesh.frag");
+    Shader skinned = make("skinned.vert", "mesh.frag");
+    Shader screen = make("screen.vert", "screen.frag");
+    Shader skybox = make("screen.vert", "skybox.frag");
+    Shader mask = make("outline-mask.vert", "outline-mask.frag");
+    Shader outline = make("outline-compose.vert", "outline-compose.frag");
+    if (!mesh.IsValid() || !skinned.IsValid() || !screen.IsValid() ||
+        !skybox.IsValid() || !mask.IsValid() || !outline.IsValid()) return false;
+    m_PS1Shader = std::move(mesh);
+    m_PS1SkinnedShader = std::move(skinned);
+    m_ScreenShader = std::move(screen);
+    m_SkyboxShader = std::move(skybox);
+    m_OutlineMaskShader = std::move(mask);
+    m_OutlineComposeShader = std::move(outline);
+    const auto& defaults = ProjectRenderer::DefaultShaders();
+    m_CustomScreenPass = sources.at("screen.vert") != defaults.at("screen.vert") ||
+                         sources.at("screen.frag") != defaults.at("screen.frag");
+    m_MeshLightingUploaded = m_SkinnedLightingUploaded = false;
+    return true;
+}
 
-    m_OutlineComposeShader = Shader(OUTLINE_COMPOSE_VERTEX_SHADER, OUTLINE_COMPOSE_FRAGMENT_SHADER);
-    if (!m_OutlineComposeShader.IsValid()) {
-        MIPSYNC_FATAL("Failed to create outline compose shader!");
-    }
-
-    m_ScreenShader = Shader(SCREEN_VERTEX_SHADER, SCREEN_FRAGMENT_SHADER);
-    if (!m_ScreenShader.IsValid()) {
-        MIPSYNC_FATAL("Failed to create screen shader!");
-    }
-
-    m_SkyboxShader = Shader(SCREEN_VERTEX_SHADER, SKYBOX_FRAGMENT_SHADER);
-    if (!m_SkyboxShader.IsValid()) {
-        MIPSYNC_FATAL("Failed to create skybox shader!");
+bool Renderer::ReloadProjectShaders() {
+    if (m_ProjectRoot.empty()) return true;
+    try {
+        auto sources = ProjectRenderer::DefaultShaders();
+        for (auto& [name, source] : sources) {
+            const auto path = m_ProjectRoot / "renderer/pc" / name;
+            if (AssetFiles::Exists(path)) source = AssetFiles::ReadText(path);
+        }
+        if (sources == m_LastShaderSources) return m_LastShaderReloadSucceeded;
+        // Remember failed attempts too, so an unchanged error is not reported
+        // every frame. Saving a correction automatically retries the full set.
+        m_LastShaderSources = sources;
+        m_LastShaderReloadSucceeded = ApplyShaderSources(sources);
+        if (!m_LastShaderReloadSucceeded)
+            MIPSYNC_ERROR("Project renderer compilation failed; keeping the last valid shaders (renderer/pc).");
+        else MIPSYNC_INFO("Loaded project renderer shaders: {}", m_ProjectRoot.string());
+        return m_LastShaderReloadSucceeded;
+    } catch (const std::exception& ex) {
+        MIPSYNC_ERROR("Cannot load project renderer: {}", ex.what());
+        return false;
     }
 }
 
@@ -657,6 +179,10 @@ void Renderer::ClearSkyboxTexture() {
 }
 
 void Renderer::BeginScene(const Camera& camera, Framebuffer* targetFBO, const Texture* backgroundTexture) {
+    if (m_AutoReloadShaders && std::chrono::steady_clock::now() >= m_NextShaderPoll) {
+        m_NextShaderPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        ReloadProjectShaders();
+    }
     m_Statistics = {};
     m_MeshLightingUploaded = m_SkinnedLightingUploaded = false;
     if (m_PSyncWorkload) {
@@ -704,8 +230,8 @@ void Renderer::BeginScene(const Camera& camera, Framebuffer* targetFBO, const Te
         glDepthMask(GL_FALSE);
         glDisable(GL_CULL_FACE);
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-        m_ScreenShader.Bind();
-        m_ScreenShader.SetInt("uScreen", 0);
+        m_BackgroundShader.Bind();
+        m_BackgroundShader.SetInt("uScreen", 0);
         backgroundTexture->Bind(0);
         m_ScreenQuad.Bind();
         glDrawElements(GL_TRIANGLES, m_ScreenQuad.GetIndexCount(), GL_UNSIGNED_INT, nullptr);
@@ -796,6 +322,40 @@ void Renderer::RestoreDefaultOpenGLState() {
 }
 
 void Renderer::EndScene(Framebuffer* targetFBO) {
+    if (m_CustomScreenPass) {
+        auto& target = GetRenderTarget(targetFBO);
+        if (!m_PostProcessFramebuffer.GetColorAttachment())
+            m_PostProcessFramebuffer = Framebuffer(target.GetWidth(), target.GetHeight());
+        else if (m_PostProcessFramebuffer.GetWidth() != target.GetWidth() ||
+                 m_PostProcessFramebuffer.GetHeight() != target.GetHeight())
+            m_PostProcessFramebuffer.Resize(target.GetWidth(), target.GetHeight());
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_BLEND);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        // Sample through a separate FBO; reading and writing the target's
+        // texture in one draw would be undefined. Preserve its depth buffer.
+        m_PostProcessFramebuffer.Bind();
+        m_ScreenShader.SetInt("uScreen", 0);
+        m_ScreenShader.SetVec2("uViewportSize", {target.GetWidth(), target.GetHeight()});
+        m_ScreenShader.SetFloat("uTime", std::chrono::duration<float>(
+            std::chrono::steady_clock::now() - m_ShaderClockStart).count());
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, target.GetColorAttachment());
+        m_ScreenQuad.Bind();
+        glDrawElements(GL_TRIANGLES, m_ScreenQuad.GetIndexCount(), GL_UNSIGNED_INT, nullptr);
+        target.Bind();
+        m_BackgroundShader.SetInt("uScreen", 0);
+        glBindTexture(GL_TEXTURE_2D, m_PostProcessFramebuffer.GetColorAttachment());
+        glDrawElements(GL_TRIANGLES, m_ScreenQuad.GetIndexCount(), GL_UNSIGNED_INT, nullptr);
+        m_ScreenQuad.Unbind();
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glDepthMask(GL_TRUE);
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
+    }
     if (targetFBO)
         targetFBO->Unbind();
     else

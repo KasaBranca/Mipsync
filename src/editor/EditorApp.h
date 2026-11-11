@@ -96,7 +96,10 @@ public:
     void CommandStartPlayMode() { StartPlayMode(); }
     void CommandStopPlayMode() { StopPlayMode(); }
     bool CaptureGameView(const std::string& file, std::string& error);
-    void CommandMarkSceneDirty() { m_SceneDirty = true; }
+    bool CaptureSceneView(const std::string& file, const Camera& camera, int width, int height, bool sceneView, std::string& error);
+    Camera CommandSceneCamera() const { return m_SceneCamera.GetCamera(); }
+    void CommandSetPreview(bool enabled) { m_CommandPreview = enabled; }
+    void CommandMarkSceneDirty() { if (!m_CommandPreview) m_SceneDirty = true; }
     void CommandRefreshSceneDirtyState() { UpdateSceneDirtyState(); }
     bool CommandSaveScene(std::string& outError);
     bool CommandOpenScene(const std::string& absolutePath, bool saveCurrent, std::string& outError);
@@ -169,6 +172,8 @@ public:
     };
 
 private:
+    bool m_CommandPreview = false;
+    bool CaptureFramebuffer(Framebuffer& fbo, const std::string& file, std::string& error);
     void SetupDockspace();
     void ApplyDockLayout(DockLayoutPreset preset, ImGuiID dockspaceId);
     void RegisterSettingsHandler();

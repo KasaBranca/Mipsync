@@ -1,6 +1,6 @@
 ---
 name: mipsync-cli
-description: Operate Mipsync projects and the Mipsync Editor through the Mipsync CLI. MUST use for scene, entity, component, mesh, material, Mips# scripting, validation, or Editor runtime tasks; do not use for changing Mipsync engine C++ source itself.
+description: Operate Mipsync projects and the Mipsync Editor through the Mipsync CLI. MUST use for scene, entity, component, mesh, material, project renderer, Mips# scripting, validation, or Editor runtime tasks; do not use for changing Mipsync engine C++ source itself.
 ---
 
 # Mipsync CLI
@@ -98,6 +98,18 @@ that Mips# has not exposed.
   diagnostics before retrying.
 - If an operation may have succeeded before transport failure, inspect state
   before issuing it again to avoid duplicates.
+
+## Customize a game's renderer
+
+Edit project-local `renderer/` sources with normal file editing. Read
+[references/renderer.md](references/renderer.md) for PC shader reload, PS1
+runtime compilation, and upgrade behavior before changing rendering code.
+The CLI remains the interface for inspecting scenes and running builds.
+
+The Editor synchronizes this entire engine-managed Skill on every project
+open, including existing projects. Keep project-specific agent instructions
+outside the Mipsync managed block in `AGENTS.md`; edits inside this Skill
+directory are replaced when it is synchronized.
 
 For concrete inspection, authoring, patching, scripting, and playtest recipes,
 read [references/workflows.md](references/workflows.md).

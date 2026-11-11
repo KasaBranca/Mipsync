@@ -6,6 +6,7 @@ mod ps1_toolchain;
 mod project;
 mod registry;
 mod settings;
+mod version;
 
 use project::ProjectInfo;
 use registry::Registry;
@@ -145,34 +146,8 @@ struct InstallsState {
     openbios_path: Option<String>,
 }
 
-fn parse_semver_triplet(version: &str) -> Option<(u32, u32, u32)> {
-    let stripped = version.strip_prefix('v').unwrap_or(version);
-    let mut parts = stripped.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    Some((major, minor, patch))
-}
-
-/// Mipsync engine releases switched naming from semver `0.X.Y` to
-/// **date-stamped** `YYYY.M.D` (e.g. `v2026.5.28`) on 2026-05-28. We define
-/// "date-style" as a triplet whose major component is a plausible year
-/// (>= 2000) — this works because Cargo's strict semver does not accept
-/// leading zeros, so dates are emitted as `2026.5.28` rather than
-/// `2026.05.28`. This lets the Hub treat the legacy 0.1.x range as
-/// pre-release scaffolding and hide it from the installable list.
-fn is_date_version(version: &str) -> bool {
-    matches!(parse_semver_triplet(version), Some((y, _, _)) if y >= 2000)
-}
-
 fn semver_is_less(current: &str, latest: &str) -> bool {
-    match (
-        parse_semver_triplet(current),
-        parse_semver_triplet(latest),
-    ) {
-        (Some(a), Some(b)) => a < b,
-        _ => current != latest && current != format!("v{latest}") && format!("v{current}") != latest,
-    }
+    version::is_less(current, latest)
 }
 
 fn reconcile_active_editor(settings: &mut settings::HubSettings) -> Result<(), String> {
@@ -436,10 +411,8 @@ fn list_editor_releases() -> Result<Vec<EditorRelease>, String> {
         if r.version.contains('-') {
             continue;
         }
-        // Naming convention switched to YYYY.M.D on 2026-05-28; everything
-        // older (0.1.x scaffolding) is intentionally excluded from the
-        // installer UI to give users a clean cut-over.
-        if !is_date_version(&r.version) {
+        // Keep the calendar-era install history alongside formal releases.
+        if !version::is_editor_release(&r.version) {
             continue;
         }
         out.push(EditorRelease {

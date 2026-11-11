@@ -3,6 +3,7 @@
 #include <charconv>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <sstream>
 
 namespace MipsyncEngine::Command {
@@ -29,7 +30,7 @@ bool Convert(const std::string& text, ValueType type, Json& out) {
             case ValueType::Number: {
                 size_t used = 0;
                 const double value = std::stod(text, &used);
-                if (used != text.size()) return false;
+                if (used != text.size() || !std::isfinite(value)) return false;
                 out = value;
                 return true;
             }
@@ -83,6 +84,25 @@ ParsedCommandLine ParseCommandLine(const std::vector<std::string>& args,
     std::vector<std::string> commandTokens;
     for (size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--json") { parsed.json = true; continue; }
+        if (args[i] == "--quiet") { parsed.quiet = true; continue; }
+        if (args[i] == "--fields" || args[i] == "--select" || args[i] == "--out" ||
+            args[i] == "--output-format" || args[i] == "--max-depth") {
+            const auto option = args[i];
+            if (i + 1 == args.size()) { parsed.error = "missing value for " + option; return parsed; }
+            const auto value = args[++i];
+            if (option == "--out") parsed.outputPath = value;
+            else if (option == "--fields" || option == "--select") parsed.fields = value;
+            else if (option == "--output-format") {
+                if (value != "compact" && value != "pretty") { parsed.error = "output-format must be compact or pretty"; return parsed; }
+                parsed.json = true; parsed.compact = value == "compact";
+            } else {
+                const auto converted = std::from_chars(value.data(), value.data()+value.size(), parsed.maxDepth);
+                if (converted.ec != std::errc{} || converted.ptr != value.data()+value.size() || parsed.maxDepth < 0 || parsed.maxDepth > 64) {
+                    parsed.error = "max-depth must be 0..64"; return parsed;
+                }
+            }
+            continue;
+        }
         if ((args[i] == "--project" || args[i] == "-p") && i + 1 < args.size()) {
             parsed.projectPath = args[++i];
             continue;
@@ -134,11 +154,14 @@ ParsedCommandLine ParseCommandLine(const std::vector<std::string>& args,
         std::string text;
         if (commandTokens[i].rfind("--", 0) == 0) {
             name = commandTokens[i].substr(2);
-            if (i + 1 >= commandTokens.size()) {
+            const auto flag = std::find_if(descriptor->parameters.begin(), descriptor->parameters.end(),
+                [&](const ParameterDescriptor& item) { return item.name == name; });
+            if (flag != descriptor->parameters.end() && flag->type == ValueType::Boolean &&
+                (i + 1 == commandTokens.size() || commandTokens[i+1].starts_with("--"))) text = "true";
+            else if (i + 1 >= commandTokens.size()) {
                 parsed.error = "missing value for --" + name;
                 return parsed;
-            }
-            text = commandTokens[++i];
+            } else text = commandTokens[++i];
         } else {
             if (positional >= descriptor->parameters.size()) {
                 parsed.error = "too many positional arguments for " + descriptor->id;

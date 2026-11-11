@@ -1,8 +1,6 @@
 param(
-  # Optional override. When omitted we default to today's date in YYYY.M.D
-  # form (no leading zeros; required because Cargo's strict semver parser
-  # rejects "05" etc.). Use the override only for emergency re-cuts or hub-
-  # only test channels.
+  # Explicit semantic version, shared by the Editor, Hub and release tag.
+  [Parameter(Mandatory = $true)]
   [string]$Version,
 
   # Build and stage the release without publishing it. This lets CI or a
@@ -13,32 +11,29 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-if (-not $Version) {
-  $now = Get-Date
-  $Version = "{0}.{1}.{2}" -f $now.Year, $now.Month, $now.Day
-  Write-Host "[release] Defaulting to today's version: $Version"
-}
-
-# Date-stamped versions: <year>.<month>.<day>, year >= 2000. The Hub uses
-# this same shape to hide pre-2026.05.28 (legacy 0.1.x) releases from the
-# installer list.
-function Test-IsDateVersion {
+# Retain both formal releases and the previous calendar-era install history.
+function Test-IsSupportedVersion {
   param([string]$Ver)
   $clean = $Ver -replace '^v', ''
   if ($clean -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { return $false }
   $parts = $clean -split '\.'
-  return [int]$parts[0] -ge 2000
+  return [int]$parts[0] -ge 1
 }
 
 $tag = "v$Version"
 $repository = "KasaBranca/Mipsync"
-if ($Version -notmatch '^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}$') {
-  throw "Release version must use YYYY.M.D: $Version"
+if ($Version -notmatch '^[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or [int]($Version -split '\.')[0] -ge 2000) {
+  throw "Release version must use MAJOR.MINOR.PATCH, starting at 1.0.0: $Version"
 }
 
 $root = (Resolve-Path "$PSScriptRoot\\..").Path
 $outDir = Join-Path $root "release"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+foreach ($notice in @("LICENSE", "THIRD_PARTY_NOTICES.md", "third_party/licenses")) {
+  if (!(Test-Path -LiteralPath (Join-Path $root $notice))) {
+    throw "Required release notices are missing: $notice"
+  }
+}
 
 $cmakeRoot = Join-Path $root "CMakeLists.txt"
 if (Test-Path $cmakeRoot) {
@@ -46,7 +41,7 @@ if (Test-Path $cmakeRoot) {
   $t2 = $t -replace '(?m)^project\(MipsyncEngine\s+VERSION\s+[0-9]+\.[0-9]+\.[0-9]+\s+LANGUAGES\s+CXX\s+C\)\s*$',
                   ("project(MipsyncEngine VERSION $Version LANGUAGES CXX C)")
   if ($t2 -ne $t) {
-    Set-Content -Path $cmakeRoot -Value $t2 -Encoding UTF8
+    [IO.File]::WriteAllText($cmakeRoot, $t2.TrimEnd() + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     Write-Host "Updated CMake project version to $Version"
   }
 }
@@ -88,7 +83,8 @@ try {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($tauriConf, ($conf | ConvertTo-Json -Depth 20), $utf8NoBom)
   }
-  npm run tauri build | Out-Host
+  # Distribution uses the portable ZIP below, so no NSIS tool download is needed.
+  npm run tauri build -- --no-bundle | Out-Host
   if ($LASTEXITCODE -ne 0) { throw "Hub build failed ($LASTEXITCODE)." }
   # Tauri's default-run binary does not guarantee a fresh updater executable.
   Push-Location (Join-Path $root "hub-tauri\\src-tauri")
@@ -250,17 +246,14 @@ $newEntry = [PSCustomObject]@{
   publishedAt = (Get-Date).ToString("o")
 }
 
-# Always generate a fresh manifest. If an old manifest exists, carry over editor
-# releases — but only ones that follow the new YYYY.M.D naming. Anything older
-# (0.1.x scaffolding) is intentionally dropped from the installer feed so users
-# only see clean, date-stamped builds going forward.
+# Preserve released calendar builds and formal versions; omit 0.x scaffolding.
 $prevReleases = @()
 try {
   $prev = ($existing | ConvertTo-Json -Depth 6) | ConvertFrom-Json
   if ($null -ne $prev -and $null -ne $prev.editor -and $null -ne $prev.editor.releases) {
     $prevReleases = @(
       @($prev.editor.releases) |
-        Where-Object { $_ -ne $null -and (Test-IsDateVersion $_.version) }
+        Where-Object { $_ -ne $null -and (Test-IsSupportedVersion $_.version) }
     )
   }
 } catch {
@@ -287,7 +280,8 @@ if ($tag -notmatch "-") {
   $currentReleases = @($manifest.editor.releases | Where-Object { $_.version -ne $tag })
   $manifest.editor.releases = @(
     $currentReleases + @($newEntry) |
-      Sort-Object @{ Expression = { [version]($_.version -replace '^v', '') }; Descending = $true }
+      Sort-Object @{ Expression = { if ([int](($_.version -replace '^v', '') -split '\.')[0] -ge 2000) { 0 } else { 1 } }; Descending = $true },
+                  @{ Expression = { [version]($_.version -replace '^v', '') }; Descending = $true }
   )
 }
 
@@ -303,6 +297,10 @@ the Editor, while **Build PS1** compiles your startup scene and Mips# scripts
 into a real PSX.EXE via PSn00bSDK.
 
 ### Highlights (v$Version)
+- Native PS1 Mips# script compilation, memory-card saves and expanded platform APIs.
+- Project-local PC shaders and PS1 renderer sources, preserved across upgrades.
+- Expanded CLI workflows for scene capture, geometry authoring and batch editing.
+- PS1 terrain caching and indexed textures contributed by @lfelipe in PR #1.
 - Agent-ready ``mipsync`` CLI with structured command discovery, Editor IPC,
   safe scene authoring, undo support, and project-scoped Codex Skills.
 - Version-matched CLI binding: projects automatically point agents at the CLI
@@ -318,8 +316,10 @@ into a real PSX.EXE via PSn00bSDK.
 - Updated PS1 runtime templates, bundled language tools, and ``tools/ninja.exe``.
 
 ### Versioning
-- Date-stamped releases: ``YYYY.M.D`` (e.g. ``$Version``). Legacy ``v0.1.x``
-  editors are hidden from the Hub installer list.
+- Formal releases now use ``MAJOR.MINOR.PATCH``, beginning with ``1.0.0``.
+- Calendar-era editors remain available in the new Hub's install history.
+- Calendar-era Hubs cannot discover the new numbering scheme automatically.
+  Download and install the new Hub once; existing projects and editor installs are retained.
 
 ### Assets
 - MipsyncEngine_Windows_x64.zip (Editor + CLI + Skills + PS1 runtime/templates)

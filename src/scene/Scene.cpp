@@ -659,6 +659,24 @@ void ProModelerComponent::ResetCylinder() {
     }
 }
 
+void ProModelerComponent::ResetCone(bool pyramid) {
+    shape = pyramid ? Shape::Pyramid : Shape::Cone;
+    vertices.clear(); indices.clear(); triangleFaceIds.clear(); faceMaterialPaths.clear(); nextFaceId=1;
+    const int count=pyramid?4:std::clamp(sides,3,64);
+    const auto half=glm::max(size,glm::vec3(0.001f))*0.5f;
+    const glm::vec3 apex{0,half.y,0}, center{0,-half.y,0};
+    auto point=[&](int i) {
+        if(pyramid) { const glm::vec2 corners[]={{-1,-1},{1,-1},{1,1},{-1,1}};return glm::vec3(corners[i%4].x*half.x,-half.y,corners[i%4].y*half.z); }
+        const float a=6.28318530718f*i/count;return glm::vec3(std::cos(a)*half.x,-half.y,std::sin(a)*half.z);
+    };
+    const uint32_t bottom=nextFaceId++;
+    for(int i=0;i<count;++i) {
+        const auto a=point(i),b=point(i+1);
+        PMPushTri(vertices,indices,a,apex,b,{0,0},{0.5f,1},{1,0});triangleFaceIds.push_back(nextFaceId++);
+        PMPushTri(vertices,indices,center,a,b,{0.5f,0.5f},{0,0},{1,0});triangleFaceIds.push_back(bottom);
+    }
+}
+
 void ProModelerComponent::EnsureFaceTopology() {
     const size_t triangleCount = indices.size() / 3u;
     if (triangleFaceIds.size() == triangleCount) {
@@ -1517,14 +1535,16 @@ void ProModelerComponent::RecalculateNormals() {
     }
 }
 
-void ProModelerComponent::RebuildMesh(MeshRendererComponent& renderer) {
+void ProModelerComponent::RebuildMesh(MeshRendererComponent& renderer, bool preserveVertexData) {
     // A Custom mesh is allowed to be empty after all of its faces are deleted.
     // Preset components with missing data still recover to the default box.
     if ((vertices.empty() || indices.empty()) && shape != Shape::Custom)
         ResetBox();
     EnsureFaceTopology();
-    RecalculatePlanarUVs();
-    RecalculateNormals();
+    if (!preserveVertexData) {
+        RecalculatePlanarUVs();
+        RecalculateNormals();
+    }
 
     std::vector<Vertex> meshVertices;
     meshVertices.reserve(vertices.size());

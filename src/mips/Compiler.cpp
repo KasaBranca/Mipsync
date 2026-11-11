@@ -504,13 +504,6 @@ void Compiler::CompileAssignment(const Ast::Expr& lhs, const Ast::Expr& rhs) {
         else isAudioProperty = false;
 
         if (isAudioProperty) {
-            if (setter == HostFunc::AudioSource_SetClip) {
-                m_Module->ps1CompatibilityErrors.push_back(
-                    m_FileName + "(" + std::to_string(lhs.location.line) + "," +
-                    std::to_string(lhs.location.column) +
-                    "): AudioSource.clip runtime assignment is not available on PS1; "
-                    "configure the clip in scene/build data");
-            }
             CompileExpression(*lhs.member->object);
             CompileExpression(rhs);
             m_Writer.EmitOp(OpCode::CallHost);
@@ -632,7 +625,10 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
             m_Writer.EmitOp(OpCode::PushField);
             m_Writer.EmitU16(static_cast<uint16_t>(fieldIdx));
             const auto& field = m_Module->fields[static_cast<size_t>(fieldIdx)];
-            if (field.typeName == "Entity" || field.typeName == "Transform") {
+            if (field.typeName == "AudioSource") {
+                m_Writer.EmitOp(OpCode::GetComponentOn);
+                m_Writer.EmitU16(AddNameConstant("AudioSource"));
+            } else if (field.typeName == "Entity" || field.typeName == "Transform") {
                 m_Writer.EmitOp(OpCode::CallHost);
                 m_Writer.EmitU16(static_cast<uint16_t>(HostFunc::Entity_FromId));
                 m_Writer.EmitU8(1);
@@ -657,12 +653,6 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
         if (expr.binary->op == Ast::BinaryOp::Assign) {
             CompileAssignment(*expr.binary->left, *expr.binary->right);
             break;
-        }
-        if (expr.binary->op == Ast::BinaryOp::Add && ContainsStringLiteral(expr)) {
-            m_Module->ps1CompatibilityErrors.push_back(
-                m_FileName + "(" + std::to_string(expr.location.line) + "," +
-                std::to_string(expr.location.column) +
-                "): string concatenation is not available on the PS1 runtime");
         }
         CompileExpression(*expr.binary->left);
         CompileExpression(*expr.binary->right);
@@ -884,39 +874,19 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
         m_Writer.EmitU8(argCount);
     };
     auto tryAnimatorMethods = [&](const Ast::Expr& objectExpr, const std::string& methodName) -> bool {
-        const bool hasTarget = objectExpr.kind != Ast::Expr::Kind::Identifier;
-        if (hasTarget)
-            CompileExpression(objectExpr);
-        const uint8_t hostArgc = static_cast<uint8_t>(argc + (hasTarget ? 1 : 0));
-        if (methodName == "GetNormalizedTime" && (argc == 0 || argc == 1)) {
-            emit(HostFunc::Animator_GetNormalizedTime, hostArgc);
-            return true;
-        }
-        if (methodName == "SetFloat" && argc == 2) {
-            emit(HostFunc::Animator_SetFloat, hostArgc);
-            return true;
-        }
-        if (methodName == "SetBool" && argc == 2) {
-            emit(HostFunc::Animator_SetBool, hostArgc);
-            return true;
-        }
-        if (methodName == "SetInt" && argc == 2) {
-            emit(HostFunc::Animator_SetInt, hostArgc);
-            return true;
-        }
-        if (methodName == "SetTrigger" && argc == 1) {
-            emit(HostFunc::Animator_SetTrigger, hostArgc);
-            return true;
-        }
-        if (methodName == "SetTriggerHeld" && argc == 1) {
-            emit(HostFunc::Animator_SetTriggerHeld, hostArgc);
-            return true;
-        }
-        if (methodName == "ReleaseTrigger" && argc == 1) {
-            emit(HostFunc::Animator_ReleaseTrigger, hostArgc);
-            return true;
-        }
-        return false;
+        HostFunc function{};
+        if (methodName == "GetNormalizedTime" && argc <= 1) function=HostFunc::Animator_GetNormalizedTime;
+        else if (methodName == "SetFloat" && argc==2) function=HostFunc::Animator_SetFloat;
+        else if (methodName == "SetBool" && argc==2) function=HostFunc::Animator_SetBool;
+        else if (methodName == "SetInt" && argc==2) function=HostFunc::Animator_SetInt;
+        else if (methodName == "SetTrigger" && argc==1) function=HostFunc::Animator_SetTrigger;
+        else if (methodName == "SetTriggerHeld" && argc==1) function=HostFunc::Animator_SetTriggerHeld;
+        else if (methodName == "ReleaseTrigger" && argc==1) function=HostFunc::Animator_ReleaseTrigger;
+        else return false;
+        const bool hasTarget=objectExpr.kind!=Ast::Expr::Kind::Identifier || objectExpr.identifier->name!="Animator";
+        if(hasTarget)CompileExpression(objectExpr);
+        emit(function,static_cast<uint8_t>(argc+(hasTarget?1:0)));
+        return true;
     };
     auto tryAudioSourceMethods = [&](const Ast::Expr& objectExpr,
                                      const std::string& methodName) -> bool {
@@ -1005,6 +975,9 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
     }
 
     const std::string& targetName = member.object->identifier->name;
+    if ((targetName=="Animator" || FindLocal(targetName)>=0 || m_Module->FindFieldIndex(targetName)>=0) &&
+        tryAnimatorMethods(*member.object,methodName)) return true;
+
 
     if (targetName == "Scene" && methodName == "FindById" && argc == 1) {
         emit(HostFunc::Entity_FromId, 1); return true;

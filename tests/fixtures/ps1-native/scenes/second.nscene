@@ -1,0 +1,1 @@
+{"entities": [{"id": 1, "name": "ScriptOwner", "transform": {"position": [0, 0, 0]}, "mipsScripts": [{"path": "assets/NativeVerify.mips"}]}, {"id": 2, "name": "Camera", "transform": {"position": [0, 0, 5]}, "camera": {"primary": true}}]}

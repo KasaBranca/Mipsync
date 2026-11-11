@@ -248,6 +248,8 @@ struct ProModelerComponent : public Component {
         Stairs,
         Custom,
         Cylinder,
+        Cone,
+        Pyramid,
     };
 
     Shape shape = Shape::Box;
@@ -272,6 +274,7 @@ struct ProModelerComponent : public Component {
     void ResetRamp();
     void ResetStairs();
     void ResetCylinder();
+    void ResetCone(bool pyramid = false);
     void RecalculatePlanarUVs();
     void RecalculateNormals();
     void EnsureFaceTopology();
@@ -285,7 +288,7 @@ struct ProModelerComponent : public Component {
                    std::vector<std::pair<uint32_t, uint32_t>>& outSelectedEdges);
     bool DeleteFaces(const std::vector<size_t>& faceTriangles);
     void FlipFaces(const std::vector<size_t>& faceTriangles);
-    void RebuildMesh(MeshRendererComponent& renderer);
+    void RebuildMesh(MeshRendererComponent& renderer, bool preserveVertexData = false);
 };
 
 struct CameraComponent : public Component {

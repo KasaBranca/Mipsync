@@ -10,6 +10,10 @@
 #include <fstream>
 #include <sstream>
 #include <unordered_set>
+#include <set>
+#include <iomanip>
+#include <cctype>
+#include <stdexcept>
 
 namespace MipsyncEngine::Mips {
 namespace fs = std::filesystem;
@@ -58,30 +62,6 @@ std::string SanitizeSymbol(const std::string& className) {
 void AddUniqueError(std::vector<std::string>& errors, const std::string& error) {
     if (std::find(errors.begin(), errors.end(), error) == errors.end())
         errors.push_back(error);
-}
-
-const char* UnsupportedHostReason(HostFunc func) {
-    switch (func) {
-    case HostFunc::Physics_Raycast:
-        return "Physics.Raycast is not available on the PS1 runtime yet (Physics.Move and Physics.IsGrounded are supported)";
-    case HostFunc::Application_Quit:
-        return "Application.Quit is not available on the PS1 runtime";
-    case HostFunc::Save_GetInt:
-    case HostFunc::Save_SetInt:
-    case HostFunc::Save_GetFloat:
-    case HostFunc::Save_SetFloat:
-    case HostFunc::Save_GetString:
-    case HostFunc::Save_SetString:
-    case HostFunc::Save_GetBool:
-    case HostFunc::Save_SetBool:
-    case HostFunc::Save_Write:
-    case HostFunc::Save_Read:
-        return "Save API is not available on the PS1 runtime yet";
-    case HostFunc::AudioSource_SetClip:
-        return "AudioSource.clip runtime assignment is not available on PS1; configure the clip in scene/build data";
-    default:
-        return nullptr;
-    }
 }
 
 bool IsKnownHostFunction(uint16_t id) {
@@ -196,8 +176,7 @@ void ValidateMethodBytecode(const CompiledModule& module,
             if (!IsKnownHostFunction(id)) {
                 AddUniqueError(errors, where + ": unknown PS1 host function #" +
                                        std::to_string(id));
-            } else if (const char* reason = UnsupportedHostReason(static_cast<HostFunc>(id))) {
-                AddUniqueError(errors, where + ": " + reason);
+
             }
             break;
         }
@@ -212,11 +191,7 @@ void ValidateMethodBytecode(const CompiledModule& module,
             break;
         }
         case OpCode::NewArraySized:
-            if (!previousWasConst || previousConst >= module.numberConstants.size()) {
-                AddUniqueError(errors, where +
-                                       ": dynamic array size cannot be verified for PS1; use a constant size up to " +
-                                       std::to_string(VM_ARRAY_LENGTH));
-            } else {
+            if (previousWasConst && previousConst < module.numberConstants.size()) {
                 const double count = module.numberConstants[previousConst];
                 if (!std::isfinite(count) || count < 0.0 || count > VM_ARRAY_LENGTH ||
                     std::floor(count) != count) {
@@ -267,43 +242,16 @@ bool ValidatePs1Target(const std::vector<CompiledModule>& modules,
         const std::string prefix = module.className.empty() ? "<unnamed script>" : module.className;
         for (const auto& error : module.ps1CompatibilityErrors)
             AddUniqueError(errors, error);
-        if (module.className.size() >= VM_CLASS_NAME_LEN)
-            AddUniqueError(errors, prefix + ": class name exceeds the PS1 limit of " +
-                                   std::to_string(VM_CLASS_NAME_LEN - 1) + " bytes");
-        if (module.numberConstants.size() > VM_NUMBER_CAP)
-            AddUniqueError(errors, prefix + ": number constant count exceeds " + std::to_string(VM_NUMBER_CAP));
-        if (module.stringConstants.size() > VM_STRING_CAP)
-            AddUniqueError(errors, prefix + ": string constant count exceeds " + std::to_string(VM_STRING_CAP));
-        if (module.nameConstants.size() > VM_NAME_CAP)
-            AddUniqueError(errors, prefix + ": name constant count exceeds " + std::to_string(VM_NAME_CAP));
         if (module.fields.size() > VM_FIELD_CAP)
             AddUniqueError(errors, prefix + ": field count exceeds " + std::to_string(VM_FIELD_CAP));
-        if (module.methods.size() > VM_METHOD_CAP)
-            AddUniqueError(errors, prefix + ": method count exceeds " + std::to_string(VM_METHOD_CAP));
-
-        for (const auto& value : module.stringConstants)
-            if (value.size() >= VM_STRING_LEN)
-                AddUniqueError(errors, prefix + ": a string constant exceeds the PS1 limit of " +
-                                       std::to_string(VM_STRING_LEN - 1) + " bytes");
-        for (const auto& value : module.nameConstants)
-            if (value.size() >= VM_NAME_LEN)
-                AddUniqueError(errors, prefix + ": name '" + value + "' exceeds the PS1 limit of " +
-                                       std::to_string(VM_NAME_LEN - 1) + " bytes");
         for (const auto& field : module.fields) {
-            if (field.name.size() >= VM_FIELD_NAME_LEN)
-                AddUniqueError(errors, prefix + ": field '" + field.name + "' exceeds the PS1 name limit");
             if (field.defaultConstIndex >= module.numberConstants.size())
                 AddUniqueError(errors, prefix + ": field '" + field.name + "' has an invalid default constant");
         }
         for (const auto& method : module.methods) {
-            if (method.name.size() >= VM_METHOD_NAME_LEN)
-                AddUniqueError(errors, prefix + ": method '" + method.name + "' exceeds the PS1 name limit");
             if (method.localCount > VM_LOCAL_CAP)
                 AddUniqueError(errors, prefix + "." + method.name + ": local count exceeds " +
                                        std::to_string(VM_LOCAL_CAP));
-            if (method.code.size() > VM_METHOD_CODE_CAP)
-                AddUniqueError(errors, prefix + "." + method.name + ": bytecode exceeds " +
-                                       std::to_string(VM_METHOD_CODE_CAP) + " bytes");
             if (IsUnsupportedLifecycle(method.name))
                 AddUniqueError(errors, prefix + "." + method.name +
                                        ": this lifecycle callback is not dispatched by the PS1 runtime yet");
@@ -389,65 +337,179 @@ bool WriteMbcFile(const CompiledModule& module, const std::string& path,
     }
 }
 
+namespace {
+std::string CText(const std::string& text) {
+    std::ostringstream out;
+    out << '"';
+    for (unsigned char c : text) {
+        if (c == '"' || c == '\\') out << '\\' << static_cast<char>(c);
+        else if (c >= 32 && c < 127) out << static_cast<char>(c);
+        else out << '\\' << std::oct << std::setfill('0') << std::setw(3)
+                 << static_cast<unsigned>(c) << std::dec;
+    }
+    return out.str() + '"';
+}
+struct NativeInstruction {
+    size_t offset, next;
+    OpCode op;
+    uint16_t operand = 0;
+    uint8_t argc = 0;
+    size_t target = 0;
+};
+std::vector<NativeInstruction> NativeInstructions(const CompiledModule& module,
+                                                 const CompiledMethod& method) {
+    std::vector<NativeInstruction> result;
+    std::set<size_t> boundaries;
+    const auto& code = method.code;
+    size_t pc = 0;
+    auto read = [&](unsigned bytes) {
+        if (pc + bytes > code.size()) throw std::runtime_error("truncated native IR operand");
+        uint32_t value = 0;
+        for (unsigned i=0;i<bytes;++i) value |= static_cast<uint32_t>(code[pc++]) << (i*8);
+        return value;
+    };
+    while (pc < code.size()) {
+        NativeInstruction i{}; i.offset = pc; boundaries.insert(pc);
+        const auto raw = read(1);
+        if (raw > static_cast<unsigned>(OpCode::GetComponentOn)) throw std::runtime_error("unknown native IR operation");
+        i.op = static_cast<OpCode>(raw);
+        switch (i.op) {
+        case OpCode::PushConst: case OpCode::PushString:
+        case OpCode::PushField: case OpCode::SetField: case OpCode::PushLocal: case OpCode::SetLocal:
+        case OpCode::GetGlobal: case OpCode::GetComponent: case OpCode::GetComponentOn:
+        case OpCode::GetMember: case OpCode::NewArray: case OpCode::StartCoroutine:
+            i.operand = static_cast<uint16_t>(read(2)); break;
+        case OpCode::PushBool: case OpCode::GetVec3Axis: case OpCode::SetVec3Axis:
+            i.operand = static_cast<uint16_t>(read(1)); break;
+        case OpCode::CallHost:
+            i.operand = static_cast<uint16_t>(read(2)); i.argc = static_cast<uint8_t>(read(1));
+            if (!IsKnownHostFunction(i.operand)) throw std::runtime_error("unknown native host function");
+            break;
+        case OpCode::Jump: case OpCode::JumpIfFalse: {
+            const int32_t delta = static_cast<int32_t>(read(4));
+            const int64_t target = static_cast<int64_t>(pc) + delta;
+            if (target < 0 || target > static_cast<int64_t>(code.size())) throw std::runtime_error("native branch outside method");
+            i.target = static_cast<size_t>(target); break;
+        }
+        default: break;
+        }
+        i.next = pc; result.push_back(i);
+    }
+    boundaries.insert(code.size());
+    for (const auto& i : result) {
+        if ((i.op == OpCode::Jump || i.op == OpCode::JumpIfFalse) && !boundaries.contains(i.target))
+            throw std::runtime_error("native branch is not on an instruction boundary");
+        if (i.op == OpCode::PushConst && i.operand >= module.numberConstants.size()) throw std::runtime_error("native number index out of range");
+        if (i.op == OpCode::PushString && i.operand >= module.stringConstants.size()) throw std::runtime_error("native string index out of range");
+    }
+    return result;
+}
+std::string NativeOperationName(OpCode op) {
+    switch(op) {
+#define NATIVE_OP_NAME(c, cpp, id) case OpCode::cpp: { std::string s = #c; std::transform(s.begin(),s.end(),s.begin(),[](unsigned char ch){return static_cast<char>(std::tolower(ch));}); return s; }
+        MIPSYNC_OPCODE_LIST(NATIVE_OP_NAME)
+#undef NATIVE_OP_NAME
+    }
+    throw std::runtime_error("unknown native operation");
+}
+void EmitNativeMethod(std::ostream& out, const CompiledModule& module,
+                      const CompiledMethod& method, const std::string& symbol) {
+    const auto instructions = NativeInstructions(module, method);
+    auto name = [&](uint16_t index) {
+        if (index >= module.nameConstants.size()) throw std::runtime_error("native name index out of range");
+        return CText(module.nameConstants[index]);
+    };
+    out << "static int " << symbol << "(vm_state* vm, script_instance* inst, vm_coroutine* co) {\n"
+           "    (void)inst;\n    if(co) { switch(co->pc) {\n    case 0: goto L0;\n";
+    std::set<size_t> resumes;
+    for (const auto& i : instructions)
+        if (i.op == OpCode::YieldNext || i.op == OpCode::YieldSeconds) resumes.insert(i.next);
+    for (auto pc : resumes) if (pc != 0) out << "    case " << pc << ": goto L" << pc << ";\n";
+    out << "    default: vm->error=1; return 0; } }\n";
+    for (const auto& i : instructions) {
+        out << "L" << i.offset << ":\n    ";
+        switch(i.op) {
+        case OpCode::PushConst:
+            out << "vm_push(vm,make_num((fix16_t)" << ToFixed16(module.numberConstants[i.operand]) << "));"; break;
+        case OpCode::PushBool:
+            out << "vm_push(vm,make_bool(" << (i.operand ? 1 : 0) << "));"; break;
+        case OpCode::PushString:
+            out << "{ host_value v=make_nil(); v.tag=HOST_VAL_NATIVE_STRING; v.text=" << CText(module.stringConstants[i.operand]) << "; vm_push(vm,v); }"; break;
+        case OpCode::PushField: case OpCode::SetField: case OpCode::PushLocal: case OpCode::SetLocal:
+        case OpCode::GetVec3Axis: case OpCode::SetVec3Axis: case OpCode::NewArray:
+            out << "native_" << NativeOperationName(i.op) << "(vm," << i.operand << ");"; break;
+        case OpCode::GetGlobal: case OpCode::GetMember: case OpCode::StartCoroutine:
+            out << "native_" << NativeOperationName(i.op) << "(vm," << name(i.operand) << ");"; break;
+        case OpCode::GetComponent: case OpCode::GetComponentOn:
+            out << "native_get_component_on(vm," << name(i.operand) << ',' << (i.op == OpCode::GetComponentOn ? 1 : 0) << ");"; break;
+        case OpCode::CallHost:
+            out << "if(!host_dispatch(vm," << i.operand << ',' << static_cast<unsigned>(i.argc) << ")) return 0;"; break;
+        case OpCode::Jump:
+            out << "goto L" << i.target << ';'; break;
+        case OpCode::JumpIfFalse:
+            out << "if(!val_as_bool(vm_pop(vm))) goto L" << i.target << ';'; break;
+        case OpCode::Return: case OpCode::YieldBreak:
+            out << "if(co) co->active=0; return !vm->error;"; break;
+        case OpCode::YieldNext: case OpCode::YieldSeconds:
+            out << "return native_yield(vm,co," << i.next << ',' << (i.op == OpCode::YieldSeconds ? 1 : 0) << ");"; break;
+        default:
+            out << "native_" << NativeOperationName(i.op) << "(vm);"; break;
+        }
+        out << "\n    if(vm->error) return 0;\n";
+    }
+    out << "L" << method.code.size() << ":\n    if(co) co->active=0; return !vm->error;\n}\n\n";
+}
+} // namespace
+
+bool ModuleUsesHostFunction(const CompiledModule& module, HostFunc function) {
+    for(const auto& method:module.methods)for(const auto& i:NativeInstructions(module,method))
+        if(i.op==OpCode::CallHost && i.operand==static_cast<uint16_t>(function))return true;
+    return false;
+}
+
 bool EmitScriptsDataC(const std::vector<CompiledModule>& modules,
                       const std::string& outCFile,
                       ScriptsDataEmit& outStats,
                       std::string& outError) {
     try {
         outStats = {};
-        const fs::path cPath = PathUtf8::FromString(outCFile);
-        if (cPath.has_parent_path())
-            fs::create_directories(cPath.parent_path());
-        std::ofstream out(cPath, std::ios::trunc);
-        if (!out.is_open()) {
-            outError = "cannot open scripts_data.c for write: " + outCFile;
-            return false;
+        std::ostringstream out;
+        out << "/* Generated Mips# native C. Compile with PSn00bSDK GCC for MIPS.\n"
+               " * Shared compiler IR is lowered to direct branches and functions here.\n"
+               " * No bytecode, instruction fetching, or interpreter is shipped. */\n"
+               "#include \"runtime/scripts_data.h\"\n"
+               "#include \"runtime/native_ops.h\"\n\n";
+        for (size_t m=0;m<modules.size();++m) {
+            const auto& module=modules[m];
+            const std::string symbol="mipsync_native_"+std::to_string(m);
+            for(size_t f=0;f<module.methods.size();++f)
+                EmitNativeMethod(out,module,module.methods[f],symbol+"_"+std::to_string(f));
+            out << "static const mbc_field " << symbol << "_fields[] = {\n";
+            if(module.fields.empty()) out << "    {0,0},\n";
+            for(const auto& field:module.fields) out << "    {" << CText(field.name) << ',' << static_cast<unsigned>(field.valueKind) << "},\n";
+            out << "};\nstatic const mbc_method " << symbol << "_methods[] = {\n";
+            if(module.methods.empty()) out << "    {0,0,0},\n";
+            for(size_t f=0;f<module.methods.size();++f)
+                out << "    {" << CText(module.methods[f].name) << ',' << symbol << '_' << f << ',' << module.methods[f].localCount << "},\n";
+            out << "};\n\n";
         }
-
-        out << "/* Auto-generated by Mipsync (src/mips/PS1Export.cpp).\n"
-               " * Do not edit by hand — regenerated by `Build PS1` every time.\n"
-               " * Holds .mbc bytecode for every Mipsync script in the project,\n"
-               " * embedded as `static const unsigned char` arrays. The PS1 mini-VM\n"
-               " * (templates/ps1/starter/runtime/vm.c) iterates `g_mipsync_scripts`\n"
-               " * and decodes each blob.\n"
-               " */\n"
-               "#include <stddef.h>\n"
-               "#include \"runtime/scripts_data.h\"\n\n";
-
-        for (size_t i = 0; i < modules.size(); ++i) {
-            const auto bytes = EncodeMbc(modules[i]);
-            outStats.totalBytes += static_cast<uint32_t>(bytes.size());
-            const std::string sym = "k_mbc_" + SanitizeSymbol(modules[i].className);
-            out << "static const unsigned char " << sym << "[" << bytes.size() << "] = {\n  ";
-            for (size_t j = 0; j < bytes.size(); ++j) {
-                out << "0x";
-                out.width(2);
-                out.fill('0');
-                out << std::hex << static_cast<int>(bytes[j]) << std::dec;
-                if (j + 1 < bytes.size()) out << ",";
-                if (((j + 1) % 16) == 0) out << "\n  ";
-                else if (j + 1 < bytes.size()) out << " ";
-            }
-            out << "\n};\n\n";
+        out << "mbc_module g_mipsync_scripts[] = {\n";
+        if(modules.empty()) out << "    {0},\n";
+        for(size_t m=0;m<modules.size();++m) {
+            const std::string symbol="mipsync_native_"+std::to_string(m);
+            out << "    {" << CText(modules[m].className) << ',' << modules[m].fields.size() << ',' << symbol << "_fields,"
+                << modules[m].methods.size() << ',' << symbol << "_methods},\n";
         }
-
-        out << "const mipsync_script_blob g_mipsync_scripts[] = {\n";
-        for (size_t i = 0; i < modules.size(); ++i) {
-            const auto bytes = EncodeMbc(modules[i]);
-            const std::string sym = "k_mbc_" + SanitizeSymbol(modules[i].className);
-            out << "    { \"" << modules[i].className << "\", "
-                << sym << ", " << bytes.size() << " },\n";
-        }
-        out << "};\n";
-        out << "const unsigned int g_mipsync_script_count = "
-            << modules.size() << "u;\n";
-
-        outStats.scriptCount = static_cast<uint32_t>(modules.size());
-        return out.good();
-    } catch (const std::exception& ex) {
-        outError = ex.what();
-        return false;
-    }
+        out << "};\nconst unsigned int g_mipsync_script_count=" << modules.size() << ";\n";
+        const fs::path path=PathUtf8::FromString(outCFile);
+        if(path.has_parent_path()) fs::create_directories(path.parent_path());
+        std::ofstream file(path,std::ios::binary|std::ios::trunc);
+        const auto text=out.str(); file.write(text.data(),static_cast<std::streamsize>(text.size()));
+        if(!file.good()) throw std::runtime_error("cannot write native scripts: "+outCFile);
+        outStats.scriptCount=static_cast<uint32_t>(modules.size());
+        outStats.totalBytes=static_cast<uint32_t>(text.size());
+        return true;
+    } catch(const std::exception& e) {outError=e.what();return false;}
 }
 
 } // namespace MipsyncEngine::Mips

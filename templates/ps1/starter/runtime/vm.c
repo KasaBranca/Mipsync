@@ -249,23 +249,7 @@ static vm_array* value_array(script_instance* inst, host_value value) {
     return &inst->arrays[index];
 }
 
-static host_value alloc_array(script_instance* inst, int length) {
-    host_value value = make_nil();
-    vm_array* array;
-    int i;
-    if (!inst || inst->array_count >= VM_ARRAY_CAP) {
-        host_log("[VM] array pool full");
-        return value;
-    }
-    if (length < 0) length = 0;
-    if (length > VM_ARRAY_LENGTH) length = VM_ARRAY_LENGTH;
-    array = &inst->arrays[inst->array_count];
-    array->length = (uint8_t)length;
-    for (i = 0; i < VM_ARRAY_LENGTH; ++i) array->values[i] = make_nil();
-    value.tag = HOST_VAL_ARRAY;
-    value.ival = (int32_t)(++inst->array_count);
-    return value;
-}
+
 
 static int vm_execute(vm_state* vm, mbc_module* module, script_instance* inst,
                       const mbc_method* method, vm_coroutine* coroutine) {
@@ -358,6 +342,9 @@ static int vm_execute(vm_state* vm, mbc_module* module, script_instance* inst,
                 if (target >= 0 && ps1_scene_entity((unsigned)target)) {
                     if (name_equals(className, "Transform")) result = make_host(HOST_REF_TRANSFORM,(uint16_t)target,0);
                     else if (name_equals(className, "AudioSource")) result = make_host(HOST_REF_AUDIO_SOURCE,(uint16_t)target,0);
+                    else if (name_equals(className, "Animator")) result = make_host(HOST_REF_ANIMATOR,(uint16_t)target,0);
+                    else if (name_equals(className, "Collider")) result = make_host(HOST_REF_COLLIDER,(uint16_t)target,0);
+                    else if (name_equals(className, "Rigidbody")) result = make_host(HOST_REF_RIGIDBODY,(uint16_t)target,0);
                     else for (i=0;i<vm->instance_count;++i)
                         if (vm->instances[i].entity_index == target && name_equals(vm->instances[i].module->class_name,className)) {
                             result = make_host(HOST_REF_SCRIPT,(uint16_t)target,(uint8_t)i); break;
@@ -412,6 +399,8 @@ static int vm_execute(vm_state* vm, mbc_module* module, script_instance* inst,
                     const ps1_entity* ent = ps1_scene_entity(obj.ref.entity_idx);
                     if (!ent) {
                         vm_push(vm, make_nil());
+                    } else if (name_equals(member, "clip")) {
+                        host_value value={0};value.tag=HOST_VAL_NATIVE_STRING;value.text=ps1_audio_clip_path(ent->audio_clip_index);vm_push(vm,value);
                     } else if (name_equals(member, "volume")) {
                         vm_push(vm, make_num((fix16_t)(((int32_t)ent->audio_volume_q8 * FIX16_ONE) / 255)));
                     } else if (name_equals(member, "loop")) {
@@ -469,7 +458,7 @@ static int vm_execute(vm_state* vm, mbc_module* module, script_instance* inst,
                 }
                 break;
             }
-            case OP_ADD: { host_value b = vm_pop(vm); host_value a = vm_pop(vm); vm_push(vm, make_num(fix16_add(val_as_num(a), val_as_num(b)))); break; }
+            case OP_ADD: { host_value b = vm_pop(vm); host_value a = vm_pop(vm); vm_push(vm, vm_add_values(vm,a,b)); break; }
             case OP_SUB: { host_value b = vm_pop(vm); host_value a = vm_pop(vm); vm_push(vm, make_num(fix16_sub(val_as_num(a), val_as_num(b)))); break; }
             case OP_MUL: { host_value b = vm_pop(vm); host_value a = vm_pop(vm); vm_push(vm, make_num(fix16_mul(val_as_num(a), val_as_num(b)))); break; }
             case OP_DIV: { host_value b = vm_pop(vm); host_value a = vm_pop(vm); vm_push(vm, make_num(fix16_div(val_as_num(a), val_as_num(b)))); break; }
@@ -531,7 +520,7 @@ static int vm_execute(vm_state* vm, mbc_module* module, script_instance* inst,
             }
             case OP_NEW_ARRAY: {
                 uint16_t count = rd_u16(code + pc); pc += 2;
-                host_value array_value = alloc_array(inst, count);
+                host_value array_value = vm_allocate_array(vm, inst, count);
                 vm_array* array = value_array(inst, array_value);
                 int i;
                 for (i = (int)count - 1; i >= 0; --i) {
@@ -544,7 +533,7 @@ static int vm_execute(vm_state* vm, mbc_module* module, script_instance* inst,
             }
             case OP_NEW_ARRAY_SIZED: {
                 int size = FIX16_TO_INT(val_as_num(vm_pop(vm)));
-                vm_push(vm, alloc_array(inst, size));
+                vm_push(vm, vm_allocate_array(vm, inst, size));
                 break;
             }
             case OP_GET_INDEX: {

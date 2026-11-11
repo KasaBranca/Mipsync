@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { compareVersions } from "./version";
 import {
   addExistingProject,
   createProject,
@@ -32,21 +33,6 @@ import {
 
 type ModalKind = "new" | "add" | null;
 type Tab = "projects" | "installs";
-
-function parseVersion(v: string): [number, number, number] {
-  const stripped = v.trim().replace(/^v/i, "");
-  const parts = stripped.split(".").map(Number);
-  return [parts[0] || 0, parts[1] || 0, parts[2] || 0];
-}
-
-function compareVersions(a: string, b: string): number {
-  const av = parseVersion(a);
-  const bv = parseVersion(b);
-  for (let i = 0; i < 3; i += 1) {
-    if (av[i] !== bv[i]) return av[i] - bv[i];
-  }
-  return a.localeCompare(b);
-}
 
 function versionsEqual(a: string | null | undefined, b: string | null | undefined): boolean {
   if (!a || !b) return false;

@@ -72,3 +72,9 @@ release/previous/
 /output.lua
 /output.vert
 /hub-tauri/liquid-glass-qa.png
+
+# Local test workspaces and unpacked release verification outputs
+/tmp/
+/Testing/
+/release/verify-*/
+/release/_tmp-*/

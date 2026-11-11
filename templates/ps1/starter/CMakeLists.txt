@@ -52,25 +52,6 @@ endfunction()
 function(mipsync_add_scene_executable name source_dir)
     set(scene_sources
     main.c
-    runtime/fixedp.c
-    runtime/boot_brand.c
-    runtime/mipsync_gte.c
-    runtime/host.c
-    runtime/vm.c
-    runtime/scene.c
-    runtime/scene_loader.c
-    runtime/lookat.c
-    runtime/lighting.c
-    runtime/color_grading.c
-    runtime/gpu_transfer.c
-    runtime/gpu_readback.c
-    runtime/render.c
-    runtime/ui.c
-    runtime/textures.c
-    runtime/input.c
-    runtime/physics.c
-    runtime/audio.c
-    runtime/midi.c
     generated/scripts_data.c
     generated/scene_data.c
     generated/mesh_data.c
@@ -78,10 +59,16 @@ function(mipsync_add_scene_executable name source_dir)
     generated/audio_data.c
     )
     list(TRANSFORM scene_sources PREPEND "${source_dir}/")
-    mipsync_add_ps1_executable(${name} ${scene_sources})
+    # Project renderer helpers are compiled along with the standard runtime.
+    file(GLOB_RECURSE runtime_sources CONFIGURE_DEPENDS
+        "${source_dir}/runtime/*.c" "${source_dir}/runtime/*.s" "${source_dir}/runtime/*.S")
+    # Native AOT uses native.c; the legacy bytecode VM exports the same symbols.
+    list(FILTER runtime_sources EXCLUDE REGEX "/runtime/vm\\.c$")
+    mipsync_add_ps1_executable(${name} ${scene_sources} ${runtime_sources})
     # Optimize the generated scene and runtime together; visibility and fixed
     # point helpers otherwise spend a substantial part of each PS1 frame in
     # cross-file calls. Keep compiler and linker options paired for LTO.
+    target_compile_definitions(${name} PRIVATE MIPSYNC_SCRIPT_AOT=1)
     target_compile_options(${name} PRIVATE -O3 -flto)
     target_link_options(${name} PRIVATE -O3 -flto)
     target_include_directories(${name} PRIVATE "${source_dir}")

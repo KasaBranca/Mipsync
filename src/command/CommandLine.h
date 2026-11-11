@@ -9,6 +9,11 @@ namespace MipsyncEngine::Command {
 struct ParsedCommandLine {
     bool valid = false;
     bool json = false;
+    bool quiet = false;
+    bool compact = false;
+    int maxDepth = -1;
+    std::string fields;
+    std::string outputPath;
     std::string projectPath;
     std::string instanceId;
     CommandRequest request;

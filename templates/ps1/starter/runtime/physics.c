@@ -2001,3 +2001,44 @@ int ps1_physics_contact_kind(unsigned int self, unsigned int other) {
             (int64_t)min_b[axis] > (int64_t)max_a[axis]+PS1_COLLISION_SKIN) return 0;
     return 1;
 }
+
+/* Match the desktop API: nearest render-mesh world AABB, normalized direction.
+ * Collider-only volumes and removed entities do not participate. */
+uint32_t ps1_physics_raycast(const fix16_t origin[3],const fix16_t direction[3],fix16_t max_distance){
+    fix16_t normal[3];uint64_t square=0,root=0,bit=(uint64_t)1<<62,n;unsigned i,axis;uint32_t hit=0;
+    if(max_distance<=0)return 0;
+    for(axis=0;axis<3;++axis){int64_t v=direction[axis];square+=v*v;}
+    n=(uint64_t)square;while(bit>n)bit>>=2;
+    while(bit){if(n>=root+bit){n-=root+bit;root=(root>>1)+bit;}else root>>=1;bit>>=2;}
+    if(!root)return 0;
+    for(axis=0;axis<3;++axis)normal[axis]=(fix16_t)(((int64_t)direction[axis]*FIX16_ONE)/(int64_t)root);
+    for(i=0;i<ps1_scene_entity_count();++i){
+        const ps1_entity* e=ps1_scene_entity(i);fix16_t lo[3],hi[3],right[3],up[3],forward[3],enter=0,leave=0x7fffffff;int miss=0,inside=1;
+        if(!e||ps1_scene_destroy_pending(i)||!e->mesh_enabled||e->mesh==PS1_MESH_NONE)continue;
+        collider_rotation_axes(e,right,up,forward);
+        if(e->mesh==PS1_MESH_CUSTOM){
+            const ps1_mesh* meshes=ps1_scene_meshes();const ps1_mesh* mesh;
+            if(e->mesh_index>=ps1_scene_mesh_count())continue;mesh=&meshes[e->mesh_index];
+            if(!mesh->verts||!mesh->vert_count)continue;
+            for(unsigned v=0;v<mesh->vert_count;++v){fix16_t point[3];mesh_vertex_world(e,mesh,&mesh->verts[v],right,up,forward,point);
+                for(axis=0;axis<3;++axis){if(!v||point[axis]<lo[axis])lo[axis]=point[axis];if(!v||point[axis]>hi[axis])hi[axis]=point[axis];}}
+        }else{
+            fix16_t half[3];for(axis=0;axis<3;++axis)half[axis]=fix16_mul(fix16_abs(e->mesh_size),fix16_abs(e->scale[axis]))/2;
+            if(e->mesh==PS1_MESH_PLANE)half[1]=0;
+            for(axis=0;axis<3;++axis){fix16_t radius=fix16_add(fix16_add(fix16_mul(fix16_abs(right[axis]),half[0]),fix16_mul(fix16_abs(up[axis]),half[1])),fix16_mul(fix16_abs(forward[axis]),half[2]));lo[axis]=fix16_sub(e->position[axis],radius);hi[axis]=fix16_add(e->position[axis],radius);}
+        }
+        for(axis=0;axis<3;++axis){
+            int64_t first,last;
+            if(origin[axis]<lo[axis]||origin[axis]>hi[axis])inside=0;
+            if(!normal[axis]){if(origin[axis]<lo[axis]||origin[axis]>hi[axis])miss=1;continue;}
+            first=(((int64_t)lo[axis]-origin[axis])*FIX16_ONE)/normal[axis];last=(((int64_t)hi[axis]-origin[axis])*FIX16_ONE)/normal[axis];
+            if(first>last){int64_t swap=first;first=last;last=swap;}
+            if(first>enter){if(first>max_distance){miss=1;break;}enter=(fix16_t)first;}
+            if(last<leave){if(last<0){miss=1;break;}leave=(fix16_t)last;}
+            if(enter>leave){miss=1;break;}
+        }
+        if(inside)enter=leave;
+        if(!miss&&enter<max_distance){max_distance=enter;hit=e->id;}
+    }
+    return hit;
+}

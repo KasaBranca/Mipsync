@@ -7,10 +7,10 @@ namespace MipsyncEngine::Command {
 inline Json Ps1Limits() {
     return {{"scriptModules",MIPSYNC_PS1_MODULE_CAP},{"scriptInstances",MIPSYNC_PS1_INSTANCE_CAP},
         {"arrayElements",VM_ARRAY_LENGTH},{"arraysPerInstance",VM_ARRAY_CAP},
-        {"numberConstants",VM_NUMBER_CAP},{"stringConstants",VM_STRING_CAP},{"stringBytes",VM_STRING_LEN-1},
-        {"nameConstants",VM_NAME_CAP},{"fields",VM_FIELD_CAP},{"methods",VM_METHOD_CAP},
-        {"methodBytecodeBytes",VM_METHOD_CODE_CAP},{"locals",VM_LOCAL_CAP},{"stackValues",VM_STACK_CAP},
-        {"coroutines",VM_COROUTINE_CAP},{"dynamicUIElements",MIPSYNC_UI_DYNAMIC_CAP},
+        {"backend","native-mips-aot"},{"numberConstants",nullptr},{"stringConstants",nullptr},{"stringBytes",VM_STRING_LEN-1},{"runtimeStrings",64},
+        {"nameConstants",nullptr},{"fields",VM_FIELD_CAP},{"methods",nullptr},
+        {"methodBytecodeBytes",nullptr},{"locals",VM_LOCAL_CAP},{"stackValues",VM_STACK_CAP},
+        {"saveEntries",24},{"saveKeyBytes",47},{"saveStringBytes",95},{"coroutines",VM_COROUTINE_CAP},{"dynamicUIElements",MIPSYNC_UI_DYNAMIC_CAP},
         {"dynamicTextBytes",MIPSYNC_UI_TEXT_BYTES-1},{"desktopInstructionsPerInvocation",100000}};
 }
 inline const Json& ComponentCatalog() {

@@ -1,4 +1,5 @@
 #include "Ps1Build.h"
+#include "../renderer/ProjectRenderer.h"
 #include "Ps1Output.h"
 #include "Ps1Toolchain.h"
 #include "BootLogo.h"
@@ -130,7 +131,7 @@ void CopyFileIfExists(const fs::path& src, const fs::path& dst, std::string& out
 }
 
 /// Refresh PS1 runtime sources from templates without overwriting exported `generated/`.
-void CopyPs1StarterSources(const fs::path& starterRoot, const fs::path& ps1Src,
+void CopyPs1StarterSources(const fs::path& projectRoot, const fs::path& starterRoot, const fs::path& ps1Src,
                            std::string& outError) {
     CopyFileIfExists(starterRoot / "main.c", ps1Src / "main.c", outError);
     if (!outError.empty())
@@ -147,7 +148,7 @@ void CopyPs1StarterSources(const fs::path& starterRoot, const fs::path& ps1Src,
     CopyDirIfExists(starterRoot / "cmake", ps1Src / "cmake", outError);
     if (!outError.empty())
         return;
-    CopyDirIfExists(starterRoot / "runtime", ps1Src / "runtime", outError);
+    ProjectRenderer::StagePs1Runtime(projectRoot, starterRoot, ps1Src, outError);
 }
 
 /// Search for a PS1 license file (licensea.dat, licensee.dat, or licensej.dat)
@@ -290,7 +291,7 @@ bool ExportBuildScenes(const fs::path& projectRoot, const BuildManifest& manifes
         const fs::path sceneDir = index == 0 ? ps1Src : ps1Src / "scenes" / std::to_string(index);
         fs::create_directories(sceneDir / "generated");
         if (index != 0) {
-            CopyPs1StarterSources(templates / "starter", sceneDir, error);
+            CopyPs1StarterSources(projectRoot, templates / "starter", sceneDir, error);
             if (!error.empty()) return false;
         }
         BuildManifest sceneManifest = manifest;
@@ -612,7 +613,11 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
 
         progress(0.31f, "Copying PS1 runtime sources");
         fs::create_directories(ps1Src / "generated", ec);
-        CopyPs1StarterSources(templates / "starter", ps1Src, error);
+        if (!ProjectRenderer::Ensure(projectRoot, templates / "starter", error)) {
+            result.message = "Project renderer setup failed: " + error;
+            return result;
+        }
+        CopyPs1StarterSources(projectRoot, templates / "starter", ps1Src, error);
         if (!error.empty()) {
             result.message = error;
             return buildLog.Finish();
@@ -698,6 +703,11 @@ Ps1BuildResult Build(const Ps1BuildRequest& request) {
                     (log.empty() ? "" : "\n" + SummarizeBuildLog(log));
                 return buildLog.Finish();
             }
+            if (ProjectRenderer::HasCustomPs1Runtime(projectRoot, templates / "starter")) {
+                result.success = false;
+                result.message = "PS1 SDK build failed with a custom project renderer. See build.log; the standard prebuilt cannot include your renderer changes.";
+                return buildLog.Finish();
+            }
             fellBack = ApplyPrebuiltFallback(templates, outDir, result);
         }
 
@@ -781,7 +791,11 @@ Ps1BuildResult ExportOnly(const Ps1BuildRequest& request) {
             return result;
         }
 
-        CopyPs1StarterSources(templates / "starter", ps1Src, error);
+        if (!ProjectRenderer::Ensure(projectRoot, templates / "starter", error)) {
+            result.message = "Project renderer setup failed: " + error;
+            return result;
+        }
+        CopyPs1StarterSources(projectRoot, templates / "starter", ps1Src, error);
         if (!error.empty()) {
             result.message = error;
             return result;

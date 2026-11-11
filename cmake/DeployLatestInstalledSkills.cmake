@@ -1,0 +1,6 @@
+if(IS_DIRECTORY "${BUILD_DIR}/skills")
+    set(SOURCE_DIR "${BUILD_DIR}/skills")
+    set(DESTINATION_DIR "${_latest_install}/skills")
+    include("${CMAKE_CURRENT_LIST_DIR}/SyncAgentSkills.cmake")
+    message(STATUS "Deployed Agent Skills to latest install: ${_latest_install}")
+endif()

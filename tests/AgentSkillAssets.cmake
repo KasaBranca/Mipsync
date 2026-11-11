@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.20)
+if(NOT DEFINED WORK_DIR OR NOT DEFINED SYNC_SCRIPT)
+    message(FATAL_ERROR "AgentSkillAssets test requires WORK_DIR and SYNC_SCRIPT")
+endif()
+file(MAKE_DIRECTORY "${WORK_DIR}/source/mipsync-cli/references")
+file(WRITE "${WORK_DIR}/source/mipsync-cli/SKILL.md" "old skill")
+file(WRITE "${WORK_DIR}/source/mipsync-cli/references/retired.md" "old API")
+function(sync)
+    execute_process(COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${WORK_DIR}/source" "-DDESTINATION_DIR=${WORK_DIR}/staged"
+        -P "${SYNC_SCRIPT}" RESULT_VARIABLE _result)
+    if(NOT _result EQUAL 0)
+        message(FATAL_ERROR "Skill asset synchronization failed")
+    endif()
+endfunction()
+sync()
+file(WRITE "${WORK_DIR}/source/mipsync-cli/SKILL.md" "new skill")
+file(REMOVE "${WORK_DIR}/source/mipsync-cli/references/retired.md")
+file(WRITE "${WORK_DIR}/source/mipsync-cli/references/renderer.md" "new renderer API")
+sync()
+file(READ "${WORK_DIR}/staged/mipsync-cli/SKILL.md" _skill)
+if(NOT _skill STREQUAL "new skill" OR
+   EXISTS "${WORK_DIR}/staged/mipsync-cli/references/retired.md" OR
+   NOT EXISTS "${WORK_DIR}/staged/mipsync-cli/references/renderer.md")
+    message(FATAL_ERROR "Documentation-only update did not fully replace bundled Skill assets")
+endif()
+message(STATUS "Skill assets update without relinking and remove retired references")

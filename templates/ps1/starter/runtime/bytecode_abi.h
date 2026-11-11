@@ -148,7 +148,7 @@
     X(VEC3_DISTANCE, Vector3_Distance, 90)
 
 /* PS1 runtime capacities. The exporter validates these before emitting C. */
-#define MIPSYNC_PS1_MODULE_CAP      4
+#define MIPSYNC_PS1_MODULE_CAP     32
 #define MIPSYNC_PS1_INSTANCE_CAP   32
 #define VM_STACK_CAP               64
 #define VM_LOCAL_CAP               64

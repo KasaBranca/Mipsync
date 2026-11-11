@@ -4,6 +4,8 @@
 
 #include <fstream>
 #include <sstream>
+#include <set>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -25,6 +27,7 @@ const char* kManagedInstructions = R"(<!-- mipsync-agent-skill:start -->
 - For every task that inspects or changes this Mipsync project's scenes, entities, components, meshes, materials, Mips# scripts, or Editor runtime, you MUST invoke `$mipsync-cli` and follow its `SKILL.md` before acting.
 - Use the Mipsync CLI for live project authoring and inspection. Do not edit `.nscene` files directly when the CLI can perform the operation.
 - The Skill is project-scoped at `.agents/skills/mipsync-cli/SKILL.md` and is synchronized from the currently running Mipsync Editor version.
+- Project renderer sources live in `renderer/`: edit these files directly, following the Skill's renderer reference. The Editor preserves customized renderer sources during upgrades.
 - Changes to the Mipsync engine C++ source itself are outside this project Skill.
 <!-- mipsync-agent-skill:end -->)";
 
@@ -83,6 +86,7 @@ bool ReplaceFileAtomically(const fs::path& target, const std::string& contents,
 
 bool CopySkill(const fs::path& source, const fs::path& destination,
                bool& updated, std::string& error) {
+    std::set<fs::path> bundledFiles;
     std::error_code ec;
     fs::create_directories(destination, ec);
     if (ec) {
@@ -111,6 +115,7 @@ bool CopySkill(const fs::path& source, const fs::path& destination,
         }
         if (!it->is_regular_file(ec))
             continue;
+        bundledFiles.insert(relative);
 
         bool differs = true;
         if (fs::is_regular_file(target, ec) && !ec) {
@@ -130,13 +135,33 @@ bool CopySkill(const fs::path& source, const fs::path& destination,
         if (!differs)
             continue;
 
-        fs::create_directories(target.parent_path(), ec);
-        fs::copy_file(it->path(), target, fs::copy_options::overwrite_existing, ec);
-        if (ec) {
-            error = "failed to synchronize Agent Skill file " + PathUtf8::ToString(target) +
-                    ": " + ec.message();
+        std::string contents;
+        if (!ReadText(it->path(), contents, error) ||
+            !ReplaceFileAtomically(target, contents, error)) {
             return false;
         }
+        updated = true;
+    }
+    if (ec) {
+        error = "failed to enumerate bundled Agent Skill: " + ec.message();
+        return false;
+    }
+    // This directory is engine-managed. Remove references retired by a newer
+    // release so agents cannot discover obsolete command/API instructions.
+    // runtime.md is generated below for the Editor version opening the project.
+    std::vector<fs::path> retired;
+    for (fs::recursive_directory_iterator it(destination, ec), end; it != end && !ec; it.increment(ec)) {
+        const auto relative = it->path().lexically_relative(destination);
+        if (it->is_regular_file(ec) && !bundledFiles.contains(relative) &&
+            relative != fs::path("references/runtime.md")) retired.push_back(it->path());
+    }
+    if (ec) {
+        error = "failed to enumerate project Agent Skill: " + ec.message();
+        return false;
+    }
+    for (const auto& path : retired) {
+        fs::remove(path, ec);
+        if (ec) { error = "failed to retire Agent Skill file: " + ec.message(); return false; }
         updated = true;
     }
     return true;

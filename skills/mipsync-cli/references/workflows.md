@@ -226,3 +226,34 @@ axes. Wait for queuedFrames=0 before changing input or queuing another step.
 An IPC access denial is reported as MIPSYNC_IPC_ACCESS_DENIED with the Win32
 error, separately from an absent editor. Use matching process permissions;
 do not infer an engine crash from a sandbox connection denial.
+# Compact scene inspection and edit-mode previews
+
+Use `scene summary --json` and `entity list --with-transform --with-bounds --json`
+before requesting full scene JSON. `entity inspect <id> --compact --json` includes
+component properties, mesh counts and shape names without raw geometry. Opt into
+buffers with `--include-mesh-data`; use `scene get-json --json --out <file>` for a
+complete document. Global `--fields` (alias `--select`) projects comma-separated
+paths from the result, including array columns such as `entities.id,entities.bounds`.
+`--output-format compact`, `--max-depth`, `--quiet` and `--out` control output size.
+`--out` is relative to the CLI working directory and suppresses stdout on success.
+
+Render the edit scene without Play: `scene capture --file tools/preview.png
+--position 8,8,8 --target 0,2,0 --json` or `scene capture --file tools/top.png
+--view top --projection orthographic --json`. `entity frame <id> --capture
+tools/entity.png --view iso --json` fits an entity hierarchy without changing
+the viewport. PNG paths are project-relative; dimensions default to 960x720.
+
+Create geometry with `promodeler create --name Roof --shape pyramid --size 8,2.5,6
+--render-type Unlit --json`. Discover presets/parameters with `promodeler describe`;
+`promodeler set <id> --shape wedge` regenerates geometry and replaces face edits.
+`material list`, `material inspect <path>`, `asset list --type texture` expose assets.
+`entity bounds`, `entity overlap`, `scene raycast` and `entity find --bounds-contains`
+use conservative render AABBs, not exact mesh/collider collisions.
+
+`batch run --file -` accepts stdin JSON arrays of `{command,arguments}`.
+`--dry-run` executes on an isolated copy with provisional IDs, preserving the live
+scene, dirty state, selection and Undo. `--summary` returns IDs/names; failures
+include `failedIndex`, `command`, `completedCount`, `results`, `rolledBack`.
+Use `commands --ids`, `help <namespace>` (short summaries) or `help <namespace>
+--details` / `describe <id>` for full definitions. Boolean flags accept explicit
+true/false or a bare flag.

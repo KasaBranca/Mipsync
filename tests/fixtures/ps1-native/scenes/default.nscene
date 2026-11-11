@@ -1,0 +1,43 @@
+{
+  "entities": [
+    {
+      "id": 1,
+      "name": "ScriptOwner",
+      "transform": {
+        "position": [
+          0,
+          0,
+          0
+        ]
+      },
+      "mipsScripts": [
+        {
+          "path": "assets/NativeSmoke.mips",
+          "fields": {
+            "source": 1
+          }
+        }
+      ],
+      "audioSource": {
+        "enabled": false,
+        "playOnAwake": false,
+        "type": 0,
+        "clip": "assets/audio/one.wav"
+      }
+    },
+    {
+      "id": 2,
+      "name": "Camera",
+      "transform": {
+        "position": [
+          0,
+          0,
+          5
+        ]
+      },
+      "camera": {
+        "primary": true
+      }
+    }
+  ]
+}

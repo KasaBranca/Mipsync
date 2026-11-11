@@ -165,9 +165,17 @@ Builds/PS1/<Product>/out/
 
 The packaged editor includes an emulator-oriented testing workflow using PCSX-Redux and OpenBIOS. Sony BIOS images and proprietary Sony SDK material are not distributed by this project.
 
+### Native PS1 script export
+
+PS1 scripts are now lowered to C and compiled to native MIPS with PSn00bSDK.
+Editor Play and Windows players keep the VM. The native target also implements
+Save on memory cards, Raycast, BIOS Quit and runtime audio clip selection.
+See [native export and platform API behavior](docs/NativePS1.md) for usage,
+capacity limits and validation. Included in Mipsync 1.0.0.
+
 ## Mips# scripting
 
-Mips# is Mipsync's deterministic gameplay language. Scripts are components with Inspector-exposed fields and familiar lifecycle methods, compiled to bytecode that runs in both the editor and PS1 runtime.
+Mips# is Mipsync's deterministic gameplay language. Scripts are components with Inspector-exposed fields and familiar lifecycle methods, compiled through a shared frontend: bytecode for Editor/PC and native C/MIPS for PS1 export.
 
 ```csharp
 class Rotator : MipsBehaviour
@@ -231,6 +239,12 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 ## Project status
+
+Mipsync 1.0.0 starts the formal `MAJOR.MINOR.PATCH` release series. Calendar-era
+Hub users need a one-time manual Hub update; projects and existing editor
+installations are retained. See [versioning and upgrade instructions](docs/Versioning.md).
+
+Project-local renderer sources are created automatically when opening new or existing games. Edit `renderer/pc/` for PC/Editor GLSL and `renderer/ps1/runtime/` for the PS1 C renderer. Customized files survive engine upgrades; the project CLI Skill is synchronized to the running Editor. See [Project renderers](docs/ProjectRenderers.md).
 
 Mipsync is under active development. Project formats, editor workflows, Mips# behavior, and PS1 output can evolve between revisions. Keep backups and validate exported builds on your intended emulator or hardware.
 

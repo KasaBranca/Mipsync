@@ -2241,14 +2241,31 @@ bool EditorApp::CaptureGameView(const std::string& file, std::string& error) {
     if (!m_GameViewFrameValid || !m_GameViewFBO.GetColorAttachment()) {
         error = "Game View has no rendered frame yet."; return false;
     }
-    const int width=m_GameViewFBO.GetWidth(),height=m_GameViewFBO.GetHeight();
+    return CaptureFramebuffer(m_GameViewFBO,file,error);
+}
+
+bool EditorApp::CaptureSceneView(const std::string& file,const Camera& camera,int width,int height,bool sceneView,std::string& error) {
+    if(width<16||width>4096||height<16||height>4096){error="Capture dimensions must be 16..4096.";return false;}
+    GLint readBinding=0,drawBinding=0,viewport[4];
+    glGetIntegerv(0x8CAA,&readBinding);glGetIntegerv(0x8CA6,&drawBinding);glGetIntegerv(GL_VIEWPORT,viewport);
+    struct Restore {
+        GLint read,draw; GLint* viewport;
+        ~Restore(){glBindFramebuffer(GL_READ_FRAMEBUFFER,read);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,draw);glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);}
+    } restore{readBinding,drawBinding,viewport};
+    Framebuffer preview(width,height);
+    RenderSceneToFramebuffer(preview,camera,{static_cast<float>(width),static_cast<float>(height)},0,0,sceneView);
+    return CaptureFramebuffer(preview,file,error);
+}
+
+bool EditorApp::CaptureFramebuffer(Framebuffer& fbo,const std::string& file,std::string& error) {
+    const int width=fbo.GetWidth(),height=fbo.GetHeight();
     std::vector<unsigned char> pixels(static_cast<size_t>(width)*height*4);
     GLint readBinding=0,drawBinding=0,alignment=0,viewport[4];
     // The bundled minimal GL loader omits these standard query constants.
     constexpr GLenum readFramebufferBinding=0x8CAA,drawFramebufferBinding=0x8CA6;
     glGetIntegerv(readFramebufferBinding,&readBinding);glGetIntegerv(drawFramebufferBinding,&drawBinding);
     glGetIntegerv(GL_PACK_ALIGNMENT,&alignment);glGetIntegerv(GL_VIEWPORT,viewport);
-    m_GameViewFBO.Bind();glPixelStorei(GL_PACK_ALIGNMENT,1);
+    fbo.Bind();glPixelStorei(GL_PACK_ALIGNMENT,1);
     glReadPixels(0,0,width,height,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
     glBindFramebuffer(GL_READ_FRAMEBUFFER,readBinding);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,drawBinding);
     glPixelStorei(GL_PACK_ALIGNMENT,alignment);glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);
@@ -3415,6 +3432,7 @@ void EditorApp::UpdatePlayInputState() {
 }
 
 void EditorApp::RecordUndoSnapshot() {
+    if (m_CommandPreview) return;
     if (m_IsPlaying) {
         if (!m_UndoStack.IsFrameActive()) {
             std::string error;
@@ -3444,6 +3462,7 @@ void EditorApp::CommitUndoTransaction() {
 }
 
 void EditorApp::AfterSceneRestoredFromHistory(bool restartUndoRecording) {
+    if (m_CommandPreview) return;
     ++m_HistoryRevision;
     Scene& scene = m_Engine->GetScene();
     ResetShotCameraState();
@@ -4108,6 +4127,7 @@ void EditorApp::PlaceNewSceneEntity(Entity& entity, Entity* parentForNew) {
 }
 
 void EditorApp::ClearEntitySelection() {
+    if (m_CommandPreview) return;
     m_PendingReferenceEntityID = 0;
     m_PendingReferenceAssetPath.clear();
     m_SelectedEntityID = 0;
@@ -4152,6 +4172,7 @@ void EditorApp::QueueHierarchyReveal(uint32_t entityId) {
 }
 
 void EditorApp::CommandRevealEntity(uint32_t entityId, bool frameInSceneView) {
+    if (m_CommandPreview) return;
     Entity* entity = m_Engine->GetScene().FindEntity(entityId);
     if (!entity)
         return;
@@ -5039,16 +5060,18 @@ void EditorApp::DrawProModelerWindow() {
     }
 
     ImGui::SeparatorText("Shape Preset");
-    const char* shapeNames[] = { "Box", "Plane", "Ramp", "Stairs", "Custom", "Cylinder" };
+    const char* shapeNames[] = { "Box", "Plane", "Ramp", "Stairs", "Custom", "Cylinder", "Cone", "Pyramid" };
     int shape = static_cast<int>(proModelerComp->shape);
     if (EditorDropdown::Combo("Preset##combo", &shape, shapeNames, IM_ARRAYSIZE(shapeNames))) {
         RecordUndoSnapshot();
-        proModelerComp->shape = static_cast<ProModelerComponent::Shape>(std::clamp(shape, 0, 5));
+        proModelerComp->shape = static_cast<ProModelerComponent::Shape>(std::clamp(shape, 0, 7));
         if      (proModelerComp->shape == ProModelerComponent::Shape::Plane)  proModelerComp->ResetPlane();
         else if (proModelerComp->shape == ProModelerComponent::Shape::Ramp)   proModelerComp->ResetRamp();
         else if (proModelerComp->shape == ProModelerComponent::Shape::Stairs) proModelerComp->ResetStairs();
         else if (proModelerComp->shape == ProModelerComponent::Shape::Cylinder) proModelerComp->ResetCylinder();
         else if (proModelerComp->shape == ProModelerComponent::Shape::Box)    proModelerComp->ResetBox();
+        else if (proModelerComp->shape == ProModelerComponent::Shape::Cone) proModelerComp->ResetCone();
+        else if (proModelerComp->shape == ProModelerComponent::Shape::Pyramid) proModelerComp->ResetCone(true);
         rebuild = true;
     }
 
@@ -5059,7 +5082,7 @@ void EditorApp::DrawProModelerWindow() {
         if (EditorTheme::SliderInt("Steps", &proModelerComp->steps, 1, 32)) changed = true;
         if (ImGui::IsItemActivated()) RecordUndoSnapshot();
     }
-    if (proModelerComp->shape == ProModelerComponent::Shape::Cylinder) {
+    if (proModelerComp->shape == ProModelerComponent::Shape::Cylinder || proModelerComp->shape == ProModelerComponent::Shape::Cone) {
         if (EditorTheme::SliderInt("Sides", &proModelerComp->sides, 3, 64)) changed = true;
         if (ImGui::IsItemActivated()) RecordUndoSnapshot();
     }
@@ -5195,6 +5218,8 @@ void EditorApp::DrawProModelerWindow() {
         else if (proModelerComp->shape == ProModelerComponent::Shape::Ramp)   proModelerComp->ResetRamp();
         else if (proModelerComp->shape == ProModelerComponent::Shape::Stairs) proModelerComp->ResetStairs();
         else if (proModelerComp->shape == ProModelerComponent::Shape::Cylinder) proModelerComp->ResetCylinder();
+        else if (proModelerComp->shape == ProModelerComponent::Shape::Cone) proModelerComp->ResetCone();
+        else if (proModelerComp->shape == ProModelerComponent::Shape::Pyramid) proModelerComp->ResetCone(true);
         else                                                                   proModelerComp->ResetBox();
         rebuild = true;
     }
