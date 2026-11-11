@@ -22,6 +22,19 @@ int main(void) {
     const int16_t tall[] = {-254, -254, 255, 255};
     check(!ps1_polygon_fits_gpu(wide, y, 4), "Oversized width requires CPU clipping");
     check(!ps1_polygon_fits_gpu(x, tall, 4), "Oversized height requires CPU clipping");
+    /* Cached visibility can certify both component triangles independently.
+     * Their union still needs the native-quad extent test in the packet path. */
+    const int16_t left_x[] = {-600, -100, 100};
+    const int16_t left_y[] = {0, 100, -100};
+    const int16_t right_x[] = {100, -100, 600};
+    const int16_t right_y[] = {-100, 100, 0};
+    const int16_t union_x[] = {-600, -100, 100, 600};
+    const int16_t union_y[] = {0, 100, -100, 0};
+    check(ps1_polygon_fits_gpu(left_x, left_y, 3) &&
+          ps1_polygon_fits_gpu(right_x, right_y, 3),
+          "Both original triangles fit the native GPU limits");
+    check(!ps1_polygon_fits_gpu(union_x, union_y, 4),
+          "A certified pair can still require two triangles instead of a quad");
     const int16_t saturated[] = {-1024, 100, -1024, 100};
     check(!ps1_polygon_fits_gpu(saturated, y, 4),
           "Saturated coordinates require CPU clipping");

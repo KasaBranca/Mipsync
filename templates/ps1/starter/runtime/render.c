@@ -2170,6 +2170,7 @@ typedef struct {
     int32_t near_z;
     int shell_ot_bias;
     int fog_enabled;
+    int visibility_certified;
     int use_tex;
     uint16_t tpage;
     uint16_t clut;
@@ -2284,7 +2285,7 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
 
     for (i = 0; i < 4; ++i) {
         uint16_t projection_index;
-        if (q[i] >= ctx->mesh->vert_count)
+        if (!ctx->visibility_certified && q[i] >= ctx->mesh->vert_count)
             return 2;
         projection_index = ctx->mesh->position_refs
             ? ctx->mesh->position_refs[q[i]] : q[i];
@@ -2292,17 +2293,16 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
             projection_index = q[i];
         sxy[i] = s_static_screen_cache[ctx->vertex_offset + projection_index];
         z[i] = s_static_depth_cache[ctx->vertex_offset + projection_index];
-        if (z[i] < ctx->near_z)
-            return 2;
-        if (z[i] > s_far_z)
+        if (!ctx->visibility_certified && (z[i] < ctx->near_z || z[i] > s_far_z))
             return 2;
         x[i] = (int16_t)(sxy[i] & 0xffff);
         y[i] = (int16_t)(sxy[i] >> 16);
     }
     if (!ps1_polygon_fits_gpu(x, y, 4))
         return 2;
-    if (!screen_front_facing_strict(x[0], y[0], x[1], y[1], x[2], y[2]) ||
-        !screen_front_facing_strict(x[2], y[2], x[1], y[1], x[3], y[3]))
+    if (!ctx->visibility_certified &&
+        (!screen_front_facing_strict(x[0], y[0], x[1], y[1], x[2], y[2]) ||
+         !screen_front_facing_strict(x[2], y[2], x[1], y[1], x[3], y[3])))
         return 2;
     if ((x[0] < -64 && x[1] < -64 && x[2] < -64 && x[3] < -64) ||
         (x[0] > s_screen_w + 64 && x[1] > s_screen_w + 64 &&
@@ -2527,6 +2527,10 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
     quad_ctx.near_z = near_z;
     quad_ctx.shell_ot_bias = shell_ot_bias;
     quad_ctx.fog_enabled = fog_enabled;
+    /* The visible list already certified face indices, strict winding and
+     * native-safe depth. The pair branch below excludes clipped faces. Keep
+     * the quad's union bounds check: two safe triangles can span a GPU limit. */
+    quad_ctx.visibility_certified = visible_triangles != 0;
 
     for (draw_index = 0; draw_index < (visible_triangles ? visible_count : mesh->tri_count); ++draw_index) {
         ti = visible_triangles ? visible_triangles[draw_index] : draw_index;
@@ -2598,8 +2602,8 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
                 }
         }
 
-        if (face->i0 >= mesh->vert_count || face->i1 >= mesh->vert_count ||
-            face->i2 >= mesh->vert_count)
+        if (!visible_triangles && (face->i0 >= mesh->vert_count || face->i1 >= mesh->vert_count ||
+            face->i2 >= mesh->vert_count))
             continue;
         p0 = mesh->position_refs ? mesh->position_refs[face->i0] : face->i0;
         p1 = mesh->position_refs ? mesh->position_refs[face->i1] : face->i1;
@@ -2616,7 +2620,7 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
         if (skip_unsafe && (visible_triangles ? s_static_safe_clip_cache[triangle_offset + ti] :
             cached_triangle_needs_safe_clip(sxy0, sxy1, sxy2, z0, z1, z2, near_z, !authored_floor_face(ent, face))))
             continue;
-        if (z0 < near_z || z1 < near_z || z2 < near_z)
+        if (!visible_triangles && (z0 < near_z || z1 < near_z || z2 < near_z))
             continue;
         if (discard_solid_fog_triangle(z0, z1, z2))
             continue;
@@ -2624,13 +2628,13 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
             z2 >= s_fog_solid_z) {
             opaque_fog_solid = 1;
         }
-        if (z0 > s_far_z || z1 > s_far_z || z2 > s_far_z)
+        if (!visible_triangles && (z0 > s_far_z || z1 > s_far_z || z2 > s_far_z))
             continue;
 
         x0 = (int16_t)(sxy0 & 0xffff); y0 = (int16_t)(sxy0 >> 16);
         x1 = (int16_t)(sxy1 & 0xffff); y1 = (int16_t)(sxy1 >> 16);
         x2 = (int16_t)(sxy2 & 0xffff); y2 = (int16_t)(sxy2 >> 16);
-        if (!screen_front_facing_strict(x0, y0, x1, y1, x2, y2) ||
+        if ((!visible_triangles && !screen_front_facing_strict(x0, y0, x1, y1, x2, y2)) ||
             triangle_outside_screen(x0, y0, x1, y1, x2, y2))
             continue;
 
