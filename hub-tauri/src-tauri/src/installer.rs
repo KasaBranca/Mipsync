@@ -14,26 +14,7 @@ pub struct InstalledEditor {
 }
 
 pub fn canonical_editor_version(version: &str) -> Option<String> {
-    let trimmed = version.trim();
-    let numeric = trimmed
-        .strip_prefix('v')
-        .or_else(|| trimmed.strip_prefix('V'))
-        .unwrap_or(trimmed);
-    let mut parts = numeric.split('.');
-    let major = parts.next()?;
-    let minor = parts.next()?;
-    let patch = parts.next()?;
-    if parts.next().is_some()
-        || major.is_empty()
-        || minor.is_empty()
-        || patch.is_empty()
-        || !major.chars().all(|c| c.is_ascii_digit())
-        || !minor.chars().all(|c| c.is_ascii_digit())
-        || !patch.chars().all(|c| c.is_ascii_digit())
-    {
-        return None;
-    }
-    Some(format!("v{major}.{minor}.{patch}"))
+    crate::version::canonical_version(version)
 }
 
 pub fn versions_equal(a: &str, b: &str) -> bool {

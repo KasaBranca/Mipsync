@@ -185,7 +185,7 @@ fn load_installs_state() -> Result<InstallsState, String> {
     reconcile_active_editor(&mut settings)?;
     let installed = installer::list_installed(&settings)?;
     Ok(InstallsState {
-        hub_version: format!("v{}", env!("CARGO_PKG_VERSION")),
+        hub_version: format!("v{}", env!("MIPSYNC_RELEASE_VERSION")),
         installs_root: settings.installs_root_dir().to_string_lossy().into_owned(),
         active_version: settings.active_version,
         installed,
@@ -419,7 +419,7 @@ fn list_editor_releases() -> Result<Vec<EditorRelease>, String> {
             version: r.version.clone(),
             title: r.title.clone(),
             published_at: r.published_at.unwrap_or_default(),
-            is_prerelease: false,
+            is_prerelease: version::is_prerelease(&r.version),
             is_draft: false,
             asset_name: Some(m.editor.asset_name.clone()),
             download_url: Some(r.download_url.clone()),
@@ -565,7 +565,7 @@ struct HubUpdateInfo {
 
 #[tauri::command]
 fn check_hub_update() -> Result<HubUpdateInfo, String> {
-    let current = env!("CARGO_PKG_VERSION").to_string();
+    let current = env!("MIPSYNC_RELEASE_VERSION").to_string();
     let current_version = format!("v{current}");
     let m = manifest::fetch_latest()?;
     let latest_version = m.hub.version.clone();

@@ -1,5 +1,5 @@
 param(
-  # Explicit semantic version, shared by the Editor, Hub and release tag.
+  # Public Editor/Hub version, for example 1.0.0f1 (a=alpha, b=beta, f=final).
   [Parameter(Mandatory = $true)]
   [string]$Version,
 
@@ -15,20 +15,35 @@ $ErrorActionPreference = "Stop"
 function Test-IsSupportedVersion {
   param([string]$Ver)
   $clean = $Ver -replace '^v', ''
-  if ($clean -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { return $false }
+  if ($clean -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([abf][1-9][0-9]*)?$') { return $false }
   $parts = $clean -split '\.'
   return [int]$parts[0] -ge 1
 }
 
+function Get-ReleaseSortKey {
+  param([string]$Ver)
+  $m = [regex]::Match(($Ver -replace '^[vV]', ''), '^(\d+)\.(\d+)\.(\d+)(?:([abf])([1-9]\d*))?$')
+  if (!$m.Success) { return '' }
+  $major = [long]$m.Groups[1].Value
+  $era = if ($major -ge 2000) { 1 } elseif ($major -ge 1) { 2 } else { 0 }
+  $stage = switch ($m.Groups[4].Value) { 'a' { 0 } 'b' { 1 } default { 2 } }
+  $build = if ($m.Groups[5].Success) { [long]$m.Groups[5].Value } else { 0 }
+  return ('{0}:{1:D10}:{2:D10}:{3:D10}:{4}:{5:D10}' -f $era, $major, [long]$m.Groups[2].Value, [long]$m.Groups[3].Value, $stage, $build)
+}
+
 $tag = "v$Version"
 $repository = "KasaBranca/Mipsync"
-if ($Version -notmatch '^[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or [int]($Version -split '\.')[0] -ge 2000) {
-  throw "Release version must use MAJOR.MINOR.PATCH, starting at 1.0.0: $Version"
+if ($Version -notmatch '^(?<major>[1-9][0-9]*)\.(?<minor>0|[1-9][0-9]*)\.(?<patch>0|[1-9][0-9]*)(?<channel>[abf])(?<build>[1-9][0-9]*)$' -or [int]$Matches.major -ge 2000) {
+  throw "Release version must use MAJOR.MINOR.PATCH[abf]BUILD, for example 1.0.0f1: $Version"
 }
+$numericVersion = "$($Matches.major).$($Matches.minor).$($Matches.patch)"
+$channel = $Matches.channel
+$packageVersion = "$numericVersion+$channel.$($Matches.build)"
 
 $root = (Resolve-Path "$PSScriptRoot\\..").Path
 $outDir = Join-Path $root "release"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+[IO.File]::WriteAllText((Join-Path $outDir 'version.txt'), $Version + "`n", [Text.UTF8Encoding]::new($false))
 foreach ($notice in @("LICENSE", "THIRD_PARTY_NOTICES.md", "third_party/licenses")) {
   if (!(Test-Path -LiteralPath (Join-Path $root $notice))) {
     throw "Required release notices are missing: $notice"
@@ -39,7 +54,7 @@ $cmakeRoot = Join-Path $root "CMakeLists.txt"
 if (Test-Path $cmakeRoot) {
   $t = Get-Content -Raw -Path $cmakeRoot
   $t2 = $t -replace '(?m)^project\(MipsyncEngine\s+VERSION\s+[0-9]+\.[0-9]+\.[0-9]+\s+LANGUAGES\s+CXX\s+C\)\s*$',
-                  ("project(MipsyncEngine VERSION $Version LANGUAGES CXX C)")
+                  ("project(MipsyncEngine VERSION $numericVersion LANGUAGES CXX C)")
   if ($t2 -ne $t) {
     [IO.File]::WriteAllText($cmakeRoot, $t2.TrimEnd() + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     Write-Host "Updated CMake project version to $Version"
@@ -75,11 +90,11 @@ try {
     $out | Set-Content -Path $Path -Encoding UTF8
   }
   $cargoToml = Join-Path $root "hub-tauri\\src-tauri\\Cargo.toml"
-  if (Test-Path $cargoToml) { Set-HubPackageVersion -Path $cargoToml -Ver $Version }
+  if (Test-Path $cargoToml) { Set-HubPackageVersion -Path $cargoToml -Ver $packageVersion }
   $tauriConf = Join-Path $root "hub-tauri\\src-tauri\\tauri.conf.json"
   if (Test-Path $tauriConf) {
     $conf = Get-Content $tauriConf -Raw | ConvertFrom-Json
-    $conf.version = $Version
+    $conf.version = $packageVersion
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($tauriConf, ($conf | ConvertTo-Json -Depth 20), $utf8NoBom)
   }
@@ -280,8 +295,7 @@ if ($tag -notmatch "-") {
   $currentReleases = @($manifest.editor.releases | Where-Object { $_.version -ne $tag })
   $manifest.editor.releases = @(
     $currentReleases + @($newEntry) |
-      Sort-Object @{ Expression = { if ([int](($_.version -replace '^v', '') -split '\.')[0] -ge 2000) { 0 } else { 1 } }; Descending = $true },
-                  @{ Expression = { [version]($_.version -replace '^v', '') }; Descending = $true }
+      Sort-Object @{ Expression = { Get-ReleaseSortKey $_.version }; Descending = $true }
   )
 }
 
@@ -316,7 +330,8 @@ into a real PSX.EXE via PSn00bSDK.
 - Updated PS1 runtime templates, bundled language tools, and ``tools/ninja.exe``.
 
 ### Versioning
-- Formal releases now use ``MAJOR.MINOR.PATCH``, beginning with ``1.0.0``.
+- Public releases use ``MAJOR.MINOR.PATCH[abf]BUILD``, beginning with ``1.0.0f1``.
+- ``a`` denotes alpha, ``b`` beta and ``f`` final; the trailing number is the build.
 - Calendar-era editors remain available in the new Hub's install history.
 - Calendar-era Hubs cannot discover the new numbering scheme automatically.
   Download and install the new Hub once; existing projects and editor installs are retained.
@@ -333,10 +348,11 @@ if ($SkipPublish) {
   Write-Host "Release assets are ready. Publishing was skipped."
 } else {
   Write-Host "Publishing GitHub Release..."
+  $publishOptions = if ($channel -eq 'f') { @('--latest') } else { @('--prerelease', '--latest=false') }
   gh release create "v$Version" -R $repository `
     --title "Mipsync $Version" `
     --notes-file $notesFile `
-    $engineZip $hubZip $manifestPath
+    $engineZip $hubZip $manifestPath @publishOptions
   if ($LASTEXITCODE -ne 0) { throw "GitHub release publishing failed ($LASTEXITCODE)." }
 }
 

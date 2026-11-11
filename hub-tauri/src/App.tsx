@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { compareVersions } from "./version";
+import { canonicalEditorVersion, compareVersions } from "./version";
 import {
   addExistingProject,
   createProject,
@@ -36,18 +36,12 @@ type Tab = "projects" | "installs";
 
 function versionsEqual(a: string | null | undefined, b: string | null | undefined): boolean {
   if (!a || !b) return false;
-  const at = a.trim();
-  const bt = b.trim();
-  return at === bt || at.replace(/^v/i, "") === bt.replace(/^v/i, "");
-}
-
-function canonicalEditorVersion(version: string | null | undefined): string | null {
-  const match = version?.trim().match(/^v?(\d+)\.(\d+)\.(\d+)$/i);
-  return match ? `v${match[1]}.${match[2]}.${match[3]}` : null;
+  const av = canonicalEditorVersion(a), bv = canonicalEditorVersion(b);
+  return av !== null && av === bv;
 }
 
 function latestEditorReleaseFrom(releases: EditorRelease[]): EditorRelease | null {
-  const candidates = releases.filter((r) => !r.isDraft && r.downloadUrl);
+  const candidates = releases.filter((r) => !r.isDraft && !r.isPrerelease && r.downloadUrl);
   if (!candidates.length) return null;
   return candidates.reduce((latest, current) =>
     compareVersions(current.version, latest.version) > 0 ? current : latest

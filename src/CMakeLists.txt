@@ -251,6 +251,10 @@ add_executable(MipsyncProjectRendererTests
 target_include_directories(MipsyncProjectRendererTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(MipsyncProjectRendererTests PRIVATE MipsyncAssetFiles)
 add_test(NAME MipsyncProjectRenderer COMMAND MipsyncProjectRendererTests)
+add_test(NAME MipsyncInstalledVersion COMMAND ${CMAKE_COMMAND}
+    "-DWORK_DIR=${CMAKE_BINARY_DIR}/Testing/installed-version"
+    "-DDEPLOY_SCRIPT=${CMAKE_SOURCE_DIR}/cmake/DeployLatestInstalledEditor.cmake"
+    -P "${CMAKE_SOURCE_DIR}/tests/DeployInstalledVersion.cmake")
 add_test(NAME MipsyncAgentSkillAssets COMMAND ${CMAKE_COMMAND}
     "-DWORK_DIR=${CMAKE_BINARY_DIR}/Testing/agent-skill-assets"
     "-DSYNC_SCRIPT=${CMAKE_SOURCE_DIR}/cmake/SyncAgentSkills.cmake"

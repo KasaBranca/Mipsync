@@ -174,7 +174,7 @@ PS1 scripts are now lowered to C and compiled to native MIPS with PSn00bSDK.
 Editor Play and Windows players keep the VM. The native target also implements
 Save on memory cards, Raycast, BIOS Quit and runtime audio clip selection.
 See [native export and platform API behavior](docs/NativePS1.md) for usage,
-capacity limits and validation. Included in Mipsync 1.0.0.
+capacity limits and validation. Included in Mipsync 1.0.0f1.
 
 ## Mips# scripting
 
@@ -243,7 +243,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 ## Project status
 
-Mipsync 1.0.0 starts the formal `MAJOR.MINOR.PATCH` release series. Calendar-era
+Mipsync 1.0.0f1 starts the `MAJOR.MINOR.PATCH[abf]BUILD` release series. Calendar-era
 Hub users need a one-time manual Hub update; projects and existing editor
 installations are retained. See [versioning and upgrade instructions](docs/Versioning.md).
 

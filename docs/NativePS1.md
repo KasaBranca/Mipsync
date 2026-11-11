@@ -1,6 +1,6 @@
 # Native MIPS script export
 
-Included in Mipsync 1.0.0, following the calendar-era 2026.10.18 release.
+Included in Mipsync 1.0.0f1, following the calendar-era 2026.10.18 release.
 
 PS1 export lowers the shared Mips# compiler IR to generated C functions. The
 PSn00bSDK GCC toolchain compiles those functions together with the engine runtime

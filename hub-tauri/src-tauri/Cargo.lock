@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "mipsync-hub"
-version = "1.0.0"
+version = "1.0.0+f.1"
 dependencies = [
  "dirs",
  "reqwest 0.12.28",
