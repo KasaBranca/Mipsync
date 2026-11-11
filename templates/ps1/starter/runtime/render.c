@@ -12,6 +12,7 @@
 #include "projection_safety.h"
 #include "watertight_projection.h"
 #include "affine_subdivision.h"
+#include "world_projection.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -53,10 +54,18 @@ static void add_world_primitive(uint32_t* bucket, void* primitive) {
 #define PSX_UNITS_PER_WORLD 64
 /* PSX fpscam default forward is +Z; Unity cameras look down -Z. */
 #define PSX_YAW_UNITY_OFFSET 2048
+#ifndef PS1_VIEWMODEL_VERTEX_CACHE_MAX
 #define PS1_VIEWMODEL_VERTEX_CACHE_MAX 2048
+#endif
+#ifndef PS1_VIEWMODEL_TRI_CACHE_MAX
 #define PS1_VIEWMODEL_TRI_CACHE_MAX 4096
+#endif
+#ifndef PS1_RIGID_VERTEX_CACHE_MAX
 #define PS1_RIGID_VERTEX_CACHE_MAX 2048
+#endif
+#ifndef PS1_STATIC_VERTEX_CACHE_MAX
 #define PS1_STATIC_VERTEX_CACHE_MAX 4096
+#endif
 /* New exports size these pools for the scene's instances and largest clip
  * frames. Keep the full capacity for older generated data without limits. */
 #ifndef PS1_STATIC_VERTEX_CACHE_TOTAL
@@ -65,13 +74,35 @@ static void add_world_primitive(uint32_t* bucket, void* primitive) {
 #ifndef PS1_STATIC_TRI_CACHE_TOTAL
 #define PS1_STATIC_TRI_CACHE_TOTAL 16384
 #endif
+#ifndef PS1_STATIC_ENTITY_CACHE_MAX
 #define PS1_STATIC_ENTITY_CACHE_MAX 64
+#endif
+#ifndef PS1_STATIC_TOPOLOGY_CACHE_MAX
 #define PS1_STATIC_TOPOLOGY_CACHE_MAX 32
+#endif
+#ifndef PS1_UI_PACKET_RESERVE
 #define PS1_UI_PACKET_RESERVE 4096
+#endif
+#ifndef PS1_OCCLUDER_CACHE_MAX
 #define PS1_OCCLUDER_CACHE_MAX 256
+#endif
+#ifndef PS1_OCCLUDER_PROJECTED_VERTEX_MAX
 #define PS1_OCCLUDER_PROJECTED_VERTEX_MAX 2048
+#endif
+#ifndef PS1_OCCLUDER_PROJECTED_TRI_MAX
 #define PS1_OCCLUDER_PROJECTED_TRI_MAX 2048
+#endif
+#ifndef PS1_RENDER_ENTITY_LIST_MAX
 #define PS1_RENDER_ENTITY_LIST_MAX 2048
+#endif
+#if PS1_VIEWMODEL_VERTEX_CACHE_MAX < 1 || PS1_VIEWMODEL_TRI_CACHE_MAX < 1 || \
+    PS1_RIGID_VERTEX_CACHE_MAX < 1 || PS1_STATIC_VERTEX_CACHE_MAX < 1 || \
+    PS1_STATIC_ENTITY_CACHE_MAX < 1 || PS1_STATIC_TOPOLOGY_CACHE_MAX < 1 || \
+    PS1_UI_PACKET_RESERVE < 1 || PS1_OCCLUDER_CACHE_MAX < 1 || \
+    PS1_OCCLUDER_PROJECTED_VERTEX_MAX < 1 || \
+    PS1_OCCLUDER_PROJECTED_TRI_MAX < 1 || PS1_RENDER_ENTITY_LIST_MAX < 1
+#error "PS1 renderer cache capacities must be positive"
+#endif
 #ifndef PS1_PROJECTION_DEBUG
 #define PS1_PROJECTION_DEBUG 0
 #endif
@@ -474,7 +505,10 @@ static void rebuild_render_entity_lists(void) {
 
     for (i = 0; i < count && i < PS1_RENDER_ENTITY_LIST_MAX; ++i) {
         const ps1_entity* ent = ps1_scene_entity(i);
-        if (!ent || ent->has_camera || !ent->mesh_enabled)
+        /* Keep disabled entities indexed: a runtime may page or reveal them
+         * later without changing the scene's entity count. Draw submission
+         * still checks mesh_enabled before doing any geometry work. */
+        if (!ent || ent->has_camera)
             continue;
         if (ent->prerender_occluder) {
             s_occluder_entities[s_occluder_count++] = (uint16_t)i;
@@ -709,10 +743,13 @@ static uint8_t s_static_safe_clip_cache[PS1_STATIC_TRI_CACHE_TOTAL];
 typedef struct {
     uint32_t vertex_offset;
     uint16_t vertex_count, triangle_begin, triangle_end;
+    uint16_t center_alignment_padding;
     SVECTOR center;
     uint16_t extent[3];
     int8_t plane_winding;
 } ps1_visibility_batch;
+_Static_assert(offsetof(ps1_visibility_batch, center) % 4 == 0,
+               "GTE LWC2 requires a four-byte-aligned visibility center");
 typedef struct {
     const ps1_mesh* mesh;
     uint16_t batch_offset, batch_count;
@@ -724,6 +761,7 @@ static uint32_t s_visibility_vertex_used;
 static uint16_t s_visibility_batch_used;
 static uint8_t s_visibility_batch_outside[PS1_VISIBILITY_BATCH_MAX];
 static uint8_t s_static_active_vertex[PS1_STATIC_VERTEX_CACHE_TOTAL];
+static uint16_t s_visibility_vertex_stamp[PS1_STATIC_VERTEX_CACHE_MAX];
 
 typedef struct {
     const ps1_mesh* mesh;
@@ -793,6 +831,7 @@ static void reset_static_entity_caches(void) {
  * retain their unique position indices. An entire group can be rejected only
  * when every vertex is outside the same frustum plane. */
 static const ps1_visibility_topology* visibility_topology_for(const ps1_mesh* mesh) {
+    if (mesh->vert_count > PS1_STATIC_VERTEX_CACHE_MAX) return 0;
     ps1_visibility_topology* free_entry = 0;
     const unsigned batches = (mesh->tri_count + PS1_VISIBILITY_BATCH_TRIANGLES - 1) / PS1_VISIBILITY_BATCH_TRIANGLES;
     unsigned i;
@@ -803,6 +842,7 @@ static const ps1_visibility_topology* visibility_topology_for(const ps1_mesh* me
     if(!free_entry || s_visibility_batch_used+batches>PS1_VISIBILITY_BATCH_MAX ||
        s_visibility_vertex_used+(uint32_t)mesh->tri_count*3>PS1_STATIC_TRI_CACHE_TOTAL*3)
         return 0;
+    memset(s_visibility_vertex_stamp, 0, mesh->vert_count * sizeof(uint16_t));
     free_entry->mesh=mesh;free_entry->batch_offset=s_visibility_batch_used;free_entry->batch_count=batches;
     for(i=0;i<batches;++i) {
         ps1_visibility_batch* batch=&s_visibility_batches[s_visibility_batch_used++];
@@ -815,12 +855,11 @@ static const ps1_visibility_topology* visibility_topology_for(const ps1_mesh* me
             const uint16_t indices[3]={face->i0,face->i1,face->i2};
             unsigned corner;
             for(corner=0;corner<3;++corner) {
-                uint16_t p=indices[corner],j;
+                uint16_t p=indices[corner];
                 if(p>=mesh->vert_count)continue;
                 if(mesh->position_refs && mesh->position_refs[p]<mesh->vert_count)p=mesh->position_refs[p];
-                for(j=0;j<batch->vertex_count;++j)
-                    if(s_visibility_vertices[batch->vertex_offset+j]==p)break;
-                if(j==batch->vertex_count) {
+                if(s_visibility_vertex_stamp[p] != i + 1u) {
+                    s_visibility_vertex_stamp[p] = i + 1u;
                     s_visibility_vertices[s_visibility_vertex_used++]=p;
                     ++batch->vertex_count;
                 }
@@ -940,10 +979,33 @@ static ps1_static_entity_cache* static_entity_cache_for(
     }
     static_entity_cache_capacity(
         entity, mesh, &vertex_capacity, &triangle_capacity);
+    if (vertex_capacity > PS1_STATIC_VERTEX_CACHE_TOTAL ||
+        triangle_capacity > PS1_STATIC_TRI_CACHE_TOTAL)
+        return 0;
     if (!free_entry ||
         s_static_vertex_cache_used + vertex_capacity > PS1_STATIC_VERTEX_CACHE_TOTAL ||
-        s_static_triangle_cache_used + triangle_capacity > PS1_STATIC_TRI_CACHE_TOTAL)
-        return 0;
+        s_static_triangle_cache_used + triangle_capacity > PS1_STATIC_TRI_CACHE_TOTAL) {
+        int reclaimable = 0;
+        /* A disabled entity can become visible again without changing its
+         * mesh. Keep its reservation until another draw actually needs space;
+         * eagerly clearing the arena also discards every live page's cached
+         * projection, lighting and topology on each subsequent frame.
+         *
+         * This allocation happens before draw_entity holds arena pointers.
+         * Earlier draws have returned and their GPU packets contain copied
+         * values, so reclaiming here cannot invalidate an in-flight draw. */
+        for (i = 0; i < PS1_STATIC_ENTITY_CACHE_MAX; ++i) {
+            const ps1_entity* cached = s_static_entity_caches[i].entity;
+            if (cached && !cached->mesh_enabled) {
+                reclaimable = 1;
+                break;
+            }
+        }
+        if (!reclaimable)
+            return 0;
+        reset_static_entity_caches();
+        free_entry = &s_static_entity_caches[0];
+    }
     free_entry->entity = entity;
     free_entry->mesh = 0;
     free_entry->next_mesh = 0;
@@ -2110,6 +2172,7 @@ typedef struct {
     int fog_enabled;
     int use_tex;
     uint16_t tpage;
+    uint16_t clut;
     int uoff;
     int voff;
 } ps1_cached_flat_quad_context;
@@ -2236,6 +2299,8 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
         x[i] = (int16_t)(sxy[i] & 0xffff);
         y[i] = (int16_t)(sxy[i] >> 16);
     }
+    if (!ps1_polygon_fits_gpu(x, y, 4))
+        return 2;
     if (!screen_front_facing_strict(x[0], y[0], x[1], y[1], x[2], y[2]) ||
         !screen_front_facing_strict(x[2], y[2], x[1], y[1], x[3], y[3]))
         return 2;
@@ -2255,7 +2320,8 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
         opaque_fog_solid = 1;
     }
 
-    if (!authored_floor_face(ctx->ent, &ctx->mesh->tris[triangle_index]))
+    if (ctx->ent->seam_fill ||
+        !authored_floor_face(ctx->ent, &ctx->mesh->tris[triangle_index]))
         SEAM_FILL_EXPAND4(x[0], y[0], x[1], y[1], x[2], y[2], x[3], y[3]);
     avsz = (z[0] + z[1] + z[2] + z[3]) / 16;
     otz = mesh_triangle_otz_fine(avsz);
@@ -2309,7 +2375,7 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
             poly->r2 = r[2]; poly->g2 = g[2]; poly->b2 = b[2];
             poly->r3 = r[3]; poly->g3 = g[3]; poly->b3 = b[3];
             poly->tpage = ctx->tpage;
-            poly->clut = 0;
+            poly->clut = ctx->clut;
             setUV4(poly,
                    clamp_u8(ctx->uoff + ctx->mesh->uvs[q[0]].u), clamp_u8(ctx->voff + ctx->mesh->uvs[q[0]].v),
                    clamp_u8(ctx->uoff + ctx->mesh->uvs[q[1]].u), clamp_u8(ctx->voff + ctx->mesh->uvs[q[1]].v),
@@ -2326,7 +2392,7 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
             setXY4(poly, x[0], y[0], x[1], y[1], x[2], y[2], x[3], y[3]);
             setRGB0(poly, r[0], g[0], b[0]);
             poly->tpage = ctx->tpage;
-            poly->clut = 0;
+            poly->clut = ctx->clut;
             setUV4(poly,
                    clamp_u8(ctx->uoff + ctx->mesh->uvs[q[0]].u), clamp_u8(ctx->voff + ctx->mesh->uvs[q[0]].v),
                    clamp_u8(ctx->uoff + ctx->mesh->uvs[q[1]].u), clamp_u8(ctx->voff + ctx->mesh->uvs[q[1]].v),
@@ -2376,6 +2442,7 @@ typedef struct {
     int otz;
     int use_tex;
     uint16_t tpage;
+    uint16_t clut;
     int uoff;
     int voff;
 } ps1_cached_fog_triangle_context;
@@ -2396,7 +2463,7 @@ static int __attribute__((noinline)) draw_cached_flat_fog_triangle(
         poly->r1 = ctx->r[1]; poly->g1 = ctx->g[1]; poly->b1 = ctx->b[1];
         poly->r2 = ctx->r[2]; poly->g2 = ctx->g[2]; poly->b2 = ctx->b[2];
         poly->tpage = ctx->tpage;
-        poly->clut = 0;
+        poly->clut = ctx->clut;
         setUV3(poly,
                clamp_u8(ctx->uoff + ctx->mesh->uvs[ctx->face->i0].u),
                clamp_u8(ctx->voff + ctx->mesh->uvs[ctx->face->i0].v),
@@ -2433,11 +2500,13 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
                                  uint16_t vertex_offset, uint16_t triangle_offset,
                                  int32_t near_z, int shell_ot_bias,
                                  int default_use_tex, uint16_t default_tpage,
+                                 uint16_t default_clut,
                                  int default_uoff, int default_voff, int skip_unsafe,
                                  const uint16_t* visible_triangles, uint16_t visible_count) {
     unsigned int cached_texture_index = 0xffffffffu;
     int cached_use_tex = 0;
     uint16_t cached_tpage = 0;
+    uint16_t cached_clut = 0;
     int cached_uoff = 0;
     int cached_voff = 0;
     const int fog_enabled = g_ps1_scene.fog_enabled;
@@ -2469,6 +2538,7 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
         int otz;
         int use_tex;
         uint16_t tpage;
+        uint16_t clut;
         int uoff, voff;
         uint8_t r, g, b;
         uint8_t r0, g0, b0, r1, g1, b1, r2, g2, b2;
@@ -2490,6 +2560,7 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
                 if (face->texture_index == 0) {
                     use_tex = default_use_tex;
                     tpage = default_tpage;
+                    clut = default_clut;
                     uoff = default_uoff;
                     voff = default_voff;
                 } else {
@@ -2501,16 +2572,19 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
                             ps1_texture_width(texture_index) > 0 &&
                             ps1_texture_height(texture_index) > 0;
                         cached_tpage = cached_use_tex ? ps1_texture_tpage(texture_index) : 0;
+                        cached_clut = cached_use_tex ? ps1_texture_clut(texture_index) : 0;
                         cached_uoff = cached_use_tex ? (int)ps1_texture_u_offset(texture_index) : 0;
                         cached_voff = cached_use_tex ? (int)ps1_texture_v_offset(texture_index) : 0;
                     }
                     use_tex = cached_use_tex;
                     tpage = cached_tpage;
+                    clut = cached_clut;
                     uoff = cached_uoff;
                     voff = cached_voff;
                 }
                 quad_ctx.use_tex = use_tex;
                 quad_ctx.tpage = tpage;
+                quad_ctx.clut = clut;
                 quad_ctx.uoff = uoff;
                 quad_ctx.voff = voff;
                 pair_result = draw_cached_flat_quad(&quad_ctx, quad, ti);
@@ -2560,7 +2634,8 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
             triangle_outside_screen(x0, y0, x1, y1, x2, y2))
             continue;
 
-        if (ent->vertex_anim_frame_count == 0 && !authored_floor_face(ent, face))
+        if (ent->vertex_anim_frame_count == 0 &&
+            (ent->seam_fill || !authored_floor_face(ent, face)))
             SEAM_FILL_EXPAND(x0, y0, x1, y1, x2, y2);
 
         avsz = (z0 + z1 + z2) / 12;
@@ -2578,11 +2653,13 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
         if (opaque_fog_solid) {
             use_tex = 0;
             tpage = 0;
+            clut = 0;
             uoff = 0;
             voff = 0;
         } else if (face->texture_index == 0) {
             use_tex = default_use_tex;
             tpage = default_tpage;
+            clut = default_clut;
             uoff = default_uoff;
             voff = default_voff;
         } else {
@@ -2594,11 +2671,13 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
                     ps1_texture_width(texture_index) > 0 &&
                     ps1_texture_height(texture_index) > 0;
                 cached_tpage = cached_use_tex ? ps1_texture_tpage(texture_index) : 0;
+                cached_clut = cached_use_tex ? ps1_texture_clut(texture_index) : 0;
                 cached_uoff = cached_use_tex ? (int)ps1_texture_u_offset(texture_index) : 0;
                 cached_voff = cached_use_tex ? (int)ps1_texture_v_offset(texture_index) : 0;
             }
             use_tex = cached_use_tex;
             tpage = cached_tpage;
+            clut = cached_clut;
             uoff = cached_uoff;
             voff = cached_voff;
         }
@@ -2643,6 +2722,7 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
             fog_ctx.otz = otz;
             fog_ctx.use_tex = use_tex;
             fog_ctx.tpage = tpage;
+            fog_ctx.clut = clut;
             fog_ctx.uoff = uoff;
             fog_ctx.voff = voff;
             if (!draw_cached_flat_fog_triangle(&fog_ctx))
@@ -2656,7 +2736,7 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
             setXY3(poly, x0, y0, x1, y1, x2, y2);
             setRGB0(poly, r, g, b);
             poly->tpage = tpage;
-            poly->clut = 0;
+            poly->clut = clut;
             setUV3(poly,
                    clamp_u8(uoff + mesh->uvs[face->i0].u),
                    clamp_u8(voff + mesh->uvs[face->i0].v),
@@ -2697,6 +2777,8 @@ static int draw_clipped_plane_triangle(char** pri, const char* packet_end, uint3
     const uint8_t* colors[3]={ca,cb,cc};
     const int u[3]={ua,ub,uc}, v[3]={va,vb,vc};
     int count, i, added=0;
+    const uint16_t clut = use_texture
+        ? ps1_texture_clut((unsigned int)ent->texture_index) : 0;
     ps1_mesh_tri floor_face={0};
     floor_face.ny=ONE;
     for (i=0;i<3;++i) {
@@ -2739,7 +2821,7 @@ static int draw_clipped_plane_triangle(char** pri, const char* packet_end, uint3
             setRGB0(tri,color[0][0],color[0][1],color[0][2]);
             setRGB1(tri,color[1][0],color[1][1],color[1][2]);
             setRGB2(tri,color[2][0],color[2][1],color[2][2]);
-            tri->tpage=tpage; tri->clut=0;
+            tri->tpage=tpage; tri->clut=clut;
             add_world_primitive(ot+bucket,tri); *pri=(char*)(tri+1);
         } else {
             POLY_G3* tri;
@@ -2793,7 +2875,8 @@ static int __attribute__((noinline)) draw_unlit_viewmodel_fast(
         char** pri, const char* packet_end, uint32_t* ot,
         const ps1_entity* ent, const ps1_mesh* m, const MATRIX* composed,
         int32_t entity_near_z,
-        int use_tex, uint16_t tpage, int tex_uoff, int tex_voff) {
+        int use_tex, uint16_t tpage, uint16_t clut,
+        int tex_uoff, int tex_voff) {
     uint16_t ti;
     int added = 0;
 
@@ -2851,7 +2934,7 @@ static int __attribute__((noinline)) draw_unlit_viewmodel_fast(
             setXY3(tri, x0, y0, x1, y1, x2, y2);
             setRGB0(tri, ent->color_r, ent->color_g, ent->color_b);
             tri->tpage = tpage;
-            tri->clut = 0;
+            tri->clut = clut;
             setUV3(tri,
                    clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
                    clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
@@ -2986,10 +3069,13 @@ static void __attribute__((noinline)) cache_world_visibility(
                             const int32_t xy=s_static_screen_cache[static_vertex_offset+vi];
                             const int32_t z=s_static_depth_cache[static_vertex_offset+vi];
                             const int x=(int16_t)xy, y=(int16_t)(xy>>16);
+                            /* The GPU clips safe native polygons to the draw
+                             * area. Crossing a viewport edge alone does not
+                             * require a CPU polygon clip. */
                             s_static_projection_flags[static_vertex_offset+vi] =
                                 (ps1_projection_vertex_needs_clip(xy,z,entity_near_z,INT32_MAX,s_geom_screen) ? 1 : 0) |
                                 (s_static_camera_cache[static_vertex_offset+vi].vz>s_far_z ? 2 : 0) |
-                                (x < -2 || x>s_screen_w+1 || y < -2 || y>s_screen_h+1 ? 4 : 0);
+                                (x < -1020 || x > 1019 || y < -1020 || y > 1019 ? 4 : 0);
                         }
                         static_cache->visible_triangle_count = 0;
                         for(unsigned bi=0;bi<batch_count;++bi) {
@@ -3040,7 +3126,7 @@ static void __attribute__((noinline)) cache_world_visibility(
                                     &s_static_camera_cache[static_vertex_offset + p2]))
                                 continue;
                             int needs_clip = projection_flags != 0;
-                            if (!needs_clip && (!authored_floor_face(ent,face) || s_screen_w>1020 || s_screen_h>508)) {
+                            if (!needs_clip) {
                                 int min_x=(int16_t)xy0,max_x=min_x,min_y=(int16_t)(xy0>>16),max_y=min_y;
                                 const int x1=(int16_t)xy1,x2=(int16_t)xy2,y1=(int16_t)(xy1>>16),y2=(int16_t)(xy2>>16);
                                 if(x1<min_x)min_x=x1;if(x2<min_x)min_x=x2;
@@ -3480,6 +3566,8 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
             int smooth_object_otz_floor = 0;
             const uint16_t tpage =
                 use_tex ? ps1_texture_tpage((unsigned int)ent->texture_index) : 0;
+            const uint16_t clut =
+                use_tex ? ps1_texture_clut((unsigned int)ent->texture_index) : 0;
             const int tex_uoff =
                 use_tex ? (int)ps1_texture_u_offset((unsigned int)ent->texture_index) : 0;
             const int tex_voff =
@@ -3515,7 +3603,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
             if (is_viewmodel && ent->render_unlit && viewmodel_cached) {
                 const int fast_added = draw_unlit_viewmodel_fast(
                     pri, packet_end, ot, ent, m, &composed, entity_near_z,
-                    use_tex, tpage, tex_uoff, tex_voff);
+                    use_tex, tpage, clut, tex_uoff, tex_voff);
                 if (fast_added >= 0)
                     return fast_added;
             }
@@ -3848,11 +3936,19 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                 /* Topology and UVs can be shared between poses; character
                  * face normals change with deformation and invalidate lighting.
                  * Unlit meshes still avoid unnecessary lighting invalidation. */
-                if (lighting_dirty && !is_smooth && !is_terrain) {
+                if (lighting_dirty && !is_smooth) {
                     uint16_t ti;
                     for (ti = 0; ti < m->tri_count; ++ti) {
                         const ps1_mesh_tri* source = &m->tris[ti];
-                        if (s_shading_unlit) {
+                        if (is_terrain) {
+                            s_static_face_light_cache[static_triangle_offset + ti][0] =
+                                (uint8_t)(((uint16_t)source->shade * source->color_r) / 255u);
+                            s_static_face_light_cache[static_triangle_offset + ti][1] =
+                                (uint8_t)(((uint16_t)source->shade * source->color_g) / 255u);
+                            s_static_face_light_cache[static_triangle_offset + ti][2] =
+                                (uint8_t)(((uint16_t)source->shade * source->color_b) / 255u);
+                            continue;
+                        } else if (s_shading_unlit) {
                             /* Preserve the existing fixed-point material and
                              * face-colour modulation, without preparing a
                              * normal, centre or lighting command. */
@@ -3910,12 +4006,12 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
             }
 
             int split_cached_flat = 0;
-            if (static_cached && !is_terrain && !is_smooth) {
+            if (static_cached && !is_smooth) {
                 const int fast_added = draw_cached_flat_mesh(
                     pri, packet_end, ot, ent, m,
                     static_vertex_offset, static_triangle_offset,
                     entity_near_z, shell_ot_bias,
-                    use_tex, tpage, tex_uoff, tex_voff,
+                    use_tex, tpage, clut, tex_uoff, tex_voff,
                     static_cache->needs_safe_clip,
                     static_cache->visible_list_valid ? &s_static_visible_triangles[static_triangle_offset] : 0,
                     static_cache->visible_triangle_count);
@@ -3994,7 +4090,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                         setXY3(tri, x0, y0, x1, y1, x2, y2);
                         setRGB0(tri, fog_r, fog_g, fog_b);
                         tri->tpage = tpage;
-                        tri->clut = 0;
+                        tri->clut = clut;
                         setUV3(tri,
                                clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
                                clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
@@ -4028,11 +4124,13 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
              * all character triangles share the same texture index. */
             const int default_use_tex = use_tex;
             const uint16_t default_tpage = tpage;
+            const uint16_t default_clut = clut;
             const int default_tex_uoff = tex_uoff;
             const int default_tex_voff = tex_voff;
             unsigned int cached_face_texture_index = 0xffffffffu;
             int cached_face_use_tex = 0;
             uint16_t cached_face_tpage = 0;
+            uint16_t cached_face_clut = 0;
             int cached_face_tex_uoff = 0;
             int cached_face_tex_voff = 0;
 
@@ -4093,6 +4191,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                     : (unsigned int)ent->texture_index;
                 int use_tex;
                 uint16_t tpage;
+                uint16_t clut;
                 int tex_uoff;
                 int tex_voff;
                 SVECTOR faceN;
@@ -4103,6 +4202,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                 if (t->texture_index == 0) {
                     use_tex = default_use_tex;
                     tpage = default_tpage;
+                    clut = default_clut;
                     tex_uoff = default_tex_uoff;
                     tex_voff = default_tex_voff;
                 } else {
@@ -4114,6 +4214,8 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             ps1_texture_height(texture_index) > 0;
                         cached_face_tpage = cached_face_use_tex
                             ? ps1_texture_tpage(texture_index) : 0;
+                        cached_face_clut = cached_face_use_tex
+                            ? ps1_texture_clut(texture_index) : 0;
                         cached_face_tex_uoff = cached_face_use_tex
                             ? (int)ps1_texture_u_offset(texture_index) : 0;
                         cached_face_tex_voff = cached_face_use_tex
@@ -4121,6 +4223,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                     }
                     use_tex = cached_face_use_tex;
                     tpage = cached_face_tpage;
+                    clut = cached_face_clut;
                     tex_uoff = cached_face_tex_uoff;
                     tex_voff = cached_face_tex_voff;
                 }
@@ -4188,7 +4291,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                 setXY3(tri, x0, y0, x1, y1, x2, y2);
                                 setRGB0(tri, base_r, base_g, base_b);
                                 tri->tpage = tpage;
-                                tri->clut = 0;
+                                tri->clut = clut;
                                 setUV3(tri,
                                        clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
                                        clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
@@ -4312,7 +4415,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                 setXY3(tri, x0, y0, x1, y1, x2, y2);
                                 setRGB0(tri, r, g, b);
                                 tri->tpage = tpage;
-                                tri->clut = 0;
+                                tri->clut = clut;
                                 setUV3(tri,
                                        clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
                                        clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
@@ -4383,7 +4486,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                     setXY3(tri, x0, y0, x1, y1, x2, y2);
                                     setRGB0(tri, r, g, b);
                                     tri->tpage = tpage;
-                                    tri->clut = 0;
+                                    tri->clut = clut;
                                     setUV3(tri,
                                            clamp_u8(tex_uoff + c0->u), clamp_u8(tex_voff + c0->v),
                                            clamp_u8(tex_uoff + c1->u), clamp_u8(tex_voff + c1->v),
@@ -4608,7 +4711,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                 continue;
                             /* Floor boundaries use shared projection and
                              * clipping, not per-triangle geometry inflation. */
-                            if (!authored_floor)
+                            if (ent->seam_fill || !authored_floor)
                                 SEAM_FILL_EXPAND(x0, y0, x1, y1, x2, y2);
 
                             /* Large front AND rear surfaces use the same
@@ -4660,7 +4763,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                     tri->r1 = cr1; tri->g1 = cg1; tri->b1 = cb1;
                                     tri->r2 = cr2; tri->g2 = cg2; tri->b2 = cb2;
                                     tri->tpage = tpage;
-                                    tri->clut = 0;
+                                    tri->clut = clut;
                                     setUV3(tri,
                                            clamp_u8(tex_uoff + c0->u), clamp_u8(tex_voff + c0->v),
                                            clamp_u8(tex_uoff + c1->u), clamp_u8(tex_voff + c1->v),
@@ -4700,7 +4803,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                     setRGB1(tri, cr1, cg1, cb1);
                                     setRGB2(tri, cr2, cg2, cb2);
                                     tri->tpage = tpage;
-                                    tri->clut = 0;
+                                    tri->clut = clut;
                                     setUV3(tri,
                                            clamp_u8(tex_uoff + c0->u), clamp_u8(tex_voff + c0->v),
                                            clamp_u8(tex_uoff + c1->u), clamp_u8(tex_voff + c1->v),
@@ -4828,7 +4931,8 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                         continue;
                 }
                 if (!is_viewmodel && !rigid_frame &&
-                    ent->vertex_anim_frame_count == 0 && !authored_floor_face(ent, t)) {
+                    ent->vertex_anim_frame_count == 0 &&
+                    (ent->seam_fill || !authored_floor_face(ent, t))) {
                     /* UV-repeat subdivision can leave adjacent exported
                      * vertices one fixed-point unit apart. At PS1 projection
                      * precision that becomes a dotted one-pixel background
@@ -4911,7 +5015,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                 setPolyGT3(gtri);
                                 setXY3(gtri, tri_x0, tri_y0, tri_x1, tri_y1, tri_x2, tri_y2);
                                 gtri->tpage = tpage;
-                                gtri->clut = 0;
+                                gtri->clut = clut;
                                 setUV3(gtri,
                                     clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
                                     clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
@@ -4939,7 +5043,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             tri->r1 = r1; tri->g1 = g1; tri->b1 = b1;
                             tri->r2 = r2; tri->g2 = g2; tri->b2 = b2;
                             tri->tpage = tpage;
-                            tri->clut = 0;
+                            tri->clut = clut;
                             setUV3(tri,
                                    clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
                                    clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
@@ -4997,7 +5101,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                 setPolyGT3(gtri);
                                 setXY3(gtri, tri_x0, tri_y0, tri_x1, tri_y1, tri_x2, tri_y2);
                                 gtri->tpage = tpage;
-                                gtri->clut = 0;
+                                gtri->clut = clut;
                                 setUV3(gtri,
                                     clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
                                     clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
@@ -5026,7 +5130,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             setXY3(tri, tri_x0, tri_y0, tri_x1, tri_y1, tri_x2, tri_y2);
                             setRGB0(tri, r, g, b);
                             tri->tpage = tpage;
-                            tri->clut = 0;
+                            tri->clut = clut;
                             setUV3(tri,
                                    clamp_u8(tex_uoff + m->uvs[t->i0].u), clamp_u8(tex_voff + m->uvs[t->i0].v),
                                    clamp_u8(tex_uoff + m->uvs[t->i1].u), clamp_u8(tex_voff + m->uvs[t->i1].v),
@@ -5154,6 +5258,8 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
             ps1_texture_height((unsigned int)ent->texture_index) > 0;
         const uint16_t texture_tpage = use_texture
             ? ps1_texture_tpage((unsigned int)ent->texture_index) : 0;
+        const uint16_t clut = use_texture
+            ? ps1_texture_clut((unsigned int)ent->texture_index) : 0;
         const int texture_u0 = use_texture
             ? (int)ps1_texture_u_offset((unsigned int)ent->texture_index) : 0;
         const int texture_v0 = use_texture
@@ -5271,7 +5377,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             apply_scene_fog(cz1, &tri->r1, &tri->g1, &tri->b1);
                             apply_scene_fog(cz2, &tri->r2, &tri->g2, &tri->b2);
                             tri->tpage = texture_tpage;
-                            tri->clut = 0;
+                            tri->clut = clut;
                             add_world_primitive(ot + otz, tri);
                             *pri = (char*)(tri + 1);
                         } else {
@@ -5354,7 +5460,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                             apply_scene_fog(cz2, &tri->r1, &tri->g1, &tri->b1);
                             apply_scene_fog(cz3, &tri->r2, &tri->g2, &tri->b2);
                             tri->tpage = texture_tpage;
-                            tri->clut = 0;
+                            tri->clut = clut;
                             add_world_primitive(ot + otz, tri);
                             *pri = (char*)(tri + 1);
                         } else {
@@ -6008,6 +6114,17 @@ void ps1_render_init(int screen_w, int screen_h) {
     s_initialized = 1;
 }
 
+int ps1_render_project_world(int32_t x_q16, int32_t y_q16, int32_t z_q16,
+        int16_t* screen_x, int16_t* screen_y, int32_t* depth) {
+    const int32_t translation[3] = {
+        s_cam_mtx.t[0], s_cam_mtx.t[1], s_cam_mtx.t[2]
+    };
+    if (!s_initialized) return 0;
+    return ps1_project_world_point(s_cam_mtx.m, translation,
+        s_screen_w, s_screen_h, s_geom_screen, s_near_z, s_far_z,
+        x_q16, y_q16, z_q16, screen_x, screen_y, depth);
+}
+
 void ps1_render_frame(uint32_t* ot, char** nextpri, const char* packet_end) {
     char* pri;
     unsigned int i, count;
@@ -6071,6 +6188,10 @@ void ps1_render_frame(uint32_t* ot, char** nextpri, const char* packet_end) {
     count = g_ps1_scene.entity_count;
     if (s_indexed_entity_count != count)
         rebuild_render_entity_lists();
+    /* Paged scenes can disable a previously cached entity without changing
+     * entity_count. Its arena reservation must not permanently displace the
+     * newly visible page. Reclaim at the frame boundary, before any draw holds
+     * pointers into the shared projection or topology arenas. */
     actor_mask = build_occluder_actor_mask();
     background_index = active_background_texture_index();
     /* With the flat fog-color background, a polygon whose every vertex has
