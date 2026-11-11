@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/images/mipsync-banner.png" alt="Mipsync" width="820">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/mipsync-banner.png">
+    <img src="docs/images/mipsync-banner-light.svg" alt="Mipsync" width="820">
+  </picture>
 </p>
 
 <p align="center">
