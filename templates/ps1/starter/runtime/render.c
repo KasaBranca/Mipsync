@@ -760,7 +760,11 @@ static uint16_t s_visibility_vertices[PS1_STATIC_TRI_CACHE_TOTAL * 3];
 static uint32_t s_visibility_vertex_used;
 static uint16_t s_visibility_batch_used;
 static uint8_t s_visibility_batch_outside[PS1_VISIBILITY_BATCH_MAX];
-static uint8_t s_static_active_vertex[PS1_STATIC_VERTEX_CACHE_TOTAL];
+enum {
+    PS1_STATIC_VERTEX_VISIBLE = 1u,
+    PS1_STATIC_VERTEX_CAMERA_VALID = 2u
+};
+static uint8_t s_static_vertex_flags[PS1_STATIC_VERTEX_CACHE_TOTAL];
 static uint16_t s_visibility_vertex_stamp[PS1_STATIC_VERTEX_CACHE_MAX];
 
 typedef struct {
@@ -2170,6 +2174,7 @@ typedef struct {
     int32_t near_z;
     int shell_ot_bias;
     int fog_enabled;
+    int visibility_certified;
     int use_tex;
     uint16_t tpage;
     uint16_t clut;
@@ -2284,7 +2289,7 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
 
     for (i = 0; i < 4; ++i) {
         uint16_t projection_index;
-        if (q[i] >= ctx->mesh->vert_count)
+        if (!ctx->visibility_certified && q[i] >= ctx->mesh->vert_count)
             return 2;
         projection_index = ctx->mesh->position_refs
             ? ctx->mesh->position_refs[q[i]] : q[i];
@@ -2292,17 +2297,16 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
             projection_index = q[i];
         sxy[i] = s_static_screen_cache[ctx->vertex_offset + projection_index];
         z[i] = s_static_depth_cache[ctx->vertex_offset + projection_index];
-        if (z[i] < ctx->near_z)
-            return 2;
-        if (z[i] > s_far_z)
+        if (!ctx->visibility_certified && (z[i] < ctx->near_z || z[i] > s_far_z))
             return 2;
         x[i] = (int16_t)(sxy[i] & 0xffff);
         y[i] = (int16_t)(sxy[i] >> 16);
     }
     if (!ps1_polygon_fits_gpu(x, y, 4))
         return 2;
-    if (!screen_front_facing_strict(x[0], y[0], x[1], y[1], x[2], y[2]) ||
-        !screen_front_facing_strict(x[2], y[2], x[1], y[1], x[3], y[3]))
+    if (!ctx->visibility_certified &&
+        (!screen_front_facing_strict(x[0], y[0], x[1], y[1], x[2], y[2]) ||
+         !screen_front_facing_strict(x[2], y[2], x[1], y[1], x[3], y[3])))
         return 2;
     if ((x[0] < -64 && x[1] < -64 && x[2] < -64 && x[3] < -64) ||
         (x[0] > s_screen_w + 64 && x[1] > s_screen_w + 64 &&
@@ -2527,6 +2531,10 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
     quad_ctx.near_z = near_z;
     quad_ctx.shell_ot_bias = shell_ot_bias;
     quad_ctx.fog_enabled = fog_enabled;
+    /* The visible list already certified face indices, strict winding and
+     * native-safe depth. The pair branch below excludes clipped faces. Keep
+     * the quad's union bounds check: two safe triangles can span a GPU limit. */
+    quad_ctx.visibility_certified = visible_triangles != 0;
 
     for (draw_index = 0; draw_index < (visible_triangles ? visible_count : mesh->tri_count); ++draw_index) {
         ti = visible_triangles ? visible_triangles[draw_index] : draw_index;
@@ -2598,8 +2606,8 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
                 }
         }
 
-        if (face->i0 >= mesh->vert_count || face->i1 >= mesh->vert_count ||
-            face->i2 >= mesh->vert_count)
+        if (!visible_triangles && (face->i0 >= mesh->vert_count || face->i1 >= mesh->vert_count ||
+            face->i2 >= mesh->vert_count))
             continue;
         p0 = mesh->position_refs ? mesh->position_refs[face->i0] : face->i0;
         p1 = mesh->position_refs ? mesh->position_refs[face->i1] : face->i1;
@@ -2616,7 +2624,7 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
         if (skip_unsafe && (visible_triangles ? s_static_safe_clip_cache[triangle_offset + ti] :
             cached_triangle_needs_safe_clip(sxy0, sxy1, sxy2, z0, z1, z2, near_z, !authored_floor_face(ent, face))))
             continue;
-        if (z0 < near_z || z1 < near_z || z2 < near_z)
+        if (!visible_triangles && (z0 < near_z || z1 < near_z || z2 < near_z))
             continue;
         if (discard_solid_fog_triangle(z0, z1, z2))
             continue;
@@ -2624,13 +2632,13 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
             z2 >= s_fog_solid_z) {
             opaque_fog_solid = 1;
         }
-        if (z0 > s_far_z || z1 > s_far_z || z2 > s_far_z)
+        if (!visible_triangles && (z0 > s_far_z || z1 > s_far_z || z2 > s_far_z))
             continue;
 
         x0 = (int16_t)(sxy0 & 0xffff); y0 = (int16_t)(sxy0 >> 16);
         x1 = (int16_t)(sxy1 & 0xffff); y1 = (int16_t)(sxy1 >> 16);
         x2 = (int16_t)(sxy2 & 0xffff); y2 = (int16_t)(sxy2 >> 16);
-        if (!screen_front_facing_strict(x0, y0, x1, y1, x2, y2) ||
+        if ((!visible_triangles && !screen_front_facing_strict(x0, y0, x1, y1, x2, y2)) ||
             triangle_outside_screen(x0, y0, x1, y1, x2, y2))
             continue;
 
@@ -3024,6 +3032,38 @@ static int visibility_batch_outside(const ps1_visibility_batch* batch,
         ((int64_t)center.vy - radius[1])*s_geom_screen > (s_screen_h-s_screen_h/2+2)*farthest;
 }
 
+/* Keep rare XYZ recovery out of the hot visibility loop. Inlining its six
+ * face-corner call sites increases code size and instruction-cache pressure. */
+static void __attribute__((noinline)) ensure_static_camera_position(const ps1_mesh* mesh, unsigned offset,
+                                          unsigned index) {
+    if (s_static_vertex_flags[offset + index] & PS1_STATIC_VERTEX_CAMERA_VALID) return;
+    gte_ldv0(&mesh->verts[index]);
+    gte_rtv0tr();
+    gte_stlvnl(&s_static_camera_cache[offset + index]);
+    s_static_vertex_flags[offset + index] |= PS1_STATIC_VERTEX_CAMERA_VALID;
+}
+
+static void cache_world_vertex_scalar(const ps1_mesh* mesh, unsigned offset,
+                                      unsigned index, int near_z) {
+    const unsigned slot = offset + index;
+    int32_t xy, z;
+    gte_ldv0(&mesh->verts[index]);
+    gte_rtps();
+    gte_stsxy(&s_static_screen_cache[slot]);
+    gte_stsz(&s_static_depth_cache[slot]);
+    gte_stlvnl(&s_static_camera_cache[slot]);
+    s_static_vertex_flags[slot] |= PS1_STATIC_VERTEX_CAMERA_VALID;
+    s_static_outcode_cache[slot] = camera_outcode(&s_static_camera_cache[slot], near_z);
+    xy = s_static_screen_cache[slot];
+    z = s_static_depth_cache[slot];
+    const int sx = (int16_t)xy, sy = (int16_t)(xy >> 16);
+    s_static_projection_flags[slot] =
+        (ps1_projection_vertex_needs_clip(xy, z, near_z, INT32_MAX, s_geom_screen) ? 1 : 0) |
+        (s_static_camera_cache[slot].vz > s_far_z ? 2 : 0) |
+        (sx < -1020 || sx > 1019 || sy < -1020 || sy > 1019 ? 4 : 0);
+    s_static_fog_cache[slot] = scene_fog_amount_q8(z);
+}
+
 static void __attribute__((noinline)) cache_world_visibility(
         const ps1_entity* ent, const ps1_mesh* m,
         ps1_static_entity_cache* static_cache, int entity_near_z, const MATRIX* composed) {
@@ -3037,8 +3077,8 @@ static void __attribute__((noinline)) cache_world_visibility(
     int mirrored = 0;
     const int floor_eye_valid = (ent->render_preset == PS1_RENDER_PRESET_FLOOR ||
         ent->render_preset == PS1_RENDER_PRESET_CORRIDOR) && floor_camera_y(composed,&eye_y,&mirrored);
+    memset(&s_static_vertex_flags[static_vertex_offset],0,m->vert_count);
     if (visibility) {
-        memset(&s_static_active_vertex[static_vertex_offset],0,m->vert_count);
         for (unsigned bi = 0; bi < batch_count; ++bi) {
             const unsigned index = visibility->batch_offset+bi;
             const ps1_visibility_batch* batch = &s_visibility_batches[index];
@@ -3049,34 +3089,44 @@ static void __attribute__((noinline)) cache_world_visibility(
             const int outside = backface || visibility_batch_outside(batch,composed,entity_near_z);
             s_visibility_batch_outside[index] = outside;
             if (!outside) for (unsigned v = 0; v < batch->vertex_count; ++v)
-                s_static_active_vertex[static_vertex_offset+s_visibility_vertices[batch->vertex_offset+v]] = 1;
+                s_static_vertex_flags[static_vertex_offset+s_visibility_vertices[batch->vertex_offset+v]] = PS1_STATIC_VERTEX_VISIBLE;
         }
     }
-                        for (vi = 0; vi < m->vert_count; ++vi) {
-                            uint16_t reference = m->position_refs ? m->position_refs[vi] : vi;
-                            if (reference != vi && reference < m->vert_count)
-                                continue;
-                            if (visibility && !s_static_active_vertex[static_vertex_offset+vi]) continue;
-                            gte_ldv0(&m->verts[vi]);
-                            gte_rtps();
-                            gte_stsxy(&s_static_screen_cache[static_vertex_offset+vi]);
-                            gte_stsz(&s_static_depth_cache[static_vertex_offset+vi]);
-                            gte_stlvnl(&s_static_camera_cache[static_vertex_offset + vi]);
-                            s_static_outcode_cache[static_vertex_offset + vi] = camera_outcode(
-                                &s_static_camera_cache[static_vertex_offset + vi], entity_near_z);
-                            s_static_fog_cache[static_vertex_offset+vi] = scene_fog_amount_q8(
-                                s_static_depth_cache[static_vertex_offset+vi]);
-                            const int32_t xy=s_static_screen_cache[static_vertex_offset+vi];
-                            const int32_t z=s_static_depth_cache[static_vertex_offset+vi];
-                            const int x=(int16_t)xy, y=(int16_t)(xy>>16);
-                            /* The GPU clips safe native polygons to the draw
-                             * area. Crossing a viewport edge alone does not
-                             * require a CPU polygon clip. */
-                            s_static_projection_flags[static_vertex_offset+vi] =
-                                (ps1_projection_vertex_needs_clip(xy,z,entity_near_z,INT32_MAX,s_geom_screen) ? 1 : 0) |
-                                (s_static_camera_cache[static_vertex_offset+vi].vz>s_far_z ? 2 : 0) |
-                                (x < -1020 || x > 1019 || y < -1020 || y > 1019 ? 4 : 0);
-                        }
+    uint16_t indices[3];
+    unsigned pending = 0;
+    for (vi = 0; vi < m->vert_count; ++vi) {
+        const uint16_t reference = m->position_refs ? m->position_refs[vi] : vi;
+        if (reference != vi && reference < m->vert_count) continue;
+        if (visibility && !(s_static_vertex_flags[static_vertex_offset + vi] & PS1_STATIC_VERTEX_VISIBLE)) continue;
+        indices[pending++] = vi;
+        if (pending == 3) {
+            int32_t xy[3], depth[3];
+            uint32_t flags;
+            gte_ldv3(&m->verts[indices[0]], &m->verts[indices[1]], &m->verts[indices[2]]);
+            gte_rtpt();
+            gte_stsxy0(&xy[0]); gte_stsxy1(&xy[1]); gte_stsxy2(&xy[2]);
+            gte_stsz3(&depth[0], &depth[1], &depth[2]);
+            flags = mipsync_gte_get_flags();
+            for (unsigned j = 0; j < 3; ++j) {
+                const unsigned slot = static_vertex_offset + indices[j];
+                /* Clean interior results need exact camera XYZ only if a
+                 * face later requests subdivision or clipping. */
+                if (ps1_projection_can_defer_camera(flags, xy[j], depth[j], entity_near_z,
+                        s_far_z, s_geom_screen, s_screen_w, s_screen_h)) {
+                    s_static_screen_cache[slot] = xy[j];
+                    s_static_depth_cache[slot] = depth[j];
+                    s_static_outcode_cache[slot] = 0;
+                    s_static_projection_flags[slot] = 0;
+                    s_static_fog_cache[slot] = scene_fog_amount_q8(depth[j]);
+                } else {
+                    cache_world_vertex_scalar(m, static_vertex_offset, indices[j], entity_near_z);
+                }
+            }
+            pending = 0;
+        }
+    }
+    for (unsigned j = 0; j < pending; ++j)
+        cache_world_vertex_scalar(m, static_vertex_offset, indices[j], entity_near_z);
                         static_cache->visible_triangle_count = 0;
                         for(unsigned bi=0;bi<batch_count;++bi) {
                             const ps1_visibility_batch* batch = visibility
@@ -3120,11 +3170,16 @@ static void __attribute__((noinline)) cache_world_visibility(
                                 if (!screen_front_facing_strict((int16_t)xy0, (int16_t)(xy0 >> 16),
                                         (int16_t)xy1, (int16_t)(xy1 >> 16), (int16_t)xy2, (int16_t)(xy2 >> 16)))
                                     continue;
-                            } else if (!camera_space_quad_front_facing(
+                            } else {
+                                ensure_static_camera_position(m, static_vertex_offset, p0);
+                                ensure_static_camera_position(m, static_vertex_offset, p1);
+                                ensure_static_camera_position(m, static_vertex_offset, p2);
+                                if (!camera_space_quad_front_facing(
                                     &s_static_camera_cache[static_vertex_offset + p0],
                                     &s_static_camera_cache[static_vertex_offset + p1],
                                     &s_static_camera_cache[static_vertex_offset + p2]))
-                                continue;
+                                    continue;
+                            }
                             int needs_clip = projection_flags != 0;
                             if (!needs_clip) {
                                 int min_x=(int16_t)xy0,max_x=min_x,min_y=(int16_t)(xy0>>16),max_y=min_y;
@@ -3139,6 +3194,11 @@ static void __attribute__((noinline)) cache_world_visibility(
                                 if(z1>max_z)max_z=z1;if(z2>max_z)max_z=z2;
                                 needs_clip=max_x-min_x>1020 || max_y-min_y>508 ||
                                     (!authored_floor_face(ent,face) && (max_x-min_x>64 || max_y-min_y>64) && max_z-min_z>min_z/8);
+                            }
+                            if (needs_clip) {
+                                ensure_static_camera_position(m, static_vertex_offset, p0);
+                                ensure_static_camera_position(m, static_vertex_offset, p1);
+                                ensure_static_camera_position(m, static_vertex_offset, p2);
                             }
                             s_static_safe_clip_cache[static_triangle_offset+ti] = needs_clip;
                             if (needs_clip) static_cache->needs_safe_clip = 1;
