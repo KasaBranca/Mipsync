@@ -48,5 +48,33 @@ int main(void) {
           "GTE division saturation must still clip");
     check(!ps1_projection_vertex_needs_clip(0, 100, 2, 5000, 160),
           "Valid depth must remain eligible");
+    const int32_t inside = (120u << 16) | 160u;
+    check(ps1_projection_can_defer_camera(0, inside, 640, 8, 6400, 160, 320, 240),
+          "An unsaturated interior point may defer camera-space work");
+    for (unsigned bit = 0; bit < 32; ++bit)
+        check(!ps1_projection_can_defer_camera(1u << bit, inside, 640, 8, 6400, 160, 320, 240),
+              "Any GTE flag must conservatively retain scalar camera coordinates");
+    check(!ps1_projection_can_defer_camera(0, inside, 80, 8, 6400, 160, 320, 240),
+          "The H/Z saturation boundary cannot defer camera-space work");
+    check(!ps1_projection_can_defer_camera(0, inside, 6401, 8, 6400, 160, 320, 240),
+          "Beyond-far points retain signed camera-space clipping");
+    check(!ps1_projection_can_defer_camera(0, inside, 65535, 8, 70000, 160, 320, 240),
+          "A saturated depth FIFO cannot certify exact camera depth");
+    check(!ps1_projection_can_defer_camera(0, (120u << 16) | 1u, 640, 8, 6400, 160, 320, 240),
+          "Viewport borders keep their conservative outcodes");
+    check(!ps1_projection_can_defer_camera(0, (120u << 16) | 318u, 640, 8, 6400, 160, 320, 240),
+          "The right margin also keeps conservative outcodes");
+    check(!ps1_projection_can_defer_camera(0, (238u << 16) | 160u, 640, 8, 6400, 160, 320, 240),
+          "The bottom margin also keeps conservative outcodes");
+    check(!ps1_projection_can_defer_camera(0, inside, 640, 8, 6400, 160, INT32_MIN, 240),
+          "Invalid viewport dimensions must not overflow boundary arithmetic");
+    check(!ps1_projection_can_defer_camera(0, inside, 640, 8, 6400, 0, 320, 240),
+          "A non-perspective focal length cannot certify camera outcodes");
+    check(!ps1_projection_can_defer_camera(0, (120u << 16) | 1020u, 640, 8, 6400, 160, 1024, 240),
+          "Wide viewports must still reserve signed GPU coordinate headroom");
+    check(!ps1_projection_can_defer_camera(0, (1020u << 16) | 160u, 640, 8, 6400, 160, 320, 1024),
+          "Tall viewports must still reserve signed GPU coordinate headroom");
+    check(!ps1_projection_can_defer_camera(0, inside, 40000, 8, 64000, 65536, 320, 240),
+          "Focal lengths must fit the GTE's unsigned 16-bit H register");
     return 0;
 }

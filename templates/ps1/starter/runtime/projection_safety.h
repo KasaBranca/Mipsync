@@ -26,6 +26,19 @@ static inline int ps1_projection_vertex_needs_clip(int32_t xy, int32_t z,
     return z < near_z || z > far_z || z * (int64_t)2 <= focal ||
            x <= -1024 || x >= 1023 || y <= -1024 || y >= 1023;
 }
+/* A clean batched GTE result strictly inside the viewport/depth limits needs
+   no camera-space outcode. Saturated inputs and boundary points must keep
+   their scalar path; faces needing subdivision recover exact XYZ lazily. */
+static inline int ps1_projection_can_defer_camera(uint32_t flags, int32_t xy,
+        int32_t z, int near_z, int far_z, int focal, int width, int height) {
+    const int x = (int16_t)xy;
+    const int y = (int16_t)((uint32_t)xy >> 16);
+    return !flags && width > 4 && width <= 1024 && height > 4 && height <= 1024 &&
+           focal > 0 && focal <= 65535 && z >= near_z && z <= far_z &&
+           z > focal / 2 && z < 65535 &&
+           x >= 2 && x <= 1019 && x < width - 2 &&
+           y >= 2 && y <= 1019 && y < height - 2;
+}
 /* Sort local geometry fragments within the visible depth range; a face
    crossing either depth plane must still draw its remaining visible part. */
 static inline int ps1_clipped_face_sort_depth(int32_t z0, int32_t z1, int32_t z2,
