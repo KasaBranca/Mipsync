@@ -10,6 +10,7 @@
 #include "viewmodel_projection.h"
 #include "clip_math.h"
 #include "projection_safety.h"
+#include "fog_bounds.h"
 #include "watertight_projection.h"
 #include "affine_subdivision.h"
 #include "world_projection.h"
@@ -2506,14 +2507,13 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
                                  int default_use_tex, uint16_t default_tpage,
                                  uint16_t default_clut,
                                  int default_uoff, int default_voff, int skip_unsafe,
-                                 const uint16_t* visible_triangles, uint16_t visible_count) {
+                                 const uint16_t* visible_triangles, uint16_t visible_count, int fog_enabled) {
     unsigned int cached_texture_index = 0xffffffffu;
     int cached_use_tex = 0;
     uint16_t cached_tpage = 0;
     uint16_t cached_clut = 0;
     int cached_uoff = 0;
     int cached_voff = 0;
-    const int fog_enabled = g_ps1_scene.fog_enabled;
     const ps1_static_topology_cache* topology =
         ent->vertex_anim_frame_count == 0
             ? static_topology_cache_for(mesh) : 0;
@@ -2626,7 +2626,7 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
             continue;
         if (!visible_triangles && (z0 < near_z || z1 < near_z || z2 < near_z))
             continue;
-        if (discard_solid_fog_triangle(z0, z1, z2))
+        if (fog_enabled && discard_solid_fog_triangle(z0, z1, z2))
             continue;
         if (fog_enabled && !ps1_texture_has_cutout(face->texture_index ? face->texture_index : ent->texture_index) && z0 >= s_fog_solid_z && z1 >= s_fog_solid_z &&
             z2 >= s_fog_solid_z) {
@@ -3221,6 +3221,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
     int     shell_ot_bias = 0;
     int     added = 0;
     int     shared_character_transform_hit = 0;
+    int fog_bounds_clear = !g_ps1_scene.fog_enabled;
     const int is_viewmodel = entity_is_viewmodel(ent);
     const ps1_entity* viewmodel_source = is_viewmodel && !entity_rigid_frame(ent)
         ? source_entity_by_id(ent->id) : 0;
@@ -3499,6 +3500,12 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
             bounding_radius = 128;
         }
 
+        /* A fully clear conservative bound certifies zero fog for every
+         * face. Keep partially fogged meshes on the per-vertex path. */
+        fog_bounds_clear = !g_ps1_scene.fog_enabled ||
+            (bounds_mesh && bounds_mesh->bounds_radius > 0 && !rigid_frame &&
+             ent->vertex_anim_frame_count == 0 &&
+             ps1_bound_before_fog(cull_z, bounding_radius, s_fog_start_z));
         if (cull_z + bounding_radius < s_near_z)
             return 0;
         /* Reject the entire object early when its closest bound is already
@@ -4074,7 +4081,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                     use_tex, tpage, clut, tex_uoff, tex_voff,
                     static_cache->needs_safe_clip,
                     static_cache->visible_list_valid ? &s_static_visible_triangles[static_triangle_offset] : 0,
-                    static_cache->visible_triangle_count);
+                    static_cache->visible_triangle_count, !fog_bounds_clear);
                 if (!static_cache->needs_safe_clip)
                     return fast_added;
                 added += fast_added;
