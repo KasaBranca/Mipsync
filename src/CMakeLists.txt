@@ -371,6 +371,9 @@ add_test(NAME MipsyncPs1ClipMath COMMAND MipsyncPs1ClipMathTests)
 add_executable(MipsyncPs1GpuClippingTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1GpuClippingTests.c)
 add_test(NAME MipsyncPs1GpuClipping COMMAND MipsyncPs1GpuClippingTests)
+add_executable(MipsyncPs1PacketFragmentTests
+    ${CMAKE_SOURCE_DIR}/tests/Ps1PacketFragmentTests.c)
+add_test(NAME MipsyncPs1PacketFragment COMMAND MipsyncPs1PacketFragmentTests)
 add_executable(MipsyncPs1FogBoundsTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1FogBoundsTests.c)
 add_test(NAME MipsyncPs1FogBounds COMMAND MipsyncPs1FogBoundsTests)

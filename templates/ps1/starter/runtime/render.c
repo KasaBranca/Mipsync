@@ -3209,6 +3209,9 @@ static void __attribute__((noinline)) cache_world_visibility(
 
 }
 
+#if PS1_RENDER_ENTITY_PACKET_HOOKS
+#define draw_entity draw_entity_uncached
+#endif
 static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const ps1_entity* ent,
                        int view_model_soft) {
     SVECTOR rotvec;
@@ -6191,6 +6194,22 @@ int ps1_render_project_world(int32_t x_q16, int32_t y_q16, int32_t z_q16,
         s_screen_w, s_screen_h, s_geom_screen, s_near_z, s_far_z,
         x_q16, y_q16, z_q16, screen_x, screen_y, depth);
 }
+
+#if PS1_RENDER_ENTITY_PACKET_HOOKS
+#undef draw_entity
+static int __attribute__((noinline)) draw_entity(char** pri, const char* packet_end, uint32_t* ot,
+                       const ps1_entity* ent, int is_viewmodel) {
+    const char* begin = *pri;
+    int added = ps1_render_entity_packet_replay(
+        ot, pri, packet_end, ent, is_viewmodel);
+    if (added >= 0)
+        return added;
+    added = draw_entity_uncached(pri, packet_end, ot, ent, is_viewmodel);
+    ps1_render_entity_packet_capture(
+        ot, begin, *pri, packet_end, ent, is_viewmodel, added);
+    return added;
+}
+#endif
 
 void ps1_render_frame(uint32_t* ot, char** nextpri, const char* packet_end) {
     char* pri;
