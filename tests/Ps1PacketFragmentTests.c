@@ -86,6 +86,39 @@ int main(void) {
               "Overlapping copies preserve payload and following memory");
     }
     {
+        uint32_t retained[7], target[6];
+        memcpy(retained,packets,sizeof packets);
+        retained[6]=0xfeedfaceu;
+        check(CAPTURE(retained,6,0x4000u,ot,4), "In-place commands are captured before reuse");
+        for(unsigned frame=0;frame<100;++frame) {
+            const uint32_t previous=0xb000u+frame*4u;
+            uint32_t heads[4]={0xffffffu,previous,0x9004u,previous+0x1000u};
+            ps1_packet_fragment_copy(retained,retained,6,0x4000u,0x4000u,heads,entries,count);
+            check(retained[0]==(0x01000000u|previous) &&
+                  retained[4]==(0x01000000u|(previous+0x1000u)),
+                  "In-place reuse replaces both previous-frame predecessors");
+            check(retained[2]==0x01004000u && heads[1]==0x4008u && heads[3]==0x4010u,
+                  "In-place reuse preserves internal links and restores bucket heads");
+            check(retained[1]==packets[1] && retained[3]==packets[3] &&
+                  retained[5]==packets[5] && retained[6]==0xfeedfaceu && heads[2]==0x9004u,
+                  "In-place reuse preserves payload, foreign buckets and following storage");
+        }
+        memset(target,0,sizeof target);
+        {
+            uint32_t heads[4]={0xffffffu,0xb000u,0x9004u,0xb100u};
+            ps1_packet_fragment_copy(target,packets,6,0x4000u,0x4000u,heads,entries,count);
+            check(target[1]==packets[1] && target[2]==0x01004000u,
+                  "Equal DMA bases with distinct CPU buffers still copy their payload");
+        }
+        {
+            uint32_t heads[4]={0xffffffu,0xb000u,0x9004u,0xb100u};
+            memcpy(retained,packets,sizeof packets);
+            ps1_packet_fragment_copy(retained,retained,6,0x4000u,0x8000u,heads,entries,count);
+            check(retained[2]==0x01008000u && heads[1]==0x8008u,
+                  "In-place relocation with a changed DMA base still rebases links");
+        }
+    }
+    {
         uint32_t packet=0x00ffffffu, table[1]={0xfffffcu};
         check(ps1_packet_fragment_capture(&packet,1,0xfffffcu,table,1,entries,4,scratch,2,&count),
               "The DMA terminator stays a terminator at the 24-bit boundary");

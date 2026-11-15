@@ -72,17 +72,21 @@ static inline void ps1_packet_fragment_copy(uint32_t* target,
     const uint32_t* source, size_t words, uint32_t source_address,
     uint32_t target_address, uint32_t* ot,
     const ps1_packet_fragment_bucket* entries, size_t entry_count) {
-    size_t index = 0;
-    while (index < words) {
-        const uint32_t tag = source[index];
-        const uint32_t address = tag & 0xffffffu;
-        const size_t length = 1u + (tag >> 24);
-        const uint32_t link = address != 0xffffffu && address >= source_address &&
-            address - source_address < words * 4u
-            ? target_address + address - source_address : 0xffffffu;
-        for (size_t i = 1; i < length; ++i) target[index + i] = source[index + i];
-        target[index] = (tag & 0xff000000u) | link;
-        index += length;
+    /* Retained commands at the same CPU and DMA addresses already have valid
+     * internal links and payload. Only bucket tails need this frame's heads. */
+    if (target != source || target_address != source_address) {
+        size_t index = 0;
+        while (index < words) {
+            const uint32_t tag = source[index];
+            const uint32_t address = tag & 0xffffffu;
+            const size_t length = 1u + (tag >> 24);
+            const uint32_t link = address != 0xffffffu && address >= source_address &&
+                address - source_address < words * 4u
+                ? target_address + address - source_address : 0xffffffu;
+            for (size_t i = 1; i < length; ++i) target[index + i] = source[index + i];
+            target[index] = (tag & 0xff000000u) | link;
+            index += length;
+        }
     }
     for (size_t i = 0; i < entry_count; ++i) {
         const ps1_packet_fragment_bucket entry = entries[i];
