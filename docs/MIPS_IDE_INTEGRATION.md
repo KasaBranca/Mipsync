@@ -47,7 +47,7 @@ VSCode / Cursor の設定:
 
 ```json
 {
-  "mipsync.enginePath": "D:\\Nostalty\\build\\src\\MipsyncEngine.exe",
+  "mipsync.enginePath": "D:\\MipsyncEngine\\build\\src\\MipsyncEngine.exe",
   "mipsync.validationDebounceMs": 350,
   "mipsync.validationTimeoutMs": 8000
 }
