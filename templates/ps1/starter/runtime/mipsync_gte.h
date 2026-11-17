@@ -139,6 +139,14 @@ static inline void mipsync_gte_cmd_nclip(void){ __asm__ volatile("nop\nnop\ncop2
 static inline void mipsync_gte_cmd_avsz3(void){ __asm__ volatile("nop\nnop\ncop2 0x158002d\n"); }
 static inline void mipsync_gte_cmd_avsz4(void){ __asm__ volatile("nop\nnop\ncop2 0x168002e\n"); }
 
+/* COP2 control register 31 reports saturation/overflow for the whole command.
+ * Leave the documented CPU register-load delay before consuming the value. */
+static inline uint32_t mipsync_gte_get_flags(void) {
+    uint32_t flags;
+    __asm__ volatile("cfc2 %0,$31\nnop\nnop\n" : "=r"(flags));
+    return flags;
+}
+
 static inline void mipsync_gte_store_sxy(void* out)  { __asm__ volatile("swc2 $14,0(%0)\n" : : "r"(out) : "memory"); }
 static inline void mipsync_gte_store_sxy0(void* out) { __asm__ volatile("swc2 $12,0(%0)\n" : : "r"(out) : "memory"); }
 static inline void mipsync_gte_store_sxy1(void* out) { __asm__ volatile("swc2 $13,0(%0)\n" : : "r"(out) : "memory"); }
