@@ -5,7 +5,13 @@ param(
 
   # Build and stage the release without publishing it. This lets CI or a
   # maintainer push the matching source commit before creating the GitHub tag.
-  [switch]$SkipPublish
+  [switch]$SkipPublish,
+
+  # Calendar-style version advertised to calendar-era Hubs, for example
+  # 2026.11.11. Those Hubs only parse YYYY.M.D, so the first formal release
+  # needs a date-shaped feed version while the Hub asset still downloads from
+  # this release's tag. Omit for normal releases.
+  [string]$HubManifestVersion
 )
 
 Set-StrictMode -Version Latest
@@ -31,7 +37,24 @@ function Get-ReleaseSortKey {
   return ('{0}:{1:D10}:{2:D10}:{3:D10}:{4}:{5:D10}' -f $era, $major, [long]$m.Groups[2].Value, [long]$m.Groups[3].Value, $stage, $build)
 }
 
+function Get-HubInstaller {
+  param([string]$Directory, [string]$PackageVersion)
+  $installer = Join-Path $Directory "Mipsync Hub_${PackageVersion}_x64-setup.exe"
+  if (!(Test-Path -LiteralPath $installer -PathType Leaf)) {
+    throw "Hub NSIS installer for $PackageVersion not found: $installer"
+  }
+  return $installer
+}
+
 $tag = "v$Version"
+$hubManifestTag = $tag
+if ($HubManifestVersion) {
+  $bridge = $HubManifestVersion.Trim().TrimStart('v', 'V')
+  if ($bridge -notmatch '^\d{4}\.\d{1,2}\.\d{1,2}$') {
+    throw "Hub manifest version must use the calendar scheme YYYY.M.D: $HubManifestVersion"
+  }
+  $hubManifestTag = "v$bridge"
+}
 $repository = "KasaBranca/Mipsync"
 if ($Version -notmatch '^(?<major>[1-9][0-9]*)\.(?<minor>0|[1-9][0-9]*)\.(?<patch>0|[1-9][0-9]*)(?<channel>[abf])(?<build>[1-9][0-9]*)$' -or [int]$Matches.major -ge 2000) {
   throw "Release version must use MAJOR.MINOR.PATCH[abf]BUILD, for example 1.0.0f1: $Version"
@@ -98,21 +121,25 @@ try {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($tauriConf, ($conf | ConvertTo-Json -Depth 20), $utf8NoBom)
   }
-  # Distribution uses the portable ZIP below, so no NSIS tool download is needed.
-  npm run tauri build -- --no-bundle | Out-Host
-  if ($LASTEXITCODE -ne 0) { throw "Hub build failed ($LASTEXITCODE)." }
-  # Tauri's default-run binary does not guarantee a fresh updater executable.
+  # The updater must exist before bundling so the NSIS installer embeds it.
   Push-Location (Join-Path $root "hub-tauri\\src-tauri")
   try {
     cargo build --release --locked --bin MipsyncHubUpdater | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "Hub updater build failed ($LASTEXITCODE)." }
   } finally { Pop-Location }
+  # Build the Hub plus the NSIS installer used for website downloads.
+  npm run tauri build | Out-Host
+  if ($LASTEXITCODE -ne 0) { throw "Hub build failed ($LASTEXITCODE)." }
 } finally {
   Pop-Location
 }
 
 if (!(Test-Path $hubExe)) { throw "Hub exe not found: $hubExe" }
 if (!(Test-Path $hubUpdaterExe)) { throw "Hub updater exe not found: $hubUpdaterExe" }
+
+# Require this release's installer; an older bundle must never be republished.
+$hubInstallerDir = Join-Path $root "hub-tauri\\src-tauri\\target\\release\\bundle\\nsis"
+$hubInstallerSource = Get-HubInstaller $hubInstallerDir $packageVersion
 
 function Assert-ReleasePath([string]$Path) {
   $absolute = [IO.Path]::GetFullPath($Path)
@@ -227,6 +254,11 @@ if (Test-Path (Join-Path $root "third_party\licenses")) {
 if (Test-Path $hubZip) { Remove-Item $hubZip -Force }
 Compress-Archive -Path "$hubStage\\*" -DestinationPath $hubZip
 
+Write-Host "Staging Hub installer..."
+$hubInstaller = Join-Path $outDir "MipsyncHub_Setup_x64.exe"
+Assert-ReleasePath $hubInstaller
+Copy-Item $hubInstallerSource $hubInstaller -Force
+
 # Generate/merge manifest.json for Hub. Preserve the checked-out/local feed if
 # GitHub is temporarily unavailable so a release never erases install history.
 $manifestPath = Join-Path $outDir "manifest.json"
@@ -279,7 +311,7 @@ $manifest = [PSCustomObject]@{
   schemaVersion = 1
   generatedAt = (Get-Date).ToString("o")
   hub = [PSCustomObject]@{
-    version = $tag
+    version = $hubManifestTag
     assetName = $hubAsset
     downloadUrl = "$downloadBase/$hubAsset"
     releaseNotesUrl = "https://github.com/$repository/releases/tag/$tag"
@@ -333,12 +365,12 @@ into a real PSX.EXE via PSn00bSDK.
 - Public releases use ``MAJOR.MINOR.PATCH[abf]BUILD``, beginning with ``1.0.0f1``.
 - ``a`` denotes alpha, ``b`` beta and ``f`` final; the trailing number is the build.
 - Calendar-era editors remain available in the new Hub's install history.
-- Calendar-era Hubs cannot discover the new numbering scheme automatically.
-  Download and install the new Hub once; existing projects and editor installs are retained.
+- Calendar-era Hubs receive the first formal update through a dated bridge feed.
 
 ### Assets
 - MipsyncEngine_Windows_x64.zip (Editor + CLI + Skills + PS1 runtime/templates)
-- MipsyncHub_Windows_x64.zip
+- MipsyncHub_Windows_x64.zip (portable Hub used by the in-app updater)
+- MipsyncHub_Setup_x64.exe (Windows installer used by the website)
 "@
 
 $notesFile = Join-Path $outDir "RELEASE_NOTES_$Version.md"
@@ -352,7 +384,7 @@ if ($SkipPublish) {
   gh release create "v$Version" -R $repository `
     --title "Mipsync $Version" `
     --notes-file $notesFile `
-    $engineZip $hubZip $manifestPath @publishOptions
+    $engineZip $hubZip $hubInstaller $manifestPath @publishOptions
   if ($LASTEXITCODE -ne 0) { throw "GitHub release publishing failed ($LASTEXITCODE)." }
 }
 

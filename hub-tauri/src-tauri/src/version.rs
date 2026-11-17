@@ -73,6 +73,17 @@ mod tests {
         assert!(!is_prerelease("1.0.0f1"));
     }
     #[test]
+    fn calendar_bridge_upgrades_once_then_hands_off() {
+        // A calendar-era Hub running 2026.10.12 must see the bridge feed.
+        assert!(is_less("2026.10.12", "v2026.11.11"));
+        // After the bridge installs the formal Hub, the date feed is not newer.
+        assert!(!is_less("v1.0.0f1", "v2026.11.11"));
+        // The next formal release resumes normal ordering for bridged Hubs.
+        assert!(is_less("v1.0.0f1", "v1.0.1f1"));
+        // A bridge-written installed_hub_version must not hide that update.
+        assert!(is_less("v2026.11.11", "v1.0.1f1"));
+    }
+    #[test]
     fn retains_history_and_rejects_invalid_versions() {
         assert!(is_editor_release("v1.0.0f1"));
         assert!(is_editor_release("v2026.10.18"));

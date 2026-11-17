@@ -1,5 +1,9 @@
 //! Verify a staged or published release with the Hub's production manifest reader.
-//! cargo run --release --example verify_release -- <editor-tag> [manifest.json|--live] [hub-tag]
+//! cargo run --release --example verify_release -- <release-tag> [manifest.json|--live] [hub-feed-version]
+//!
+//! `hub-feed-version` defaults to the release tag. The one-time bridge release
+//! advertises a calendar-style version so calendar-era Hubs detect it, while the
+//! Hub asset itself still lives on the release tag.
 #[path = "../src/manifest.rs"]
 mod manifest;
 
@@ -19,8 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(feed.hub.asset_name, "MipsyncHub_Windows_x64.zip");
     assert_eq!(feed.editor.asset_name, "MipsyncEngine_Windows_x64.zip");
     let base = format!("https://github.com/{}/releases/download/{expected}", manifest::repo());
-    let hub_base = format!("https://github.com/{}/releases/download/{expected_hub}", manifest::repo());
-    assert_eq!(feed.hub.download_url, format!("{hub_base}/{}", feed.hub.asset_name));
+    assert_eq!(feed.hub.download_url, format!("{base}/{}", feed.hub.asset_name));
     let releases = feed.editor.releases.into_vec();
     assert_eq!(releases.first().map(|r| r.version.as_str()), Some(expected.as_str()), "latest editor must be first");
     assert_eq!(releases.iter().filter(|r| r.version == expected).count(), 1);

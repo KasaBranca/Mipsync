@@ -8,6 +8,9 @@ assert.equal(compareVersions('V1.0.0', '1.0.0'), 0);
 assert.ok(compareVersions('invalid', 'v1.0.0') < 0);
 assert.deepEqual(['1.0.0f2', '1.0.0b10', '1.0.0f10', '1.0.0a10', '1.0.0f1']
   .sort(compareVersions), ['1.0.0a10', '1.0.0b10', '1.0.0f1', '1.0.0f2', '1.0.0f10']);
+assert.ok(compareVersions('2026.10.12', 'v2026.11.11') < 0);
+assert.ok(compareVersions('v1.0.0f1', 'v2026.11.11') > 0);
+assert.ok(compareVersions('v2026.11.11', 'v1.0.1f1') < 0);
 assert.equal(canonicalEditorVersion('V1.0.0f1'), 'v1.0.0f1');
 for (const invalid of ['1.0.0f0', '1.0.0f', '1.0.0f1/../', '2026.10.18f1', '1.0.0-preview']) {
   assert.equal(canonicalEditorVersion(invalid), null);

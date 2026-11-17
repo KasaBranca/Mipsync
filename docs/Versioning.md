@@ -16,12 +16,18 @@ versions and Cargo-compatible build metadata are internal packaging details.
 
 ## Upgrading a calendar-era Hub
 
-Download `MipsyncHub_Windows_x64.zip` from the 1.0.0f1 release, close the old Hub,
-and extract the new Hub into a separate directory or replace the old Hub files.
-Run `MipsyncHub.exe`. Existing projects, editor installations and settings are
-retained. Calendar-era Hubs filter out the new numbering scheme and do not
-offer this first update automatically. Later 1.x Hub releases use the regular
-update flow.
+Calendar-era Hubs only understand the `YYYY.M.D` feed version and ignore the
+`[abf]BUILD` suffix, so the 1.0.0f1 feed advertises
+`hub.version = v2026.11.11` while `hub.downloadUrl` still points at the
+1.0.0f1 Hub asset. Existing Hubs therefore offer this first upgrade through the
+regular update flow. Once on 1.0.0f1, the formal Hub treats the calendar feed
+version as older and stays quiet. Later 1.x Hub releases use the standard
+formal feed version and normal update flow.
+
+Publish that bridge feed with
+`scripts/release_windows.ps1 -Version 1.0.0f1 -HubManifestVersion 2026.11.11`.
+Omit `-HubManifestVersion` for every later release. Existing projects, editor
+installations and settings are retained across the bridge.
 
 Projects keep their selected editor version. Select 1.0.0f1 explicitly when
 upgrading a project, and keep a project backup before migration.
@@ -29,6 +35,9 @@ upgrading a project, and keep a project backup before migration.
 ## Publishing
 
 Run `scripts/release_windows.ps1 -Version <major.minor.patchfbuild> -SkipPublish` to
-build and stage the Editor and Hub ZIPs, manifest and notes. Validate the staged
-files, commit the matching source and manifest, and publish the release tag at
-that commit. Retain previous calendar-era entries in the manifest.
+build and stage the Editor ZIP, portable Hub ZIP, NSIS Hub installer, manifest
+and notes. The script publishes the installer as `MipsyncHub_Setup_x64.exe`, the
+asset name the website downloads. Keep the portable ZIP because the in-app
+updater consumes it. Validate the staged files, commit the matching source and
+manifest, and publish the release tag at that commit. Retain previous
+calendar-era entries in the manifest.
