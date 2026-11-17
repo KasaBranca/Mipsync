@@ -12,6 +12,9 @@ typedef struct {
     uint16_t        clut_texture_index;
     /* One-based owner of a VRAM slot shared by mutually exclusive poses. */
     uint16_t        residency_slot;
+    /* Zero preserves raw TIM storage; otherwise tim points to zero-run data.
+     * tim_word_count remains the decoded size, excluding any stored padding. */
+    unsigned int    encoded_byte_count;
 } ps1_texture_desc;
 
 extern const ps1_texture_desc g_ps1_textures[];
@@ -19,6 +22,10 @@ extern const unsigned int     g_ps1_texture_count;
 
 /* Upload TIM textures to VRAM. Call once after GPU init. */
 void ps1_textures_init(void);
+/* Optional caller-owned, word-aligned scratch storage. Keep it alive while
+ * encoded textures may be uploaded. No heap allocation or retained TIM
+ * pointers are used. A null/empty buffer disables encoded texture uploads. */
+void ps1_textures_set_unpack_buffer(uint32_t* buffer, unsigned int word_capacity);
 void ps1_texture_load_to_vram(unsigned int texture_index);
 void ps1_texture_ensure_resident(unsigned int texture_index);
 
