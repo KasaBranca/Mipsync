@@ -1,9 +1,19 @@
 #include "textures.h"
 #include "gpu_transfer.h"
+#include "texture_unpack.h"
+#include <limits.h>
 #include <psxgpu.h>
 #include <stdint.h>
 
 #define PS1_TEXTURE_CAPACITY 256u
+
+static uint32_t* s_unpack_buffer;
+static unsigned int s_unpack_word_capacity;
+
+void ps1_textures_set_unpack_buffer(uint32_t* buffer, unsigned int word_capacity) {
+    s_unpack_buffer = buffer && !((uintptr_t)buffer & 3u) ? buffer : 0;
+    s_unpack_word_capacity = s_unpack_buffer ? word_capacity : 0;
+}
 
 static uint16_t s_tpages[PS1_TEXTURE_CAPACITY];
 static uint16_t s_cluts[PS1_TEXTURE_CAPACITY];
@@ -41,6 +51,23 @@ static void ps1_texture_flush_gpu_cache(void) {
     DrawSync(0);
 }
 
+/* Encoded data is untrusted until its TIM chunks fit inside the decoded
+ * buffer. Raw TIMs retain the existing SDK parsing path. */
+static int ps1_texture_unpacked_tim_valid(const uint32_t* words, unsigned int count) {
+    unsigned int offset = 2, block;
+    if (count < 5 || words[0] != 0x10u) return 0;
+    if (words[1] & 8u) {
+        block = words[offset];
+        if (block < 12 || (block & 3u) || block / 4u > count - offset) return 0;
+        if ((uint64_t)(words[offset + 2] & 65535u) * (words[offset + 2] >> 16) * 2u > block - 12u) return 0;
+        offset += block / 4u;
+    }
+    if (count - offset < 3) return 0;
+    block = words[offset];
+    if (block < 12 || block / 4u > count - offset || (block & 3u)) return 0;
+    return (uint64_t)(words[offset + 2] & 65535u) * (words[offset + 2] >> 16) * 2u <= block - 12u;
+}
+
 static int ps1_texture_get_tim(unsigned int texture_index, TIM_IMAGE* tim) {
     const ps1_texture_desc* t;
     if (!ps1_texture_index_valid(texture_index))
@@ -48,8 +75,16 @@ static int ps1_texture_get_tim(unsigned int texture_index, TIM_IMAGE* tim) {
     t = &g_ps1_textures[texture_index - 1u];
     if (!t->tim || t->tim_word_count < 5)
         return 0;
-    if (GetTimInfo(t->tim, tim) != 0)
+    if (t->encoded_byte_count) {
+        if (!s_unpack_buffer || t->tim_word_count > s_unpack_word_capacity ||
+            t->tim_word_count > UINT_MAX / 4u ||
+            !ps1_texture_unpack_zero_runs(t->tim, t->encoded_byte_count,
+                                         s_unpack_buffer, t->tim_word_count * 4u) ||
+            !ps1_texture_unpacked_tim_valid(s_unpack_buffer, t->tim_word_count) ||
+            GetTimInfo(s_unpack_buffer, tim) != 0) return 0;
+    } else if (GetTimInfo(t->tim, tim) != 0) {
         return 0;
+    }
     if (!tim->prect || !tim->paddr)
         return 0;
     return 1;
@@ -81,12 +116,17 @@ void ps1_texture_load_to_vram(unsigned int texture_index) {
     ps1_gpu_load_image(tim.prect, tim.paddr);
     DrawSync(0);
     ps1_texture_flush_gpu_cache();
+    /* Encoded descriptors are immutable. Reuse metadata resolved at init (or
+     * the first upload), rather than unpacking the shared palette owner again
+     * on every pose change. Keep the legacy raw-TIM refresh behavior. */
+    const int cached_clut = g_ps1_textures[texture_index - 1u].encoded_byte_count &&
+        s_widths[texture_index - 1u] && s_heights[texture_index - 1u];
     s_heights[texture_index - 1u] = (uint16_t)tim.prect->h;
     s_vram_x[texture_index - 1u] = (uint16_t)tim.prect->x;
     s_vram_y[texture_index - 1u] = (uint16_t)tim.prect->y;
     s_modes[texture_index - 1u] = (uint8_t)(tim.mode & 3u);
     s_widths[texture_index - 1u] = ps1_texture_pixel_width(&tim);
-    s_cluts[texture_index - 1u] = ps1_texture_resolve_clut(texture_index);
+    if (!cached_clut) s_cluts[texture_index - 1u] = ps1_texture_resolve_clut(texture_index);
     s_slot_texture[slot - 1u] = (uint16_t)texture_index;
 }
 
@@ -122,6 +162,9 @@ void ps1_textures_init(void) {
             if (tim.mode & 0x8)
                 ps1_gpu_load_image(tim.crect, tim.caddr);
             ps1_gpu_load_image(tim.prect, tim.paddr);
+            /* DMA may still read scratch. Finish before CLUT lookup or the
+             * next descriptor unpacks into the same buffer. */
+            if (g_ps1_textures[i].encoded_byte_count) DrawSync(0);
             s_slot_texture[i] = (uint16_t)(i + 1u);
         }
 
