@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/mipsync-banner.png">
-    <img src="docs/images/mipsync-banner-light.svg" alt="Mipsync" width="820">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/mipsync-logo-dark.svg">
+    <img src="docs/images/mipsync-logo-light.svg" alt="Mipsync Engine" width="640">
   </picture>
 </p>
 
