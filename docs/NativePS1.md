@@ -24,7 +24,7 @@ those tests; production export uses generated C exclusively.
 Generated code is compiled with the existing `-O3 -flto` settings. This removes
 instruction-dispatch overhead and constant-pool decoding/storage. Actual speed
 and code size depend on the script; no fixed FPS improvement is promised.
-P-Sync's existing workload estimate is not an AOT benchmark. Measure exported games.
+Measure exported games in an emulator or on hardware.
 
 ## PC/PS1 API coverage
 

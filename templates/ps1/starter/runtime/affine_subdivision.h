@@ -7,17 +7,38 @@ typedef struct {
     int u, v, r, g, b;
 } ps1_screen_clip_vert;
 
+/* Exactly ps1_clip_screen_attribute(a, b, za, zb, 1, 2): the perspective
+ * midpoint a + trunc((b - a) * za / (za + zb)). For PS1 depths (<= 65535) and
+ * deltas <= 65535 the product fits uint32, so one native DIV gives the same
+ * truncated quotient without int64 arithmetic. Other inputs take the
+ * generic path. */
+static inline int32_t ps1_affine_half_attribute(int32_t a, int32_t b,
+                                                int32_t za, int32_t zb) {
+    if (a == b) return a;
+    if ((uint32_t)za <= 65535u && (uint32_t)zb <= 65535u) {
+        const uint32_t total = (uint32_t)za + (uint32_t)zb;
+        const int32_t delta = b - a;
+        const uint32_t magnitude = delta < 0 ? (uint32_t)-delta : (uint32_t)delta;
+        if (!total) return a;
+        if (magnitude <= 65535u) {
+            const uint32_t q = (magnitude * (uint32_t)za) / total;
+            return delta < 0 ? a - (int32_t)q : a + (int32_t)q;
+        }
+    }
+    return ps1_clip_screen_attribute(a, b, za, zb, 1, 2);
+}
+
 static inline ps1_screen_clip_vert ps1_affine_midpoint(
         const ps1_screen_clip_vert* a, const ps1_screen_clip_vert* b) {
     ps1_screen_clip_vert out;
     out.x = (a->x + b->x) / 2;
     out.y = (a->y + b->y) / 2;
-    out.z = ps1_clip_screen_attribute(a->z, b->z, a->z, b->z, 1, 2);
-    out.u = ps1_clip_screen_attribute(a->u, b->u, a->z, b->z, 1, 2);
-    out.v = ps1_clip_screen_attribute(a->v, b->v, a->z, b->z, 1, 2);
-    out.r = ps1_clip_screen_attribute(a->r, b->r, a->z, b->z, 1, 2);
-    out.g = ps1_clip_screen_attribute(a->g, b->g, a->z, b->z, 1, 2);
-    out.b = ps1_clip_screen_attribute(a->b, b->b, a->z, b->z, 1, 2);
+    out.z = ps1_affine_half_attribute(a->z, b->z, a->z, b->z);
+    out.u = ps1_affine_half_attribute(a->u, b->u, a->z, b->z);
+    out.v = ps1_affine_half_attribute(a->v, b->v, a->z, b->z);
+    out.r = ps1_affine_half_attribute(a->r, b->r, a->z, b->z);
+    out.g = ps1_affine_half_attribute(a->g, b->g, a->z, b->z);
+    out.b = ps1_affine_half_attribute(a->b, b->b, a->z, b->z);
     return out;
 }
 
@@ -28,8 +49,8 @@ static inline int ps1_affine_edge_error(const ps1_screen_clip_vert* a,
     if (dx < 0) dx = -dx;
     if (dy < 0) dy = -dy;
     if (dx <= 32 && dy <= 32) return 0;
-    du = 2 * ps1_clip_screen_attribute(a->u, b->u, a->z, b->z, 1, 2) - a->u - b->u;
-    dv = 2 * ps1_clip_screen_attribute(a->v, b->v, a->z, b->z, 1, 2) - a->v - b->v;
+    du = 2 * ps1_affine_half_attribute(a->u, b->u, a->z, b->z) - a->u - b->u;
+    dv = 2 * ps1_affine_half_attribute(a->v, b->v, a->z, b->z) - a->v - b->v;
     if (du < 0) du = -du;
     if (dv < 0) dv = -dv;
     int error = du > dv ? du : dv;

@@ -52,6 +52,7 @@
 #include "../assets/AssetManager.h"
 #include "../assets/AssetThumbnail.h"
 #include "../assets/Material.h"
+#include "../assets/BuiltinAssets.h"
 #include "../core/OsFileDrop.h"
 #include "../core/RuntimePaths.h"
 #include "../core/PlayLoadingProcess.h"
@@ -1415,8 +1416,6 @@ void EditorApp::TickPendingPlaySetup() {
         switch (m_PlaySetupStep) {
         case 1:
             ResetShotCameraState();
-            m_Engine->GetPSyncState().clock.Reset();
-            m_Engine->GetPSyncState().cadence.Reset();
             m_GameViewFrameValid = false;
             m_GamePointerPressed = m_GamePointerReleased = false;
             break;
@@ -1457,6 +1456,9 @@ void EditorApp::StartPlayMode(bool saveConfirmed) {
     m_UndoStack.CancelFrame();
     m_PlaySetupError.clear();
     m_Engine->ClearCliSteps();
+    // Audio devices are owned by this thread; Play preparation runs on a
+    // worker, so close earlier voices (e.g. an Inspector preview) here.
+    m_Engine->GetAudioSystem().EndPlay();
     m_PlaySetupStep = 0;
     m_PlaySetupPresented = false;
     Input::EndGameFrame();
@@ -1900,6 +1902,21 @@ void RefreshInspectorAssetPicker(AssetKind kind, const std::string& selected) {
               [](const AssetEntry& a, const AssetEntry& b) {
                   return a.name < b.name;
               });
+
+    // Like Unity's object picker, built-in resources are offered ahead of
+    // project assets (e.g. the default material for a MeshRenderer).
+    std::vector<AssetEntry> builtins;
+    for (const std::string& builtin : BuiltinAssets::List()) {
+        if (AssetBrowserPanel::ClassifyAssetByPath(builtin) != kind)
+            continue;
+        AssetEntry entry;
+        entry.name = PathUtf8::ToString(PathUtf8::FromString(builtin).filename());
+        entry.projectRelPath = builtin;
+        entry.absolutePath = AssetManager::Get().ToAbsolute(builtin);
+        entry.kind = kind;
+        builtins.push_back(std::move(entry));
+    }
+    state.entries.insert(state.entries.begin(), builtins.begin(), builtins.end());
 }
 
 std::shared_ptr<Texture> GetInspectorAssetThumbnail(EditorApp* editor,
@@ -2127,6 +2144,7 @@ bool DrawAssetReferenceField(EditorApp* editor, const char* label, AssetKind exp
             if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetModel);
             if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetTexture);
             if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetMaterial);
+            if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetPrefab);
             if (!payload) payload = ImGui::AcceptDragDropPayload(DragDrop::kAssetAudio);
             if (payload) {
                 const auto paths = PathsFromDragPayload(payload);
@@ -2221,8 +2239,6 @@ void EditorApp::StopPlayMode() {
     m_PrePlayUndoStack.Clear();
     m_PrePlaySelection.clear();
     m_PrePlaySavedFingerprint.clear();
-    m_Engine->GetPSyncState().clock.Reset();
-    m_Engine->GetPSyncState().cadence.Reset();
     m_GameViewFrameValid = false;
     m_GamePointerPressed = m_GamePointerReleased = false;
     Input::EndGameFrame();
@@ -2292,10 +2308,16 @@ void EditorApp::TickAutoPlayOnStart() {
 
 void EditorApp::BeginFrame() {
     std::string historyError;
-    if (!m_IsPlaying && !IsPreparingPlay() && !m_Engine->IsPlayerMode()) {
+    // Undo snapshots are started on demand (widget activation, gizmo start,
+    // Play-mode interaction, or asset tracking) instead of serializing the
+    // whole scene every frame. Large scenes made the old per-frame snapshots
+    // dominate frame time.
+    if (m_Engine->IsPlayerMode() || IsPreparingPlay()) {
+        m_UndoStack.CancelFrame();
+    } else if (m_IsPlaying && m_HadActiveEdit && !m_UndoStack.IsFrameActive()) {
         if (!m_UndoStack.BeginFrame(m_Engine->GetScene(), historyError))
             MIPSYNC_WARN("Undo snapshot failed: {}", historyError);
-    } else m_UndoStack.CancelFrame();
+    }
 
     if (m_CommandHost && !IsPreparingPlay())
         m_CommandHost->Pump();
@@ -2318,12 +2340,16 @@ void EditorApp::EndFrame() {
         const uint64_t gesture = m_PointerEditGesture ? m_PointerEditGesture : ImGuizmo::IsUsing()
             ? (uint64_t(1) << 32) | m_SelectedEntityID
             : ImGui::GetCurrentContext()->ActiveId;
-        bool sceneChanged = false;
-        if (!m_UndoStack.EndFrame(m_Engine->GetScene(), gesture, historyError, &sceneChanged))
-            MIPSYNC_WARN("Undo recording failed: {}", historyError);
-        if (m_IsPlaying && sceneChanged) {
-            m_Engine->GetMipsRuntime().RefreshPlayInstances(m_Engine->GetScene());
-            m_Engine->GetPhysicsWorld().RefreshBodies(m_Engine->GetScene());
+        // Defer the expensive before/after serialization until the gesture
+        // releases; keep the original "before" snapshot for the whole drag.
+        if (m_UndoStack.IsFrameActive() && !m_HadActiveEdit && m_PointerEditGesture == 0) {
+            bool sceneChanged = false;
+            if (!m_UndoStack.EndFrame(m_Engine->GetScene(), gesture, historyError, &sceneChanged))
+                MIPSYNC_WARN("Undo recording failed: {}", historyError);
+            if (m_IsPlaying && sceneChanged) {
+                m_Engine->GetMipsRuntime().RefreshPlayInstances(m_Engine->GetScene());
+                m_Engine->GetPhysicsWorld().RefreshBodies(m_Engine->GetScene());
+            }
         }
     } else m_UndoStack.CancelFrame();
     ImGuiIO& io = ImGui::GetIO();
@@ -2381,7 +2407,8 @@ void EditorApp::OnImGuiRender() {
         ResetDockLayout();
     }
 
-    UpdateSceneDirtyState();
+    if (m_SceneDirtyCheckPending && !m_HadActiveEdit)
+        UpdateSceneDirtyState();
     DrawSceneSaveConfirmation();
     DrawFontRestartModal();
 
@@ -3173,12 +3200,14 @@ void EditorApp::RefreshSavedSceneState() {
     if (!SceneIO::SerializeSceneFingerprint(m_Engine->GetScene(), m_SceneSavedFingerprint, err))
         MIPSYNC_WARN("Scene fingerprint failed: {}", err);
     m_SceneDirty = false;
+    m_SceneDirtyCheckPending = false;
 }
 
 void EditorApp::UpdateSceneDirtyState() {
     if (m_IsPlaying) {
         if (m_PlaySession.Active())
             m_SceneDirty = m_PlaySession.OriginalSnapshot() != m_PrePlaySavedFingerprint;
+        m_SceneDirtyCheckPending = false;
         return;
     }
 
@@ -3188,6 +3217,7 @@ void EditorApp::UpdateSceneDirtyState() {
         return;
 
     m_SceneDirty = (current != m_SceneSavedFingerprint);
+    m_SceneDirtyCheckPending = false;
 }
 
 bool EditorApp::RequestSceneSaveConfirmation(SceneAction action, const std::string& path,
@@ -3433,6 +3463,7 @@ void EditorApp::UpdatePlayInputState() {
 
 void EditorApp::RecordUndoSnapshot() {
     if (m_CommandPreview) return;
+    m_SceneDirtyCheckPending = true;
     if (m_IsPlaying) {
         if (!m_UndoStack.IsFrameActive()) {
             std::string error;
@@ -3446,7 +3477,16 @@ void EditorApp::RecordUndoSnapshot() {
 
 bool EditorApp::RecordAssetUndoSnapshot(const std::string& absolutePath, bool recursive) {
     if (m_Engine->IsPlayerMode()) return true;
-    if (!m_UndoStack.IsFrameActive() && m_IsPlaying) RecordUndoSnapshot();
+    m_SceneDirtyCheckPending = true;
+    if (m_IsPlaying) {
+        if (!m_UndoStack.IsFrameActive()) RecordUndoSnapshot();
+    } else if (!m_UndoStack.IsFrameActive()) {
+        std::string error;
+        if (!m_UndoStack.BeginFrame(m_Engine->GetScene(), error)) {
+            MIPSYNC_WARN("Asset edit snapshot failed: {}", error);
+            return false;
+        }
+    }
     if (!m_UndoStack.IsFrameActive()) return true;
     std::string error;
     if (m_UndoStack.TrackPath(absolutePath, recursive, error)) return true;
@@ -3502,6 +3542,8 @@ void EditorApp::UpdateUndoRecording() {
 
     const bool active = ImGui::IsAnyItemActive() || ImGuizmo::IsUsing();
     m_HadActiveEdit = active;
+    if (active)
+        m_SceneDirtyCheckPending = true;
 }
 
 void EditorApp::HandleEditorShortcuts() {
@@ -3743,17 +3785,10 @@ void EditorApp::LoadEditorSettings() {
 void EditorApp::ApplyEditorPreferences() {
     Input::SetPS1PadMapping(m_Preferences.GetPS1PadMapping());
     m_FontSize = static_cast<float>(m_Preferences.Get("fontSize"));
-    const bool pSync = m_Preferences.Enabled("gameViewPSync");
     const int width = static_cast<int>(m_Preferences.Get("gameViewWidth"));
     const int height = static_cast<int>(m_Preferences.Get("gameViewHeight"));
-    if (m_GameViewSettings.pSync != pSync) {
-        m_Engine->GetPSyncState().clock.Reset();
-        m_Engine->GetPSyncState().cadence.Reset();
-        m_GameViewFrameValid = false;
-    }
     if (m_GameViewSettings.renderWidth != width || m_GameViewSettings.renderHeight != height)
         m_GameViewFrameValid = false;
-    m_GameViewSettings.pSync = pSync;
     m_GameViewSettings.renderWidth = width;
     m_GameViewSettings.renderHeight = height;
     m_GameViewSettings.playMode = m_Preferences.Enabled("gameViewPlayMode") ? GameViewPlayMode::Maximized : GameViewPlayMode::Focused;
@@ -3777,7 +3812,6 @@ void EditorApp::SaveEditorSettings() {
     m_Preferences.Set("gameViewPlayMode", m_GameViewSettings.playMode == GameViewPlayMode::Maximized);
     m_Preferences.Set("gameViewGizmos", m_GameViewSettings.showGizmos);
     m_Preferences.Set("gameViewStatistics", m_GameViewSettings.showStatistics);
-    m_Preferences.Set("gameViewPSync", m_GameViewSettings.pSync);
     std::error_code error;
     std::filesystem::create_directories(EditorSettingsPath().parent_path(), error);
     std::ofstream file(EditorSettingsPath());
@@ -4000,7 +4034,7 @@ void EditorApp::ApplyPostProcessVolumeSettings(PS1Settings& settings) {
     if (!m_Engine)
         return;
 
-    m_Engine->GetRenderer().ClearSkyboxTexture();
+    m_Engine->GetRenderer().ClearSky();
 
     PostProcessVolumeComponent* best = nullptr;
     for (const auto& entityPtr : m_Engine->GetScene().GetEntities()) {
@@ -4029,16 +4063,9 @@ void EditorApp::ApplyPostProcessVolumeSettings(PS1Settings& settings) {
     settings.vignetteIntensity = best->vignetteIntensity;
     settings.vignetteSmoothness = best->vignetteSmoothness;
 
-    if (best->skyboxEnabled && !best->skyboxTexturePath.empty()) {
-        if (!best->skyboxTexture)
-            best->skyboxTexture = AssetManager::Get().GetSkyboxTexture(best->skyboxTexturePath);
-        if (best->skyboxTexture && best->skyboxTexture->GetID() != 0) {
-            m_Engine->GetRenderer().SetSkyboxTexture(best->skyboxTexture.get(),
-                                                     best->skyboxTint,
-                                                     best->skyboxExposure,
-                                                     best->skyboxRotationDegrees);
-        }
-    }
+    if (best->skyboxEnabled)
+        m_Engine->GetRenderer().SetSkyGradient(best->skyTopColor, best->skyHorizonColor,
+                                               best->skyGroundColor);
 }
 
 const Texture* EditorApp::ResolvePrerenderedBackgroundTexture(uint32_t cameraEntityId) {
@@ -4646,8 +4673,6 @@ bool EditorApp::HandleTerrainBrush(const ImVec2& imageMin, const ImVec2& imageSi
 
     if (applied) {
         terrain->RebuildMesh(*meshRenderer);
-        if (!meshRenderer->texture)
-            meshRenderer->texture = std::make_shared<Texture>(Texture::CreateCheckerboard(256, 32));
         m_Engine->GetMipsRuntime().SyncEditSnapshot(scene);
         m_SceneDirty = true;
     }
@@ -5231,8 +5256,6 @@ void EditorApp::DrawProModelerWindow() {
         proModelerComp->steps = std::clamp(proModelerComp->steps, 1, 32);
         RecenterProModelerPivot(*selectedEntity, *proModelerComp);
         proModelerComp->RebuildMesh(*mr);
-        if (!mr->texture)
-            mr->texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
         m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
         m_SceneDirty = true;
     }
@@ -5368,14 +5391,8 @@ void EditorApp::DrawSceneViewPanel() {
 }
 
 void EditorApp::DrawGameViewToolbar() {
-    const bool wasSync = m_GameViewSettings.pSync;
-    if (DrawGameViewControls(m_GameViewSettings, &m_Engine->GetPSyncState()))
+    if (DrawGameViewControls(m_GameViewSettings))
         SaveEditorSettings();
-    if (wasSync != m_GameViewSettings.pSync) {
-        m_Engine->GetPSyncState().cadence.Reset();
-        m_Engine->GetPSyncState().clock.Reset();
-        m_GameViewFrameValid = false;
-    }
 }
 
 void EditorApp::DrawPlayerModeUI() {
@@ -5531,57 +5548,14 @@ void EditorApp::DrawGameViewPanel(bool maximized) {
             pointerActive, pointerX, pointerY, io.MouseDown[ImGuiMouseButton_Left],
             m_GamePointerPressed, m_GamePointerReleased);
 
-        auto& sync = m_Engine->GetPSyncState();
-        const bool repaint = !m_GameViewSettings.pSync || !m_IsPlaying || m_IsPaused ||
-            sync.frameDue || !m_GameViewFrameValid;
-        if (repaint) {
-            PSyncWorkload workload;
-            if (m_GameViewSettings.pSync) {
-                PS1Settings effective = m_Engine->GetRenderer().GetPS1Settings();
-                ApplyPostProcessVolumeSettings(effective);
-                if (Ps1::NeedsColorGrading({effective.colorGradingEnabled,effective.exposure,
-                    effective.contrast,effective.saturation,{effective.colorFilter.r,
-                    effective.colorFilter.g,effective.colorFilter.b}})) workload.colorGradingPixels = 320 * 240;
-                workload.opcodes = m_Engine->GetMipsRuntime().GetOpcodeCounts();
-                workload.hostCalls = m_Engine->GetMipsRuntime().GetHostCounts();
-                for (const auto& object : scene.GetEntities()) {
-                    if (!object || !scene.IsActiveInHierarchy(*object)) continue;
-                    ++workload.objects;
-                    const auto* collider = object->GetComponent<ColliderComponent>();
-                    if (collider && collider->enabled) {
-                        ++workload.colliders;
-                        const auto* mesh = object->GetComponent<MeshRendererComponent>();
-                        if (collider->shape == ColliderShape::Mesh && mesh && mesh->mesh)
-                            workload.colliderTriangles += mesh->mesh->GetIndexCount() / 3;
-                    }
-                    const auto* body = object->GetComponent<RigidbodyComponent>();
-                    if (body && body->enabled && body->bodyType != RigidbodyType::Static) ++workload.movingBodies;
-                    const auto* audio = object->GetComponent<AudioSourceComponent>();
-                    if (audio && audio->enabled && !audio->clipPath.empty()) ++workload.audioSources;
-                    const auto* animator = object->GetComponent<AnimatorComponent>();
-                    if (animator && animator->enabled && animator->model && scene.GetAnimateCharacters())
-                        workload.animatedBones += animator->model->bones.size();
-                }
-                m_Engine->GetRenderer().SetPSyncWorkload(&workload);
-                m_Engine->GetUIRenderer().SetPSyncWorkload(&workload);
-            }
-            Input::BeginGameUIFrame(m_GameViewSettings.pSync && m_IsPlaying && !m_IsPaused);
+        {
+            Input::BeginGameUIFrame();
             RenderSceneToFramebuffer(m_GameViewFBO, activeCamera, renderSize, 0, activeCamId, false,
                                      m_GameViewSettings.renderWidth, m_GameViewSettings.renderHeight);
             Input::EndGameUIFrame();
-            m_Engine->GetRenderer().SetPSyncWorkload(nullptr);
-            m_Engine->GetUIRenderer().SetPSyncWorkload(nullptr);
             m_GameViewStatistics = m_Engine->GetRenderer().GetStatistics();
             m_GameViewFrameValid = true;
             m_GamePointerPressed = m_GamePointerReleased = false;
-            if (m_GameViewSettings.pSync) {
-                // UI callbacks run during RenderUI, so sample VM counts again.
-                workload.opcodes = m_Engine->GetMipsRuntime().GetOpcodeCounts();
-                workload.hostCalls = m_Engine->GetMipsRuntime().GetHostCounts();
-                sync.workload = workload;
-                sync.estimate = sync.cadence.Update(EstimatePSync(workload), ImGui::GetTime());
-                sync.sampleValid = true;
-            }
         }
 
         drawList->PushClipRect(letterbox.displayMin, displayMax, true);
@@ -5592,7 +5566,7 @@ void EditorApp::DrawGameViewPanel(bool maximized) {
             const size_t activeObjects = std::count_if(scene.GetEntities().begin(), scene.GetEntities().end(),
                 [](const auto& entity) { return entity && entity->IsActive(); });
             DrawGameViewStatistics(panelMin, viewportPanelSize, m_GameViewSettings,
-                                    m_GameViewStatistics, activeObjects, io.Framerate, &sync);
+                                    m_GameViewStatistics, activeObjects, io.Framerate);
         }
 
         if (m_IsPlaying && !m_IsPaused && m_GameViewHovered) {
@@ -5658,7 +5632,6 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
             auto* entity = scene.CreateEntity("Cube");
             auto& mr = entity->AddComponent<MeshRendererComponent>();
             mr.SetPrimitive("Cube", 1.0f);
-            mr.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
             AddDefaultCollider(*entity, "Cube", 1.0f);
             selectNew(entity);
         }
@@ -5667,7 +5640,6 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
             auto* entity = scene.CreateEntity("Sphere");
             auto& mr = entity->AddComponent<MeshRendererComponent>();
             mr.SetPrimitive("Sphere", 1.0f);
-            mr.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
             AddDefaultCollider(*entity, "Sphere", 1.0f);
             selectNew(entity);
         }
@@ -5676,7 +5648,6 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
             auto* entity = scene.CreateEntity("Plane");
             auto& mr = entity->AddComponent<MeshRendererComponent>();
             mr.SetPrimitive("Plane", 10.0f);
-            mr.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(256, 32));
             AddDefaultCollider(*entity, "Plane", 10.0f);
             selectNew(entity);
         }
@@ -5686,7 +5657,6 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
             auto& mr = entity->AddComponent<MeshRendererComponent>();
             auto& terrain = entity->AddComponent<TerrainComponent>();
             terrain.RebuildMesh(mr);
-            mr.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(256, 32));
             if (auto* tr = entity->GetComponent<TransformComponent>())
                 tr->position.y = 0.0f;
             selectNew(entity);
@@ -5704,7 +5674,6 @@ void EditorApp::DrawHierarchyContextMenu(Entity* parentForNew) {
                 else pb.ResetBox();
                 pb.RebuildMesh(mr);
                 AddProModelerMeshCollider(*entity, mr);
-                mr.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
                 selectNew(entity);
             };
             if (EditorMenu::MenuItem("Cube")) createProModeler("ProModeler Cube", ProModelerComponent::Shape::Box);
@@ -7254,23 +7223,18 @@ void EditorApp::DrawInspectorPanel() {
                     ImGui::TextColored(EditorTheme::TextMuted,
                         "Highest enabled priority volume drives the scene post-process.");
 
-                    if (ImGui::CollapsingHeader("HDRI Skybox", ImGuiTreeNodeFlags_DefaultOpen)) {
-                        if (InspectorCheckbox("Enable Skybox", &postProcess->skyboxEnabled))
+                    if (ImGui::CollapsingHeader("Sky", ImGuiTreeNodeFlags_DefaultOpen)) {
+                        if (InspectorCheckbox("Procedural Sky", &postProcess->skyboxEnabled))
                             RecordUndoSnapshot();
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Gradient sky drawn behind the scene on PC and PS1.\n"
+                                              "When off, the background is cleared to the fog colour.");
                         ImGui::BeginDisabled(!postProcess->skyboxEnabled);
-                        if (DrawAssetReferenceField(this, "HDRI Texture", AssetKind::Texture,
-                                                    postProcess->skyboxTexturePath, "None (Texture)")) {
+                        if (InspectorColorEdit3("Zenith", glm::value_ptr(postProcess->skyTopColor)))
                             RecordUndoSnapshot();
-                            postProcess->skyboxTexture = postProcess->skyboxTexturePath.empty()
-                                ? nullptr
-                                : AssetManager::Get().GetSkyboxTexture(postProcess->skyboxTexturePath);
-                        }
-                        if (InspectorDragFloat("Rotation Y", &postProcess->skyboxRotationDegrees,
-                                             0.5f, -360.0f, 360.0f, "%.1f deg"))
+                        if (InspectorColorEdit3("Horizon", glm::value_ptr(postProcess->skyHorizonColor)))
                             RecordUndoSnapshot();
-                        if (InspectorSliderFloat("Skybox Exposure", &postProcess->skyboxExposure, -4.0f, 4.0f))
-                            RecordUndoSnapshot();
-                        if (InspectorColorEdit3("Skybox Tint", glm::value_ptr(postProcess->skyboxTint)))
+                        if (InspectorColorEdit3("Ground", glm::value_ptr(postProcess->skyGroundColor)))
                             RecordUndoSnapshot();
                         ImGui::EndDisabled();
                     }
@@ -7636,6 +7600,15 @@ void EditorApp::DrawInspectorPanel() {
                                 std::clamp(preset, 0, 4));
                         PropagateInspectorValues(&meshRendererComp->typePreset);
                     }
+                    if (InspectorDragFloat("PS1 Depth Bias (m)", &meshRendererComp->ps1DepthBias,
+                                           0.05f, -32.0f, 32.0f, "%.2f")) {
+                        PropagateInspectorValues(&meshRendererComp->ps1DepthBias);
+                        m_SceneDirty = true;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("PS1 has no depth buffer. Positive values sort this mesh "
+                                          "farther so objects on or around it paint over it "
+                                          "(roads, wheels inside arches).");
                     if (meshRendererComp->meshPrimitive == "File") {
                         if (DrawAssetReferenceField(this, "Mesh", AssetKind::Model,
                                                     meshRendererComp->meshPath, "None (Mesh)")) {
@@ -7768,8 +7741,6 @@ void EditorApp::DrawInspectorPanel() {
                     if (!mr)
                         mr = &selectedEntity->AddComponent<MeshRendererComponent>();
                     terrainComp->RebuildMesh(*mr);
-                    if (!mr->texture)
-                        mr->texture = std::make_shared<Texture>(Texture::CreateCheckerboard(256, 32));
                     m_Engine->GetMipsRuntime().SyncEditSnapshot(m_Engine->GetScene());
                 };
                 const bool open = BeginInspectableComponent(
@@ -8487,15 +8458,17 @@ void EditorApp::DrawInspectorPanel() {
                             const bool isInt = field.typeName == "int";
                             const bool isBool = field.typeName == "bool";
                             const bool isAudio = field.valueKind == Mips::FieldValueKind::AudioClip;
+                            const bool isPrefab = field.valueKind == Mips::FieldValueKind::Prefab;
                             const bool isArray = field.valueKind == Mips::FieldValueKind::Array;
                             const bool isEntityReference =
                                 field.valueKind == Mips::FieldValueKind::EntityReference;
-                            if (isAudio) {
+                            if (isAudio || isPrefab) {
                                 if (i >= mipsScript->fieldAssetPaths.size())
                                     mipsScript->fieldAssetPaths.resize(mipsScript->module->fields.size());
-                                if (DrawAssetReferenceField(this, displayLabel.c_str(), AssetKind::Audio,
+                                const AssetKind assetKind = isPrefab ? AssetKind::Prefab : AssetKind::Audio;
+                                if (DrawAssetReferenceField(this, displayLabel.c_str(), assetKind,
                                                             mipsScript->fieldAssetPaths[i],
-                                                            "None (Audio Clip)"))
+                                                            isPrefab ? "None (Prefab)" : "None (Audio Clip)"))
                                     RecordUndoSnapshot();
                                 continue;
                             }
@@ -8710,8 +8683,6 @@ void EditorApp::DrawInspectorPanel() {
                         addMissingInspectorComponents.operator()<MeshRendererComponent>(
                             [](Entity&, MeshRendererComponent& mr) {
                                 mr.SetPrimitive("Cube", 1.0f);
-                                mr.texture = std::make_shared<Texture>(
-                                    Texture::CreateCheckerboard(128, 16));
                             });
                         ImGui::CloseCurrentPopup();
                     });
@@ -8720,10 +8691,7 @@ void EditorApp::DrawInspectorPanel() {
                     m_ComponentPicker.Add("Skinned Mesh Renderer", [&] {
                         RecordUndoSnapshot();
                         addMissingInspectorComponents.operator()<SkinnedMeshRendererComponent>(
-                            [](Entity&, SkinnedMeshRendererComponent& sk) {
-                                sk.texture = std::make_shared<Texture>(
-                                    Texture::CreateCheckerboard(128, 16));
-                            });
+                            [](Entity&, SkinnedMeshRendererComponent&) {});
                         ImGui::CloseCurrentPopup();
                     });
                 }
@@ -8733,11 +8701,8 @@ void EditorApp::DrawInspectorPanel() {
                         addMissingInspectorComponents.operator()<TerrainComponent>(
                             [](Entity& entity, TerrainComponent& terrain) {
                                 auto* mr = entity.GetComponent<MeshRendererComponent>();
-                                if (!mr) {
+                                if (!mr)
                                     mr = &entity.AddComponent<MeshRendererComponent>();
-                                    mr->texture = std::make_shared<Texture>(
-                                        Texture::CreateCheckerboard(256, 32));
-                                }
                                 terrain.RebuildMesh(*mr);
                             });
                         ImGui::CloseCurrentPopup();
@@ -8749,11 +8714,8 @@ void EditorApp::DrawInspectorPanel() {
                         addMissingInspectorComponents.operator()<ProModelerComponent>(
                             [&](Entity& entity, ProModelerComponent& pb) {
                                 auto* mr = entity.GetComponent<MeshRendererComponent>();
-                                if (!mr) {
+                                if (!mr)
                                     mr = &entity.AddComponent<MeshRendererComponent>();
-                                    mr->texture = std::make_shared<Texture>(
-                                        Texture::CreateCheckerboard(128, 16));
-                                }
                                 pb.ResetBox();
                                 pb.RebuildMesh(*mr);
                                 AddProModelerMeshCollider(entity, *mr);
@@ -9294,7 +9256,10 @@ void EditorApp::DrawMaterialAssetInspector(const std::string& projectRelPath) {
     static Material mat;
     static bool loadFailed = false;
 
-    if (!RecordAssetUndoSnapshot(AssetManager::Get().ToAbsolute(projectRelPath))) return;
+    // Built-in materials ship with the engine and are read-only, like
+    // Unity's Default-Material: shown, never edited or saved.
+    const bool readOnly = BuiltinAssets::IsBuiltinPath(projectRelPath);
+    if (!readOnly && !RecordAssetUndoSnapshot(AssetManager::Get().ToAbsolute(projectRelPath))) return;
     if (loadedPath != projectRelPath || loadedRevision != m_HistoryRevision) {
         loadedRevision = m_HistoryRevision;
         loadedPath = projectRelPath;
@@ -9316,10 +9281,16 @@ void EditorApp::DrawMaterialAssetInspector(const std::string& projectRelPath) {
         ? projectRelPath.c_str()
         : projectRelPath.c_str() + slash + 1;
 
-    ImGui::TextColored(EditorTheme::TextSecondary, "Material Asset");
+    ImGui::TextColored(EditorTheme::TextSecondary,
+                       readOnly ? "Material Asset (Built-in, read-only)" : "Material Asset");
     ImGui::Text("%s", fileName);
+    if (readOnly) {
+        ImGui::TextColored(EditorTheme::TextMuted,
+                           "Duplicate it to Assets from the Project window to edit a copy.");
+    }
     ImGui::Separator();
 
+    ImGui::BeginDisabled(readOnly);
     bool changed = false;
     if (InspectorColorEdit4("Color", glm::value_ptr(mat.color)))
         changed = true;
@@ -9354,13 +9325,14 @@ void EditorApp::DrawMaterialAssetInspector(const std::string& projectRelPath) {
         }
     };
 
-    if (changed)
+    if (changed && !readOnly)
         commitMaterial();
 
     ImGui::Spacing();
     if (EditorTheme::AeroButton("Save Material", ImVec2(-1.0f, EditorTheme::ButtonHeight),
-                                AeroButtonKind::Primary))
+                                AeroButtonKind::Primary) && !readOnly)
         commitMaterial();
+    ImGui::EndDisabled();
 }
 
 void EditorApp::DrawMaterialSlot(MeshRendererComponent& mr) {

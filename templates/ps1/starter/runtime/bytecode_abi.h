@@ -145,7 +145,15 @@
     X(ENTITY_DESTROY, Entity_Destroy, 87) \
     X(ENTITY_FROM_ID, Entity_FromId, 88) \
     X(SCENE_FIND, Scene_Find, 89) \
-    X(VEC3_DISTANCE, Vector3_Distance, 90)
+    X(VEC3_DISTANCE, Vector3_Distance, 90) \
+    X(ENTITY_SET_ACTIVE, Entity_SetActive, 91) \
+    X(ENTITY_IS_ACTIVE, Entity_IsActive, 92) \
+    X(POOL_REGISTER, Pool_Register, 93) \
+    X(POOL_ACQUIRE, Pool_Acquire, 94) \
+    X(POOL_RELEASE, Pool_Release, 95) \
+    X(POOL_COUNT, Pool_Count, 96) \
+    X(SCENE_SPAWN, Scene_Spawn, 97) \
+    X(SCENE_PREWARM, Scene_Prewarm, 98)
 
 /* PS1 runtime capacities. The exporter validates these before emitting C. */
 #define MIPSYNC_PS1_MODULE_CAP     32
@@ -166,6 +174,8 @@
 #define VM_ARRAY_CAP                8
 #define VM_ARRAY_LENGTH            32
 #define VM_COROUTINE_CAP            4
+#define VM_POOL_CAP                 8
+#define VM_POOL_MEMBER_CAP         32
 #define MIPSYNC_UI_DYNAMIC_CAP      64
 #define MIPSYNC_UI_TEXT_BYTES       96
 

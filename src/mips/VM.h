@@ -4,6 +4,7 @@
 #include "Value.h"
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 #include <array>
 
@@ -35,6 +36,19 @@ struct CoroutineState {
     bool completed = false;
 };
 
+struct RuntimePool {
+    std::string name;
+    std::vector<uint32_t> entityIds;
+    std::vector<bool> active;
+};
+
+struct RuntimePrefabState {
+    std::string path;
+    uint32_t capacity = 0;
+    std::vector<uint32_t> spawned;
+    std::vector<bool> active;
+};
+
 struct ScriptInstance {
     std::shared_ptr<CompiledModule> module;
     Entity* entity = nullptr;
@@ -59,15 +73,22 @@ public:
     void SetExecutionLimits(const VMExecutionLimits& limits) { m_Limits = limits; }
     const VMExecutionLimits& GetExecutionLimits() const { return m_Limits; }
     size_t GetLastInvocationInstructions() const { return m_LastInvocationInstructions; }
-    void SetPerformanceCounting(bool enabled) { m_PerformanceCounting = enabled; }
-    void ResetPerformanceCounts() { m_OpcodeCounts.fill(0); m_HostCounts.fill(0); }
-    const auto& GetOpcodeCounts() const { return m_OpcodeCounts; }
-    const auto& GetHostCounts() const { return m_HostCounts; }
 
     bool RunMethod(ScriptInstance& instance, const std::string& methodName,
                    std::vector<std::string>& outErrors);
     void ResumeCoroutines(ScriptInstance& instance, float deltaTime,
                           std::vector<std::string>& outErrors);
+
+    const std::vector<RuntimePool>& GetRuntimePools() const { return m_RuntimePools; }
+    const std::vector<RuntimePrefabState>& GetRuntimePrefabs() const { return m_RuntimePrefabs; }
+    std::vector<uint32_t> TakeSpawnRequests() { return std::exchange(m_SpawnRequests, {}); }
+    std::vector<uint32_t> TakeDespawnRequests() { return std::exchange(m_DespawnRequests, {}); }
+    void ResetRuntimeState() {
+        m_RuntimePools.clear();
+        m_RuntimePrefabs.clear();
+        m_SpawnRequests.clear();
+        m_DespawnRequests.clear();
+    }
 
 private:
     bool Execute(ScriptInstance& instance, const CompiledMethod& method,
@@ -90,8 +111,6 @@ private:
     std::vector<Value> m_Locals; // re-used per Execute (supports Host refs)
     std::vector<std::string> m_RuntimeStrings;
     VMExecutionLimits m_Limits;
-    bool m_PerformanceCounting = false;
-    std::array<uint64_t, 256> m_OpcodeCounts{}, m_HostCounts{};
     size_t m_RuntimeStringBytes = 0;
     bool m_RuntimeStringLimitExceeded = false;
 
@@ -100,6 +119,16 @@ private:
     static Value MakeValueVec3(double x, double y, double z);
     bool ReadVec3(const Value& value, double& x, double& y, double& z) const;
     Entity* ResolveEntity(const Value& value) const;
+    void SetEntityActive(Entity& entity, bool active, bool notify);
+    int RegisterRuntimePool(const std::string& name);
+    RuntimePool* FindRuntimePool(const std::string& name);
+    RuntimePrefabState* FindRuntimePrefab(const std::string& path);
+    void RecordRuntimePrefab(const std::string& path, uint32_t capacity, uint32_t entityId);
+
+    std::vector<RuntimePool> m_RuntimePools;
+    std::vector<RuntimePrefabState> m_RuntimePrefabs;
+    std::vector<uint32_t> m_SpawnRequests;
+    std::vector<uint32_t> m_DespawnRequests;
 };
 
 } // namespace Mips

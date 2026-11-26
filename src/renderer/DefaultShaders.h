@@ -463,33 +463,25 @@ inline constexpr const char* SKYBOX_FRAGMENT_SHADER = R"(
 #version 330 core
 in vec2 vUV;
 out vec4 fragColor;
-uniform sampler2D uSkybox;
 uniform mat4 uInvView;
 uniform mat4 uInvProjection;
-uniform vec3 uTint;
-uniform float uExposure;
-uniform float uRotationRadians;
+uniform vec3 uSkyTop;
+uniform vec3 uSkyHorizon;
+uniform vec3 uSkyGround;
 
-const float PI = 3.14159265359;
-
-vec3 rotateY(vec3 v, float angle) {
-    float s = sin(angle);
-    float c = cos(angle);
-    return vec3(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
-}
-
+// Procedural gradient sky. The blend factor is tan(elevation), which is
+// linear in screen Y for a level camera, so the PS1 runtime reproduces the
+// same gradient with Gouraud-shaded quads: zenith colour at 45 degrees and
+// above, ground colour from tan(depression) = 1/3 downwards.
 void main() {
     vec2 ndc = vUV * 2.0 - 1.0;
-    vec4 clip = vec4(ndc, 1.0, 1.0);
-    vec4 view = uInvProjection * clip;
+    vec4 view = uInvProjection * vec4(ndc, 1.0, 1.0);
     view = vec4(normalize(view.xyz / max(view.w, 0.0001)), 0.0);
     vec3 dir = normalize((uInvView * view).xyz);
-    dir = rotateY(dir, uRotationRadians);
-
-    float u = atan(dir.z, dir.x) / (2.0 * PI) + 0.5;
-    float v = 0.5 - asin(clamp(dir.y, -1.0, 1.0)) / PI;
-    vec3 color = texture(uSkybox, vec2(u, v)).rgb;
-    color *= exp2(uExposure) * uTint;
+    float tanElevation = dir.y / max(length(dir.xz), 0.0001);
+    vec3 color = tanElevation >= 0.0
+        ? mix(uSkyHorizon, uSkyTop, clamp(tanElevation, 0.0, 1.0))
+        : mix(uSkyHorizon, uSkyGround, clamp(-tanElevation * 3.0, 0.0, 1.0));
     fragColor = vec4(color, 1.0);
 }
 )";

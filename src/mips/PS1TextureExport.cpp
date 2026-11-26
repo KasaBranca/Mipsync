@@ -2,6 +2,7 @@
 #include "../core/AssetFiles.h"
 #include "../core/Log.h"
 #include "../assets/AssetManager.h"
+#include "../assets/BuiltinAssets.h"
 #include <stb_image.h>
 #include <algorithm>
 #include <cmath>
@@ -273,7 +274,7 @@ bool EmitTexturesDataC(const std::vector<std::string>& projectRelativePaths,
             const bool isUi = sourceRel.rfind("mipsyncui://", 0) == 0;
             if (isUi)
                 sourceRel.erase(0, std::char_traits<char>::length("mipsyncui://"));
-            const fs::path abs = root / PathUtf8::FromString(sourceRel);
+            const fs::path abs = BuiltinAssets::ResolveAssetPath(root, sourceRel);
             PsxExportedTexture tex;
             std::string err;
             int maxTexSize = i < textureMaxSizes.size()

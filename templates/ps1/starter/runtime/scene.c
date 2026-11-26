@@ -25,6 +25,9 @@ static int s_active_camera_index = -1;
 /* Keep immutable scene arrays and cached indices stable; dead entities are
  * tombstones, excluded by the public scene accessors on every runtime path. */
 static uint8_t s_destroy_state[4096];
+/* Entities that completed destruction this scene; 0 lets per-frame UI and
+ * trigger checks skip the linear entity scan entirely. */
+static unsigned int s_destroyed_count;
 static int s_pending_camera_index = -1;
 static uint8_t s_pending_camera_frames = 0;
 
@@ -282,6 +285,7 @@ void ps1_scene_init(void) {
     unsigned int entity_count = g_ps1_scene.entity_count;
     unsigned int r_count = 0;
 
+    s_destroyed_count = 0;
     for (unsigned int i = 0; i < 4096; ++i) {
         s_runtime_lookup[i] = -1;
         s_destroy_state[i] = 0;
@@ -991,12 +995,15 @@ int ps1_scene_next_destroy(void) {
 }
 
 void ps1_scene_finish_destroy(unsigned int index) {
-    if (index < g_ps1_scene.entity_count && index < 4096u) s_destroy_state[index] = 3;
+    if (index < g_ps1_scene.entity_count && index < 4096u) {
+        if (s_destroy_state[index] != 3) ++s_destroyed_count;
+        s_destroy_state[index] = 3;
+    }
 }
 
 int ps1_scene_source_id_destroyed(uint32_t source_id) {
     unsigned int i;
-    if (!source_id) return 0;
+    if (!source_id || !s_destroyed_count) return 0;
     for (i = 0; i < g_ps1_scene.entity_count && i < 4096u; ++i)
         if (g_ps1_scene.entities[i].source_entity_id == source_id && s_destroy_state[i] == 3)
             return 1;

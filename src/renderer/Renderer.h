@@ -10,7 +10,6 @@
 #include "Framebuffer.h"
 #include <glm/glm.hpp>
 #include <memory>
-#include "../ps1/PSync.h"
 #include <unordered_map>
 #include <chrono>
 #include <filesystem>
@@ -105,8 +104,7 @@ public:
                   const glm::vec2& textureTiling = glm::vec2(1.0f),
                   const glm::vec2& textureOffset = glm::vec2(0.0f),
                   uint32_t indexOffset = 0, uint32_t indexCount = 0,
-                  float projectionDepthClamp = 0.0f, bool doubleSided = false,
-                  PSyncDrawOptions syncOptions = {});
+                  float projectionDepthClamp = 0.0f, bool doubleSided = false);
     void DrawMeshDepthOnly(const Mesh& mesh, const glm::mat4& transform);
 
     void DrawSkinnedMesh(const SkinnedMesh& mesh, const glm::mat4& entityWorld,
@@ -123,7 +121,6 @@ public:
     void SetObjectUnlit(bool unlit) { m_ObjectUnlit = unlit; }
     RenderMode GetRenderMode() const { return m_RenderMode; }
     const RenderStatistics& GetStatistics() const { return m_Statistics; }
-    void SetPSyncWorkload(PSyncWorkload* workload) { m_PSyncWorkload = workload; }
 
     // Post-process selection outline: draws a clean N-pixel outline around the
     // silhouette of `mesh` directly on top of `targetFBO` using a mask + edge pass.
@@ -139,9 +136,9 @@ public:
         return m_Light;
     }
 
-    void SetSkyboxTexture(const Texture* texture, const glm::vec3& tint,
-                          float exposure, float rotationDegrees);
-    void ClearSkyboxTexture();
+    /// Procedural gradient sky (zenith / horizon / ground colours).
+    void SetSkyGradient(const glm::vec3& top, const glm::vec3& horizon, const glm::vec3& ground);
+    void ClearSky();
 
     /// Scene lights for vertex shading; pass count 0 to use legacy single directional uLightDir.
     void SetSceneLights(const SceneLightGpu* lights, int count);
@@ -192,14 +189,11 @@ private:
     bool m_MeshLightingUploaded = false;
     bool m_SkinnedLightingUploaded = false;
     RenderStatistics m_Statistics;
-    PSyncWorkload* m_PSyncWorkload = nullptr;
-    std::unordered_map<uint64_t, PSyncGeometryCacheEntry> m_PSyncPrevious, m_PSyncCurrent;
-    uint64_t m_PSyncCachedVertices = 0;
 
-    const Texture* m_SkyboxTexture = nullptr;
-    glm::vec3 m_SkyboxTint{1.0f, 1.0f, 1.0f};
-    float m_SkyboxExposure = 0.0f;
-    float m_SkyboxRotationDegrees = 0.0f;
+    bool m_SkyEnabled = false;
+    glm::vec3 m_SkyTop{0.22f, 0.45f, 0.85f};
+    glm::vec3 m_SkyHorizon{0.70f, 0.84f, 0.96f};
+    glm::vec3 m_SkyGround{0.36f, 0.34f, 0.31f};
 
     // Current frame state
     glm::mat4 m_ViewMatrix;

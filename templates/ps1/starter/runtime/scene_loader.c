@@ -59,7 +59,8 @@ void ps1_scene_process_load(void) {
         ps1_audio_stop(i);
     /* BIOS LoadExec replaces the current scene's executable in RAM. Quiesce
      * all SDK/BIOS drivers first; the next main() installs fresh handlers. */
-    CdControlB(CdlPause, 0, 0);
+    if (ps1_audio_cd_ready())
+        CdControlB(CdlPause, 0, 0);
     DrawSync(0);
     StopCARD();
     StopPAD();
@@ -83,7 +84,7 @@ void ps1_scene_process_load(void) {
 
 void ps1_platform_quit(void){
     unsigned i;for(i=0;i<g_ps1_scene.entity_count;++i)ps1_audio_stop(i);
-    CdControlB(CdlPause,0,0);DrawSync(0);SetDispMask(0);
+    if(ps1_audio_cd_ready())CdControlB(CdlPause,0,0);DrawSync(0);SetDispMask(0);
     StopCARD();StopPAD();StopCallback();_boot();
     /* BIOS implementations should not return; recover drivers if they do. */
     RestartCallback();StartPAD();host_log("BIOS quit returned");

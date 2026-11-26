@@ -32,6 +32,19 @@ static fix16_t  s_delta_q16_16 = FIX16_ONE / 60; /* assume 60 Hz field rate */
 static uint32_t s_other_entity_id;
 static int s_cursor_locked;
 
+typedef struct {
+    char     name[VM_NAME_LEN];
+    uint16_t indices[VM_POOL_MEMBER_CAP];
+    uint8_t  count;
+} ps1_runtime_pool;
+
+static ps1_runtime_pool s_pools[VM_POOL_CAP];
+static int s_pool_count;
+static uint16_t s_pool_spawn[VM_POOL_MEMBER_CAP];
+static uint16_t s_pool_despawn[VM_POOL_MEMBER_CAP];
+static int s_pool_spawn_count;
+static int s_pool_despawn_count;
+
 void host_set_physics_other_entity_id(uint32_t id) { s_other_entity_id = id; }
 
 void host_init(void) {
@@ -41,7 +54,26 @@ void host_init(void) {
     s_cursor_locked = 0;
     s_log_head = 0;
     s_log_count = 0;
+    s_pool_count = 0;
+    s_pool_spawn_count = 0;
+    s_pool_despawn_count = 0;
     for (int i = 0; i < LOG_LINES; ++i) s_log[i][0] = 0;
+}
+
+int host_take_pool_spawn(uint16_t* out, int capacity) {
+    int count = s_pool_spawn_count < capacity ? s_pool_spawn_count : capacity;
+    int i;
+    for (i = 0; i < count; ++i) out[i] = s_pool_spawn[i];
+    s_pool_spawn_count = 0;
+    return count;
+}
+
+int host_take_pool_despawn(uint16_t* out, int capacity) {
+    int count = s_pool_despawn_count < capacity ? s_pool_despawn_count : capacity;
+    int i;
+    for (i = 0; i < count; ++i) out[i] = s_pool_despawn[i];
+    s_pool_despawn_count = 0;
+    return count;
 }
 
 void host_set_delta_q16_16(fix16_t dt) {
@@ -203,6 +235,71 @@ static void active_camera_planar_axes(fix16_t* right_x, fix16_t* right_z,
     if (forward_x) *forward_x = fix16_neg(sy);
     if (forward_z) *forward_z = fix16_neg(cy);
     if (yaw_out) *yaw_out = yaw;
+}
+
+static void pool_queue_event(uint16_t* queue, int* count, uint16_t index) {
+    if (*count >= VM_POOL_MEMBER_CAP) return;
+    queue[(*count)++] = index;
+}
+
+static void set_entity_active_recursive(unsigned int index, int active, int notify) {
+    unsigned int i;
+    ps1_entity* entity = ps1_scene_mutable_entity(index);
+    if (!entity) return;
+    const uint8_t inactive = (uint8_t)(active ? 0 : 1);
+    const uint8_t meshEnabled = (uint8_t)(active ? 1 : 0);
+    if (entity->inactive != inactive || entity->mesh_enabled != meshEnabled) {
+        entity->inactive = inactive;
+        entity->mesh_enabled = meshEnabled;
+        if (notify)
+            pool_queue_event(active ? s_pool_spawn : s_pool_despawn,
+                             active ? &s_pool_spawn_count : &s_pool_despawn_count,
+                             (uint16_t)index);
+    }
+    for (i = 0; i < ps1_scene_entity_count(); ++i) {
+        const ps1_entity* child = ps1_scene_entity(i);
+        if (child && child->parent_entity_index == (int16_t)index)
+            set_entity_active_recursive(i, active, notify);
+    }
+}
+
+static int find_pool(const char* name) {
+    int i;
+    if (!name) return -1;
+    for (i = 0; i < s_pool_count; ++i)
+        if (!strcmp(s_pools[i].name, name)) return i;
+    return -1;
+}
+
+static int register_pool(const char* name) {
+    int existing = find_pool(name);
+    ps1_runtime_pool* pool;
+    unsigned int i;
+    size_t name_len;
+    if (!name || !name[0]) return 0;
+    if (existing >= 0) return (int)s_pools[existing].count;
+    if (s_pool_count >= VM_POOL_CAP) return 0;
+    pool = &s_pools[s_pool_count];
+    memset(pool, 0, sizeof(*pool));
+    name_len = strlen(name);
+    if (name_len >= sizeof(pool->name)) name_len = sizeof(pool->name) - 1;
+    memcpy(pool->name, name, name_len);
+    pool->name[name_len] = 0;
+    for (i = 0; i < ps1_scene_entity_count() && pool->count < VM_POOL_MEMBER_CAP; ++i) {
+        const ps1_entity* entity = ps1_scene_entity(i);
+        size_t entity_len;
+        int matches;
+        if (!entity || !entity->name) continue;
+        entity_len = strlen(entity->name);
+        matches = !strcmp(entity->name, name) ||
+            (entity_len > name_len && !strncmp(entity->name, name, name_len) &&
+             entity->name[name_len] == '.');
+        if (!matches) continue;
+        pool->indices[pool->count++] = (uint16_t)i;
+        set_entity_active_recursive(i, 0, 0);
+    }
+    ++s_pool_count;
+    return (int)pool->count;
 }
 
 int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
@@ -385,7 +482,7 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
             if (argc >= 1 && host_is_string(a[0])) {
                 const char* button=vm_value_string(vm,a[0]);
                 int pressed=0;
-                if (ps1_named_button_mask(button) || (button && strcmp(button,"QuickTurn")==0))
+                if (ps1_input_button_mask(button) || (button && strcmp(button,"QuickTurn")==0))
                     pressed=host_id==HF_INPUT_GETBUTTONDOWN ? ps1_input_key_down(button) :
                         host_id==HF_INPUT_GETBUTTONUP ? ps1_input_key_up(button) : ps1_input_key_held(button);
                 push_number(vm,pressed ? FIX16_ONE : 0);
@@ -466,6 +563,103 @@ int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc) {
                 value.tag=HOST_VAL_HOST;value.ref.kind=HOST_REF_ENTITY;value.ref.entity_idx=(uint16_t)index;
             }
             vm_push(vm,value);return 1;
+        }
+        case HF_ENTITY_SET_ACTIVE: {
+            int index = argc >= 1 ? vm_entity_index(a[0]) : -1;
+            int active = argc >= 2 && a[1].ival != 0;
+            if (index >= 0) set_entity_active_recursive((unsigned)index, active, 1);
+            push_bool(vm, index >= 0);
+            return 1;
+        }
+        case HF_ENTITY_IS_ACTIVE: {
+            int index = argc >= 1 ? vm_entity_index(a[0]) : -1;
+            const ps1_entity* entity = index >= 0 ? ps1_scene_entity((unsigned)index) : 0;
+            push_bool(vm, entity && !entity->inactive);
+            return 1;
+        }
+        case HF_POOL_REGISTER: {
+            const char* name = argc >= 1 && host_is_string(a[0]) ? vm_value_string(vm, a[0]) : 0;
+            push_number(vm, FIX16_FROM_INT(register_pool(name)));
+            return 1;
+        }
+        case HF_POOL_ACQUIRE: {
+            const char* name = argc >= 1 && host_is_string(a[0]) ? vm_value_string(vm, a[0]) : 0;
+            int pool_index = find_pool(name);
+            host_value value = {0};
+            if (pool_index < 0 && name && name[0]) {
+                register_pool(name);
+                pool_index = find_pool(name);
+            }
+            if (pool_index >= 0) {
+                ps1_runtime_pool* pool = &s_pools[pool_index];
+                int i;
+                for (i = 0; i < pool->count; ++i) {
+                    const ps1_entity* entity = ps1_scene_entity(pool->indices[i]);
+                    if (entity && entity->inactive) {
+                        set_entity_active_recursive(pool->indices[i], 1, 1);
+                        value.tag = HOST_VAL_HOST;
+                        value.ref.kind = HOST_REF_ENTITY;
+                        value.ref.entity_idx = pool->indices[i];
+                        break;
+                    }
+                }
+            }
+            vm_push(vm, value);
+            return 1;
+        }
+        case HF_POOL_RELEASE: {
+            int index = argc >= 1 ? vm_entity_index(a[0]) : -1;
+            if (index >= 0) set_entity_active_recursive((unsigned)index, 0, 1);
+            push_bool(vm, index >= 0);
+            return 1;
+        }
+        case HF_POOL_COUNT: {
+            const char* name = argc >= 1 && host_is_string(a[0]) ? vm_value_string(vm, a[0]) : 0;
+            int pool_index = find_pool(name);
+            push_number(vm, FIX16_FROM_INT(pool_index >= 0 ? (int)s_pools[pool_index].count : 0));
+            return 1;
+        }
+        case HF_SCENE_PREWARM: {
+            const char* path = argc >= 1 && host_is_string(a[0]) ? vm_value_string(vm, a[0]) : 0;
+            unsigned int i;
+            for (i = 0; i < g_ps1_scene.prefab_count; ++i)
+                if (path && g_ps1_scene.prefabs[i].path &&
+                    !strcmp(g_ps1_scene.prefabs[i].path, path)) {
+                    push_number(vm, FIX16_FROM_INT((int)g_ps1_scene.prefabs[i].count));
+                    return 1;
+                }
+            push_number(vm, 0);
+            return 1;
+        }
+        case HF_SCENE_SPAWN: {
+            const char* path = argc >= 1 && host_is_string(a[0]) ? vm_value_string(vm, a[0]) : 0;
+            host_value value = {0};
+            unsigned int i;
+            int j;
+            for (i = 0; i < g_ps1_scene.prefab_count; ++i) {
+                const ps1_prefab_entry* prefab = &g_ps1_scene.prefabs[i];
+                if (!path || !prefab->path || strcmp(prefab->path, path)) continue;
+                for (j = 0; j < (int)prefab->count; ++j) {
+                    const ps1_entity* root = ps1_scene_entity(prefab->roots[j]);
+                    ps1_entity* mutable_root;
+                    if (!root || !root->inactive) continue;
+                    set_entity_active_recursive(prefab->roots[j], 1, 1);
+                    mutable_root = ps1_scene_mutable_entity(prefab->roots[j]);
+                    if (mutable_root && argc >= 4) {
+                        mutable_root->position[0] = (fix16_t)a[1].ival;
+                        mutable_root->position[1] = (fix16_t)a[2].ival;
+                        mutable_root->position[2] = (fix16_t)a[3].ival;
+                        ps1_scene_resolve_hierarchy();
+                    }
+                    value.tag = HOST_VAL_HOST;
+                    value.ref.kind = HOST_REF_ENTITY;
+                    value.ref.entity_idx = prefab->roots[j];
+                    break;
+                }
+                break;
+            }
+            vm_push(vm, value);
+            return 1;
         }
         case HF_VEC3_CREATE:
             vm_push(vm,vm_make_vec3(argc>0?a[0].ival:0,argc>1?a[1].ival:0,argc>2?a[2].ival:0));return 1;

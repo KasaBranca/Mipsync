@@ -47,9 +47,9 @@ requests alone do not hide it. Escape releases capture until the next click.
 `mipsync runtime inspect --json` reports input enablement, cursor capture, and
 both stick axes for diagnosing Play Mode input.
 
-Press and release edges are buffered between P-Sync simulation ticks and handed
-to scripts and UI once. A brief tap is retained even if no game tick occurred
-while the button was held. PS1 uses the corresponding VBlank edge buffer.
+Press and release edges are buffered between game frames and handed to scripts
+and UI once. A brief tap is retained even if no game frame occurred while the
+button was held. PS1 uses the corresponding VBlank edge buffer.
 An actual gamepad can be used alongside the virtual keyboard/mouse controller.
 
 The shipped FirstPersonController, RadioController and SilentHillController

@@ -7,6 +7,7 @@
 #include "MipsRuntime.h"
 #include "../assets/AssetManager.h"
 #include "../assets/Material.h"
+#include "../assets/BuiltinAssets.h"
 #include "../animation/AnimatorControllerIO.h"
 #include "../animation/AnimationTypes.h"
 #include "../animation/SkeletalModel.h"
@@ -30,6 +31,7 @@
 #include <glm/gtx/matrix_decompose.hpp>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <array>
 #include <cctype>
@@ -391,7 +393,7 @@ void ResolveEntityAppearances(const std::string& projectRoot, const fs::path& sc
         Material mat;
         if (!e.materialPath.empty()) {
             std::string err;
-            const fs::path matAbs = root / e.materialPath;
+            const fs::path matAbs = BuiltinAssets::ResolveAssetPath(root, e.materialPath);
             if (Material::Load(PathUtf8::ToString(matAbs), mat, err)) {
                 e.color[0] = ToByte01(mat.color.r);
                 e.color[1] = ToByte01(mat.color.g);
@@ -403,6 +405,7 @@ void ResolveEntityAppearances(const std::string& projectRoot, const fs::path& sc
                 e.textureOffset[1] = mat.mainTextureOffset.y;
             } else {
                 MIPSYNC_WARN("PS1 material load failed '{}': {}", e.materialPath, err);
+                e.color[0] = 255; e.color[1] = 0; e.color[2] = 255;
             }
         } else {
             // Read-only compatibility for scenes saved before renderers became
@@ -3181,6 +3184,33 @@ static uint8_t TerrainTriShade(const glm::vec3& normal, const glm::vec3& center,
     return static_cast<uint8_t>(std::clamp(shade, 34, 190));
 }
 
+// Mirrors SceneIO's MeshRenderer material rules so PS1 output matches the
+// editor: a missing "material" key (pre-reference scenes) means the built-in
+// default material unless legacy renderer appearance is present, and an
+// explicit "" is "None (Material)", drawn in the error color.
+void ResolveExportMaterialReference(const json& mr, Ps1ExportedEntity& e) {
+    if (mr.contains("material")) {
+        if (e.materialPath.empty() && e.texturePath.empty()) {
+            e.color[0] = 255; e.color[1] = 0; e.color[2] = 255;
+        }
+        return;
+    }
+    glm::vec4 color{ 1.0f };
+    glm::vec2 tiling{ 1.0f };
+    glm::vec2 offset{ 0.0f };
+    auto readFloats = [&](const char* key, float* out, size_t count) {
+        const auto it = mr.find(key);
+        if (it == mr.end() || !it->is_array() || it->size() < count) return;
+        for (size_t i = 0; i < count; ++i)
+            if ((*it)[i].is_number()) out[i] = (*it)[i].get<float>();
+    };
+    readFloats("color", &color.x, 4);
+    readFloats("tiling", &tiling.x, 2);
+    readFloats("offset", &offset.x, 2);
+    if (!BuiltinAssets::LegacyAppearanceNeedsMaterial(e.texturePath, color, tiling, offset))
+        e.materialPath = BuiltinAssets::kDefaultMaterial;
+}
+
 void ExtractColor(const json& mr, uint8_t out[3]) {
     if (mr.contains("color") && mr["color"].is_array() && mr["color"].size() >= 3) {
         auto clampByte = [](float v) {
@@ -3568,6 +3598,7 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
     Ps1ExportedEntity e;
     e.id = nextId++;
     e.name = ent.value("name", std::string{"Entity"});
+    e.active = ent.value("active", true);
     const uint32_t sourceId = ent.value("id", 0u);
     e.sourceEntityId = sourceId;
     e.parentEntityId = ent.value("parent", parentSourceEntityId);
@@ -3666,8 +3697,13 @@ void FlattenEntityJson(const json& ent, Ps1SceneExportResult& result, uint32_t& 
             ExtractColor(mr, e.color);
             e.materialPath = mr.value("material", std::string{});
             e.texturePath = mr.value("texture", std::string{});
+            ResolveExportMaterialReference(mr, e);
             e.renderPreset = RenderPresetFromJson(mr);
             e.renderUnlit = LowerAscii(mr.value("renderType", std::string{"Lit"})) == "unlit";
+            // Runtime OT index = camera depth / 2 PSX units; 64 PSX units per
+            // metre gives 32 slots per metre.
+            e.depthBiasOt = static_cast<int16_t>(std::lround(
+                std::clamp(mr.value("ps1DepthBias", 0.0f), -32.0f, 32.0f) * 32.0f));
             e.seamFill = mr.value("ps1SeamFill", false);
             if (ent.contains("meshSubdivider") && ent["meshSubdivider"].is_object()) {
                 e.meshSubdivisionExplicit = true;
@@ -4336,38 +4372,6 @@ static void ExtractUiElements(const json& root, Ps1SceneExportResult& outResult)
     }
 }
 
-static void ExtractSkyboxBackground(const json& root, Ps1SceneExportResult& outResult) {
-    std::string bestTexture;
-    int bestPriority = std::numeric_limits<int>::min();
-    if (!root.contains("entities") || !root["entities"].is_array())
-        return;
-
-    auto scan = [&](auto&& self, const json& ent) -> void {
-        if (ent.is_object() && ent.contains("postProcessVolume") &&
-            ent["postProcessVolume"].is_object()) {
-            const json& pp = ent["postProcessVolume"];
-            const bool enabled = pp.value("enabled", true);
-            const bool skyboxEnabled = pp.value("skyboxEnabled", false);
-            const std::string texture = pp.value("skyboxTexture", std::string{});
-            const int priority = pp.value("priority", 0);
-            if (enabled && skyboxEnabled && !texture.empty() && priority >= bestPriority) {
-                bestPriority = priority;
-                bestTexture = texture;
-            }
-        }
-        if (ent.is_object() && ent.contains("children") && ent["children"].is_array()) {
-            for (const json& child : ent["children"])
-                self(self, child);
-        }
-    };
-
-    for (const json& ent : root["entities"])
-        scan(scan, ent);
-
-    if (!bestTexture.empty())
-        outResult.backgroundImagePath = bestTexture;
-}
-
 static void ExtractPostProcessFog(const json& root, Ps1SceneExportResult& outResult) {
     int bestPriority = std::numeric_limits<int>::min();
     bool found = false;
@@ -4399,6 +4403,15 @@ static void ExtractPostProcessFog(const json& root, Ps1SceneExportResult& outRes
                     outResult.fogColor[1] = ToByte01(pp["fogColor"][1].get<float>());
                     outResult.fogColor[2] = ToByte01(pp["fogColor"][2].get<float>());
                 }
+                // Matches PostProcessVolumeComponent's defaults when keys are absent.
+                outResult.skyEnabled = pp.value("skyboxEnabled", true);
+                const auto skyColor = [&](const char* key, uint8_t out[3]) {
+                    if (pp.contains(key) && pp[key].is_array() && pp[key].size() >= 3)
+                        for (int c = 0; c < 3; ++c) out[c] = ToByte01(pp[key][c].get<float>());
+                };
+                skyColor("skyTopColor", outResult.skyTop);
+                skyColor("skyHorizonColor", outResult.skyHorizon);
+                skyColor("skyGroundColor", outResult.skyGround);
             }
         }
         if (ent.is_object() && ent.contains("children") && ent["children"].is_array()) {
@@ -4435,139 +4448,6 @@ static bool ResolveTexturePathForBake(const fs::path& projectRoot, const fs::pat
         }
     }
     return false;
-}
-
-static uint8_t SampleSkyboxByte(const uint8_t* pixels, int width, int height, int channels,
-                                float u, float v, int c) {
-    u = u - std::floor(u);
-    v = std::clamp(v, 0.0f, 1.0f);
-    const int x = std::clamp(static_cast<int>(std::floor(u * static_cast<float>(width))), 0, width - 1);
-    const int y = std::clamp(static_cast<int>(std::floor(v * static_cast<float>(height))), 0, height - 1);
-    return pixels[(static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) *
-                  static_cast<size_t>(channels) + static_cast<size_t>(c)];
-}
-
-static void BakeSkyboxBackgroundForPs1(const json& root, const std::string& projectRootUtf8,
-                                       const fs::path& scenePath, const std::string& generatedDir,
-                                       Ps1SceneExportResult& outResult) {
-    std::string bestTexture;
-    float bestRotation = 0.0f;
-    float bestExposure = 0.0f;
-    glm::vec3 bestTint{ 1.0f };
-    int bestPriority = std::numeric_limits<int>::min();
-    if (!root.contains("entities") || !root["entities"].is_array())
-        return;
-
-    auto scan = [&](auto&& self, const json& ent) -> void {
-        if (ent.is_object() && ent.contains("postProcessVolume") &&
-            ent["postProcessVolume"].is_object()) {
-            const json& pp = ent["postProcessVolume"];
-            const bool enabled = pp.value("enabled", true);
-            const bool skyboxEnabled = pp.value("skyboxEnabled", false);
-            const std::string texture = pp.value("skyboxTexture", std::string{});
-            const int priority = pp.value("priority", 0);
-            if (enabled && skyboxEnabled && !texture.empty() && priority >= bestPriority) {
-                bestPriority = priority;
-                bestTexture = texture;
-                bestRotation = pp.value("skyboxRotation", 0.0f);
-                bestExposure = pp.value("skyboxExposure", 0.0f);
-                glm::vec3 tint{ 1.0f };
-                if (pp.contains("skyboxTint") && pp["skyboxTint"].is_array() &&
-                    pp["skyboxTint"].size() >= 3) {
-                    tint.r = pp["skyboxTint"][0].get<float>();
-                    tint.g = pp["skyboxTint"][1].get<float>();
-                    tint.b = pp["skyboxTint"][2].get<float>();
-                }
-                bestTint = tint;
-            }
-        }
-        if (ent.is_object() && ent.contains("children") && ent["children"].is_array()) {
-            for (const json& child : ent["children"])
-                self(self, child);
-        }
-    };
-    for (const json& ent : root["entities"])
-        scan(scan, ent);
-    if (bestTexture.empty())
-        return;
-
-    const fs::path projectRoot = PathUtf8::FromString(projectRootUtf8);
-    fs::path srcAbs;
-    if (!ResolveTexturePathForBake(projectRoot, scenePath, bestTexture, srcAbs)) {
-        outResult.backgroundImagePath = bestTexture;
-        return;
-    }
-
-    int srcW = 0, srcH = 0, srcC = 0;
-    const auto sourceBytes = AssetFiles::Read(srcAbs);
-    uint8_t* src = stbi_load_from_memory(sourceBytes.data(), static_cast<int>(sourceBytes.size()), &srcW, &srcH, &srcC, 4);
-    if (!src || srcW <= 0 || srcH <= 0) {
-        if (src) stbi_image_free(src);
-        outResult.backgroundImagePath = bestTexture;
-        return;
-    }
-
-    constexpr int outW = 256;
-    constexpr int outH = 192;
-    std::vector<uint8_t> out(static_cast<size_t>(outW) * static_cast<size_t>(outH) * 4u, 255u);
-
-    const Ps1ExportedEntity* camera = nullptr;
-    if (outResult.cameraEntityIndex >= 0 &&
-        static_cast<size_t>(outResult.cameraEntityIndex) < outResult.entities.size()) {
-        camera = &outResult.entities[static_cast<size_t>(outResult.cameraEntityIndex)];
-    }
-    const float fov = camera ? camera->cameraFov : 60.0f;
-    const float nearPlane = camera ? std::max(camera->cameraNear, 0.001f) : 0.1f;
-    const float farPlane = camera ? std::max(camera->cameraFar, nearPlane + 1.0f) : 100.0f;
-    const glm::mat4 invProjection = glm::inverse(glm::perspective(
-        glm::radians(fov), 4.0f / 3.0f, nearPlane, farPlane));
-    const glm::mat3 invView = camera
-        ? Ps1RotationMatrixFromEuler(glm::vec3(camera->rotation[0], camera->rotation[1], camera->rotation[2]))
-        : glm::mat3(1.0f);
-
-    const float rot = glm::radians(bestRotation);
-    const float s = std::sin(rot);
-    const float c = std::cos(rot);
-    const float exposureScale = std::exp2(bestExposure);
-    constexpr float pi = 3.14159265358979323846f;
-
-    for (int y = 0; y < outH; ++y) {
-        for (int x = 0; x < outW; ++x) {
-            const glm::vec2 uv{
-                (static_cast<float>(x) + 0.5f) / static_cast<float>(outW),
-                (static_cast<float>(outH - 1 - y) + 0.5f) / static_cast<float>(outH),
-            };
-            const glm::vec2 ndc = uv * 2.0f - glm::vec2(1.0f);
-            glm::vec4 view = invProjection * glm::vec4(ndc, 1.0f, 1.0f);
-            view = glm::vec4(glm::normalize(glm::vec3(view) / std::max(view.w, 0.0001f)), 0.0f);
-            glm::vec3 dir = glm::normalize(invView * glm::vec3(view));
-            dir = glm::normalize(glm::vec3(c * dir.x + s * dir.z, dir.y, -s * dir.x + c * dir.z));
-
-            const float sampleU = std::atan2(dir.z, dir.x) / (2.0f * pi) + 0.5f;
-            const float sampleV = 0.5f - std::asin(std::clamp(dir.y, -1.0f, 1.0f)) / pi;
-            const size_t dst = (static_cast<size_t>(y) * outW + static_cast<size_t>(x)) * 4u;
-            for (int ch = 0; ch < 3; ++ch) {
-                const float tint = ch == 0 ? bestTint.r : (ch == 1 ? bestTint.g : bestTint.b);
-                const float color = static_cast<float>(SampleSkyboxByte(src, srcW, srcH, 4, sampleU, sampleV, ch)) *
-                                    exposureScale * tint;
-                out[dst + static_cast<size_t>(ch)] =
-                    static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(color)), 0, 255));
-            }
-            out[dst + 3u] = 255u;
-        }
-    }
-
-    stbi_image_free(src);
-
-    const fs::path outPath = PathUtf8::FromString(generatedDir) / "ps1_skybox_background.png";
-    std::error_code ec;
-    fs::create_directories(outPath.parent_path(), ec);
-    if (stbi_write_png(PathUtf8::ToString(outPath).c_str(), outW, outH, 4,
-                       out.data(), outW * 4) != 0) {
-        outResult.backgroundImagePath = PathUtf8::ToString(outPath);
-    } else {
-        outResult.backgroundImagePath = bestTexture;
-    }
 }
 
 static void BuildUiGlyphs(Ps1SceneExportResult& outResult) {
@@ -4671,7 +4551,15 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
         }
 
         out << "/* Auto-generated by Mipsync PS1SceneExport. Do not edit. */\n"
-               "#include \"../runtime/scene.h\"\n\n";
+               "#include \"../runtime/scene.h\"\n\n"
+               "/* Customized runtimes whose scene.h predates ps1_entity.depth_bias_ot\n"
+               " * keep compiling: the trailing initializer then expands to nothing. */\n"
+               "#ifndef PS1_ENTITY_DEPTH_BIAS\n"
+               "#define PS1_ENTITY_DEPTH_BIAS(x)\n"
+               "#endif\n"
+               "#ifndef PS1_SCENE_SKY\n"
+               "#define PS1_SCENE_SKY(...)\n"
+               "#endif\n\n";
 
         out << "static const ps1_entity k_ps1_entities[] = {\n";
         for (size_t i = 0; i < data.entities.size(); ++i) {
@@ -4802,6 +4690,8 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                 << ", " << unsigned(e.animatorActionCondition) << ", " << ToFixed16(e.animatorActionThreshold)
                 << ", " << (e.renderUnlit ? 1 : 0)
                 << ", " << e.sourceEntityId << "u"
+                << ", " << (e.active ? 0 : 1)
+                << " PS1_ENTITY_DEPTH_BIAS(" << e.depthBiasOt << ")"
                 << " },\n";
         }
         out << "};\n\n";
@@ -4834,26 +4724,66 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
         }
         out << "};\n\n";
 
-        out << "static const ps1_script_binding k_ps1_bindings[] = {\n";
         std::unordered_map<std::string, int> classToModule;
         for (size_t i = 0; i < data.moduleClassNames.size(); ++i)
             classToModule[data.moduleClassNames[i]] = static_cast<int>(i);
 
+        std::vector<std::pair<size_t, const Ps1ExportedScript*>> bindings;
         for (size_t ei = 0; ei < data.entities.size(); ++ei) {
             const auto& e = data.entities[ei];
-          for (const auto& script : e.scripts) {
-            if (script.className.empty()) continue;
+            for (const auto& script : e.scripts) {
+                if (script.className.empty()) continue;
+                if (classToModule.find(script.className) == classToModule.end()) continue;
+                bindings.emplace_back(ei, &script);
+            }
+        }
+        for (size_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex) {
+            const Ps1ExportedScript& script = *bindings[bindingIndex].second;
+            const bool hasAssets = std::any_of(script.assetFieldPaths.begin(),
+                script.assetFieldPaths.end(),
+                [](const std::string& path) { return !path.empty(); });
+            if (!hasAssets) continue;
+            out << "static const char* const k_ps1_binding_assets_"
+                << bindingIndex << "[] = { ";
+            for (size_t fi = 0; fi < script.assetFieldPaths.size(); ++fi) {
+                if (fi) out << ", ";
+                out << json(script.assetFieldPaths[fi]).dump();
+            }
+            if (script.assetFieldPaths.empty()) out << "0";
+            out << " };\n";
+        }
+        out << "static const ps1_script_binding k_ps1_bindings[] = {\n";
+        for (size_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex) {
+            const auto [ei, scriptPtr] = bindings[bindingIndex];
+            const Ps1ExportedScript& script = *scriptPtr;
             auto it = classToModule.find(script.className);
-            if (it == classToModule.end()) continue;
             out << "    { " << ei << "u, " << it->second << "u, "
                 << static_cast<int>(script.fieldValuesQ16.size()) << "u, { ";
             for (size_t fi = 0; fi < script.fieldValuesQ16.size(); ++fi) {
                 out << script.fieldValuesQ16[fi];
                 if (fi + 1 < script.fieldValuesQ16.size()) out << ", ";
             }
-            out << " } },\n";
-          }
+            const bool hasAssets = std::any_of(script.assetFieldPaths.begin(),
+                script.assetFieldPaths.end(),
+                [](const std::string& path) { return !path.empty(); });
+            out << " }, " << (hasAssets
+                ? "k_ps1_binding_assets_" + std::to_string(bindingIndex)
+                : std::string("0")) << " },\n";
         }
+        out << "};\n\n";
+
+        out << "static const ps1_prefab_entry k_ps1_prefabs[] = {\n";
+        for (const auto& prefab : data.prefabs) {
+            out << "    { \"" << EscapeCString(prefab.path) << "\", "
+                << static_cast<unsigned>(prefab.rootIndices.size()) << "u, { ";
+            for (size_t i = 0; i < prefab.rootIndices.size(); ++i) {
+                out << prefab.rootIndices[i] << "u";
+                if (i + 1 < prefab.rootIndices.size()) out << ", ";
+            }
+            out << " } },\n";
+        }
+        if (data.prefabs.empty())
+            out << "    { 0, 0u, { 0 } },\n";
         out << "};\n\n";
 
         out << "static const char k_ps1_ui_text[] = \""
@@ -5012,7 +4942,13 @@ bool EmitSceneDataC(const Ps1SceneExportResult& data, const std::string& outCFil
                "    " << static_cast<int>(data.backgroundTextureIndex) << "u,\n"
                "    k_ps1_scene_lights,\n"
                "    " << data.lights.size() << "u,\n"
+               "    k_ps1_prefabs,\n"
+               "    " << data.prefabs.size() << "u,\n"
                "    " << (Ps1::NeedsColorGrading(data.colorGrading) ? "k_ps1_color_grading_lut" : "0") << "\n"
+               "    PS1_SCENE_SKY(" << (data.skyEnabled ? 1 : 0) << ", "
+            << int(data.skyTop[0]) << ", " << int(data.skyTop[1]) << ", " << int(data.skyTop[2]) << ", "
+            << int(data.skyHorizon[0]) << ", " << int(data.skyHorizon[1]) << ", " << int(data.skyHorizon[2]) << ", "
+            << int(data.skyGround[0]) << ", " << int(data.skyGround[1]) << ", " << int(data.skyGround[2]) << ")\n"
                "};\n";
         return out.good();
     } catch (const std::exception& ex) {
@@ -5853,7 +5789,16 @@ bool EmitAudioDataC(const std::string& projectRoot, Ps1SceneExportResult& data,
         if (!ensureClip(entity.audioClipPath, entity.audioSfx, entity.audioSample, entity.audioClipIndex))
             return false;
       for (auto& script : entity.scripts) {
+        const CompiledModule* module = nullptr;
+        for (const CompiledModule& candidate : data.modules)
+            if (candidate.className == script.className) {
+                module = &candidate;
+                break;
+            }
         for (size_t i = 0; i < script.assetFieldPaths.size(); ++i) {
+            if (!module || i >= module->fields.size() ||
+                module->fields[i].valueKind != FieldValueKind::AudioClip)
+                continue;
             uint8_t index = 0;
             if (!ensureClip(script.assetFieldPaths[i], IsMidiPath(script.assetFieldPaths[i]), false, index))
                 return false;
@@ -6467,7 +6412,13 @@ std::shared_ptr<Mesh> BuildPs1PreviewMeshInternal(const Mesh& sourceMesh, bool p
         return nullptr;
 
     const float previewHalf = std::max(MeshBBoxHalfExtent(simp.verts), 1e-6f);
-    const float toRuntimeWorld = 0.5f / previewHalf;
+    // Whole meshes are already fitted to unit size by the importer. A model
+    // part must keep its whole-model scale: the PS1 exporter, the PC renderer
+    // and entity bounds all use it. Re-fitting each part to unit size made a
+    // tire part ~7x larger in the Editor's PS1 preview than in a PS1 build.
+    const float toRuntimeWorld = sourceMesh.IsModelPart()
+        ? sourceHalf / previewHalf
+        : 0.5f / previewHalf;
     for (auto& v : simp.verts)
         v.position *= toRuntimeWorld;
 
@@ -7766,6 +7717,180 @@ std::shared_ptr<MipsyncEngine::SkinnedMesh> BuildPs1RigidBonePreview(
     return std::make_shared<MipsyncEngine::SkinnedMesh>(finalVertices, finalIndices);
 }
 
+namespace {
+
+bool CollectPrefabRequirements(
+    const json& entities, const std::string& projectRoot,
+    std::map<std::string, uint32_t>& requirements, std::string& outError) {
+    std::unordered_map<std::string, std::shared_ptr<CompiledModule>> cache;
+    std::function<bool(const json&)> visit = [&](const json& ent) -> bool {
+        std::vector<const json*> scripts;
+        if (ent.contains("mipsScripts") && ent["mipsScripts"].is_array())
+            for (const json& script : ent["mipsScripts"])
+                if (script.is_object() && script.value("enabled", true))
+                    scripts.push_back(&script);
+        if (ent.contains("mipsScript") && ent["mipsScript"].is_object() &&
+            ent["mipsScript"].value("enabled", true))
+            scripts.push_back(&ent["mipsScript"]);
+        for (const json* script : scripts) {
+            if (!script->contains("path") || !(*script)["path"].is_string())
+                continue;
+            const std::string path = (*script)["path"].get<std::string>();
+            auto cached = cache.find(path);
+            if (cached == cache.end()) {
+                const fs::path abs =
+                    PathUtf8::FromString(projectRoot) / PathUtf8::FromString(path);
+                std::vector<std::string> errors;
+                auto module = MipsRuntime::CompileScriptFile(
+                    PathUtf8::ToString(abs), errors);
+                if (!module) {
+                    // The normal script compilation pass reports the error.
+                    continue;
+                }
+                cached = cache.emplace(path, std::move(module)).first;
+            }
+            const CompiledModule& module = *cached->second;
+            if (module.ps1DynamicPrefabSpawn) {
+                outError = "PS1 Scene.Spawn/Prewarm requires a literal prefab path "
+                           "or a Prefab field: " + path;
+                return false;
+            }
+            for (const PrefabRequirement& requirement : module.prefabRequirements) {
+                std::string prefabPath = requirement.path;
+                if (prefabPath.empty() && !requirement.fieldName.empty()) {
+                    if (module.FindFieldIndex(requirement.fieldName) < 0) {
+                        outError = "PS1 prefab path must be a literal or a Prefab field: " +
+                                   path + "." + requirement.fieldName;
+                        return false;
+                    }
+                    if (!script->contains("fields") ||
+                        !(*script)["fields"].is_object() ||
+                        !(*script)["fields"].contains(requirement.fieldName) ||
+                        !(*script)["fields"][requirement.fieldName].is_string()) {
+                        outError = "PS1 Prefab field is unset: " + path + "." +
+                                   requirement.fieldName;
+                        return false;
+                    }
+                    prefabPath = (*script)["fields"][requirement.fieldName]
+                                     .get<std::string>();
+                }
+                if (prefabPath.empty()) {
+                    outError = "PS1 Prefab field is unset: " + path + "." +
+                               requirement.fieldName;
+                    return false;
+                }
+                uint32_t requested = requirement.capacity;
+                if (!requirement.capacityFieldName.empty()) {
+                    // Scene value first, then the declared field default.
+                    double value = 0.0;
+                    const json* fields = script->contains("fields") &&
+                        (*script)["fields"].is_object() ? &(*script)["fields"] : nullptr;
+                    if (fields && fields->contains(requirement.capacityFieldName) &&
+                        (*fields)[requirement.capacityFieldName].is_number()) {
+                        value = (*fields)[requirement.capacityFieldName].get<double>();
+                    } else {
+                        const int index = module.FindFieldIndex(requirement.capacityFieldName);
+                        if (index >= 0) {
+                            const uint16_t constant = module.fields[index].defaultConstIndex;
+                            if (constant < module.numberConstants.size())
+                                value = module.numberConstants[constant];
+                        }
+                    }
+                    if (value >= 1.0)
+                        requested = std::max(requested, static_cast<uint32_t>(value));
+                    else
+                        MIPSYNC_WARN("PS1 prefab '{}': Prewarm capacity field {}.{} is {}; "
+                                     "using the default", prefabPath, path,
+                                     requirement.capacityFieldName, value);
+                }
+                if (requested > kPs1PrefabRootCap)
+                    MIPSYNC_WARN("PS1 prefab '{}': requested capacity {} exceeds the "
+                                 "PS1 limit {}; clamping", prefabPath, requested,
+                                 kPs1PrefabRootCap);
+                uint32_t& capacity = requirements[prefabPath];
+                capacity = std::max(capacity, requested);
+            }
+        }
+        if (ent.contains("children") && ent["children"].is_array())
+            for (const json& child : ent["children"])
+                if (!visit(child))
+                    return false;
+        return true;
+    };
+    for (const json& ent : entities)
+        if (!visit(ent))
+            return false;
+    return true;
+}
+
+uint32_t MaxSourceId(const json& ent) {
+    uint32_t result = ent.value("id", 0u);
+    if (ent.contains("children") && ent["children"].is_array())
+        for (const json& child : ent["children"])
+            result = std::max(result, MaxSourceId(child));
+    return result;
+}
+
+uint32_t AssignPrefabIds(json& ent, uint32_t nextId,
+                         std::unordered_set<uint32_t>& sourceIds) {
+    const uint32_t assigned = nextId++;
+    ent["id"] = assigned;
+    ent.erase("parent");
+    ent["active"] = false;
+    sourceIds.insert(assigned);
+    if (ent.contains("children") && ent["children"].is_array())
+        for (json& child : ent["children"])
+            nextId = AssignPrefabIds(child, nextId, sourceIds);
+    return nextId;
+}
+
+bool AppendPrefabCopies(
+    json& root, const std::string& projectRoot,
+    const std::map<std::string, uint32_t>& requirements,
+    std::vector<Ps1ExportedPrefab>& outPrefabs,
+    std::unordered_set<uint32_t>& prefabSourceIds,
+    std::unordered_set<std::string>& appendedPaths,
+    std::string& outError) {
+    uint32_t nextId = 1;
+    for (const json& ent : root["entities"])
+        nextId = std::max(nextId, MaxSourceId(ent) + 1u);
+
+    for (const auto& [path, requested] : requirements) {
+        if (appendedPaths.contains(path))
+            continue;
+        const uint32_t capacity = std::clamp<uint32_t>(
+            requested == 0 ? 4u : requested, 1u, kPs1PrefabRootCap);
+        const fs::path absolute =
+            PathUtf8::FromString(projectRoot) / PathUtf8::FromString(path);
+        json prefabRoot;
+        try {
+            std::istringstream input(AssetFiles::ReadText(absolute));
+            input >> prefabRoot;
+        } catch (const std::exception& ex) {
+            outError = "Cannot read PS1 prefab '" + path + "': " + ex.what();
+            return false;
+        }
+        if (!prefabRoot.contains("entity") || !prefabRoot["entity"].is_object()) {
+            outError = "Invalid PS1 prefab (missing entity): " + path;
+            return false;
+        }
+        Ps1ExportedPrefab prefab;
+        prefab.path = path;
+        for (uint32_t copy = 0; copy < capacity; ++copy) {
+            json clone = prefabRoot["entity"];
+            nextId = AssignPrefabIds(clone, nextId, prefabSourceIds);
+            prefab.rootSourceIds.push_back(clone.value("id", 0u));
+            root["entities"].push_back(std::move(clone));
+        }
+        MIPSYNC_INFO("PS1 prefab '{}': {} runtime instance(s)", path, capacity);
+        outPrefabs.push_back(std::move(prefab));
+        appendedPaths.insert(path);
+    }
+    return true;
+}
+
+} // namespace
+
 bool ExportPs1SceneAndScripts(const std::string& projectRoot,
                               const BuildManifest& bootManifest,
                               const std::string& generatedDir,
@@ -7838,6 +7963,27 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
         root["entities"] = FilterActivePs1Entities(
             root["entities"], inactiveSourceEntityIds);
 
+        // Expand runtime-prefab spawns into inactive PS1 entity copies. PC
+        // loads the .nprefab directly; PS1 reuses these baked instances.
+        std::map<std::string, uint32_t> prefabRequirements;
+        if (!CollectPrefabRequirements(root["entities"], projectRoot,
+                                       prefabRequirements, outError))
+            return false;
+        std::unordered_set<uint32_t> prefabSourceIds;
+        std::unordered_set<std::string> appendedPrefabs;
+        for (int pass = 0; pass < 4; ++pass) {
+            if (!AppendPrefabCopies(root, projectRoot, prefabRequirements,
+                                    outResult.prefabs, prefabSourceIds,
+                                    appendedPrefabs, outError))
+                return false;
+            const size_t before = prefabRequirements.size();
+            if (!CollectPrefabRequirements(root["entities"], projectRoot,
+                                           prefabRequirements, outError))
+                return false;
+            if (prefabRequirements.size() == before)
+                break;
+        }
+
         std::unordered_map<uint32_t, Ps1ResolvedTransform> flatWorldTransforms;
         BuildFlatWorldTransforms(root["entities"], flatWorldTransforms);
         std::unordered_map<uint32_t, Ps1ResolvedAnimator> flatAnimatorContexts;
@@ -7850,8 +7996,15 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
                               glm::vec3(0.0f), glm::vec3(0.0f), glm::vec3(1.0f),
                               &flatWorldTransforms, &flatAnimatorContexts, nullptr, 0,
                               &flatControlRoots);
+        if (!prefabSourceIds.empty()) {
+            for (Ps1ExportedEntity& entity : outResult.entities) {
+                if (prefabSourceIds.contains(entity.sourceEntityId)) {
+                    entity.active = false;
+                    entity.meshEnabled = false;
+                }
+            }
+        }
         ExtractUiElements(root, outResult);
-        ExtractSkyboxBackground(root, outResult);
         ExtractPostProcessFog(root, outResult);
         BuildUiGlyphs(outResult);
 
@@ -7859,6 +8012,8 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
         auto scanLights = [&](auto&& self, const json& e, const glm::mat4& parent) -> void {
             glm::mat4 world = parent * Ps1TransformMatrix(ReadEntityLocalTransform(e));
             const uint32_t sourceId = e.value("id", 0u);
+            if (prefabSourceIds.contains(sourceId))
+                return;
             if (const auto it = flatWorldTransforms.find(sourceId); it != flatWorldTransforms.end())
                 world = it->second.matrix;
             if (e.contains("light") && e["light"].is_object() &&
@@ -7949,7 +8104,8 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
             script.assetFieldPaths.resize(mod->fields.size());
             for (size_t fi = 0; fi < mod->fields.size(); ++fi) {
                 const auto& field = mod->fields[fi];
-                if (field.valueKind == FieldValueKind::AudioClip) {
+                if (field.valueKind == FieldValueKind::AudioClip ||
+                    field.valueKind == FieldValueKind::Prefab) {
                     auto assetIt = script.assetFieldOverrides.find(field.name);
                     if (assetIt != script.assetFieldOverrides.end())
                         script.assetFieldPaths[fi] = assetIt->second;
@@ -7974,6 +8130,18 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
             entityIndexById[outResult.entities[i].id] = static_cast<int>(i);
             if (outResult.entities[i].sourceEntityId != 0)
                 entityIndexBySourceId[outResult.entities[i].sourceEntityId] = static_cast<int>(i);
+        }
+
+        for (Ps1ExportedPrefab& prefab : outResult.prefabs) {
+            for (uint32_t sourceId : prefab.rootSourceIds) {
+                const auto found = entityIndexBySourceId.find(sourceId);
+                if (found == entityIndexBySourceId.end() || found->second > 65535) {
+                    outError = "PS1 prefab root entity was not exported: " + prefab.path;
+                    return false;
+                }
+                prefab.rootIndices.push_back(
+                    static_cast<uint16_t>(found->second));
+            }
         }
 
         for (auto& group : outResult.uiButtonGroups) {
@@ -8084,6 +8252,8 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
         int bestAnyCamera = -1;
         for (size_t i = 0; i < outResult.entities.size(); ++i) {
             auto& e = outResult.entities[i];
+            if (prefabSourceIds.contains(e.sourceEntityId))
+                continue;
             if (e.hasCamera && e.cameraShotTriggerId != 0) {
                 auto it = entityIndexBySourceId.find(e.cameraShotTriggerId);
                 if (it != entityIndexBySourceId.end())
@@ -8112,7 +8282,6 @@ bool ExportPs1SceneAndScripts(const std::string& projectRoot,
             }
         }
         outResult.cameraEntityIndex = bestPrimaryCamera >= 0 ? bestPrimaryCamera : bestAnyCamera;
-        BakeSkyboxBackgroundForPs1(root, projectRoot, scenePath, generatedDir, outResult);
 
         // Count bindings.
         for (const auto& e : outResult.entities) {

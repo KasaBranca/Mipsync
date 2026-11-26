@@ -18,15 +18,27 @@ if(NOT IS_DIRECTORY "${_installs_root}")
 endif()
 
 file(GLOB _candidates LIST_DIRECTORIES true "${_installs_root}/v*")
+# Same selection as DeployLatestInstalledEditor.cmake: formal releases
+# (v1.0.0f1, major 1..1999) win over date-style builds (v2026.10.18). The old
+# pattern ignored the f/a/b suffix and sent the CLI to a different install
+# than the Editor.
 set(_versions)
+set(_formal_versions)
 foreach(_candidate IN LISTS _candidates)
     if(IS_DIRECTORY "${_candidate}")
         get_filename_component(_name "${_candidate}" NAME)
-        if(_name MATCHES "^v[0-9]+(\\.[0-9]+)*$")
-            list(APPEND _versions "${_candidate}")
+        if(_name MATCHES "^v([0-9]+)\\.[0-9]+\\.[0-9]+([abf][1-9][0-9]*)?$")
+            if(CMAKE_MATCH_1 GREATER 0 AND CMAKE_MATCH_1 LESS 2000)
+                list(APPEND _formal_versions "${_candidate}")
+            else()
+                list(APPEND _versions "${_candidate}")
+            endif()
         endif()
     endif()
 endforeach()
+if(_formal_versions)
+    set(_versions ${_formal_versions})
+endif()
 if(NOT _versions)
     message(STATUS "No versioned Mipsync install found; skipping installed CLI deployment")
     return()
@@ -34,8 +46,23 @@ endif()
 
 list(SORT _versions COMPARE NATURAL ORDER DESCENDING)
 list(GET _versions 0 _latest)
+set(_destination "${_latest}/mipsync.exe")
+if(EXISTS "${_destination}")
+    file(SHA256 "${CLI_EXE}" _new_hash)
+    file(SHA256 "${_destination}" _old_hash)
+    if(_new_hash STREQUAL _old_hash)
+        message(STATUS "MipsyncCLI already current in ${_latest}")
+        return()
+    endif()
+    # Keep the replaced CLI, like the Editor deployment does.
+    string(TIMESTAMP _stamp "%Y%m%d-%H%M%S" UTC)
+    file(COPY_FILE "${_destination}" "${_destination}.previous-${_stamp}" RESULT _backup_result)
+    if(NOT _backup_result STREQUAL "0")
+        message(FATAL_ERROR "Could not preserve installed CLI ${_destination}: ${_backup_result}")
+    endif()
+endif()
 execute_process(
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CLI_EXE}" "${_latest}/mipsync.exe"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CLI_EXE}" "${_destination}"
     RESULT_VARIABLE _copy_result
 )
 if(NOT _copy_result EQUAL 0)

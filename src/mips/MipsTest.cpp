@@ -8,12 +8,12 @@
 #include "../scene/Scene.h"
 #include "../scene/SceneIO.h"
 #include "../physics/PhysicsWorld.h"
-#include "../ps1/PSync.h"
 #include "../../tests/SceneHierarchyTests.h"
 #include "../../tests/EditorSceneSessionTests.h"
 #include "../../tests/AssetBrowserSelectionTests.h"
 #include "../../tests/EditorUndoHistoryTests.h"
 #include "../../tests/MipsFieldReloadTests.h"
+#include "../../tests/MipsPrefabSpawnTests.h"
 #include "../../tests/FPSControllerInputTests.h"
 #include "../../tests/MipsDestroyTests.h"
 #include "../../tests/MipsObjectReferenceTests.h"
@@ -50,6 +50,9 @@ bool RunMipsRuntimeRegressionTests(const char* scriptPath,
     if (!RunMipsFieldReloadTests(hierarchyError)) {
         errors.push_back(hierarchyError); return false;
     }
+    if (!RunMipsPrefabSpawnTests(hierarchyError)) {
+        errors.push_back(hierarchyError); return false;
+    }
     if (!RunEditorUndoHistoryTests(hierarchyError)) {
         errors.push_back(hierarchyError); return false;
     }
@@ -84,62 +87,6 @@ bool RunMipsRuntimeRegressionTests(const char* scriptPath,
     }
 
     VM vm;
-    {
-        // P-Sync must count executed operations, including host calls, without
-        // changing script semantics or retaining counts across game frames.
-        ScriptInstance profiled;
-        profiled.module = std::make_shared<CompiledModule>();
-        profiled.module->numberConstants = {2.0, 3.0};
-        BytecodeWriter writer;
-        writer.EmitOp(OpCode::PushConst); writer.EmitU16(0);
-        writer.EmitOp(OpCode::PushConst); writer.EmitU16(1);
-        writer.EmitOp(OpCode::Add); writer.EmitOp(OpCode::Pop);
-        writer.EmitOp(OpCode::CallHost); writer.EmitU16(static_cast<uint16_t>(HostFunc::Time_DeltaTime)); writer.EmitU8(0);
-        writer.EmitOp(OpCode::Pop); writer.EmitOp(OpCode::Return);
-        CompiledMethod method;
-        method.name = "Profile"; method.code = writer.Code();
-        profiled.module->methods.push_back(method);
-        VM counter;
-        counter.SetPerformanceCounting(true);
-        if (!counter.RunMethod(profiled, "Profile", errors)) return false;
-        uint64_t instructions = 0;
-        for (const uint64_t count : counter.GetOpcodeCounts()) instructions += count;
-        if (instructions != 7 || counter.GetHostCounts()[static_cast<uint16_t>(HostFunc::Time_DeltaTime)] != 1) {
-            errors.push_back("P-Sync regression: executed VM workload wasn't counted correctly");
-            return false;
-        }
-        counter.ResetPerformanceCounts();
-        counter.SetPerformanceCounting(false);
-        if (!counter.RunMethod(profiled, "Profile", errors)) return false;
-        for (const uint64_t count : counter.GetOpcodeCounts()) {
-            if (count) { errors.push_back("P-Sync regression: disabled profiling accumulated operations"); return false; }
-        }
-    }
-    {
-        // At ~15 FPS, physics must consume the same four-field delta as scripts
-        // rather than silently truncating character movement to 50 ms.
-        Scene scene;
-        Entity* character = scene.CreateEntity("P-Sync timing regression");
-        character->AddComponent<ColliderComponent>().shape = ColliderShape::Capsule;
-        auto& body = character->AddComponent<RigidbodyComponent>();
-        body.characterController = true;
-        body.useGravity = false;
-        PhysicsWorld physics;
-        physics.BeginPlay(scene);
-        const float logicDelta = PSyncSimulationDeltaTime(4);
-        auto checkMovement = [&](bool sync) {
-            const float before = scene.GetWorldPosition(*character).x;
-            if (!physics.SetCharacterVelocity(*character, glm::vec3(1, 0, 0))) return false;
-            if (sync) physics.Simulate(scene, logicDelta, logicDelta);
-            else physics.Simulate(scene, logicDelta);
-            const float expected = sync ? logicDelta : 0.05f;
-            return std::abs(scene.GetWorldPosition(*character).x - before - expected) < 1e-5f;
-        };
-        if (!checkMovement(true) || !checkMovement(false)) {
-            errors.push_back("P-Sync regression: physics and script frame deltas diverged");
-            return false;
-        }
-    }
     if (!vm.RunMethod(instance, "Start", errors))
         return false;
     const int resultField = module->FindFieldIndex("result");

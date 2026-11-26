@@ -32,6 +32,7 @@ set(MIPSYNC_ENGINE_SOURCES
     animation/SkinnedMesh.cpp
     assets/AssetManager.cpp
     assets/AssetThumbnail.cpp
+    assets/BuiltinAssets.cpp
     assets/Material.cpp
     audio/AudioDecoder.cpp
     audio/MemoryAudioVoice.cpp
@@ -55,7 +56,6 @@ set(MIPSYNC_ENGINE_SOURCES
     core/BootSplash.cpp
     core/PlayLoadingProcess.cpp
     core/Engine.cpp
-    ps1/PSync.cpp
     core/Input.cpp
     core/Log.cpp
     core/OsFileDrop.cpp
@@ -269,7 +269,7 @@ add_executable(MipsyncUnlitRendererTests
     ${CMAKE_SOURCE_DIR}/tests/UnlitRendererTests.cpp
     renderer/ProjectRenderer.cpp renderer/Renderer.cpp renderer/Shader.cpp renderer/Mesh.cpp
     renderer/Camera.cpp renderer/Texture.cpp renderer/Framebuffer.cpp
-    animation/SkinnedMesh.cpp scene/Transform.cpp core/Log.cpp ps1/PSync.cpp)
+    animation/SkinnedMesh.cpp scene/Transform.cpp core/Log.cpp)
 target_include_directories(MipsyncUnlitRendererTests PRIVATE
     ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/generated)
 target_compile_definitions(MipsyncUnlitRendererTests PRIVATE GLFW_INCLUDE_NONE)
@@ -380,6 +380,10 @@ add_test(NAME MipsyncPs1FogBounds COMMAND MipsyncPs1FogBoundsTests)
 add_executable(MipsyncPs1WorldProjectionTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1WorldProjectionTests.c)
 add_test(NAME MipsyncPs1WorldProjection COMMAND MipsyncPs1WorldProjectionTests)
+add_executable(MipsyncPs1GteRotationTests ${CMAKE_SOURCE_DIR}/tests/Ps1GteRotationTests.c)
+add_test(NAME MipsyncPs1GteRotation COMMAND MipsyncPs1GteRotationTests)
+add_executable(MipsyncPs1AffineSubdivisionTests ${CMAKE_SOURCE_DIR}/tests/Ps1AffineSubdivisionTests.c)
+add_test(NAME MipsyncPs1AffineSubdivision COMMAND MipsyncPs1AffineSubdivisionTests)
 add_executable(MipsyncPs1TexturePaletteTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1TexturePaletteTests.c
     ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/textures.c)
@@ -388,7 +392,8 @@ target_include_directories(MipsyncPs1TexturePaletteTests PRIVATE
 add_test(NAME MipsyncPs1TexturePalette COMMAND MipsyncPs1TexturePaletteTests)
 add_executable(MipsyncPs1TextureResolutionTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1TextureResolutionTests.cpp
-    mips/PS1TextureExport.cpp assets/Material.cpp core/Log.cpp)
+    mips/PS1TextureExport.cpp assets/Material.cpp assets/BuiltinAssets.cpp
+    core/RuntimePaths.cpp core/Log.cpp)
 target_include_directories(MipsyncPs1TextureResolutionTests PRIVATE
     ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(MipsyncPs1TextureResolutionTests PRIVATE
@@ -439,19 +444,17 @@ target_include_directories(MipsyncMidiTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(MipsyncMidiTests PRIVATE cxx_std_20)
 add_test(NAME MipsyncMidi COMMAND MipsyncMidiTests)
 
-add_executable(MipsyncPSyncTests ${CMAKE_SOURCE_DIR}/tests/PSyncTests.cpp ps1/PSync.cpp
-    ${CMAKE_SOURCE_DIR}/tests/PSyncFrameTimingTests.c
+add_executable(MipsyncPs1FrameTimingTests ${CMAKE_SOURCE_DIR}/tests/Ps1FrameTimingTests.cpp
+    ${CMAKE_SOURCE_DIR}/tests/Ps1FrameTimingTests.c
     ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/fixedp.c)
-target_compile_features(MipsyncPSyncTests PRIVATE cxx_std_20)
-target_include_directories(MipsyncPSyncTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(MipsyncPSyncTests PRIVATE glm::glm)
-add_test(NAME MipsyncPSync COMMAND MipsyncPSyncTests)
-add_executable(MipsyncPSyncInputTests ${CMAKE_SOURCE_DIR}/tests/PSyncInputTests.cpp)
-target_compile_features(MipsyncPSyncInputTests PRIVATE cxx_std_20)
-target_include_directories(MipsyncPSyncInputTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(MipsyncPSyncInputTests PRIVATE glm::glm glfw)
-add_test(NAME MipsyncPSyncInput COMMAND MipsyncPSyncInputTests)
-add_test(NAME MipsyncPSyncVM COMMAND MipsyncEngine --test-mips-runtime
+target_compile_features(MipsyncPs1FrameTimingTests PRIVATE cxx_std_20)
+add_test(NAME MipsyncPs1FrameTiming COMMAND MipsyncPs1FrameTimingTests)
+add_executable(MipsyncInputTests ${CMAKE_SOURCE_DIR}/tests/InputTests.cpp)
+target_compile_features(MipsyncInputTests PRIVATE cxx_std_20)
+target_include_directories(MipsyncInputTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(MipsyncInputTests PRIVATE glm::glm glfw)
+add_test(NAME MipsyncInput COMMAND MipsyncInputTests)
+add_test(NAME MipsyncMipsVM COMMAND MipsyncEngine --test-mips-runtime
     "${CMAKE_SOURCE_DIR}/tests/mips/ArraysCoroutines.mips")
 add_executable(MipsyncComponentPickerTests
     ${CMAKE_SOURCE_DIR}/tests/EditorComponentPickerTests.cpp editor/EditorComponentPicker.cpp)
@@ -494,7 +497,7 @@ add_test(NAME MipsyncRuntimeRegression
     COMMAND $<TARGET_FILE:MipsyncEngine>
             --test-mips-runtime "${CMAKE_SOURCE_DIR}/tests/mips/ArraysCoroutines.mips")
 # Both entries execute the same round-trip tests with shared legacy temp paths.
-set_tests_properties(MipsyncPSyncVM MipsyncRuntimeRegression PROPERTIES
+set_tests_properties(MipsyncMipsVM MipsyncRuntimeRegression PROPERTIES
     RESOURCE_LOCK MipsyncRuntimeFixtures)
 add_test(NAME MipsyncSilentHillControllerValidation
     COMMAND $<TARGET_FILE:MipsyncEngine>
@@ -597,6 +600,17 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/resources/icons/app_icon.png")
             "${CMAKE_SOURCE_DIR}/resources/icons/app_icon.png"
             "$<TARGET_FILE_DIR:MipsyncEngine>/resources/icons/app_icon.png"
         COMMENT "Copying window icon next to executable"
+    )
+endif()
+
+# Read-only built-in assets (default material + checker texture) referenced
+# by projects as "builtin/...". They are engine files, never project files.
+if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/resources/builtin")
+    add_custom_command(TARGET MipsyncEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/resources/builtin"
+            "$<TARGET_FILE_DIR:MipsyncEngine>/resources/builtin"
+        COMMENT "Copying built-in resources next to executable"
     )
 endif()
 

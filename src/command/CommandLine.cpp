@@ -1,5 +1,6 @@
 #include "CommandLine.h"
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cctype>
@@ -82,10 +83,27 @@ ParsedCommandLine ParseCommandLine(const std::vector<std::string>& args,
                                    const CommandRegistry& registry) {
     ParsedCommandLine parsed;
     std::vector<std::string> commandTokens;
+    struct PendingFieldSelector { size_t tokenIndex = 0; std::string option; std::string value; };
+    std::vector<PendingFieldSelector> pendingFieldSelectors;
     for (size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--json") { parsed.json = true; continue; }
         if (args[i] == "--quiet") { parsed.quiet = true; continue; }
-        if (args[i] == "--fields" || args[i] == "--select" || args[i] == "--out" ||
+        if (args[i] == "--fields" || args[i] == "--select") {
+            const auto option = args[i];
+            if (i + 1 == args.size()) { parsed.error = "missing value for " + option; return parsed; }
+            const size_t index = commandTokens.size();
+            if (option == "--select") {
+                // --select is always a global output projection. --fields may
+                // belong to a command that declares a "fields" parameter.
+                pendingFieldSelectors.push_back({index, option, args[++i]});
+            } else {
+                pendingFieldSelectors.push_back({index, option, args[i + 1]});
+                commandTokens.push_back(args[i]);
+                commandTokens.push_back(args[++i]);
+            }
+            continue;
+        }
+        if (args[i] == "--out" ||
             args[i] == "--output-format" || args[i] == "--max-depth") {
             const auto option = args[i];
             if (i + 1 == args.size()) { parsed.error = "missing value for " + option; return parsed; }
@@ -119,21 +137,31 @@ ParsedCommandLine ParseCommandLine(const std::vector<std::string>& args,
     }
     if (commandTokens.empty()) commandTokens.push_back("help");
 
+    std::vector<std::string> detectionTokens;
+    for (size_t i = 0; i < commandTokens.size(); ++i) {
+        if (commandTokens[i] == "--fields" && i + 1 < commandTokens.size()) {
+            ++i; // global/command selector pairs are not command names
+            continue;
+        }
+        detectionTokens.push_back(commandTokens[i]);
+    }
+    if (detectionTokens.empty()) detectionTokens.push_back("help");
+
     const CommandDescriptor* descriptor = nullptr;
     size_t consumed = 0;
-    for (size_t count = std::min<size_t>(4, commandTokens.size()); count > 0; --count) {
+    for (size_t count = std::min<size_t>(4, detectionTokens.size()); count > 0; --count) {
         std::string candidate;
         for (size_t i = 0; i < count; ++i) {
             if (!candidate.empty()) candidate += '.';
-            candidate += commandTokens[i];
+            candidate += detectionTokens[i];
         }
         if (const auto* found = registry.Find(candidate)) {
             descriptor = found;
             consumed = count;
             break;
         }
-        if (count == 1 && commandTokens[0].find('.') != std::string::npos) {
-            if (const auto* found = registry.Find(commandTokens[0])) {
+        if (count == 1 && detectionTokens[0].find('.') != std::string::npos) {
+            if (const auto* found = registry.Find(detectionTokens[0])) {
                 descriptor = found;
                 consumed = 1;
                 break;
@@ -141,8 +169,30 @@ ParsedCommandLine ParseCommandLine(const std::vector<std::string>& args,
         }
     }
     if (!descriptor) {
-        parsed.error = "unknown command: " + commandTokens[0];
+        parsed.error = "unknown command: " + detectionTokens[0];
         return parsed;
+    }
+
+    const bool commandHasFields = std::any_of(descriptor->parameters.begin(), descriptor->parameters.end(),
+        [](const ParameterDescriptor& item) { return item.name == "fields"; });
+    std::vector<size_t> removeTokens;
+    for (const auto& selector : pendingFieldSelectors) {
+        if (selector.option == "--select") {
+            parsed.fields = selector.value;
+            continue;
+        }
+        const bool commandArgument = commandHasFields && selector.tokenIndex >= consumed;
+        if (commandArgument)
+            continue;
+        parsed.fields = selector.value;
+        removeTokens.push_back(selector.tokenIndex);
+    }
+    std::sort(removeTokens.begin(), removeTokens.end(), std::greater<size_t>());
+    for (size_t index : removeTokens) {
+        if (index + 1 < commandTokens.size()) {
+            commandTokens.erase(commandTokens.begin() + static_cast<std::ptrdiff_t>(index),
+                                commandTokens.begin() + static_cast<std::ptrdiff_t>(index + 2));
+        }
     }
 
     parsed.request.command = descriptor->id;

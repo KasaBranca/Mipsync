@@ -7,20 +7,19 @@
 
 namespace MipsyncEngine {
 
-bool DrawGameViewControls(GameViewSettings& settings, const PSyncState* pSync) {
+bool DrawGameViewControls(GameViewSettings& settings) {
     EditorToolbar toolbar;
     bool changed = false;
     const float gizmoWidth = EditorToolbar::IconButtonWidth("Gizmos");
-    const float syncWidth = EditorToolbar::IconButtonWidth("P-Sync");
     float statsWidth = EditorToolbar::IconButtonWidth("Statistics");
     float modeWidth = ImGui::CalcTextSize("Play Maximized").x + 16.0f + ImGui::GetFrameHeight();
-    const bool compact = modeWidth + statsWidth + gizmoWidth + syncWidth > toolbar.Width();
+    const bool compact = modeWidth + statsWidth + gizmoWidth > toolbar.Width();
     if (compact) {
         statsWidth = EditorToolbar::IconButtonWidth("Stats");
         modeWidth = ImGui::CalcTextSize("Maximized").x + 16.0f + ImGui::GetFrameHeight();
     }
-    const bool wrap = 60.0f + statsWidth + gizmoWidth + syncWidth > toolbar.Width();
-    modeWidth = wrap ? toolbar.Width() : std::max(60.0f, std::min(modeWidth, toolbar.Width() - statsWidth - gizmoWidth - syncWidth));
+    const bool wrap = 60.0f + statsWidth + gizmoWidth > toolbar.Width();
+    modeWidth = wrap ? toolbar.Width() : std::max(60.0f, std::min(modeWidth, toolbar.Width() - statsWidth - gizmoWidth));
     const bool maximized = settings.playMode == GameViewPlayMode::Maximized;
     const char* preview = compact ? (maximized ? "Maximized" : "Focused")
                                   : (maximized ? "Play Maximized" : "Play Focused");
@@ -43,7 +42,7 @@ bool DrawGameViewControls(GameViewSettings& settings, const PSyncState* pSync) {
         secondRow.emplace();
         toggles = &*secondRow;
     }
-    toggles->SetX(std::max(toggles->CursorX(), toggles->Width() - statsWidth - gizmoWidth - syncWidth));
+    toggles->SetX(std::max(toggles->CursorX(), toggles->Width() - statsWidth - gizmoWidth));
     auto toggle = [&](const char* label, ToolbarIcon icon, bool& enabled, float width, const char* tooltip) {
         if (toggles->CursorX() > 0.0f && width > toggles->Width() - toggles->CursorX() + 0.5f) {
             toggles->End();
@@ -56,11 +55,6 @@ bool DrawGameViewControls(GameViewSettings& settings, const PSyncState* pSync) {
         if (wasEnabled) ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
     };
-    toggle("P-Sync", ToolbarIcon::PSync, settings.pSync, syncWidth, "Run the game at the predicted PS1 frame rate\nNTSC / 320 x 240. Performance estimate, not a hardware measurement.");
-    if (pSync && settings.pSync && ImGui::IsItemHovered())
-        ImGui::SetTooltip("PS1 estimate: %.1f FPS (%u VBlank)\nCPU %.2f ms / GPU %.2f ms / DMA %.2f ms\nNTSC / 320 x 240. Performance estimate, not a hardware measurement.",
-            pSync->estimate.fps, pSync->estimate.vblanks, pSync->estimate.cpuMs,
-            pSync->estimate.gpuMs, pSync->estimate.dmaMs);
     toggle(compact ? "Stats" : "Statistics", ToolbarIcon::Statistics, settings.showStatistics, statsWidth, "Toggle rendering statistics");
     toggle("Gizmos", ToolbarIcon::Gizmos, settings.showGizmos, gizmoWidth, "Toggle scene gizmos, light rays, ranges and previews");
     return changed;
@@ -85,13 +79,13 @@ bool BeginMaximizedGameView(const ImVec2& position, const ImVec2& size, bool foc
 
 void DrawGameViewStatistics(const ImVec2& panelMin, const ImVec2& panelSize,
                             const GameViewSettings& settings, const RenderStatistics& statistics,
-                            size_t activeObjects, float frameRate, const PSyncState* pSync) {
+                            size_t activeObjects, float frameRate) {
     ImDrawList* draw = ImGui::GetWindowDrawList();
     const float line = ImGui::GetTextLineHeight() + 6.0f;
     const float width = std::min(270.0f * ImGui::GetFontSize() / 14.0f, panelSize.x - 16.0f);
     if (width < 80.0f || panelSize.y < line * 2.0f) return;
     const ImVec2 min(panelMin.x + panelSize.x - width - 8.0f, panelMin.y + 8.0f);
-    const float rows = settings.pSync ? (pSync ? 10.0f : 6.0f) : 7.0f;
+    const float rows = 7.0f;
     const ImVec2 max(min.x + width, std::min(min.y + line * rows + 18.0f, panelMin.y + panelSize.y - 8.0f));
     draw->PushClipRect(min, max, true);
     ImVec4 face = EditorTheme::PanelFace;
@@ -112,24 +106,12 @@ void DrawGameViewStatistics(const ImVec2& panelMin, const ImVec2& panelSize,
         cursor.y += line;
     };
     char value[80];
-    if (settings.pSync) {
-        if (pSync) std::snprintf(value, sizeof(value), "%.1f FPS", pSync->estimate.fps);
-        else std::snprintf(value, sizeof(value), "--");
-        row("PS1 estimate", value);
-    } else {
-        std::snprintf(value, sizeof(value), "%.1f FPS", frameRate); row("Editor frame rate", value);
-        std::snprintf(value, sizeof(value), "%.2f ms", frameRate > 0.0f ? 1000.0f / frameRate : 0.0f); row("Editor frame time", value);
-    }
+    std::snprintf(value, sizeof(value), "%.1f FPS", frameRate); row("Editor frame rate", value);
+    std::snprintf(value, sizeof(value), "%.2f ms", frameRate > 0.0f ? 1000.0f / frameRate : 0.0f); row("Editor frame time", value);
     std::snprintf(value, sizeof(value), "%d x %d", settings.renderWidth, settings.renderHeight); row("Render resolution", value);
     std::snprintf(value, sizeof(value), "%llu", static_cast<unsigned long long>(statistics.drawCalls)); row("3D draw calls", value);
     std::snprintf(value, sizeof(value), "%llu", static_cast<unsigned long long>(statistics.triangles)); row("Triangles", value);
     std::snprintf(value, sizeof(value), "%zu", activeObjects); row("Active objects", value);
-    if (settings.pSync && pSync) {
-        std::snprintf(value, sizeof(value), "%u VBlank", pSync->estimate.vblanks); row("NTSC / 320 x 240", value);
-        std::snprintf(value, sizeof(value), "%.2f ms", pSync->estimate.cpuMs); row("CPU estimate", value);
-        std::snprintf(value, sizeof(value), "%.2f ms", pSync->estimate.gpuMs); row("GPU estimate", value);
-        std::snprintf(value, sizeof(value), "%.2f ms", pSync->estimate.dmaMs); row("DMA estimate", value);
-    }
     draw->PopClipRect();
 }
 

@@ -3,7 +3,6 @@
 #include "../core/AssetFiles.h"
 #include <chrono>
 #include <stdexcept>
-#include "../ps1/PSyncGeometry.h"
 #include "../ps1/Ps1ColorGrading.h"
 #include "../animation/AnimationTypes.h"
 #include "../animation/SkinnedMesh.h"
@@ -28,19 +27,6 @@ void SetColorGradingUniforms(Shader& shader, const PS1Settings& settings) {
         matrix[col][row]=static_cast<float>(transform.matrix[row*3+col]);
     shader.SetMat3("uColorGradingMatrix",matrix);
     shader.SetVec3("uColorGradingOffset",glm::vec3(transform.offset[0],transform.offset[1],transform.offset[2]));
-}
-uint64_t PSyncMatrixSignature(const glm::mat4& matrix) {
-    uint64_t hash = 1469598103934665603ULL;
-    for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r)
-        hash = (hash ^ std::bit_cast<uint32_t>(matrix[c][r])) * 1099511628211ULL;
-    return hash;
-}
-uint64_t PSyncLightSignature(const SceneLightGpu* lights, int count, const glm::vec4& color) {
-    uint64_t hash = 1469598103934665603ULL;
-    const auto* bytes = reinterpret_cast<const unsigned char*>(lights);
-    for (size_t i = 0; i < sizeof(SceneLightGpu) * count; ++i) hash = (hash ^ bytes[i]) * 1099511628211ULL;
-    for (int i = 0; i < 4; ++i) hash = (hash ^ std::bit_cast<uint32_t>(color[i])) * 1099511628211ULL;
-    return hash;
 }
 }
 
@@ -163,19 +149,16 @@ void Renderer::SetSceneLights(const SceneLightGpu* lights, int count) {
         m_SceneLights[i] = lights[i];
 }
 
-void Renderer::SetSkyboxTexture(const Texture* texture, const glm::vec3& tint,
-                                float exposure, float rotationDegrees) {
-    m_SkyboxTexture = texture;
-    m_SkyboxTint = tint;
-    m_SkyboxExposure = exposure;
-    m_SkyboxRotationDegrees = rotationDegrees;
+void Renderer::SetSkyGradient(const glm::vec3& top, const glm::vec3& horizon,
+                              const glm::vec3& ground) {
+    m_SkyEnabled = true;
+    m_SkyTop = top;
+    m_SkyHorizon = horizon;
+    m_SkyGround = ground;
 }
 
-void Renderer::ClearSkyboxTexture() {
-    m_SkyboxTexture = nullptr;
-    m_SkyboxTint = glm::vec3(1.0f);
-    m_SkyboxExposure = 0.0f;
-    m_SkyboxRotationDegrees = 0.0f;
+void Renderer::ClearSky() {
+    m_SkyEnabled = false;
 }
 
 void Renderer::BeginScene(const Camera& camera, Framebuffer* targetFBO, const Texture* backgroundTexture) {
@@ -185,21 +168,6 @@ void Renderer::BeginScene(const Camera& camera, Framebuffer* targetFBO, const Te
     }
     m_Statistics = {};
     m_MeshLightingUploaded = m_SkinnedLightingUploaded = false;
-    if (m_PSyncWorkload) {
-        m_PSyncPrevious.swap(m_PSyncCurrent);
-        m_PSyncCurrent.clear();
-        m_PSyncCachedVertices = 0;
-        m_PSyncWorkload->lights = m_SceneLightCount;
-        for (int i = 0; i < m_SceneLightCount; ++i) {
-            if (m_SceneLights[i].posType.w == 1.0f) ++m_PSyncWorkload->pointLights;
-            if (m_SceneLights[i].posType.w == 2.0f) ++m_PSyncWorkload->spotLights;
-        }
-        if (backgroundTexture || m_SkyboxTexture) {
-            // Exported prerender/sky background is one textured full-screen FT4.
-            m_PSyncWorkload->gpuCycles += 320.0 * 240.0 * 2.0;
-            m_PSyncWorkload->dmaWords += 10;
-        }
-    }
     if (targetFBO) {
         targetFBO->Bind();
     } else {
@@ -241,23 +209,20 @@ void Renderer::BeginScene(const Camera& camera, Framebuffer* targetFBO, const Te
         glDepthMask(GL_TRUE);
         glEnable(GL_CULL_FACE);
         glCullFace(GL_BACK);
-    } else if (m_SkyboxTexture && m_SkyboxTexture->GetID() != 0) {
+    } else if (m_SkyEnabled) {
         glDisable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
         glDisable(GL_CULL_FACE);
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         m_SkyboxShader.Bind();
-        m_SkyboxShader.SetInt("uSkybox", 0);
         m_SkyboxShader.SetMat4("uInvProjection", glm::inverse(m_ProjectionMatrix));
         m_SkyboxShader.SetMat4("uInvView", glm::inverse(glm::mat4(glm::mat3(m_ViewMatrix))));
-        m_SkyboxShader.SetVec3("uTint", m_SkyboxTint);
-        m_SkyboxShader.SetFloat("uExposure", m_SkyboxExposure);
-        m_SkyboxShader.SetFloat("uRotationRadians", glm::radians(m_SkyboxRotationDegrees));
-        m_SkyboxTexture->Bind(0);
+        m_SkyboxShader.SetVec3("uSkyTop", m_SkyTop);
+        m_SkyboxShader.SetVec3("uSkyHorizon", m_SkyHorizon);
+        m_SkyboxShader.SetVec3("uSkyGround", m_SkyGround);
         m_ScreenQuad.Bind();
         glDrawElements(GL_TRIANGLES, m_ScreenQuad.GetIndexCount(), GL_UNSIGNED_INT, nullptr);
         m_ScreenQuad.Unbind();
-        m_SkyboxTexture->Unbind();
         glEnable(GL_DEPTH_TEST);
         glDepthMask(GL_TRUE);
         glEnable(GL_CULL_FACE);
@@ -465,28 +430,6 @@ void Renderer::DrawSkinnedMesh(const SkinnedMesh& mesh, const glm::mat4& entityW
     if (indexCount == 0)
         indexCount = mesh.GetIndexCount();
 
-    if (m_PSyncWorkload) {
-        const glm::mat4 vp = m_ProjectionMatrix * m_ViewMatrix * entityWorld;
-        const auto project = [&](const SkinnedVertex& v) {
-            const glm::vec4 position(v.position, 1.0f);
-            glm::vec4 skinned(0.0f);
-            const float weight = v.boneWeights.x + v.boneWeights.y + v.boneWeights.z + v.boneWeights.w;
-            if (weight > 1e-6f) {
-                for (int i = 0; i < 4; ++i) {
-                    const int bone = std::clamp(static_cast<int>(v.boneIndices[i] + 0.5f), 0, kMaxBones - 1);
-                    skinned += palette[bone] * position * v.boneWeights[i];
-                }
-                skinned /= weight;
-            } else skinned = position;
-            const glm::vec3 fitted = (glm::vec3(partGeometryToWorld * skinned) - displayCenter) * displayScale;
-            return vp * glm::vec4(fitted, 1.0f);
-        };
-        ProfilePSyncGeometry(*m_PSyncWorkload, mesh.GetVertices(), mesh.GetIndices(), indexOffset,
-            indexCount, project, texture != nullptr, true,
-            PSyncLightSignature(m_SceneLights, shaderRenderMode == 0 ? m_SceneLightCount : 0, materialColor),
-            m_PSyncPrevious, m_PSyncCurrent, m_PSyncCachedVertices,
-            PSyncMatrixSignature(entityWorld), true, false, shaderRenderMode == 0);
-    }
 
     mesh.Bind();
     const void* indexPtr =
@@ -502,7 +445,7 @@ void Renderer::DrawSkinnedMesh(const SkinnedMesh& mesh, const glm::mat4& entityW
 void Renderer::DrawMesh(const Mesh& mesh, const glm::mat4& transform, const Texture* texture,
                         const glm::vec4& materialColor, const glm::vec2& textureTiling,
                         const glm::vec2& textureOffset, uint32_t indexOffset, uint32_t indexCount,
-                        float projectionDepthClamp, bool doubleSided, PSyncDrawOptions syncOptions) {
+                        float projectionDepthClamp, bool doubleSided) {
     if (indexCount == 0)
         indexCount = mesh.GetIndexCount();
     if (indexCount == 0)
@@ -511,38 +454,6 @@ void Renderer::DrawMesh(const Mesh& mesh, const glm::mat4& transform, const Text
     const int objectRenderMode = m_RenderMode == RenderMode::Normals ? 2 :
         (m_RenderMode == RenderMode::Unlit || m_RenderMode == RenderMode::Wireframe || m_ObjectUnlit ? 1 : 0);
 
-    if (m_PSyncWorkload) {
-        const glm::mat4 mvp = m_ProjectionMatrix * m_ViewMatrix * transform;
-        const uint64_t world = PSyncMatrixSignature(transform);
-        const uint64_t lighting = PSyncLightSignature(m_SceneLights, objectRenderMode == 0 ? m_SceneLightCount : 0, materialColor) ^ world;
-        if (syncOptions.plane) {
-            // Use the same material-boundary cells as the PS1 runtime, including
-            // offsets and the compact atlas used only for very dense repeats.
-            const float atlas=std::abs(textureTiling.x)>8 || std::abs(textureTiling.y)>8 ? 8.f : 1.f;
-            ps1_plane_span spansX[PS1_PLANE_AXIS_CAP],spansZ[PS1_PLANE_AXIS_CAP];
-            const int nx=PSyncPlaneAxis(texture ? textureTiling.x/atlas : 0,textureOffset.x/atlas,
-                syncOptions.subdivisionLevels,spansX);
-            const int nz=PSyncPlaneAxis(texture ? textureTiling.y/atlas : 0,textureOffset.y/atlas,
-                syncOptions.subdivisionLevels,spansZ);
-            const auto lo = mesh.GetBoundsMin(), hi = mesh.GetBoundsMax();
-            std::vector<glm::vec4> positions;
-            std::vector<uint32_t> triangles;
-            for (int z=0; z<nz; ++z) for (int x=0; x<nx; ++x) {
-                const float x0=glm::mix(lo.x,hi.x,spansX[x].start_q16/65536.f), x1=glm::mix(lo.x,hi.x,spansX[x].end_q16/65536.f);
-                const float z0=glm::mix(lo.z,hi.z,spansZ[z].start_q16/65536.f), z1=glm::mix(lo.z,hi.z,spansZ[z].end_q16/65536.f);
-                const uint32_t first=static_cast<uint32_t>(positions.size());
-                positions.insert(positions.end(), {{x0,lo.y,z0,1}, {x1,lo.y,z0,1}, {x1,lo.y,z1,1}, {x0,lo.y,z1,1}});
-                triangles.insert(triangles.end(), {first,first+1,first+2,first,first+2,first+3});
-            }
-            ProfilePSyncGeometry(*m_PSyncWorkload, positions, triangles, 0, static_cast<uint32_t>(triangles.size()),
-                [&](const glm::vec4& p) { return mvp*p; }, texture != nullptr, true, lighting,
-                m_PSyncPrevious,m_PSyncCurrent,m_PSyncCachedVertices,world,false,false,objectRenderMode == 0);
-        } else ProfilePSyncGeometry(*m_PSyncWorkload, mesh.GetVertices(), mesh.GetIndices(), indexOffset,
-            indexCount, [&](const Vertex& v) { return mvp * glm::vec4(v.position, 1.0f); },
-            texture != nullptr, doubleSided, lighting,
-            m_PSyncPrevious, m_PSyncCurrent, m_PSyncCachedVertices,world,
-            syncOptions.flatShading,syncOptions.cacheable,objectRenderMode == 0);
-    }
 
     m_PS1Shader.Bind();
     m_PS1Shader.SetMat4("uModel", transform);

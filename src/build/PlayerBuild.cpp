@@ -1,6 +1,7 @@
 #include "PlayerBuild.h"
 #include "BuildManifest.h"
 #include "../assets/AssetManager.h"
+#include "../assets/BuiltinAssets.h"
 #include "../core/AssetFiles.h"
 #include "../core/Log.h"
 #include "../core/NativePaths.h"
@@ -43,7 +44,7 @@ void CopyOptional(const fs::path& source,const fs::path& dest) {
     if(fs::exists(source))NativePaths::CopyTree(source,dest);
 }
 AssetFiles::Bytes TextBytes(const Json& j) {auto s=j.dump();return {s.begin(),s.end()};}
-AssetFiles::Entries Collect(const fs::path& root,const PlayerSettings& settings) {
+AssetFiles::Entries Collect(const fs::path& root,const fs::path& engineDir,const PlayerSettings& settings) {
     AssetFiles::Entries files;
     auto add=[&](const fs::path& relative) {
         auto source=ConfinedFile(root,relative);
@@ -80,6 +81,18 @@ AssetFiles::Entries Collect(const fs::path& root,const PlayerSettings& settings)
             if (entry.is_regular_file() && (entry.path().extension()==".vert" || entry.path().extension()==".frag"))
                 add(NativePaths::OrdinaryPath(entry.path()).lexically_relative(root));
     }
+    // Built-in resources ("builtin/...") resolve to <Product>_Data/Resources/
+    // builtin in the player. That folder is inside the mounted package
+    // namespace, which never falls back to loose files, so pack them there.
+    const auto builtin = engineDir / "resources" / BuiltinAssets::kRoot;
+    if (fs::is_directory(NativePaths::FilePath(builtin))) {
+        for (const auto& entry : fs::directory_iterator(NativePaths::FilePath(builtin))) {
+            if (!entry.is_regular_file()) continue;
+            auto name = PathUtf8::ToString(entry.path().filename());
+            files.emplace("Resources/" + std::string(BuiltinAssets::kRoot) + "/" + name,
+                          AssetFiles::Read(NativePaths::OrdinaryPath(entry.path())));
+        }
+    }
     Json boot={{"version",2},{"productName",settings.productName},{"companyName",settings.companyName},{"startupSceneIndex",settings.startupSceneIndex},{"scenesInBuild",settings.scenesInBuild}};
     files.emplace("boot.json",TextBytes(boot));
     Json project={{"name",settings.productName},{"defaultScene",BuildManifestIO::FromPlayerSettings(settings).StartupScenePath()},{"playerSettings",boot}};
@@ -113,7 +126,7 @@ PlayerBuildResult PlayerBuild::BuildWindows(const PlayerBuildRequest& request) {
         for(size_t i=0;i<8;++i){suffix+=hex[key[i]>>4];suffix+=hex[key[i]&15];}
         staging=parent/PathUtf8::FromString(settings.productName+".building-"+suffix);fs::create_directories(NativePaths::FilePath(staging));
         auto data=staging/PathUtf8::FromString(settings.productName+"_Data");fs::create_directories(NativePaths::FilePath(data));
-        progress(.2f,"Compiling scripts and collecting runtime assets");auto files=Collect(root,settings);
+        progress(.2f,"Compiling scripts and collecting runtime assets");auto files=Collect(root,engineDir,settings);
         progress(.5f,"Encrypting player data");std::string error;
         if(!AssetFiles::WritePack(data/"game.mpak",files,key,error))throw std::runtime_error(error);files.clear();
         auto exe=staging/PathUtf8::FromString(settings.productName+".exe");NativePaths::CopyRegularFile(engineDir/"MipsyncEngine.exe",exe);

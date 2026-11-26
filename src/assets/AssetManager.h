@@ -52,9 +52,6 @@ public:
     std::string ToAbsolute(const std::string& projectRelativePath) const;
 
     std::shared_ptr<Texture> GetTexture(const std::string& projectRelativePath);
-    /// High-quality texture path for editor backgrounds / HDRI skyboxes.
-    /// Unlike gameplay textures, this keeps much more resolution and uses linear filtering.
-    std::shared_ptr<Texture> GetSkyboxTexture(const std::string& projectRelativePath);
     void DropTexture(const std::string& projectRelativePath);
 
     std::shared_ptr<Mesh> GetMesh(const std::string& projectRelativePath, int meshPart = -1);
@@ -74,7 +71,13 @@ public:
                                       const std::string& materialPath);
     void ApplyMaterialToSkinnedMeshRenderer(SkinnedMeshRendererComponent& mr, const Material& mat,
                                             const std::string& materialPath);
+    /// Sets the renderer to "None (Material)", drawn with the error color.
     void ClearMeshRendererMaterial(MeshRendererComponent& mr);
+    /// Loads mr.materialPath into the renderer's resolved appearance. A missing
+    /// or unreadable material resolves to the error appearance.
+    void ResolveMeshRendererMaterial(MeshRendererComponent& mr);
+    /// Resolves only when materialPath changed since the last resolution.
+    void EnsureMeshRendererMaterial(MeshRendererComponent& mr);
     void ClearSkinnedMeshRendererMaterial(SkinnedMeshRendererComponent& mr);
 
     /// Re-apply a material asset to every MeshRenderer that references it (live edit).
@@ -85,12 +88,10 @@ private:
     AssetManager() = default;
     std::string m_Root;
     std::unordered_map<std::string, std::shared_ptr<Texture>> m_Textures;
-    std::unordered_map<std::string, std::shared_ptr<Texture>> m_SkyboxTextures;
     std::unordered_map<std::string, std::shared_ptr<Mesh>> m_Meshes;
     std::unordered_map<std::string, std::shared_ptr<SkeletalModelAsset>> m_SkeletalModels;
     std::unordered_map<std::string, std::shared_ptr<AnimatorControllerAsset>> m_Controllers;
     std::unordered_set<std::string> m_FailedTexturePaths;
-    std::unordered_set<std::string> m_FailedSkyboxTexturePaths;
     std::unordered_set<std::string> m_FailedMeshPaths;
     std::unordered_set<std::string> m_FailedSkeletalModelPaths;
 };

@@ -21,7 +21,7 @@ static void Require(bool condition, const char* message) {
 static void CheckPersistence() {
     EditorPreferences settings;
     settings.Load(nullptr, 14);
-    Require(settings.Get("fontSize") == 14 && settings.Enabled("gameViewPSync"), "fresh defaults");
+    Require(settings.Get("fontSize") == 14 && !settings.Enabled("gameViewGizmos"), "fresh defaults");
     Require(EditorPreferenceDefinitions().size() >= 35, "settings catalog incomplete");
     std::unordered_set<std::string> keys;
     for (const auto& definition : EditorPreferenceDefinitions()) {
@@ -32,12 +32,12 @@ static void CheckPersistence() {
     restored.Load(nlohmann::json::parse(settings.Save().dump()), 13);
     for (const auto& definition : EditorPreferenceDefinitions())
         Require(restored.Get(definition.key) == definition.maximum, "round-trip dropped a setting");
-    restored.Load({{"fontSize", 12}, {"gameViewPSync", false}, {"futureSetting", "preserve"}}, 13);
-    Require(restored.Get("fontSize") == 13 && !restored.Enabled("gameViewPSync"), "legacy migration changed P-Sync choice");
+    restored.Load({{"fontSize", 12}, {"gameViewGizmos", true}, {"futureSetting", "preserve"}}, 13);
+    Require(restored.Get("fontSize") == 13 && restored.Enabled("gameViewGizmos"), "legacy migration changed a toggle");
     Require(restored.Save()["futureSetting"] == "preserve", "unknown settings lost");
     restored.Load({{"fontSize", 12}, {"fontSizeDefaultVersion", 1}}, 13);
     Require(restored.Get("fontSize") == 12, "explicit font choice overwritten");
-    restored.Load({{"fontSize", "invalid"}, {"flySpeed", -100}, {"gameViewPSync", nlohmann::json::array()},
+    restored.Load({{"fontSize", "invalid"}, {"flySpeed", -100}, {"gameViewGizmos", nlohmann::json::array()},
                    {"sceneNearClip", 1e99}, {"undoSteps", 42.7}, {"gameViewPlayMode", "Maximized"}}, 13);
     Require(restored.Get("fontSize") == 13 && restored.Get("flySpeed") == .1 &&
         restored.Get("sceneNearClip") == 1 && restored.Get("undoSteps") == 43 && restored.Get("gameViewPlayMode") == 1,
@@ -163,7 +163,7 @@ static void CheckWindow(float scale) {
     for (auto* candidate : ImGui::GetCurrentContext()->Windows)
         if (candidate->Active && std::string(candidate->Name).find("Preferences/Settings") == 0) properties = candidate;
     Require(properties != nullptr, "properties pane missing");
-    // The first control is P-Sync. Read the actual table column and row geometry.
+    // The first control is Show gizmos. Read the actual table column and row geometry.
     ImGuiTable* table = nullptr;
     auto* context = ImGui::GetCurrentContext();
     for (int i = 0; i < context->Tables.GetMapSize(); ++i) {
@@ -174,9 +174,9 @@ static void CheckWindow(float scale) {
     const ImVec2 checkbox(table->Columns[1].WorkMinX + 6,
         properties->Pos.y + properties->WindowPadding.y + properties->FontRefSize + ImGui::GetStyle().ItemSpacing.y * 2 + (properties->FontRefSize + ImGui::GetStyle().FramePadding.y * 2) * .5f);
     click(checkbox);
-    Require(!settings.Enabled("gameViewPSync") && edited, "P-Sync control click failed");
+    Require(settings.Enabled("gameViewGizmos") && edited, "Game View toggle click failed");
     EditorPreferences reopened; reopened.Load(settings.Save(), 13);
-    Require(!reopened.Enabled("gameViewPSync"), "UI choice not persisted");
+    Require(reopened.Enabled("gameViewGizmos"), "UI choice not persisted");
     // Search finds settings in every category.
     click({root->Pos.x + 90, root->Pos.y + root->TitleBarHeight + root->WindowPadding.y + (root->FontRefSize + ImGui::GetStyle().FramePadding.y * 2) * .5f});
     io.AddInputCharactersUTF8("fly"); frame(); frame();
@@ -190,7 +190,7 @@ static void CheckWindow(float scale) {
     click({(table->Columns[1].WorkMinX + table->Columns[1].WorkMaxX) * .5f, firstRowY + rowHeight * .5f});
     Require(settings.Get("orbitSensitivity") != .3, "camera sensitivity slider did not accept input");
     click({root->Pos.x + 65, root->Pos.y + root->Size.y - root->WindowPadding.y - (root->FontRefSize + ImGui::GetStyle().FramePadding.y * 2) * .5f});
-    Require(settings.Get("orbitSensitivity") == .3 && !settings.Enabled("gameViewPSync"), "reset category changed an unrelated preference");
+    Require(settings.Get("orbitSensitivity") == .3 && settings.Enabled("gameViewGizmos"), "reset category changed an unrelated preference");
     window.Open("PS1 Controller"); frame(); frame();
     const float bindingRowHeight=properties->FontRefSize+ImGui::GetStyle().FramePadding.y*2+5;
     const float bindingStart=properties->Pos.y+properties->WindowPadding.y+properties->FontRefSize+

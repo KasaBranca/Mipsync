@@ -10,6 +10,7 @@
 #include <sstream>
 #include "../assets/AssetManager.h"
 #include "../assets/Material.h"
+#include "../assets/BuiltinAssets.h"
 #include "../audio/MidiFile.h"
 #include "../core/Engine.h"
 #include "../core/Input.h"
@@ -103,6 +104,18 @@ bool RequireEditMode(EditorApp& editor, CommandResult& outResult) {
 }
 
 bool ResolveMaterialPath(const std::string& input, std::string& outRelative, std::string& outError) {
+    if (BuiltinAssets::IsBuiltinPath(input)) {
+        std::string normalized =
+            PathUtf8::ToString(PathUtf8::FromString(input).lexically_normal());
+        std::replace(normalized.begin(), normalized.end(), '\\', '/');
+        if (BuiltinAssets::Resolve(normalized).empty() ||
+            Lower(PathUtf8::ToString(PathUtf8::FromString(normalized).extension())) != ".nmat") {
+            outError = "Unknown built-in material.";
+            return false;
+        }
+        outRelative = normalized;
+        return true;
+    }
     const auto path = PathUtf8::FromString(input).lexically_normal();
     if (path.empty() || path.is_absolute()) {
         outError = "Material path must be project-relative.";
@@ -116,7 +129,7 @@ bool ResolveMaterialPath(const std::string& input, std::string& outRelative, std
     }
     auto it = path.begin();
     if (it == path.end() || Lower(PathUtf8::ToString(*it)) != "assets") {
-        outError = "Material path must be inside assets/.";
+        outError = "Material path must be inside assets/ or builtin/.";
         return false;
     }
     if (Lower(PathUtf8::ToString(path.extension())) != ".nmat") {
@@ -902,18 +915,38 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         if (!entity) return CommandResult::Fail("MIPSYNC_ENTITY_NOT_FOUND", lookupError);
         auto* renderer = entity->GetComponent<MeshRendererComponent>();
         if (!renderer) return CommandResult::Fail("MIPSYNC_COMPONENT_NOT_FOUND", "Entity has no MeshRenderer component.");
-        const char* properties[] = {"primitive", "size", "material", "enabled", "editor-only", "type-preset", "view-model", "render-type"};
+        const char* properties[] = {"primitive", "size", "material", "enabled", "editor-only", "type-preset", "view-model", "render-type", "ps1-depth-bias"};
         bool hasValue = false;
         for (const char* property : properties) hasValue |= request.arguments.contains(property);
         if (!hasValue) return CommandResult::Fail("MIPSYNC_MESH_SET_EMPTY", "Supply at least one renderer property.");
         const auto renderType=Lower(request.arguments.value("render-type",std::string("Lit")));
         if(renderType!="lit"&&renderType!="unlit")return CommandResult::Fail("MIPSYNC_RENDER_TYPE","render-type must be Lit or Unlit.");
+        // Validate everything before recording Undo: a rejected call must not
+        // leave an Undo step behind (a following editor.undo would then revert
+        // an unrelated earlier edit).
+        std::string primitive = Lower(request.arguments.value("primitive", renderer->meshPrimitive));
+        const bool changesPrimitive = request.arguments.contains("primitive") || request.arguments.contains("size");
+        if (changesPrimitive && primitive != "cube" && primitive != "sphere" && primitive != "plane")
+            return CommandResult::Fail("MIPSYNC_ENTITY_PRIMITIVE", request.arguments.contains("primitive")
+                ? std::string("Primitive must be cube, sphere or plane.")
+                : "size applies to cube, sphere and plane primitives only; this renderer uses " +
+                  renderer->meshPrimitive + ". Scale the Transform instead.");
+        std::string preset;
+        if (request.arguments.contains("type-preset")) {
+            preset = Lower(request.arguments.at("type-preset").get<std::string>());
+            if (preset != "prop" && preset != "corridor" && preset != "character" &&
+                preset != "viewmodel" && preset != "view-model" && preset != "floor")
+                return CommandResult::Fail("MIPSYNC_RENDER_PRESET",
+                    "Type preset must be prop, corridor, character, viewmodel or floor.");
+        }
+        double depthBias = renderer->ps1DepthBias;
+        if (request.arguments.contains("ps1-depth-bias")) {
+            depthBias = request.arguments.at("ps1-depth-bias").get<double>();
+            if (!std::isfinite(depthBias) || depthBias < -32.0 || depthBias > 32.0)
+                return CommandResult::Fail("MIPSYNC_PS1_DEPTH_BIAS", "ps1-depth-bias must be between -32 and 32 metres.");
+        }
         editor.RecordUndoSnapshot();
-        if (request.arguments.contains("primitive") || request.arguments.contains("size")) {
-            std::string primitive = request.arguments.value("primitive", renderer->meshPrimitive);
-            primitive = Lower(primitive);
-            if (primitive != "cube" && primitive != "sphere" && primitive != "plane")
-                return CommandResult::Fail("MIPSYNC_ENTITY_PRIMITIVE", "Primitive must be cube, sphere or plane.");
+        if (changesPrimitive) {
             primitive.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(primitive.front())));
             renderer->SetPrimitive(primitive, static_cast<float>(request.arguments.value("size", static_cast<double>(renderer->meshSize))));
         }
@@ -925,19 +958,16 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         if (request.arguments.contains("enabled")) renderer->enabled = request.arguments.at("enabled").get<bool>();
         if (request.arguments.contains("editor-only")) renderer->editorOnly = request.arguments.at("editor-only").get<bool>();
         if (request.arguments.contains("render-type"))renderer->renderType=renderType=="unlit"?RendererType::Unlit:RendererType::Lit;
-        if (request.arguments.contains("type-preset")) {
-            const std::string preset = Lower(request.arguments.at("type-preset").get<std::string>());
+        if (!preset.empty()) {
             if (preset == "prop") renderer->typePreset = MeshRendererComponent::TypePreset::Prop;
             else if (preset == "corridor") renderer->typePreset = MeshRendererComponent::TypePreset::Corridor;
             else if (preset == "character") renderer->typePreset = MeshRendererComponent::TypePreset::Character;
             else if (preset == "viewmodel" || preset == "view-model")
                 renderer->typePreset = MeshRendererComponent::TypePreset::Viewmodel;
-            else if (preset == "floor")
-                renderer->typePreset = MeshRendererComponent::TypePreset::Floor;
             else
-                return CommandResult::Fail("MIPSYNC_RENDER_PRESET",
-                    "Type preset must be prop, corridor, character, viewmodel or floor.");
+                renderer->typePreset = MeshRendererComponent::TypePreset::Floor;
         }
+        renderer->ps1DepthBias = static_cast<float>(depthBias);
         if (request.arguments.contains("view-model")) {
             renderer->typePreset = request.arguments.at("view-model").get<bool>()
                 ? MeshRendererComponent::TypePreset::Viewmodel
@@ -994,6 +1024,13 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         return CommandResult::Ok({{"opened", true}, {"file", file}, {"line", line}, {"column", column}});
     }
     if (request.command == "runtime.play") {
+        if (editor.IsPlaying()) {
+            if (editor.IsPaused())
+                editor.SetPlayPaused(false);
+            return CommandResult::Ok({{"state","playing"},{"playing",true},
+                {"preparing",false},{"paused",editor.IsPaused()},
+                {"resumed",!editor.IsPaused()}});
+        }
         editor.CommandRefreshSceneDirtyState();
         if(editor.IsSceneDirty() && !editor.IsPlaying() && !editor.IsPreparingPlay()) {
             if(!request.arguments.value("save-current",false)) {
@@ -1013,8 +1050,6 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
         return CommandResult::Ok({{"playing", editor.IsPlaying()}, {"paused", editor.IsPaused()}});
     }
     if (request.command == "runtime.inspect") {
-        const auto& sync = m_Engine.GetPSyncState();
-        const auto& w = sync.workload;
         Json animators=Json::array();
         if(!editor.IsPreparingPlay())for(const auto& entity:scene.GetEntities())if(auto* a=entity->GetComponent<AnimatorComponent>()) {
             auto value=InspectAnimator(*a);value["entity"]=entity->GetID();animators.push_back(value);
@@ -1027,14 +1062,7 @@ CommandResult EditorCommandHost::ExecuteEditorCommand(const CommandRequest& requ
             {"execution",editor.IsPreparingPlay()?Json::object():m_Engine.GetMipsRuntime().InspectExecution()},
             {"input", {{"enabled", Input::IsGameInputEnabled()}, {"cursorLocked", Input::IsCursorLocked()},
                 {"leftStickX", Input::GetPS1Axis("LeftStickX")}, {"leftStickY", Input::GetPS1Axis("LeftStickY")},
-                {"rightStickX", Input::GetPS1Axis("RightStickX")}, {"rightStickY", Input::GetPS1Axis("RightStickY")}}},
-            {"pSync", {{"enabled", editor.GetGameViewSettings().pSync}, {"sampleValid", sync.sampleValid},
-                {"fps", sync.estimate.fps}, {"vblanks", sync.estimate.vblanks},
-                {"cpuMs", sync.estimate.cpuMs}, {"gpuMs", sync.estimate.gpuMs}, {"dmaMs", sync.estimate.dmaMs},
-                {"submittedTriangles", w.submittedTriangles}, {"drawnTriangles", w.drawnTriangles},
-                {"projectedVertices", w.projectedVertices}, {"litVertices", w.litVertices},
-                {"litFaces", w.litFaces}, {"pointLights", w.pointLights}, {"spotLights", w.spotLights},
-                {"lights", w.lights}, {"colorGradingPixels", w.colorGradingPixels}}}});
+                {"rightStickX", Input::GetPS1Axis("RightStickX")}, {"rightStickY", Input::GetPS1Axis("RightStickY")}}}});
     }
     return CommandResult::Fail("MIPSYNC_EDITOR_COMMAND_NOT_FOUND", "Unsupported Editor command: " + request.command);
 }

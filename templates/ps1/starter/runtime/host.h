@@ -83,4 +83,10 @@ void host_render(uint32_t frame_index, uint32_t scripts_loaded, uint32_t scripts
  * logged). */
 int host_dispatch(struct vm_state* vm, uint16_t host_id, uint8_t argc);
 
+/* Pool spawn/despawn lifecycle events queued by Pool/Entity host calls.
+ * Indices are runtime scene indices; the caller invokes OnSpawn/OnDespawn on
+ * matching script instances. */
+int host_take_pool_spawn(uint16_t* out, int capacity);
+int host_take_pool_despawn(uint16_t* out, int capacity);
+
 #endif /* MIPSYNC_HOST_H */

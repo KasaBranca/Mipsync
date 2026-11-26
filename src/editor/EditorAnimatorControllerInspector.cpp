@@ -634,11 +634,8 @@ bool CreateAndAssignControllerFromModel(EditorApp* editor, AnimatorComponent& an
     if (modelProjectPath.empty())
         return false;
 
-    if (skinned) {
+    if (skinned)
         skinned->SetModelFile(modelProjectPath);
-        if (!skinned->texture)
-            skinned->texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
-    }
 
     auto model = AssetManager::Get().GetSkeletalModel(modelProjectPath);
     if (!model) {

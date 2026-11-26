@@ -124,7 +124,9 @@ void MipsRuntime::ApplyFieldOverrides(Entity* entity, const MipsScriptComponent&
                 value.tag = Value::Tag::Bool;
                 value.boolValue = instance.fields[i] != 0.0;
             } else if (i < instance.module->fields.size() &&
-                       instance.module->fields[i].valueKind != FieldValueKind::Array) {
+                       instance.module->fields[i].valueKind != FieldValueKind::Array &&
+                       instance.module->fields[i].valueKind != FieldValueKind::AudioClip &&
+                       instance.module->fields[i].valueKind != FieldValueKind::Prefab) {
                 value.tag = Value::Tag::Number;
                 value.number = instance.fields[i];
             }
@@ -184,6 +186,7 @@ bool MipsRuntime::AddInstance(Entity* entity, MipsScriptComponent& component) {
                 instance.runtimeFields[i].tag = Value::Tag::Bool;
                 instance.runtimeFields[i].boolValue = instance.fields[i] != 0.0;
             } else if (script->module->fields[i].valueKind != FieldValueKind::AudioClip &&
+                       script->module->fields[i].valueKind != FieldValueKind::Prefab &&
                        script->module->fields[i].valueKind != FieldValueKind::Array) {
                 instance.runtimeFields[i].tag = Value::Tag::Number;
                 instance.runtimeFields[i].number = instance.fields[i];
@@ -270,6 +273,7 @@ void MipsRuntime::RefreshPlayInstances(Scene& scene, bool addNew) {
             InvokeLifecycle(m_VM, m_Instances[index], "Start", errors);
     }
     for (const auto& error : errors) MIPSYNC_CONSOLE_WARN("{}", error);
+    m_LastStructureRevision = Entity::GetStructureRevision();
 }
 
 void MipsRuntime::ReloadChangedScripts(MipsyncEngine::Scene& scene) {
@@ -361,7 +365,9 @@ void MipsRuntime::OnPlayStarted(Scene& scene) {
 
     m_Playing = true;
     m_Paused = false;
+    m_VM.ResetRuntimeState();
     CollectInstances(scene);
+    m_LastStructureRevision = Entity::GetStructureRevision();
     m_VM.SetActiveInstances(&m_Instances);
 
     m_VM.SetScene(&scene);
@@ -380,6 +386,9 @@ void MipsRuntime::OnPlayStarted(Scene& scene) {
 
     m_ExecutionErrors=errors;
     if(!errors.empty())throw std::runtime_error("Awake/Start failed: "+errors.front());
+    FlushRuntimeEvents(scene);
+    if (m_PhysicsWorld)
+        m_PhysicsWorld->RefreshBodies(scene);
     FlushDestroyRequests(scene);
     MIPSYNC_INFO("[Mips#] Play started ({} script instance(s))", m_Instances.size());
 }
@@ -417,18 +426,78 @@ nlohmann::json MipsRuntime::InspectFields(const MipsScriptComponent& script) con
             case Value::Tag::Number:return v.number;
             case Value::Tag::Array:{Json values=Json::array();if(v.array)for(const auto& item:v.array->elements)values.push_back(self(self,item,depth+1));return values;}
             case Value::Tag::String:if(!v.runtimeString&&v.stringIndex<instance.module->stringConstants.size())return instance.module->stringConstants[v.stringIndex];return {{"runtimeString",true}};
+            case Value::Tag::Host:{
+                if (v.host.entity) {
+                    std::string name = "Entity";
+                    if (const auto* tag = v.host.entity->GetComponent<TagComponent>())
+                        name = tag->tag;
+                    return {{"id", v.host.entity->GetID()}, {"name", name}};
+                }
+                if (v.host.kind == HostKind::MipsScript && v.host.script && v.host.script->entity) {
+                    std::string name = "Entity";
+                    if (const auto* tag = v.host.script->entity->GetComponent<TagComponent>())
+                        name = tag->tag;
+                    return {{"id", v.host.script->entity->GetID()}, {"name", name}};
+                }
+                return nullptr;
+            }
             default:return nullptr;
             }
         };
         Json fields=Json::object();
         for(size_t i=0;i<instance.module->fields.size();++i){
-            if(instance.module->fields[i].valueKind==FieldValueKind::AudioClip)fields[instance.module->fields[i].name]=i<instance.assetFields.size()?instance.assetFields[i]:"";
+            if(instance.module->fields[i].valueKind==FieldValueKind::AudioClip ||
+               instance.module->fields[i].valueKind==FieldValueKind::Prefab)
+                fields[instance.module->fields[i].name]=i<instance.assetFields.size()?instance.assetFields[i]:"";
             else if(i<instance.runtimeFields.size()&&instance.runtimeFields[i].tag!=Value::Tag::Nil)fields[instance.module->fields[i].name]=value(value,instance.runtimeFields[i],0);
             else fields[instance.module->fields[i].name]=i<instance.fields.size()?instance.fields[i]:0.;
         }
         return {{"entity",instance.entityId},{"class",instance.module->className},{"fields",fields}};
     }
     return {{"active",false},{"fields",Json::object()}};
+}
+
+nlohmann::json MipsRuntime::InspectPools() const {
+    using Json = nlohmann::json;
+    Json pools = Json::array();
+    for (const RuntimePool& pool : m_VM.GetRuntimePools()) {
+        size_t active = 0;
+        Json entities = Json::array();
+        for (size_t i = 0; i < pool.entityIds.size(); ++i) {
+            const bool isActive = i < pool.active.size() && pool.active[i];
+            if (isActive) ++active;
+            entities.push_back({{"id", pool.entityIds[i]}, {"active", isActive}});
+        }
+        pools.push_back({
+            {"name", pool.name},
+            {"capacity", pool.entityIds.size()},
+            {"active", active},
+            {"inactive", pool.entityIds.size() - active},
+            {"exhausted", active >= pool.entityIds.size()},
+            {"entities", std::move(entities)},
+        });
+    }
+    Json prefabs = Json::array();
+    for (const RuntimePrefabState& prefab : m_VM.GetRuntimePrefabs()) {
+        size_t active = 0;
+        Json entities = Json::array();
+        for (size_t i = 0; i < prefab.spawned.size(); ++i) {
+            const bool isActive = i < prefab.active.size() && prefab.active[i];
+            if (isActive) ++active;
+            entities.push_back({{"id", prefab.spawned[i]}, {"active", isActive}});
+        }
+        prefabs.push_back({
+            {"name", prefab.path},
+            {"kind", "prefab"},
+            {"capacity", prefab.capacity},
+            {"spawned", prefab.spawned.size()},
+            {"active", active},
+            {"inactive", prefab.spawned.size() - active},
+            {"exhausted", prefab.capacity != 0 && prefab.spawned.size() >= prefab.capacity && active >= prefab.capacity},
+            {"entities", std::move(entities)},
+        });
+    }
+    return {{"pools", std::move(pools)}, {"prefabs", std::move(prefabs)}};
 }
 
 nlohmann::json MipsRuntime::InspectExecution() const {
@@ -454,6 +523,7 @@ void MipsRuntime::OnPlayStopped(Scene& scene) {
 
     m_Instances.clear();
     m_VM.ClearDestroyRequests();
+    m_VM.ResetRuntimeState();
     m_PhysicsEvents.Clear();
     m_Playing = false;
     m_Paused = false;
@@ -550,9 +620,11 @@ void MipsRuntime::Update(Scene& scene, float deltaTime) {
     if (!m_Playing || m_Paused)
         return;
 
-    RefreshPlayInstances(scene);
+    if (Entity::GetStructureRevision() != m_LastStructureRevision)
+        RefreshPlayInstances(scene);
 
     InvokeLifecycleAll("Update", scene, deltaTime);
+    FlushRuntimeEvents(scene);
     std::vector<std::string> coroutineErrors;
     for (auto& instance : m_Instances)
         if (!m_VM.IsDestroyPending(instance.entityId) &&
@@ -567,7 +639,46 @@ void MipsRuntime::LateUpdate(Scene& scene, float deltaTime) {
     if (!m_Playing || m_Paused)
         return;
     InvokeLifecycleAll("LateUpdate", scene, deltaTime);
+    FlushRuntimeEvents(scene);
     FlushDestroyRequests(scene);
+}
+
+void MipsRuntime::FlushRuntimeEvents(Scene& scene) {
+    const std::vector<uint32_t> spawns = m_VM.TakeSpawnRequests();
+    const std::vector<uint32_t> despawns = m_VM.TakeDespawnRequests();
+    if (spawns.empty() && despawns.empty())
+        return;
+
+    // Newly instantiated prefabs must have their script instances created
+    // before OnSpawn can run on them. Pool activation alone does not change
+    // scene structure, so it avoids the full rescan.
+    if (!spawns.empty() &&
+        Entity::GetStructureRevision() != m_LastStructureRevision)
+        RefreshPlayInstances(scene);
+
+    std::vector<std::string> errors;
+    for (uint32_t id : spawns) {
+        Entity* entity = scene.FindEntity(id);
+        if (!entity || !scene.IsActiveInHierarchy(*entity))
+            continue;
+        for (auto& instance : m_Instances) {
+            if (instance.entityId != id || !instance.sourceComponent->enabled)
+                continue;
+            InvokeLifecycle(m_VM, instance, "OnSpawn", errors);
+        }
+    }
+    for (uint32_t id : despawns) {
+        for (auto& instance : m_Instances) {
+            if (instance.entityId != id || !instance.sourceComponent->enabled)
+                continue;
+            InvokeLifecycle(m_VM, instance, "OnDespawn", errors);
+        }
+    }
+    for (const auto& error : errors)
+        MIPSYNC_CONSOLE_WARN("{}", error);
+
+    if (m_PhysicsWorld)
+        m_PhysicsWorld->RefreshBodies(scene);
 }
 
 void MipsRuntime::FlushDestroyRequests(Scene& scene) {

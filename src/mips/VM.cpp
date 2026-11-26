@@ -8,12 +8,14 @@
 #include "../audio/AudioSystem.h"
 #include "../animation/AnimatorRuntime.h"
 #include "../scene/Scene.h"
+#include "../scene/SceneIO.h"
 #include "../editor/Raycast.h"
 #include "../physics/ColliderUtils.h"
 #include "../physics/PhysicsWorld.h"
 #include <GLFW/glfw3.h>
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <cstring>
 #include <filesystem>
 #include <unordered_map>
@@ -342,6 +344,98 @@ Entity* VM::ResolveEntity(const Value& value) const {
     return nullptr;
 }
 
+void VM::SetEntityActive(Entity& entity, bool active, bool notify) {
+    if (entity.IsActive() == active)
+        return;
+    entity.SetActive(active);
+    const uint32_t id = entity.GetID();
+    for (RuntimePool& pool : m_RuntimePools)
+        for (size_t i = 0; i < pool.entityIds.size(); ++i)
+            if (pool.entityIds[i] == id)
+                pool.active[i] = active;
+    for (RuntimePrefabState& prefab : m_RuntimePrefabs)
+        for (size_t i = 0; i < prefab.spawned.size(); ++i)
+            if (prefab.spawned[i] == id)
+                prefab.active[i] = active;
+    if (!notify)
+        return;
+    std::vector<uint32_t>& queue = active ? m_SpawnRequests : m_DespawnRequests;
+    std::function<void(Entity&)> collect = [&](Entity& current) {
+        queue.push_back(current.GetID());
+        if (!m_Scene)
+            return;
+        for (uint32_t childId : current.GetChildIDs())
+            if (Entity* child = m_Scene->FindEntity(childId))
+                collect(*child);
+    };
+    collect(entity);
+}
+
+RuntimePool* VM::FindRuntimePool(const std::string& name) {
+    for (RuntimePool& pool : m_RuntimePools)
+        if (pool.name == name)
+            return &pool;
+    return nullptr;
+}
+
+RuntimePrefabState* VM::FindRuntimePrefab(const std::string& path) {
+    for (RuntimePrefabState& prefab : m_RuntimePrefabs)
+        if (prefab.path == path)
+            return &prefab;
+    return nullptr;
+}
+
+void VM::RecordRuntimePrefab(const std::string& path, uint32_t capacity,
+                             uint32_t entityId) {
+    if (path.empty())
+        return;
+    RuntimePrefabState* prefab = FindRuntimePrefab(path);
+    if (!prefab) {
+        m_RuntimePrefabs.push_back({path, capacity, {}});
+        prefab = &m_RuntimePrefabs.back();
+    }
+    prefab->capacity = std::max(prefab->capacity, capacity);
+    if (entityId != 0) {
+        prefab->spawned.push_back(entityId);
+        prefab->active.push_back(true);
+    }
+}
+
+int VM::RegisterRuntimePool(const std::string& name) {
+    if (name.empty())
+        return 0;
+    if (RuntimePool* existing = FindRuntimePool(name))
+        return static_cast<int>(existing->entityIds.size());
+    if (m_RuntimePools.size() >= VM_POOL_CAP)
+        return 0;
+
+    RuntimePool pool;
+    pool.name = name;
+    if (m_Scene) {
+        for (const auto& entityPtr : m_Scene->GetEntities()) {
+            Entity* entity = entityPtr.get();
+            if (!entity)
+                continue;
+            const auto* tag = entity->GetComponent<TagComponent>();
+            const std::string& entityName = tag ? tag->tag : std::string{};
+            const bool matches = entityName == name ||
+                (entityName.size() > name.size() &&
+                 entityName.compare(0, name.size(), name) == 0 &&
+                 entityName[name.size()] == '.');
+            if (!matches)
+                continue;
+            if (pool.entityIds.size() >= VM_POOL_MEMBER_CAP)
+                break;
+            pool.entityIds.push_back(entity->GetID());
+            pool.active.push_back(false);
+            entity->SetActive(false);
+        }
+    }
+    const int count = static_cast<int>(pool.entityIds.size());
+    m_RuntimePools.push_back(std::move(pool));
+    return count;
+}
+
 Value VM::Pop() {
     if (m_Stack.empty())
         return Value{};
@@ -430,7 +524,6 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
             return false;
         }
         const OpCode op = static_cast<OpCode>(code[ip++]);
-        if (m_PerformanceCounting) ++m_OpcodeCounts[static_cast<uint8_t>(op)];
 
         switch (op) {
         case OpCode::PushConst: {
@@ -470,7 +563,8 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                 Push(v); break;
             }
             if (idx < m_Module->fields.size() &&
-                m_Module->fields[idx].valueKind == FieldValueKind::AudioClip) {
+                (m_Module->fields[idx].valueKind == FieldValueKind::AudioClip ||
+                 m_Module->fields[idx].valueKind == FieldValueKind::Prefab)) {
                 Push(MakeRuntimeString(idx < instance.assetFields.size()
                     ? instance.assetFields[idx] : std::string{}));
                 break;
@@ -501,7 +595,8 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                 val = {}; val.tag = Value::Tag::Number; val.number = entity ? entity->GetID() : 0;
             }
             if (idx < m_Module->fields.size() &&
-                m_Module->fields[idx].valueKind == FieldValueKind::AudioClip) {
+                (m_Module->fields[idx].valueKind == FieldValueKind::AudioClip ||
+                 m_Module->fields[idx].valueKind == FieldValueKind::Prefab)) {
                 if (idx < instance.assetFields.size() && val.tag == Value::Tag::String)
                     instance.assetFields[idx] = ResolveString(val);
             } else {
@@ -640,14 +735,16 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                 break;
             }
             if (obj.tag == Value::Tag::Host && obj.host.kind == HostKind::Transform &&
-                (member == "rotation" || member == "position" || member == "scale")) {
+                (member == "rotation" || member == "position" ||
+                 member == "localPosition" || member == "scale")) {
                 Value v;
                 v.tag = Value::Tag::Host;
                 v.host.kind = HostKind::Vec3;
                 if (obj.host.transform) {
                     glm::vec3* target = nullptr;
                     if (member == "rotation")      target = &obj.host.transform->rotation;
-                    else if (member == "position") target = &obj.host.transform->position;
+                    else if (member == "position" || member == "localPosition")
+                        target = &obj.host.transform->position;
                     else                            target = &obj.host.transform->scale;
                     v.host.vec3.x = &target->x;
                     v.host.vec3.y = &target->y;
@@ -878,6 +975,14 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                 } else if (a.tag == Value::Tag::String && b.tag == Value::Tag::String) {
                     result = ResolveString(a) == ResolveString(b);
                     if (op == OpCode::Ne) result = !result;
+                } else if (a.tag == Value::Tag::String || b.tag == Value::Tag::String) {
+                    // Asset references (AudioClip/Prefab fields) are paths and
+                    // `null` compiles to 0: a reference equals null only while
+                    // unassigned. Numeric coercion made every path equal null.
+                    const bool stringIsA = a.tag == Value::Tag::String;
+                    result = ResolveString(stringIsA ? a : b).empty() &&
+                             !IsTruthy(stringIsA ? b : a);
+                    if (op == OpCode::Ne) result = !result;
                 }
             }
             Value r;
@@ -908,7 +1013,6 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
             const uint16_t hostId = ReadU16(code, ip);
             const uint8_t argc = ReadU8(code, ip);
             const HostFunc func = static_cast<HostFunc>(hostId);
-            if (m_PerformanceCounting && hostId < m_HostCounts.size()) ++m_HostCounts[hostId];
 
             std::vector<Value> args(argc);
             for (int i = static_cast<int>(argc) - 1; i >= 0; --i)
@@ -1378,6 +1482,114 @@ bool VM::Execute(ScriptInstance& instance, const CompiledMethod& method,
                         m_DestroyRequests.push_back(id);
                 }
                 Push(Value{});
+                break;
+            }
+            case HostFunc::Entity_SetActive: {
+                Entity* entity = argc >= 1 ? ResolveEntity(args[0]) : nullptr;
+                const bool makeActive = argc >= 2 ? NumberValue(args[1]) != 0.0 : false;
+                if (entity)
+                    SetEntityActive(*entity, makeActive, true);
+                pushNumber(entity ? 1.0 : 0.0);
+                break;
+            }
+            case HostFunc::Entity_IsActive: {
+                Entity* entity = argc >= 1 ? ResolveEntity(args[0]) : nullptr;
+                pushNumber(entity && entity->IsActive() ? 1.0 : 0.0);
+                break;
+            }
+            case HostFunc::Pool_Register: {
+                const std::string name = argc >= 1 && args[0].tag == Value::Tag::String
+                    ? ResolveString(args[0]) : std::string{};
+                pushNumber(static_cast<double>(RegisterRuntimePool(name)));
+                break;
+            }
+            case HostFunc::Pool_Acquire: {
+                const std::string name = argc >= 1 && args[0].tag == Value::Tag::String
+                    ? ResolveString(args[0]) : std::string{};
+                RuntimePool* pool = FindRuntimePool(name);
+                if (!pool && !name.empty()) {
+                    RegisterRuntimePool(name);
+                    pool = FindRuntimePool(name);
+                }
+                Value result;
+                if (pool && m_Scene) {
+                    for (size_t i = 0; i < pool->entityIds.size(); ++i) {
+                        if (pool->active[i])
+                            continue;
+                        Entity* entity = m_Scene->FindEntity(pool->entityIds[i]);
+                        if (!entity)
+                            continue;
+                        SetEntityActive(*entity, true, true);
+                        pool->active[i] = true;
+                        result.tag = Value::Tag::Host;
+                        result.host.kind = HostKind::Entity;
+                        result.host.entity = entity;
+                        break;
+                    }
+                }
+                Push(result);
+                break;
+            }
+            case HostFunc::Pool_Release: {
+                Entity* entity = argc >= 1 ? ResolveEntity(args[0]) : nullptr;
+                if (entity)
+                    SetEntityActive(*entity, false, true);
+                pushNumber(entity ? 1.0 : 0.0);
+                break;
+            }
+            case HostFunc::Pool_Count: {
+                const std::string name = argc >= 1 && args[0].tag == Value::Tag::String
+                    ? ResolveString(args[0]) : std::string{};
+                const RuntimePool* pool = FindRuntimePool(name);
+                pushNumber(pool ? static_cast<double>(pool->entityIds.size()) : 0.0);
+                break;
+            }
+            case HostFunc::Scene_Prewarm: {
+                const std::string path = argc >= 1 && args[0].tag == Value::Tag::String
+                    ? ResolveString(args[0]) : std::string{};
+                const uint32_t capacity = argc >= 2
+                    ? static_cast<uint32_t>(std::max(0.0, NumberValue(args[1]))) : 0u;
+                if (path.empty())
+                    outErrors.push_back("Scene.Prewarm: prefab is unset.");
+                RecordRuntimePrefab(path, capacity, 0);
+                pushNumber(argc >= 2 ? NumberValue(args[1]) : 0.0);
+                break;
+            }
+            case HostFunc::Scene_Spawn: {
+                const std::string path = argc >= 1 && args[0].tag == Value::Tag::String
+                    ? ResolveString(args[0]) : std::string{};
+                Entity* entity = nullptr;
+                if (path.empty())
+                    outErrors.push_back("Scene.Spawn: prefab is unset.");
+                else if (m_Scene) {
+                    std::string error;
+                    entity = SceneIO::InstantiateFromFile(
+                        *m_Scene, AssetManager::Get().ToAbsolute(path), error);
+                    if (!entity) {
+                        outErrors.push_back("Scene.Spawn failed: " + error);
+                    } else {
+                        const glm::vec3 position(
+                            argc >= 2 ? static_cast<float>(NumberValue(args[1])) : 0.0f,
+                            argc >= 3 ? static_cast<float>(NumberValue(args[2])) : 0.0f,
+                            argc >= 4 ? static_cast<float>(NumberValue(args[3])) : 0.0f);
+                        m_Scene->SetWorldPosition(*entity, position);
+                        std::function<void(Entity&)> enqueue = [&](Entity& e) {
+                            m_SpawnRequests.push_back(e.GetID());
+                            for (uint32_t childId : e.GetChildIDs())
+                                if (Entity* child = m_Scene->FindEntity(childId))
+                                    enqueue(*child);
+                        };
+                        enqueue(*entity);
+                        RecordRuntimePrefab(path, 0, entity->GetID());
+                    }
+                }
+                Value result;
+                if (entity) {
+                    result.tag = Value::Tag::Host;
+                    result.host.kind = HostKind::Entity;
+                    result.host.entity = entity;
+                }
+                Push(result);
                 break;
             }
             case HostFunc::Entity_GetId:

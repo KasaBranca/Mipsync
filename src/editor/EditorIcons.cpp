@@ -184,15 +184,6 @@ void DrawToolbarIcon(ToolbarIcon icon, ImDrawList* dl, ImVec2 center, float size
     const float stroke = std::max(1.0f, size / 12.0f);
     auto line = [&](float x, float y, float u, float v) { dl->AddLine(p(x,y),p(u,v),color,stroke); };
     switch (icon) {
-    case ToolbarIcon::PSync:
-        for (float start : {-.7f, 2.44159265f}) {
-            const float end = start + 2.1f;
-            dl->PathArcTo(center, size * .34f, start, end, 12);
-            dl->PathStroke(color, 0, stroke);
-            DrawArrowHead(dl, p(std::cos(end)*.34f,std::sin(end)*.34f),
-                          {-std::sin(end),std::cos(end)},size*.2f,color);
-        }
-        break;
     case ToolbarIcon::Statistics:
         for (int i=0;i<3;++i) {
             const float x=-.32f+i*.25f, top=.13f-i*.22f;

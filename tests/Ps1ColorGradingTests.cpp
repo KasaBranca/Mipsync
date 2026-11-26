@@ -1,5 +1,5 @@
 #include "ps1/Ps1ColorGrading.h"
-#include "ps1/PSync.h"
+#include "ps1/Ps1ColorGrading.h"
 #include <vector>
 #include <iostream>
 #include <stdexcept>

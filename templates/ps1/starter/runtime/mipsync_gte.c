@@ -59,6 +59,7 @@ static int32_t cos_turn_q12(int32_t angle) {
 }
 
 void mipsync_gte_init(void) {
+#if defined(__mips__)
     /* Enable COP2 in COP0.Status, then establish Mipsync's depth averaging. */
     __asm__ volatile(
         "mfc0 $8,$12\n"
@@ -73,6 +74,7 @@ void mipsync_gte_init(void) {
         __asm__ volatile("ctc2 %0,$29\nctc2 %1,$30\n"
                          : : "r"(zsf3), "r"(zsf4));
     }
+#endif /* Host unit tests compile only the pure-C matrix helpers. */
 }
 
 MATRIX* mipsync_gte_mul_matrix(const MATRIX* left, const MATRIX* right,
@@ -99,26 +101,35 @@ MATRIX* mipsync_gte_mul_matrix(const MATRIX* left, const MATRIX* right,
 }
 
 MATRIX* mipsync_gte_rot_matrix(const SVECTOR* rotation, MATRIX* out) {
-    MATRIX x = {{{ONE,0,0},{0,0,0},{0,0,0}}, {0,0,0}};
-    MATRIX y = {{{0,0,0},{0,ONE,0},{0,0,0}}, {0,0,0}};
-    MATRIX z = {{{0,0,0},{0,0,0},{0,0,ONE}}, {0,0,0}};
-    MATRIX yx;
-    const int32_t sx = sin_turn_q12(rotation->vx);
-    const int32_t cx = cos_turn_q12(rotation->vx);
-    const int32_t sy = sin_turn_q12(rotation->vy);
-    const int32_t cy = cos_turn_q12(rotation->vy);
-    const int32_t sz = sin_turn_q12(rotation->vz);
-    const int32_t cz = cos_turn_q12(rotation->vz);
-    x.m[1][1] = (int16_t)cx; x.m[1][2] = (int16_t)-sx;
-    x.m[2][1] = (int16_t)sx; x.m[2][2] = (int16_t)cx;
-    y.m[0][0] = (int16_t)cy; y.m[0][2] = (int16_t)sy;
-    y.m[2][0] = (int16_t)-sy; y.m[2][2] = (int16_t)cy;
-    z.m[0][0] = (int16_t)cz; z.m[0][1] = (int16_t)-sz;
-    z.m[1][0] = (int16_t)sz; z.m[1][1] = (int16_t)cz;
-    /* Match Mipsync's editor transform convention: Ry * Rx * Rz. */
-    mipsync_gte_mul_matrix(&y, &x, &yx);
-    mipsync_gte_mul_matrix(&yx, &z, out);
-    out->t[0] = out->t[1] = out->t[2] = 0;
+    const int32_t sx = (int16_t)sin_turn_q12(rotation->vx);
+    const int32_t cx = (int16_t)cos_turn_q12(rotation->vx);
+    const int32_t sy = (int16_t)sin_turn_q12(rotation->vy);
+    const int32_t cy = (int16_t)cos_turn_q12(rotation->vy);
+    const int32_t sz = (int16_t)sin_turn_q12(rotation->vz);
+    const int32_t cz = (int16_t)cos_turn_q12(rotation->vz);
+    int16_t yx[3][3];
+    int row;
+    /* Match Mipsync's editor transform convention: Ry * Rx * Rz. This is the
+     * closed form of two generic 3x3 products (Ry * Rx, then * Rz) with the
+     * zero terms removed. Each surviving sum keeps the generic product's
+     * Q24 -> Q12 rounding and int16 clamp, so the result is bit-identical. */
+    yx[0][0] = clamp_i16(round_q24_to_q12_i32(cy * ONE));
+    yx[0][1] = clamp_i16(round_q24_to_q12_i32(sy * sx));
+    yx[0][2] = clamp_i16(round_q24_to_q12_i32(sy * cx));
+    yx[1][0] = 0;
+    yx[1][1] = clamp_i16(round_q24_to_q12_i32(ONE * cx));
+    yx[1][2] = clamp_i16(round_q24_to_q12_i32(ONE * (int32_t)(int16_t)-sx));
+    yx[2][0] = clamp_i16(round_q24_to_q12_i32((int32_t)(int16_t)-sy * ONE));
+    yx[2][1] = clamp_i16(round_q24_to_q12_i32(cy * sx));
+    yx[2][2] = clamp_i16(round_q24_to_q12_i32(cy * cx));
+    for (row = 0; row < 3; ++row) {
+        out->m[row][0] = clamp_i16(round_q24_to_q12_i32(
+            (int32_t)yx[row][0] * cz + (int32_t)yx[row][1] * sz));
+        out->m[row][1] = clamp_i16(round_q24_to_q12_i32(
+            (int32_t)yx[row][0] * (int32_t)(int16_t)-sz + (int32_t)yx[row][1] * cz));
+        out->m[row][2] = clamp_i16(round_q24_to_q12_i32((int32_t)yx[row][2] * ONE));
+        out->t[row] = 0;
+    }
     return out;
 }
 

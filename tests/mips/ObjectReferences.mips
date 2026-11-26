@@ -8,7 +8,13 @@ class ObjectReferences : MipsBehaviour {
     public float healthX;
     public bool referencesOK;
     public bool cleared;
+    public Prefab spawnPrefab;
+    public Prefab missingPrefab;
+    public bool prefabNullOK;
     void Start() {
+        // GitHub #4: assigned asset references are not null; unassigned ones are.
+        prefabNullOK = spawnPrefab != null && !(spawnPrefab == null)
+            && missingPrefab == null && !(missingPrefab != null);
         cached = Scene.Find("Target");
         referencesOK = target != null && cached == target && Scene.FindById(target.id) == target
             && Scene.Find("Missing") == null && Scene.FindById(0) == null && target.name == "Target"

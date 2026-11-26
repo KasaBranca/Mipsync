@@ -27,6 +27,8 @@ int  ps1_audio_is_playing(unsigned int entity_index);
 void ps1_audio_apply_entity(unsigned int entity_index);
 void ps1_audio_get_spectrum(uint8_t* bands, unsigned int count);
 int ps1_audio_find_clip(const char* path); /* 1-based index, 0 empty, -1 missing */
+/* Non-zero once the SDK CD driver is initialized (only for CD-streamed clips). */
+int ps1_audio_cd_ready(void);
 const char* ps1_audio_clip_path(unsigned int index);
 
 #endif

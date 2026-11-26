@@ -55,7 +55,7 @@ int main() {
         pad.BeginFrame(); const auto slow=pad.frame.axes;
         pad.Clear(); pad.Sample(held,down,up,0,{0,0,0,0},{1,-1},1.f/60,true); pad.BeginFrame();
         Require(std::abs(pad.frame.axes[2]-slow[2])<.00001f && std::abs(pad.frame.axes[3]-slow[3])<.00001f,
-            "mouse stick strength depends on P-Sync cadence");
+            "mouse stick strength depends on sample cadence");
         Require(slow[2]>0 && slow[3]>0 && slow[2]<=1,"mouse stick signs/range wrong");
         for (const auto delta : std::array<std::array<float,2>,4>{{{1,0},{-1,0},{0,-1},{0,1}}}) {
             pad.Clear(); pad.Sample(held,down,up,0,{0,0,0,0},delta,1.f/60,true); pad.BeginFrame();
@@ -93,7 +93,7 @@ int main() {
         Input::SetPS1PadMapping(mapping);
         held={}; down={}; up={};
         s_PadInput.Sample(held,down,up,0,{0,0,0,0},{1,-1},1.f/60,true);
-        Input::BeginGameFrame(true);
+        Input::BeginGameFrame();
         Require(Input::GetPS1Axis("RightStickX")>0 && Input::GetPS1Axis("RightStickY")>0 &&
             Input::GetPS1Axis("LeftStickX")==0,"VM input scope misses default right mouse stick");
         Input::EndGameFrame();
@@ -101,48 +101,28 @@ int main() {
         // Feed the actual input scope used by the VM, including UI handoff.
         held={}; down={}; up={}; down[0]=true;
         s_PadInput.Sample(held,down,up,0,{0,0,0,0},{0,0},1.f/60,true);
-        Input::BeginGameFrame(true); Require(Input::GetPS1ButtonDown("Cross"),"VM misses virtual PS1 press");
-        Input::EndGameFrame(); Input::BeginGameUIFrame(true);
+        Input::BeginGameFrame(); Require(Input::GetPS1ButtonDown("Cross"),"VM misses virtual PS1 press");
+        Input::EndGameFrame(); Input::BeginGameUIFrame();
         Require(Input::GetPS1ButtonDown("Cross"),"UI lost virtual PS1 press"); Input::EndGameUIFrame();
-        Input::BeginGameFrame(true); Require(!Input::GetPS1ButtonDown("Cross"),"virtual PS1 press replayed"); Input::EndGameFrame();
+        Input::BeginGameFrame(); Require(!Input::GetPS1ButtonDown("Cross"),"virtual PS1 press replayed"); Input::EndGameFrame();
         Input::SetGameInputEnabled(false); Require(!Input::GetPS1ButtonDown("Cross"),"disabled pad leaked edge");
         Input::SetGameInputEnabled(true);
         Input::SetInjectedPS1Input(1,{0,0,.25f,-.5f});
-        Input::BeginGameFrame(false);Input::BeginInjectedPS1Frame();
+        Input::BeginGameFrame();Input::BeginInjectedPS1Frame();
         Require(Input::GetPS1ButtonDown("Cross")&&Input::GetPS1Axis("RightStickX")==.25f,
             "injected PS1 input did not reach the gameplay frame");
-        Input::EndGameFrame();Input::BeginGameFrame(false);Input::BeginInjectedPS1Frame();
+        Input::EndGameFrame();Input::BeginGameFrame();Input::BeginInjectedPS1Frame();
         Require(Input::GetPS1Button("Cross")&&!Input::GetPS1ButtonDown("Cross"),"injected held input replayed its press edge");
-        Input::EndGameFrame();Input::SetInjectedPS1Input(0,{});Input::BeginGameFrame(false);Input::BeginInjectedPS1Frame();
+        Input::EndGameFrame();Input::SetInjectedPS1Input(0,{});Input::BeginGameFrame();Input::BeginInjectedPS1Frame();
         Require(Input::GetPS1ButtonUp("Cross"),"injected PS1 release edge was lost");
         Input::EndGameFrame();Input::ClearInjectedPS1Input();
-        bool edges[GLFW_KEY_LAST + 1] = {};
-        edges[GLFW_KEY_SPACE] = true;
-        s_GameBuffer.Accumulate(edges, {5, 3}, 2);
-        edges[GLFW_KEY_SPACE] = false;
-        s_GameBuffer.Accumulate(edges, {-2, 1}, -1);
-        Input::BeginGameFrame(true);
-        Require(Input::IsKeyDown(GLFW_KEY_SPACE), "script misses short press between game ticks");
-        Require(Input::GetMouseDelta() == glm::vec2(3, 4) && Input::GetScrollDelta() == 1,
-                "script input doesn't accumulate");
-        Input::EndGameFrame();
-        Require(!Input::IsKeyDown(GLFW_KEY_SPACE), "game key leaked into editor scope");
-        Input::BeginGameUIFrame(true);
-        Require(Input::IsKeyDown(GLFW_KEY_SPACE), "UI lost key consumed by script update");
-        Input::EndGameUIFrame();
-        Input::BeginGameFrame(true);
-        Require(!Input::IsKeyDown(GLFW_KEY_SPACE) && Input::GetMouseDelta() == glm::vec2(0),
-                "input replayed on next tick");
-        Input::EndGameFrame();
         s_KeyDownEdge[GLFW_KEY_A] = true;
-        Input::BeginGameFrame(false);
-        Require(Input::IsKeyDown(GLFW_KEY_A), "normal mode key handling changed");
+        Input::BeginGameFrame();
+        Require(Input::IsKeyDown(GLFW_KEY_A), "game frame key handling changed");
         Input::EndGameFrame();
-        s_GameBuffer.Accumulate(edges, {10, 10}, 0);
-        Input::BeginGameFrame(true);
+        s_KeyDownEdge[GLFW_KEY_A] = false;
         WindowFocusCallback(nullptr, 0);
-        Require(Input::GetMouseDelta() == glm::vec2(0), "focus loss didn't clear pending input");
-        Input::EndGameFrame();
+        Require(!Input::IsKeyDown(GLFW_KEY_A), "focus loss didn't clear pending input");
         MouseWindow mainMouse, gameMouse;
         mainMouse.focused=GLFW_FALSE;
         auto* mainWindow=reinterpret_cast<GLFWwindow*>(&mainMouse);
@@ -199,7 +179,7 @@ int main() {
         Input::ForgetGameInputWindow(mainWindow);
         Require(!Input::GetGameInputWindow() && !Input::IsCursorLocked() && mainMouse.cursor==GLFW_CURSOR_NORMAL,
                 "destroyed viewport retained a capture or dangling input target");
-        std::cout << "P-Sync input scopes, UI handoff, normal mode and focus-loss checks passed\n";
+        std::cout << "Input scopes, UI handoff, game frame and focus-loss checks passed\n";
         std::cout << "Mouse capture, detached viewport routing, relative motion, recapture and release checks passed\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

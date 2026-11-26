@@ -1,6 +1,6 @@
 #pragma once
 // ─────────────────────────────────────────────────
-// Mips# Language Specification (v0.6)
+// Mips# Language Specification (v0.7)
 // Unity C#-like syntax for Mipsync Engine component scripts
 // ─────────────────────────────────────────────────
 //
@@ -20,13 +20,28 @@
 //   void OnCollisionExit();
 //   void OnTriggerEnter();
 //   void OnTriggerExit();
+//   void OnSpawn();      // pooled entity acquired with Pool.Acquire
+//   void OnDespawn();    // pooled entity released with Pool.Release
 //
-// Fields (Inspector-serialized):
+// Fields (public fields are Inspector-serialized):
 //   public float speed = 90.0;
 //   public bool grounded = true;
 //   public int phase = 0;
 //   public AudioClip music;  // Inspector audio asset drag-and-drop
+//   public Prefab enemyPrefab; // Inspector prefab drag-and-drop (asset path)
 //   public Vector3 travel = Vector3(0, 3, 0); // Inspector XYZ field
+//   [SerializeField] private float tuned = 0.0; // private but serialized
+//   private float _cache = 0.0; // runtime state, hidden and not serialized
+// Access modifiers public/private/protected/internal are accepted on fields
+// and methods.
+//
+// Methods:
+//   private float ClampSpeed(float value) { return Mathf.Clamp(value, -1.0, 1.0); }
+//   // Calls are inlined at compile time; recursion is rejected.
+//
+// Operators:
+//   condition ? a : b;  value += delta;  count++;  count--;
+//   enum Mode { Idle, Drive } // trailing ';' optional
 //
 // Auto-properties (backing field, Unity-style):
 //   public float Speed { get; set; }
@@ -103,9 +118,28 @@
 //       grounded CharacterVirtuals inherit its platform velocity
 //   Physics.otherEntityId — other entity id during OnCollision*/OnTrigger* callbacks
 //
+// Fixed pools (pre-place entities named "Road", "Road.1", ...):
+//   int capacity = Pool.Register("Road"); // hides matching entities
+//   Entity e = Pool.Acquire("Road");      // first inactive member, or null
+//   e.transform.position = Vector3(x, y, z);
+//   Pool.Release(e);                      // deactivate + return to pool
+//   int total = Pool.Count("Road");
+//   e.SetActive(true/false);  bool active = e.IsActive();
+//   Pool members must be active when the scene is built; Register hides them
+//   at runtime. No automatic growth: Acquire returns null when exhausted.
+//
+// Runtime prefabs:
+//   public Prefab enemyPrefab; // Inspector drag-and-drop
+//   int n = Scene.Prewarm(enemyPrefab, 8); // PS1 capacity
+//   Entity e = Scene.Spawn(enemyPrefab, x, y, z);
+//   // String literal overloads are also kept for compatibility.
+//   Scene.Despawn(e); // deactivate; use Destroy(e) to remove permanently
+//   PC reads the .nprefab directly. PS1 bakes fixed copies at build time;
+//   capacity defaults to 4 when Prewarm is omitted and never grows.
+//
 // Scene / application:
-//   Scene.Load("scenes/level2.nscene") — deferred load; restarts play if active
-//   Scene.LoadBuildIndex(1) — load by index in Build Settings scene list
+//   Scene.Load("scenes/level2.nscene") ? deferred load; restarts play if active
+//   Scene.LoadBuildIndex(1) ? load by index in Build Settings scene list
 //   Application.Quit()
 //
 // Save (JSON under project/saves/):
@@ -122,7 +156,9 @@
 //
 // Common helpers:
 //   Debug.Log("value=", value)  // alias of Log.Info
-//   Mathf.Min / Max / Lerp / Floor / Ceil / Round / Sign
+//   Mathf.Min / Max / Clamp / Clamp01 / Lerp / MoveTowards
+//   Mathf.Abs / Sqrt / Sign / Floor / Ceil / Round / Sin / Cos / Atan2
+//   Mathf.PI / Deg2Rad / Rad2Deg
 //
 // Animator (same entity, or via GetComponent<Animator>()):
 //   Animator.SetFloat("Speed", 1.0)
@@ -149,7 +185,7 @@
 
 namespace MipsyncEngine::Mips {
 
-inline constexpr const char* kLanguageVersion = "0.6";
+inline constexpr const char* kLanguageVersion = "0.7";
 inline constexpr const char* kBaseClassName = "MipsBehaviour";
 
 } // namespace MipsyncEngine::Mips

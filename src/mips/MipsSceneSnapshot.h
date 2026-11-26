@@ -21,6 +21,7 @@ public:
 private:
     struct TransformEntry {
         uint32_t entityId = 0;
+        bool active = true;
         glm::vec3 position{};
         glm::vec3 rotation{};
         glm::vec3 scale{ 1.0f };

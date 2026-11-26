@@ -56,9 +56,9 @@ public:
     static void SetPreparationInProgress(bool preparing);
 
     static void Update();
-    static void BeginGameFrame(bool accumulated);
+    static void BeginGameFrame();
     static void EndGameFrame();
-    static void BeginGameUIFrame(bool accumulated);
+    static void BeginGameUIFrame();
     static void EndGameUIFrame();
 
 private:

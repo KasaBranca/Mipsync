@@ -30,7 +30,7 @@ struct CompiledMethod {
     bool isPublic = false;
 };
 
-enum class FieldValueKind : uint8_t { Number = 0, Bool, AudioClip, Array, EntityReference };
+enum class FieldValueKind : uint8_t { Number = 0, Bool, AudioClip, Array, EntityReference, Prefab };
 
 struct CompiledField {
     InspectorAttributes inspector;
@@ -40,6 +40,16 @@ struct CompiledField {
     uint16_t defaultConstIndex = 0;
     bool hasGetter = true;
     bool hasSetter = true;
+    bool isPublic = true;
+};
+
+struct PrefabRequirement {
+    std::string path;
+    std::string fieldName; // non-empty when resolved from a Prefab field at build time
+    uint32_t capacity = 0; // 0 = inferred default; Prewarm increases it
+    // Scene.Prewarm(prefab, intField): resolved from the serialized scene value
+    // (or the field default) at PS1 export time.
+    std::string capacityFieldName;
 };
 
 struct CompiledModule {
@@ -49,9 +59,14 @@ struct CompiledModule {
     std::vector<double> numberConstants;
     std::vector<std::string> stringConstants;
     std::vector<std::string> nameConstants; // globals / members
+    std::vector<PrefabRequirement> prefabRequirements;
+    bool ps1DynamicPrefabSpawn = false;
     // Desktop-valid constructs that intentionally cannot run with matching
     // semantics on the current PS1 runtime. The PS1 exporter reports these.
     std::vector<std::string> ps1CompatibilityErrors;
+    // Valid on both targets but likely to behave differently on PS1 (for
+    // example a Prewarm capacity the exporter cannot resolve).
+    std::vector<std::string> ps1Warnings;
 
     const CompiledMethod* FindMethod(const std::string& name) const;
     int FindFieldIndex(const std::string& name) const;

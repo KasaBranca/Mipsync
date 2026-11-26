@@ -12,6 +12,9 @@ const char* TokenTypeName(TokenType type) {
         case TokenType::StringLiteral: return "StringLiteral";
         case TokenType::KwClass: return "class";
         case TokenType::KwPublic: return "public";
+        case TokenType::KwPrivate: return "private";
+        case TokenType::KwProtected: return "protected";
+        case TokenType::KwInternal: return "internal";
         case TokenType::KwVoid: return "void";
         case TokenType::KwIf: return "if";
         case TokenType::KwElse: return "else";
@@ -33,7 +36,15 @@ const char* TokenTypeName(TokenType type) {
         case TokenType::Star: return "*";
         case TokenType::Slash: return "/";
         case TokenType::Percent: return "%";
+        case TokenType::PlusPlus: return "++";
+        case TokenType::MinusMinus: return "--";
         case TokenType::Assign: return "=";
+        case TokenType::PlusAssign: return "+=";
+        case TokenType::MinusAssign: return "-=";
+        case TokenType::StarAssign: return "*=";
+        case TokenType::SlashAssign: return "/=";
+        case TokenType::PercentAssign: return "%=";
+        case TokenType::Question: return "?";
         case TokenType::EqualEqual: return "==";
         case TokenType::BangEqual: return "!=";
         case TokenType::Less: return "<";

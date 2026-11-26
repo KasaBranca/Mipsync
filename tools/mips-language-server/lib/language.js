@@ -2,10 +2,10 @@
 const { KEYWORDS, TYPES, GLOBALS, ATTRIBUTES } = require("./api");
 const TOKEN_TYPES = ["class", "enum", "function", "method", "property", "variable", "type", "parameter", "enumMember", "keyword", "operator", "number", "decorator"];
 const primitives = new Set(["void", "bool", "int", "float", "string"]);
-const keywords = new Set([...KEYWORDS, "get", "set", "private"]);
+const keywords = new Set([...KEYWORDS, "get", "set", "private", "protected", "internal"]);
 function lex(text) {
   const out = [];
-  const re = /\/\/[^\r\n]*|\/\*[\s\S]*?(?:\*\/|$)|"(?:\\[\s\S]|[^"\\])*(?:"|$)|[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?|==|!=|<=|>=|&&|\|\||[+*/%=!<>-]|[^\s]/g;
+  const re = /\/\/[^\r\n]*|\/\*[\s\S]*?(?:\*\/|$)|"(?:\\[\s\S]|[^"\\])*(?:"|$)|[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?|==|!=|<=|>=|&&|\|\||\+\+|--|\+=|-=|\*=|\/=|%=|\?|[+*/%=!<>-]|[^\s]/g;
   for (const m of text.matchAll(re)) {
     const value = m[0];
     const kind = value.startsWith("//") || value.startsWith("/*") ? "comment" : value[0] === '"' ? "string" : /^[A-Za-z_]/.test(value) ? "identifier" : /^\d/.test(value) ? "number" : /^[+*/%=!<>|&-]/.test(value) ? "operator" : "punctuation";

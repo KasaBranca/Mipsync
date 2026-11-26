@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 
-/* Shared by the PS1 loop and editor P-Sync. The presentation clock is the
- * hardware NTSC rate; game logic uses nominal 60 Hz Q16.16 field deltas. */
+/* Used by the PS1 main loop. The presentation clock is the hardware NTSC
+ * rate; game logic uses nominal 60 Hz Q16.16 field deltas. */
 #define PS1_LOGIC_FIELD_HZ 60
 #define PS1_MAX_LOGIC_VBLANKS 4
 

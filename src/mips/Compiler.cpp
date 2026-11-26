@@ -39,6 +39,31 @@ bool TryEvalFieldDefault(const Ast::Expr& expr, double& out) {
     return false;
 }
 
+bool TryGetStringLiteral(const Ast::Expr& expr, std::string& out) {
+    if (expr.kind != Ast::Expr::Kind::Literal || !expr.literal ||
+        expr.literal->kind != Ast::LiteralExpr::Kind::String)
+        return false;
+    out = expr.literal->stringValue;
+    return true;
+}
+
+bool TryGetIntLiteral(const Ast::Expr& expr, int& out) {
+    if (expr.kind == Ast::Expr::Kind::Literal && expr.literal &&
+        expr.literal->kind == Ast::LiteralExpr::Kind::Int) {
+        out = static_cast<int>(expr.literal->intValue);
+        return true;
+    }
+    if (expr.kind == Ast::Expr::Kind::Unary && expr.unary &&
+        expr.unary->op == Ast::UnaryOp::Neg && expr.unary->operand &&
+        expr.unary->operand->kind == Ast::Expr::Kind::Literal &&
+        expr.unary->operand->literal &&
+        expr.unary->operand->literal->kind == Ast::LiteralExpr::Kind::Int) {
+        out = -static_cast<int>(expr.unary->operand->literal->intValue);
+        return true;
+    }
+    return false;
+}
+
 bool TryEvalVector3FieldDefault(const Ast::Expr& expr, double out[3]) {
     if (expr.kind != Ast::Expr::Kind::Call || !expr.call || !expr.call->callee ||
         expr.call->callee->kind != Ast::Expr::Kind::Identifier ||
@@ -129,6 +154,39 @@ Compiler::Compiler(const Ast::ClassDecl& classDecl, const Ast::Program* program,
     : m_Class(classDecl), m_Program(program), m_FileName(std::move(fileName)) {
     if (m_Program)
         BuildEnumConstants(*m_Program, m_EnumConstants);
+    for (const auto& method : m_Class.methods) {
+        if (method && method->body)
+            m_UserMethods.emplace(method->name, method.get());
+    }
+}
+
+const Ast::MethodDecl* Compiler::FindUserMethod(const std::string& name) const {
+    const auto it = m_UserMethods.find(name);
+    return it == m_UserMethods.end() ? nullptr : it->second;
+}
+
+void Compiler::EmitNumber(double value) {
+    m_Writer.EmitOp(OpCode::PushConst);
+    m_Writer.EmitU16(AddNumberConstant(value));
+}
+
+void Compiler::EmitBinaryOp(Ast::BinaryOp op) {
+    switch (op) {
+        case Ast::BinaryOp::Add: m_Writer.EmitOp(OpCode::Add); break;
+        case Ast::BinaryOp::Sub: m_Writer.EmitOp(OpCode::Sub); break;
+        case Ast::BinaryOp::Mul: m_Writer.EmitOp(OpCode::Mul); break;
+        case Ast::BinaryOp::Div: m_Writer.EmitOp(OpCode::Div); break;
+        case Ast::BinaryOp::Mod: m_Writer.EmitOp(OpCode::Mod); break;
+        case Ast::BinaryOp::Eq: m_Writer.EmitOp(OpCode::Eq); break;
+        case Ast::BinaryOp::NotEq: m_Writer.EmitOp(OpCode::Ne); break;
+        case Ast::BinaryOp::Less: m_Writer.EmitOp(OpCode::Lt); break;
+        case Ast::BinaryOp::Greater: m_Writer.EmitOp(OpCode::Gt); break;
+        case Ast::BinaryOp::LessEq: m_Writer.EmitOp(OpCode::Le); break;
+        case Ast::BinaryOp::GreaterEq: m_Writer.EmitOp(OpCode::Ge); break;
+        case Ast::BinaryOp::And: m_Writer.EmitOp(OpCode::And); break;
+        case Ast::BinaryOp::Or: m_Writer.EmitOp(OpCode::Or); break;
+        default: break;
+    }
 }
 
 uint16_t Compiler::AddNumberConstant(double value) {
@@ -189,7 +247,7 @@ bool Compiler::IsTransformVecMemberAssign(const Ast::Expr& expr, std::string& ou
     if (expr.member->object->identifier->name != "transform")
         return false;
     if (expr.member->member != "rotation" && expr.member->member != "position" &&
-        expr.member->member != "scale")
+        expr.member->member != "localPosition" && expr.member->member != "scale")
         return false;
     outVecMember = expr.member->member;
     return true;
@@ -201,6 +259,7 @@ bool Compiler::IsTransformVecChain(const Ast::Expr& expr, std::string& outVecMem
     if (!IsIdentifier(*expr.member->object, "transform"))
         return false;
     if (expr.member->member != "rotation" && expr.member->member != "position" &&
+        expr.member->member != "localPosition" &&
         expr.member->member != "scale" && expr.member->member != "worldPosition")
         return false;
     outVecMember = expr.member->member;
@@ -217,6 +276,14 @@ bool Compiler::IsTransformVecAxis(const Ast::Expr& expr, std::string& outVecMemb
 }
 
 int Compiler::FindLocal(const std::string& name) const {
+    if (!m_InlineNameMaps.empty()) {
+        for (auto it = m_InlineNameMaps.rbegin(); it != m_InlineNameMaps.rend(); ++it) {
+            const auto found = it->find(name);
+            if (found != it->end())
+                return found->second;
+        }
+        return -1;
+    }
     for (size_t i = 0; i < m_Locals.size(); ++i)
         if (m_Locals[i] == name)
             return static_cast<int>(i);
@@ -224,6 +291,18 @@ int Compiler::FindLocal(const std::string& name) const {
 }
 
 int Compiler::AllocateLocal(const std::string& name) {
+    if (!m_InlineNameMaps.empty()) {
+        const std::string storage =
+            "__inline_" + std::to_string(m_InlineTempCounter++) + "_" + name;
+        m_Locals.push_back(storage);
+        if (m_Locals.size() > m_LocalCount)
+            m_LocalCount = static_cast<uint32_t>(m_Locals.size());
+        const int slot = static_cast<int>(m_Locals.size()) - 1;
+        m_InlineNameMaps.back()[name] = slot;
+        if (!m_InlineNameInsertions.empty())
+            m_InlineNameInsertions.back().push_back(name);
+        return slot;
+    }
     if (FindLocal(name) >= 0) {
         AddLocatedError("local '" + name + "' shadows existing variable");
         return FindLocal(name);
@@ -236,6 +315,7 @@ int Compiler::AllocateLocal(const std::string& name) {
 
 void Compiler::BeginScope() {
     m_ScopeBases.push_back(m_Locals.size());
+    m_InlineNameInsertions.emplace_back();
 }
 
 void Compiler::EndScope() {
@@ -243,6 +323,14 @@ void Compiler::EndScope() {
         return;
     m_Locals.resize(m_ScopeBases.back());
     m_ScopeBases.pop_back();
+    if (!m_InlineNameInsertions.empty()) {
+        if (!m_InlineNameMaps.empty()) {
+            auto& map = m_InlineNameMaps.back();
+            for (const std::string& name : m_InlineNameInsertions.back())
+                map.erase(name);
+        }
+        m_InlineNameInsertions.pop_back();
+    }
 }
 
 void Compiler::AddError(const Ast::Stmt& stmt, const std::string& message) {
@@ -274,6 +362,7 @@ std::unique_ptr<CompiledModule> Compiler::Compile() {
                 component.defaultConstIndex = AddNumberConstant(defaults[axis]);
                 component.hasGetter = field->hasGetter;
                 component.hasSetter = field->hasSetter;
+                component.isPublic = field->isPublic || field->inspector.serialize;
                 m_Module->fields.push_back(std::move(component));
             }
             continue;
@@ -284,10 +373,13 @@ std::unique_ptr<CompiledModule> Compiler::Compile() {
         cf.typeName = field->typeName;
         cf.hasGetter = field->hasGetter;
         cf.hasSetter = field->hasSetter;
+        cf.isPublic = field->isPublic || field->inspector.serialize;
         if (field->typeName == "bool")
             cf.valueKind = FieldValueKind::Bool;
         else if (field->typeName == "AudioClip")
             cf.valueKind = FieldValueKind::AudioClip;
+        else if (field->typeName == "Prefab")
+            cf.valueKind = FieldValueKind::Prefab;
         else if (field->typeName == "Entity" || field->typeName == "Transform" || field->typeName == "Camera" || field->typeName == "AudioSource")
             cf.valueKind = FieldValueKind::EntityReference;
         else if (field->typeName.size() >= 2 &&
@@ -314,6 +406,9 @@ void Compiler::CompileMethod(const Ast::MethodDecl& method) {
     m_Locals.clear();
     m_ScopeBases.clear();
     m_Loops.clear();
+    m_InlineStack.clear();
+    m_InlineReturnJumps.clear();
+    m_InlineStack.push_back(method.name);
 
     if (method.body)
         CompileBlock(*method.body);
@@ -443,6 +538,14 @@ void Compiler::CompileStatement(const Ast::Stmt& stmt) {
         break;
 
     case Ast::Stmt::Kind::Return:
+        if (!m_InlineReturnJumps.empty()) {
+            if (stmt.returnStmt && stmt.returnStmt->value)
+                CompileExpression(*stmt.returnStmt->value);
+            else
+                EmitNumber(0.0);
+            m_InlineReturnJumps.back().push_back(m_Writer.EmitJumpPlaceholder());
+            break;
+        }
         if (stmt.returnStmt && stmt.returnStmt->value)
             CompileExpression(*stmt.returnStmt->value);
         m_Writer.EmitOp(OpCode::Return);
@@ -516,6 +619,118 @@ void Compiler::CompileAssignment(const Ast::Expr& lhs, const Ast::Expr& rhs) {
     CompileLValueStore(lhs);
 }
 
+void Compiler::CompileCompoundAssignment(const Ast::Expr& lhs, const Ast::Expr& rhs,
+                                         Ast::BinaryOp op) {
+    Ast::BinaryOp arithmetic = Ast::BinaryOp::Add;
+    if (op == Ast::BinaryOp::SubAssign) arithmetic = Ast::BinaryOp::Sub;
+    else if (op == Ast::BinaryOp::MulAssign) arithmetic = Ast::BinaryOp::Mul;
+    else if (op == Ast::BinaryOp::DivAssign) arithmetic = Ast::BinaryOp::Div;
+    else if (op == Ast::BinaryOp::ModAssign) arithmetic = Ast::BinaryOp::Mod;
+
+    if (lhs.kind == Ast::Expr::Kind::Index && lhs.index) {
+        BeginScope();
+        const int objectSlot = AllocateLocal("__compound_obj_" + std::to_string(m_InlineTempCounter++));
+        const int indexSlot = AllocateLocal("__compound_idx_" + std::to_string(m_InlineTempCounter++));
+        const int valueSlot = AllocateLocal("__compound_val_" + std::to_string(m_InlineTempCounter++));
+        CompileExpression(*lhs.index->object);
+        m_Writer.EmitOp(OpCode::SetLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(objectSlot));
+        CompileExpression(*lhs.index->index);
+        m_Writer.EmitOp(OpCode::SetLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(indexSlot));
+        m_Writer.EmitOp(OpCode::PushLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(objectSlot));
+        m_Writer.EmitOp(OpCode::PushLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(indexSlot));
+        m_Writer.EmitOp(OpCode::GetIndex);
+        CompileExpression(rhs);
+        EmitBinaryOp(arithmetic);
+        m_Writer.EmitOp(OpCode::SetLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(valueSlot));
+        m_Writer.EmitOp(OpCode::PushLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(objectSlot));
+        m_Writer.EmitOp(OpCode::PushLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(indexSlot));
+        m_Writer.EmitOp(OpCode::PushLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(valueSlot));
+        m_Writer.EmitOp(OpCode::SetIndex);
+        m_Writer.EmitOp(OpCode::PushLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(valueSlot));
+        EndScope();
+        return;
+    }
+
+    CompileExpression(lhs);
+    CompileExpression(rhs);
+    EmitBinaryOp(arithmetic);
+    CompileLValueStore(lhs);
+    CompileExpression(lhs);
+}
+
+void Compiler::CompileIncDec(const Ast::Expr& target, bool increment, bool postfix) {
+    if (target.kind == Ast::Expr::Kind::Index && target.index) {
+        BeginScope();
+        const int objectSlot = AllocateLocal("__inc_obj_" + std::to_string(m_InlineTempCounter++));
+        const int indexSlot = AllocateLocal("__inc_idx_" + std::to_string(m_InlineTempCounter++));
+        const int oldSlot = AllocateLocal("__inc_old_" + std::to_string(m_InlineTempCounter++));
+        CompileExpression(*target.index->object);
+        m_Writer.EmitOp(OpCode::SetLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(objectSlot));
+        CompileExpression(*target.index->index);
+        m_Writer.EmitOp(OpCode::SetLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(indexSlot));
+        m_Writer.EmitOp(OpCode::PushLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(objectSlot));
+        m_Writer.EmitOp(OpCode::PushLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(indexSlot));
+        m_Writer.EmitOp(OpCode::GetIndex);
+        m_Writer.EmitOp(OpCode::SetLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(oldSlot));
+        m_Writer.EmitOp(OpCode::PushLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(objectSlot));
+        m_Writer.EmitOp(OpCode::PushLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(indexSlot));
+        m_Writer.EmitOp(OpCode::PushLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(oldSlot));
+        EmitNumber(1.0);
+        m_Writer.EmitOp(increment ? OpCode::Add : OpCode::Sub);
+        m_Writer.EmitOp(OpCode::SetIndex);
+        if (postfix) {
+            m_Writer.EmitOp(OpCode::PushLocal);
+            m_Writer.EmitU16(static_cast<uint16_t>(oldSlot));
+        } else {
+            m_Writer.EmitOp(OpCode::PushLocal);
+            m_Writer.EmitU16(static_cast<uint16_t>(objectSlot));
+            m_Writer.EmitOp(OpCode::PushLocal);
+            m_Writer.EmitU16(static_cast<uint16_t>(indexSlot));
+            m_Writer.EmitOp(OpCode::GetIndex);
+        }
+        EndScope();
+        return;
+    }
+
+    BeginScope();
+    if (postfix) {
+        const int oldSlot = AllocateLocal("__inc_old_" + std::to_string(m_InlineTempCounter++));
+        CompileExpression(target);
+        m_Writer.EmitOp(OpCode::SetLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(oldSlot));
+        CompileExpression(target);
+        EmitNumber(1.0);
+        m_Writer.EmitOp(increment ? OpCode::Add : OpCode::Sub);
+        CompileLValueStore(target);
+        m_Writer.EmitOp(OpCode::PushLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(oldSlot));
+    } else {
+        CompileExpression(target);
+        EmitNumber(1.0);
+        m_Writer.EmitOp(increment ? OpCode::Add : OpCode::Sub);
+        CompileLValueStore(target);
+        CompileExpression(target);
+    }
+    EndScope();
+}
+
 void Compiler::CompileLValueStore(const Ast::Expr& lhs) {
     if (const int vectorFieldAxis = FindVectorFieldAxis(lhs); vectorFieldAxis >= 0) {
         m_Writer.EmitOp(OpCode::SetField);
@@ -573,7 +788,8 @@ void Compiler::CompileLValueStore(const Ast::Expr& lhs) {
             m_Writer.EmitU8(member == "x" ? 0 : member == "y" ? 1 : 2);
             return;
         }
-        if (member == "position" || member == "worldPosition" || member == "rotation" || member == "scale") {
+        if (member == "position" || member == "localPosition" ||
+            member == "worldPosition" || member == "rotation" || member == "scale") {
             CompileExpression(lhs);
             m_Writer.EmitOp(OpCode::SetVec3FromValue);
             return;
@@ -654,31 +870,47 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
             CompileAssignment(*expr.binary->left, *expr.binary->right);
             break;
         }
+        if (expr.binary->op == Ast::BinaryOp::AddAssign ||
+            expr.binary->op == Ast::BinaryOp::SubAssign ||
+            expr.binary->op == Ast::BinaryOp::MulAssign ||
+            expr.binary->op == Ast::BinaryOp::DivAssign ||
+            expr.binary->op == Ast::BinaryOp::ModAssign) {
+            CompileCompoundAssignment(*expr.binary->left, *expr.binary->right,
+                                      expr.binary->op);
+            break;
+        }
         CompileExpression(*expr.binary->left);
         CompileExpression(*expr.binary->right);
-        switch (expr.binary->op) {
-            case Ast::BinaryOp::Add: m_Writer.EmitOp(OpCode::Add); break;
-            case Ast::BinaryOp::Sub: m_Writer.EmitOp(OpCode::Sub); break;
-            case Ast::BinaryOp::Mul: m_Writer.EmitOp(OpCode::Mul); break;
-            case Ast::BinaryOp::Div: m_Writer.EmitOp(OpCode::Div); break;
-            case Ast::BinaryOp::Mod: m_Writer.EmitOp(OpCode::Mod); break;
-            case Ast::BinaryOp::Eq: m_Writer.EmitOp(OpCode::Eq); break;
-            case Ast::BinaryOp::NotEq: m_Writer.EmitOp(OpCode::Ne); break;
-            case Ast::BinaryOp::Less: m_Writer.EmitOp(OpCode::Lt); break;
-            case Ast::BinaryOp::Greater: m_Writer.EmitOp(OpCode::Gt); break;
-            case Ast::BinaryOp::LessEq: m_Writer.EmitOp(OpCode::Le); break;
-            case Ast::BinaryOp::GreaterEq: m_Writer.EmitOp(OpCode::Ge); break;
-            case Ast::BinaryOp::And: m_Writer.EmitOp(OpCode::And); break;
-            case Ast::BinaryOp::Or: m_Writer.EmitOp(OpCode::Or); break;
-            default: break;
-        }
+        EmitBinaryOp(expr.binary->op);
         break;
     }
 
     case Ast::Expr::Kind::Unary:
+        if (expr.unary->op == Ast::UnaryOp::PreInc ||
+            expr.unary->op == Ast::UnaryOp::PreDec ||
+            expr.unary->op == Ast::UnaryOp::PostInc ||
+            expr.unary->op == Ast::UnaryOp::PostDec) {
+            const bool increment = expr.unary->op == Ast::UnaryOp::PreInc ||
+                                   expr.unary->op == Ast::UnaryOp::PostInc;
+            const bool postfix = expr.unary->op == Ast::UnaryOp::PostInc ||
+                                 expr.unary->op == Ast::UnaryOp::PostDec;
+            CompileIncDec(*expr.unary->operand, increment, postfix);
+            break;
+        }
         CompileExpression(*expr.unary->operand);
         m_Writer.EmitOp(expr.unary->op == Ast::UnaryOp::Not ? OpCode::Not : OpCode::Neg);
         break;
+
+    case Ast::Expr::Kind::Conditional: {
+        CompileExpression(*expr.conditional->condition);
+        const size_t jumpElse = m_Writer.EmitJumpIfFalsePlaceholder();
+        CompileExpression(*expr.conditional->thenExpr);
+        const size_t jumpEnd = m_Writer.EmitJumpPlaceholder();
+        m_Writer.PatchJump(jumpElse, m_Writer.CurrentOffset());
+        CompileExpression(*expr.conditional->elseExpr);
+        m_Writer.PatchJump(jumpEnd, m_Writer.CurrentOffset());
+        break;
+    }
 
     case Ast::Expr::Kind::Member: {
         if (const int vectorFieldAxis = FindVectorFieldAxis(expr); vectorFieldAxis >= 0) {
@@ -689,6 +921,29 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
         if (expr.member->member == "Length" || expr.member->member == "Count") {
             CompileExpression(*expr.member->object);
             m_Writer.EmitOp(OpCode::ArrayLength);
+            break;
+        }
+        if (IsMemberChain(expr, "Mathf", "PI")) {
+            EmitNumber(3.14159265358979323846);
+            break;
+        }
+        if (IsMemberChain(expr, "Mathf", "Deg2Rad")) {
+            EmitNumber(0.017453292519943295);
+            break;
+        }
+        if (IsMemberChain(expr, "Mathf", "Rad2Deg")) {
+            EmitNumber(57.29577951308232);
+            break;
+        }
+        if (IsMemberChain(expr, "Vector3", "zero") ||
+            IsMemberChain(expr, "Vector3", "one")) {
+            const double fill = IsMemberChain(expr, "Vector3", "one") ? 1.0 : 0.0;
+            EmitNumber(fill);
+            EmitNumber(fill);
+            EmitNumber(fill);
+            m_Writer.EmitOp(OpCode::CallHost);
+            m_Writer.EmitU16(static_cast<uint16_t>(HostFunc::Vector3_Create));
+            m_Writer.EmitU8(3);
             break;
         }
         // Time.deltaTime
@@ -820,7 +1075,13 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
     case Ast::Expr::Kind::Call: {
         if (TryCompileBuiltinCall(*expr.call))
             break;
-        m_CurrentLocation=expr.location;AddLocatedError("unsupported call expression; user-defined method calls are not supported by this VM yet. Use lifecycle callbacks or supported built-in APIs; see language.reference.");
+        if (TryCompileUserMethodCall(*expr.call))
+            break;
+        m_CurrentLocation=expr.location;AddLocatedError("unsupported call expression: '" +
+            (expr.call->callee && expr.call->callee->kind == Ast::Expr::Kind::Identifier
+                ? expr.call->callee->identifier->name : std::string("call")) +
+            "' is not a built-in API or a method declared in this class.");
+        EmitNumber(0.0);
         break;
     }
 
@@ -842,6 +1103,13 @@ void Compiler::CompileExpression(const Ast::Expr& expr) {
         if (expr.newExpr->arraySize) {
             CompileExpression(*expr.newExpr->arraySize);
             m_Writer.EmitOp(OpCode::NewArraySized);
+        } else if (expr.newExpr->typeName == "Vector3" &&
+                   expr.newExpr->arguments.size() == 3) {
+            for (const auto& argument : expr.newExpr->arguments)
+                CompileExpression(*argument);
+            m_Writer.EmitOp(OpCode::CallHost);
+            m_Writer.EmitU16(static_cast<uint16_t>(HostFunc::Vector3_Create));
+            m_Writer.EmitU8(3);
         } else {
             AddLocatedError("unsupported constructor: " + expr.newExpr->typeName);
             m_Writer.EmitOp(OpCode::PushConst);
@@ -948,6 +1216,29 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
     if (!member.object)
         return false;
 
+    if (methodName == "SetActive" && argc == 1) {
+        CompileExpression(*member.object);
+        CompileExpression(*call.arguments[0]);
+        m_Writer.EmitOp(OpCode::CallHost);
+        m_Writer.EmitU16(static_cast<uint16_t>(HostFunc::Entity_SetActive));
+        m_Writer.EmitU8(2);
+        return true;
+    }
+    if (methodName == "IsActive" && argc == 0) {
+        CompileExpression(*member.object);
+        m_Writer.EmitOp(OpCode::CallHost);
+        m_Writer.EmitU16(static_cast<uint16_t>(HostFunc::Entity_IsActive));
+        m_Writer.EmitU8(1);
+        return true;
+    }
+    if ((methodName == "GetID" || methodName == "GetId") && argc == 0) {
+        CompileExpression(*member.object);
+        m_Writer.EmitOp(OpCode::CallHost);
+        m_Writer.EmitU16(static_cast<uint16_t>(HostFunc::Entity_GetId));
+        m_Writer.EmitU8(1);
+        return true;
+    }
+
     if (methodName == "Add" && argc == 1) {
         CompileExpression(*member.object);
         CompileExpression(*call.arguments[0]);
@@ -979,11 +1270,79 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
         tryAnimatorMethods(*member.object,methodName)) return true;
 
 
+    if (targetName == "Pool") {
+        if (methodName == "Register" && argc == 1) { emit(HostFunc::Pool_Register, 1); return true; }
+        if (methodName == "Acquire" && argc == 1)  { emit(HostFunc::Pool_Acquire, 1); return true; }
+        if (methodName == "Release" && argc == 1)  { emit(HostFunc::Pool_Release, 1); return true; }
+        if (methodName == "Count" && argc == 1)    { emit(HostFunc::Pool_Count, 1); return true; }
+    }
+    if (targetName == "Scene" && (methodName == "Spawn" || methodName == "Prewarm")) {
+        const size_t expected = methodName == "Spawn" ? 4 : 2;
+        if (argc != expected) {
+            AddLocatedError("Scene." + methodName + " expects " +
+                            (methodName == "Spawn" ? "path, x, y, z" : "path, capacity"));
+            EmitNumber(0.0);
+            return true;
+        }
+        std::string path;
+        std::string fieldName;
+        if (!TryGetStringLiteral(*call.arguments[0], path)) {
+            if (call.arguments[0]->kind == Ast::Expr::Kind::Identifier)
+                fieldName = call.arguments[0]->identifier->name;
+            else
+                m_Module->ps1DynamicPrefabSpawn = true;
+        }
+        uint32_t capacity = 0;
+        std::string capacityFieldName;
+        if (methodName == "Prewarm") {
+            int value = 0;
+            const Ast::Expr& capacityExpr = *call.arguments[1];
+            if (TryGetIntLiteral(capacityExpr, value) && value > 0) {
+                capacity = static_cast<uint32_t>(value);
+            } else if (capacityExpr.kind == Ast::Expr::Kind::Identifier &&
+                       capacityExpr.identifier &&
+                       FindLocal(capacityExpr.identifier->name) < 0 &&
+                       m_Module->FindFieldIndex(capacityExpr.identifier->name) >= 0) {
+                capacityFieldName = capacityExpr.identifier->name;
+            } else {
+                // Previously this silently baked the default 4 copies on PS1.
+                m_Module->ps1Warnings.push_back(
+                    "Scene.Prewarm capacity is not an integer literal or a field; "
+                    "PS1 export bakes the default 4 copies. Use a literal or an int field.");
+            }
+        }
+        if (!path.empty() || !fieldName.empty()) {
+            auto existing = std::find_if(m_Module->prefabRequirements.begin(),
+                m_Module->prefabRequirements.end(),
+                [&](const PrefabRequirement& item) {
+                    return item.path == path && item.fieldName == fieldName;
+                });
+            if (existing == m_Module->prefabRequirements.end()) {
+                m_Module->prefabRequirements.push_back({path, fieldName, capacity,
+                                                        capacityFieldName});
+            } else {
+                existing->capacity = std::max(existing->capacity, capacity);
+                if (existing->capacityFieldName.empty())
+                    existing->capacityFieldName = capacityFieldName;
+            }
+        }
+        emit(methodName == "Spawn" ? HostFunc::Scene_Spawn : HostFunc::Scene_Prewarm,
+             static_cast<uint8_t>(argc));
+        return true;
+    }
     if (targetName == "Scene" && methodName == "FindById" && argc == 1) {
         emit(HostFunc::Entity_FromId, 1); return true;
     }
     if (targetName == "Scene" && methodName == "Find" && argc == 1) {
         emit(HostFunc::Scene_Find, 1); return true;
+    }
+    if (targetName == "Scene" && methodName == "Despawn" && argc == 1) {
+        CompileExpression(*call.arguments[0]);
+        EmitNumber(0.0);
+        m_Writer.EmitOp(OpCode::CallHost);
+        m_Writer.EmitU16(static_cast<uint16_t>(HostFunc::Entity_SetActive));
+        m_Writer.EmitU8(2);
+        return true;
     }
     if (targetName == "Vector3" && methodName == "Distance" && argc == 2) {
         emit(HostFunc::Vector3_Distance, 2); return true;
@@ -1066,6 +1425,15 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
         if (methodName == "Sqrt" && argc == 1)   { emit(HostFunc::Mathf_Sqrt, 1); return true; }
         if (methodName == "Abs" && argc == 1)    { emit(HostFunc::Mathf_Abs, 1); return true; }
         if (methodName == "Clamp" && argc == 3)  { emit(HostFunc::Mathf_Clamp, 3); return true; }
+        if (methodName == "Clamp01" && argc == 1) {
+            CompileExpression(*call.arguments[0]);
+            EmitNumber(0.0);
+            EmitNumber(1.0);
+            m_Writer.EmitOp(OpCode::CallHost);
+            m_Writer.EmitU16(static_cast<uint16_t>(HostFunc::Mathf_Clamp));
+            m_Writer.EmitU8(3);
+            return true;
+        }
         if (methodName == "Atan2" && argc == 2)  { emit(HostFunc::Mathf_Atan2, 2); return true; }
         if (methodName == "Min" && argc == 2)    { emit(HostFunc::Mathf_Min, 2); return true; }
         if (methodName == "Max" && argc == 2)    { emit(HostFunc::Mathf_Max, 2); return true; }
@@ -1074,6 +1442,51 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
         if (methodName == "Ceil" && argc == 1)   { emit(HostFunc::Mathf_Ceil, 1); return true; }
         if (methodName == "Round" && argc == 1)  { emit(HostFunc::Mathf_Round, 1); return true; }
         if (methodName == "Sign" && argc == 1)   { emit(HostFunc::Mathf_Sign, 1); return true; }
+        if (methodName == "Deg2Rad" && argc == 1) {
+            CompileExpression(*call.arguments[0]);
+            EmitNumber(0.017453292519943295);
+            m_Writer.EmitOp(OpCode::Mul);
+            return true;
+        }
+        if (methodName == "Rad2Deg" && argc == 1) {
+            CompileExpression(*call.arguments[0]);
+            EmitNumber(57.29577951308232);
+            m_Writer.EmitOp(OpCode::Mul);
+            return true;
+        }
+        if (methodName == "MoveTowards" && argc == 3) {
+            BeginScope();
+            const int currentSlot = AllocateLocal("__move_current_" + std::to_string(m_InlineTempCounter++));
+            const int targetSlot = AllocateLocal("__move_target_" + std::to_string(m_InlineTempCounter++));
+            const int deltaSlot = AllocateLocal("__move_delta_" + std::to_string(m_InlineTempCounter++));
+            CompileExpression(*call.arguments[0]);
+            m_Writer.EmitOp(OpCode::SetLocal);
+            m_Writer.EmitU16(static_cast<uint16_t>(currentSlot));
+            CompileExpression(*call.arguments[1]);
+            m_Writer.EmitOp(OpCode::SetLocal);
+            m_Writer.EmitU16(static_cast<uint16_t>(targetSlot));
+            CompileExpression(*call.arguments[2]);
+            m_Writer.EmitOp(OpCode::SetLocal);
+            m_Writer.EmitU16(static_cast<uint16_t>(deltaSlot));
+            m_Writer.EmitOp(OpCode::PushLocal);
+            m_Writer.EmitU16(static_cast<uint16_t>(targetSlot));
+            m_Writer.EmitOp(OpCode::PushLocal);
+            m_Writer.EmitU16(static_cast<uint16_t>(currentSlot));
+            m_Writer.EmitOp(OpCode::Sub);
+            m_Writer.EmitOp(OpCode::PushLocal);
+            m_Writer.EmitU16(static_cast<uint16_t>(deltaSlot));
+            m_Writer.EmitOp(OpCode::Neg);
+            m_Writer.EmitOp(OpCode::PushLocal);
+            m_Writer.EmitU16(static_cast<uint16_t>(deltaSlot));
+            m_Writer.EmitOp(OpCode::CallHost);
+            m_Writer.EmitU16(static_cast<uint16_t>(HostFunc::Mathf_Clamp));
+            m_Writer.EmitU8(3);
+            m_Writer.EmitOp(OpCode::PushLocal);
+            m_Writer.EmitU16(static_cast<uint16_t>(currentSlot));
+            m_Writer.EmitOp(OpCode::Add);
+            EndScope();
+            return true;
+        }
     }
     if (targetName == "Animator")
         return tryAnimatorMethods(*member.object, methodName);
@@ -1143,6 +1556,68 @@ bool Compiler::TryCompileBuiltinCall(const Ast::CallExpr& call) {
         }
     }
     return false;
+}
+
+bool Compiler::TryCompileUserMethodCall(const Ast::CallExpr& call) {
+    if (!call.callee || call.callee->kind != Ast::Expr::Kind::Identifier)
+        return false;
+    const std::string& name = call.callee->identifier->name;
+    const Ast::MethodDecl* method = FindUserMethod(name);
+    if (!method || !method->body)
+        return false;
+    if (method->returnType == "IEnumerator") {
+        AddLocatedError("coroutines must be started with StartCoroutine(" + name + "())");
+        EmitNumber(0.0);
+        return true;
+    }
+    for (const std::string& active : m_InlineStack) {
+        if (active == name) {
+            AddLocatedError("recursive user method call is not supported: " + name);
+            EmitNumber(0.0);
+            return true;
+        }
+    }
+    if (call.arguments.size() != method->parameters.size()) {
+        AddLocatedError("method '" + name + "' expects " +
+                        std::to_string(method->parameters.size()) + " arguments, got " +
+                        std::to_string(call.arguments.size()));
+        EmitNumber(0.0);
+        return true;
+    }
+
+    BeginScope();
+    std::vector<int> argumentSlots;
+    argumentSlots.reserve(call.arguments.size());
+    for (const auto& argument : call.arguments) {
+        CompileExpression(*argument);
+        const int slot = AllocateLocal("__arg_" + name + "_" +
+                                       std::to_string(m_InlineTempCounter++));
+        m_Writer.EmitOp(OpCode::SetLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(slot));
+        argumentSlots.push_back(slot);
+    }
+
+    m_InlineStack.push_back(name);
+    m_InlineReturnJumps.push_back({});
+    m_InlineNameMaps.emplace_back();
+    for (size_t i = 0; i < method->parameters.size(); ++i) {
+        const int slot = AllocateLocal(method->parameters[i].second);
+        m_Writer.EmitOp(OpCode::PushLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(argumentSlots[i]));
+        m_Writer.EmitOp(OpCode::SetLocal);
+        m_Writer.EmitU16(static_cast<uint16_t>(slot));
+    }
+    CompileBlock(*method->body);
+
+    EmitNumber(0.0);
+    const size_t end = m_Writer.CurrentOffset();
+    for (size_t jump : m_InlineReturnJumps.back())
+        m_Writer.PatchJump(jump, end);
+    m_InlineNameMaps.pop_back();
+    EndScope();
+    m_InlineReturnJumps.pop_back();
+    m_InlineStack.pop_back();
+    return true;
 }
 
 std::unique_ptr<CompiledModule> CompileClass(const Ast::ClassDecl& classDecl,

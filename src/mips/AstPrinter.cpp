@@ -25,6 +25,11 @@ const char* BinaryOpName(Ast::BinaryOp op) {
         case Ast::BinaryOp::And: return "&&";
         case Ast::BinaryOp::Or: return "||";
         case Ast::BinaryOp::Assign: return "=";
+        case Ast::BinaryOp::AddAssign: return "+=";
+        case Ast::BinaryOp::SubAssign: return "-=";
+        case Ast::BinaryOp::MulAssign: return "*=";
+        case Ast::BinaryOp::DivAssign: return "/=";
+        case Ast::BinaryOp::ModAssign: return "%=";
         default: return "?";
     }
 }
@@ -55,9 +60,22 @@ std::string PrintExpr(const Ast::Expr& expr, int indent) {
         out << PrintExpr(*expr.binary->left, indent + 1);
         out << PrintExpr(*expr.binary->right, indent + 1);
         break;
-    case Ast::Expr::Kind::Unary:
-        out << pad << "Unary(" << (expr.unary->op == Ast::UnaryOp::Not ? "!" : "-") << ")\n";
+    case Ast::Expr::Kind::Unary: {
+        const char* op = "-";
+        if (expr.unary->op == Ast::UnaryOp::Not) op = "!";
+        else if (expr.unary->op == Ast::UnaryOp::PreInc) op = "++";
+        else if (expr.unary->op == Ast::UnaryOp::PreDec) op = "--";
+        else if (expr.unary->op == Ast::UnaryOp::PostInc) op = "++(post)";
+        else if (expr.unary->op == Ast::UnaryOp::PostDec) op = "--(post)";
+        out << pad << "Unary(" << op << ")\n";
         out << PrintExpr(*expr.unary->operand, indent + 1);
+        break;
+    }
+    case Ast::Expr::Kind::Conditional:
+        out << pad << "Conditional\n";
+        out << PrintExpr(*expr.conditional->condition, indent + 1);
+        out << PrintExpr(*expr.conditional->thenExpr, indent + 1);
+        out << PrintExpr(*expr.conditional->elseExpr, indent + 1);
         break;
     case Ast::Expr::Kind::Call:
         out << pad << "Call\n";

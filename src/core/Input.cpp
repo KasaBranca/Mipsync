@@ -1,5 +1,4 @@
 #include "Input.h"
-#include "GameInputBuffer.h"
 #include <algorithm>
 #include <iterator>
 #include <atomic>
@@ -37,9 +36,6 @@ static bool s_InjectedUIPending=false;
 static bool s_UsePadFrame = false;
 static double s_PadLastTime = 0;
 static bool s_ResetMouseDelta = false;
-static GameInputBuffer<GLFW_KEY_LAST + 1> s_GameBuffer;
-static GameInputBuffer<GLFW_KEY_LAST + 1> s_GameFrameBuffer;
-static bool s_UseGameBuffer = false;
 
 static void KeyCallback(GLFWwindow* /*window*/, int key, int /*scancode*/, int action,
                         int /*mods*/) {
@@ -64,8 +60,6 @@ static void WindowFocusCallback(GLFWwindow* /*window*/, int focused) {
     // key stuck if its release happened while another window owned focus.
     std::fill(std::begin(s_PrevKeyDown), std::end(s_PrevKeyDown), false);
     std::fill(std::begin(s_PendingKeyDownEdge), std::end(s_PendingKeyDownEdge), false);
-    s_GameBuffer.Clear();
-    s_GameFrameBuffer.Clear();
     std::fill(std::begin(s_PendingKeyUpEdge), std::end(s_PendingKeyUpEdge), false);
     std::fill(std::begin(s_KeyDownEdge), std::end(s_KeyDownEdge), false);
     std::fill(std::begin(s_KeyUpEdge), std::end(s_KeyUpEdge), false);
@@ -109,7 +103,7 @@ void Input::Init(GLFWwindow* window) {
 }
 
 void Input::SetGameInputEnabled(bool enabled) {
-    if (s_GameInputEnabled != enabled) { s_GameBuffer.Clear(); s_PadInput.Clear(); }
+    if (s_GameInputEnabled != enabled) s_PadInput.Clear();
     s_GameInputEnabled = enabled;
 }
 
@@ -139,8 +133,6 @@ void Input::SetCursorLocked(bool locked) {
     if (changed && !preparing) {
         s_FirstMouse = true;
         s_MouseDelta = {0.0f, 0.0f};
-        s_GameBuffer.Clear();
-        s_GameFrameBuffer.Clear();
         s_PadInput.Clear();
     }
 }
@@ -161,8 +153,6 @@ void Input::SetGameInputWindow(GLFWwindow* window) {
     SetCursorLocked(false);
     s_GameInputWindow = window;
     s_FirstMouse = true;
-    s_GameBuffer.Clear();
-    s_GameFrameBuffer.Clear();
     s_PadInput.Clear();
 }
 
@@ -199,7 +189,6 @@ void Input::Update() {
 
     s_ScrollDelta = s_ScrollAccumulator;
     s_ScrollAccumulator = 0.0f;
-    s_GameBuffer.Accumulate(s_KeyDownEdge, s_MouseDelta, s_ScrollDelta);
     std::array<bool,24> held{}, down{}, up{};
     for (size_t i=0; i<held.size(); ++i) {
         const int binding = s_PadInput.mapping.bindings[i];
@@ -234,14 +223,12 @@ void Input::Update() {
     std::fill(std::begin(s_PendingMouseUp),std::end(s_PendingMouseUp),false);
 }
 
-void Input::BeginGameFrame(bool accumulated) {
-    s_GameFrameBuffer = s_GameBuffer;
-    s_UseGameBuffer = accumulated;
+void Input::BeginGameFrame() {
     s_PadInput.BeginFrame(); s_UsePadFrame = true;
 }
-void Input::EndGameFrame() { s_UseGameBuffer = s_UsePadFrame = false; s_GameBuffer.Clear(); s_PadInput.Consume(); }
-void Input::BeginGameUIFrame(bool accumulated) { s_UseGameBuffer = accumulated; s_UsePadFrame = true;if(s_InjectedUIPending)s_PadInput.frame=s_InjectedUIFrame; }
-void Input::EndGameUIFrame() { s_UseGameBuffer = s_UsePadFrame = false;s_InjectedUIPending=false; s_GameFrameBuffer.Clear(); s_PadInput.frame.down = s_PadInput.frame.up = 0; }
+void Input::EndGameFrame() { s_UsePadFrame = false; s_PadInput.Consume(); }
+void Input::BeginGameUIFrame() { s_UsePadFrame = true;if(s_InjectedUIPending)s_PadInput.frame=s_InjectedUIFrame; }
+void Input::EndGameUIFrame() { s_UsePadFrame = false;s_InjectedUIPending=false; s_PadInput.frame.down = s_PadInput.frame.up = 0; }
 void Input::SetInjectedPS1Input(uint16_t held,const std::array<float,4>& axes) { s_InjectedHeld=held;s_InjectedAxes=axes; }
 void Input::ClearInjectedPS1Input() { s_InjectedHeld=s_PreviousInjectedHeld=0;s_InjectedAxes={};s_InjectedUIPending=false;s_InjectedUIFrame={}; }
 void Input::BeginInjectedPS1Frame() {
@@ -304,7 +291,7 @@ bool Input::IsKeyPressed(int key) {
 bool Input::IsKeyDown(int key) {
     if (key < 0 || key > GLFW_KEY_LAST)
         return false;
-    return s_UseGameBuffer ? s_GameFrameBuffer.keyDown[key] : s_KeyDownEdge[key];
+    return s_KeyDownEdge[key];
 }
 
 bool Input::IsKeyReleased(int key) {
@@ -328,7 +315,7 @@ glm::vec2 Input::GetMousePosition() {
 float Input::GetMouseX() { return GetMousePosition().x; }
 float Input::GetMouseY() { return GetMousePosition().y; }
 
-glm::vec2 Input::GetMouseDelta() { return s_UseGameBuffer ? s_GameFrameBuffer.mouseDelta : s_MouseDelta; }
-float Input::GetScrollDelta() { return s_UseGameBuffer ? s_GameFrameBuffer.scrollDelta : s_ScrollDelta; }
+glm::vec2 Input::GetMouseDelta() { return s_MouseDelta; }
+float Input::GetScrollDelta() { return s_ScrollDelta; }
 
 } // namespace MipsyncEngine

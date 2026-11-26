@@ -91,7 +91,7 @@
           }
         },
         {
-          "match": "\\b(?:(public)\\s+)?((?!if\\b|else\\b|while\\b|for\\b|return\\b|yield\\b|break\\b|continue\\b|new\\b|class\\b|enum\\b|var\\b)[A-Za-z_][A-Za-z0-9_]*(?:\\s*\\[\\s*\\])?)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "match": "\\b(?:(public|private|protected|internal)\\s+)?((?!if\\b|else\\b|while\\b|for\\b|return\\b|yield\\b|break\\b|continue\\b|new\\b|class\\b|enum\\b|var\\b)[A-Za-z_][A-Za-z0-9_]*(?:\\s*\\[\\s*\\])?)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
           "captures": {
             "1": {
               "name": "storage.modifier.mips"
@@ -111,7 +111,7 @@
           }
         },
         {
-          "match": "\\b(public)\\s+((?!if\\b|else\\b|while\\b|for\\b|return\\b|yield\\b|break\\b|continue\\b|new\\b|class\\b|enum\\b|var\\b)[A-Za-z_][A-Za-z0-9_]*(?:\\s*\\[\\s*\\])?)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "match": "\\b(public|private|protected|internal)\\s+((?!if\\b|else\\b|while\\b|for\\b|return\\b|yield\\b|break\\b|continue\\b|new\\b|class\\b|enum\\b|var\\b)[A-Za-z_][A-Za-z0-9_]*(?:\\s*\\[\\s*\\])?)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b",
           "captures": {
             "1": {
               "name": "storage.modifier.mips"
@@ -209,7 +209,7 @@
         },
         {
           "name": "storage.modifier.mips",
-          "match": "\\b(public|private|get|set)\\b"
+          "match": "\\b(public|private|protected|internal|get|set)\\b"
         },
         {
           "name": "storage.type.mips",
@@ -237,7 +237,7 @@
       "patterns": [
         {
           "name": "keyword.operator.mips",
-          "match": "==|!=|<=|>=|&&|\\|\\||[+*/%=!<>-]"
+          "match": "==|!=|<=|>=|&&|\\|\\||\\+\\+|--|\\+=|-=|\\*=|/=|%=|\\?|[+*/%=!<>-]"
         }
       ]
     },
@@ -258,7 +258,7 @@
       ]
     },
     "attributes": {
-      "begin": "\\[(?=\\s*(?:Header|Space|Tooltip|Range|Min|ReadOnly|HideInInspector|InspectorName|Order)(?:Attribute)?\\b)",
+      "begin": "\\[(?=\\s*(?:Header|Space|Tooltip|Range|Min|ReadOnly|HideInInspector|InspectorName|Order|SerializeField|ShowInInspector)(?:Attribute)?\\b)",
       "end": "\\]",
       "beginCaptures": {
         "0": {
@@ -282,7 +282,7 @@
         },
         {
           "name": "support.type.attribute.mips",
-          "match": "\\b(?:Header|Space|Tooltip|Range|Min|ReadOnly|HideInInspector|InspectorName|Order)(?:Attribute)?\\b"
+          "match": "\\b(?:Header|Space|Tooltip|Range|Min|ReadOnly|HideInInspector|InspectorName|Order|SerializeField|ShowInInspector)(?:Attribute)?\\b"
         },
         {
           "include": "#operators"

@@ -106,6 +106,7 @@ CommandResult CompileLanguage(const CommandRequest& request, CommandContext& con
                 {"numberConstants",module->numberConstants.size()}, {"methodDetails",methods},
                 {"ps1Compatible", ps1Diagnostics.empty()},
                 {"ps1Diagnostics", ps1Diagnostics},
+                {"ps1Warnings", module->ps1Warnings},
             });
             compiledModules.push_back(*module);
         }
@@ -130,6 +131,8 @@ CommandResult CompileLanguage(const CommandRequest& request, CommandContext& con
     });
     const auto target=request.arguments.value("target",std::string("pc"));
     if(target!="pc"&&target!="ps1")return CommandResult::Fail("MIPSYNC_TARGET","target must be pc or ps1.");
+    for(const auto& compiled:compiledModules)for(const auto& warning:compiled.ps1Warnings)
+        result.diagnostics.push_back({"MIPS_PS1_WARNING","warning",compiled.className+": "+warning,{{"file",path.string()},{"line",1},{"column",1}}});
     if(target=="ps1"&&!compatible){result.success=false;result.status="failed";result.diagnostics.push_back({"MIPS_PS1_COMPATIBILITY","error",ps1Error,{{"file",path.string()},{"line",1},{"column",1}}});}
     return result;
 }
@@ -154,18 +157,43 @@ void RegisterLanguageSymbols(SymbolRegistry& symbols) {
     add("language.lifecycle.Start", "method", "Runs before the first gameplay update.", "void Start()");
     add("language.lifecycle.Update", "method", "Runs once per gameplay frame.", "void Update()", {"void Update() { transform.position.x = transform.position.x + Time.deltaTime; }"}, {"Time.deltaTime", "Transform.position"});
     add("language.lifecycle.LateUpdate", "method", "Runs after Update callbacks.", "void LateUpdate()");
+    add("language.lifecycle.OnDestroy", "method", "Runs once before the entity is destroyed.", "void OnDestroy()");
+    add("language.lifecycle.OnCollisionEnter", "method", "Runs when a collision starts; read Physics.otherEntityId.", "void OnCollisionEnter()");
+    add("language.lifecycle.OnCollisionExit", "method", "Runs when a collision ends; read Physics.otherEntityId.", "void OnCollisionExit()");
+    add("language.lifecycle.OnTriggerEnter", "method", "Runs when a trigger is entered; read Physics.otherEntityId.", "void OnTriggerEnter()");
+    add("language.lifecycle.OnTriggerExit", "method", "Runs when a trigger is exited; read Physics.otherEntityId.", "void OnTriggerExit()");
+    add("language.lifecycle.OnSpawn", "method", "Runs on a pooled entity after Pool.Acquire or SetActive(true).", "void OnSpawn()");
+    add("language.lifecycle.OnDespawn", "method", "Runs on a pooled entity before Pool.Release or SetActive(false).", "void OnDespawn()");
+    add("Pool", "type", "Fixed runtime pools built from pre-placed entities whose name matches the pool prefix.", "Pool");
+    add("Pool.Register", "method", "Registers matching scene entities (name == prefix or prefix.*), hides them and returns the capacity.", "int Pool.Register(string prefix)");
+    add("Pool.Acquire", "method", "Activates the first inactive pool member and returns its Entity, or null when exhausted.", "Entity Pool.Acquire(string prefix)");
+    add("Pool.Release", "method", "Deactivates a pooled entity and returns it to the pool.", "bool Pool.Release(Entity entity)");
+    add("Pool.Count", "method", "Returns the fixed capacity of a registered pool.", "int Pool.Count(string prefix)");
+    add("Entity.SetActive", "method", "Activates or deactivates an entity and its runtime scripts/render/physics participation.", "void Entity.SetActive(bool active)");
+    add("Entity.IsActive", "method", "Returns whether the entity is currently active.", "bool Entity.IsActive()");
+    add("Scene.Despawn", "method", "Deactivates an entity (alias for SetActive(false)).", "void Scene.Despawn(Entity entity)");
+    add("GetComponent", "method", "Reads a component or another MipsScript on an entity.", "T GetComponent<T>()", {}, {"Entity"});
+    add("Entity", "type", "Entity reference or numeric entity ID.", "Entity");
+    add("Scene.Find", "method", "Finds an entity by name.", "Entity Scene.Find(string name)");
+    add("Scene.FindById", "method", "Finds an entity by stable ID.", "Entity Scene.FindById(int entityId)");
+    add("Scene.Spawn", "method", "Instantiates a .nprefab at a world position. PC reads the prefab directly; PS1 reuses fixed copies declared with Prewarm/Scene.Spawn.", "Entity Scene.Spawn(string prefabPath, float x, float y, float z)");
+    add("Scene.Prewarm", "method", "Declares PS1 prefab capacity and returns it. Harmless at runtime on PC.", "int Scene.Prewarm(string prefabPath, int capacity)");
+    add("Application.Quit", "method", "Requests application shutdown.", "void Application.Quit()");
     add("Transform", "type", "Entity transform component.", "Transform");
-    add("Transform.position", "property", "Local position as a Vector3.", "Vector3 Transform.position", {}, {"Vector3"});
+    add("Transform.position", "property", "Local position as a Vector3 (Unity-compatible alias of localPosition).", "Vector3 Transform.position", {}, {"Vector3"});
+    add("Transform.localPosition", "property", "Local position as a Vector3. Alias of Transform.position.", "Vector3 Transform.localPosition", {}, {"Vector3", "Transform.position"});
+    add("Transform.worldPosition", "property", "World position as a Vector3.", "Vector3 Transform.worldPosition", {}, {"Vector3"});
     add("Transform.rotation", "property", "Local Euler rotation in degrees.", "Vector3 Transform.rotation", {}, {"Mathf.Sin", "Mathf.Cos"});
     add("Transform.scale", "property", "Local scale as a Vector3.", "Vector3 Transform.scale");
     add("Vector3", "type", "Three-component vector value.", "Vector3(x, y, z)");
-    add("Vector3.Normalize", "method", "Returns a unit-length vector.", "Vector3 Vector3.Normalize(Vector3 value)");
+    add("Prefab", "type", "Prefab asset reference. Public Prefab fields are Inspector drag-and-drop slots and serialize as asset paths; pass them to Scene.Spawn/Scene.Prewarm.", "Prefab");
+    add("AudioClip", "type", "Audio asset reference stored as a project-relative path.", "AudioClip");
     add("Time.deltaTime", "property", "Scaled duration of the current frame in seconds.", "float Time.deltaTime");
     add("Input.GetKey", "method", "Returns whether a named key is held.", "bool Input.GetKey(string key)", {"Input.GetKey(\"W\")"});
     add("Input.GetKeyDown", "method", "Returns true on the frame a named key is pressed.", "bool Input.GetKeyDown(string key)");
     add("Input.GetAxis", "method", "PS1 sticks: LeftStickX/Y and RightStickX/Y, -1 to 1; right/up are positive. Horizontal/Vertical alias the left stick.", "float Input.GetAxis(string axis)", {"Input.GetAxis(\"RightStickX\")"});
     add("Input.GetButton", "method", "PS1 button held: Cross, Circle, Square, Triangle, Start, Select, L1/R1/L2/R2/L3/R3, DPadUp/Down/Left/Right. Editor mappings are in Preferences > PS1 Controller.", "bool Input.GetButton(string button)", {"Input.GetButton(\"Square\")"});
-    add("Input.GetButtonDown", "method", "PS1 button press edge, buffered between P-Sync ticks.", "bool Input.GetButtonDown(string button)", {"Input.GetButtonDown(\"Cross\")"});
+    add("Input.GetButtonDown", "method", "PS1 button press edge for the current game frame.", "bool Input.GetButtonDown(string button)", {"Input.GetButtonDown(\"Cross\")"});
     add("Input.GetButtonUp", "method", "PS1 button release edge.", "bool Input.GetButtonUp(string button)");
     add("Scene.Load", "method", "Loads a scene after the current frame. PS1 destinations must be in Scenes In Build.", "void Scene.Load(string projectRelativePath)");
     add("Scene.LoadBuildIndex", "method", "Loads a scene by its zero-based index in Scenes In Build after the current frame.", "void Scene.LoadBuildIndex(int buildIndex)");
@@ -176,18 +204,75 @@ void RegisterLanguageSymbols(SymbolRegistry& symbols) {
     add("UI.SetColor", "method", "Updates text/image RGBA on PC/PS1; channels are clamped to 0..1.", "bool UI.SetColor(int entityId, float r, float g, float b, float a)");
     add("Mathf.Sin", "method", "Returns the sine of a radian angle.", "float Mathf.Sin(float radians)");
     add("Mathf.Cos", "method", "Returns the cosine of a radian angle.", "float Mathf.Cos(float radians)");
+    add("Mathf.Sqrt", "method", "Returns the square root of a number.", "float Mathf.Sqrt(float value)");
+    add("Mathf.Abs", "method", "Returns the absolute value of a number.", "float Mathf.Abs(float value)");
+    add("Mathf.Min", "method", "Returns the smaller of two numbers.", "float Mathf.Min(float a, float b)");
+    add("Mathf.Max", "method", "Returns the larger of two numbers.", "float Mathf.Max(float a, float b)");
     add("Mathf.Clamp", "method", "Clamps a number to an inclusive range.", "float Mathf.Clamp(float value, float min, float max)");
+    add("Mathf.Clamp01", "method", "Clamps a number to the 0..1 range.", "float Mathf.Clamp01(float value)");
+    add("Mathf.Lerp", "method", "Linearly interpolates between two values.", "float Mathf.Lerp(float a, float b, float t)");
+    add("Mathf.MoveTowards", "method", "Moves a value toward a target by at most maxDelta.", "float Mathf.MoveTowards(float current, float target, float maxDelta)");
+    add("Mathf.Sign", "method", "Returns -1, 0 or 1 for the sign of a number.", "float Mathf.Sign(float value)");
+    add("Mathf.Floor", "method", "Rounds down to an integer value.", "float Mathf.Floor(float value)");
+    add("Mathf.Ceil", "method", "Rounds up to an integer value.", "float Mathf.Ceil(float value)");
+    add("Mathf.Round", "method", "Rounds to the nearest integer value.", "float Mathf.Round(float value)");
+    add("Mathf.Atan2", "method", "Returns the angle whose tangent is y/x.", "float Mathf.Atan2(float y, float x)");
+    add("Mathf.Deg2Rad", "property", "Degrees-to-radians constant (about 0.0174533).", "float Mathf.Deg2Rad");
+    add("Mathf.Rad2Deg", "property", "Radians-to-degrees constant (about 57.2958).", "float Mathf.Rad2Deg");
+    add("Mathf.PI", "property", "Pi as a Mips# constant.", "float Mathf.PI");
+    add("Vector3.Add", "method", "Adds two vectors.", "Vector3 Vector3.Add(Vector3 a, Vector3 b)");
+    add("Vector3.Sub", "method", "Subtracts two vectors.", "Vector3 Vector3.Sub(Vector3 a, Vector3 b)");
+    add("Vector3.Scale", "method", "Multiplies vectors component-wise.", "Vector3 Vector3.Scale(Vector3 a, Vector3 b)");
+    add("Vector3.Length", "method", "Returns the length of a vector.", "float Vector3.Length(Vector3 value)");
+    add("Vector3.Normalize", "method", "Returns a unit-length vector.", "Vector3 Vector3.Normalize(Vector3 value)");
+    add("Vector3.Distance", "method", "Returns the distance between two world-space points.", "float Vector3.Distance(Vector3 a, Vector3 b)");
+    add("Vector3.zero", "property", "Vector3(0, 0, 0).", "Vector3 Vector3.zero");
+    add("Vector3.one", "property", "Vector3(1, 1, 1).", "Vector3 Vector3.one");
+    add("Vector3.up", "property", "Vector3(0, 1, 0).", "Vector3 Vector3.up");
+    add("Vector3.forward", "property", "Vector3(0, 0, 1).", "Vector3 Vector3.forward");
+    add("Vector3.right", "property", "Vector3(1, 0, 0).", "Vector3 Vector3.right");
+    add("Camera.Follow", "method", "Follows a target with a third-person camera.", "void Camera.Follow(Camera camera, float yaw, float distance, float height, float lookHeight, float sharpness, float pitchOffset)");
+    add("Camera.RotatePitch", "method", "Rotates vertical look and returns the clamped pitch.", "float Camera.RotatePitch(Camera camera, float deltaDegrees, float minPitch, float maxPitch)");
+    add("Debug.Log", "method", "Alias of Log.Info; writes values to the console.", "void Debug.Log(...values)");
+    add("Save.SetInt", "method", "Writes an integer save entry.", "void Save.SetInt(string key, int value)");
+    add("Save.GetInt", "method", "Reads an integer save entry.", "int Save.GetInt(string key, int fallback)");
+    add("Save.SetFloat", "method", "Writes a float save entry.", "void Save.SetFloat(string key, float value)");
+    add("Save.GetFloat", "method", "Reads a float save entry.", "float Save.GetFloat(string key, float fallback)");
+    add("Save.SetBool", "method", "Writes a boolean save entry.", "void Save.SetBool(string key, bool value)");
+    add("Save.GetBool", "method", "Reads a boolean save entry.", "bool Save.GetBool(string key, bool fallback)");
+    add("Save.SetString", "method", "Writes a string save entry.", "void Save.SetString(string key, string value)");
+    add("Save.GetString", "method", "Reads a string save entry.", "string Save.GetString(string key, string fallback)");
+    add("Save.Write", "method", "Writes the save slot to disk.", "void Save.Write(string slot)");
+    add("Save.Read", "method", "Reads a save slot from disk and returns 1 on success.", "float Save.Read(string slot)");
+    add("Rigidbody", "unsupported", "Rigidbody script APIs are not exposed. Use Physics.Move / Physics.MoveKinematic or a Vehicle component instead.", "unsupported", {}, {"Physics.Move", "Physics.MoveKinematic"});
+    add("Quaternion", "unsupported", "Quaternion is not exposed. Use transform.rotation Euler angles with Mathf.Sin/Cos or Camera helpers.", "unsupported", {}, {"Transform.rotation"});
+    add("Random", "unsupported", "Random.Range is not exposed in Mips# yet. Precompute deterministic values or author them in the scene.", "unsupported");
+    add("Instantiate", "unsupported", "Use Scene.Spawn(prefabPath, x, y, z) for runtime prefab creation, or fixed Pool.Register / Pool.Acquire recycling for pre-placed objects.", "unsupported", {}, {"Scene.Spawn", "Scene.Prewarm", "Pool.Register", "Pool.Acquire", "Pool.Release"});
+    add("Time.time", "unsupported", "Only Time.deltaTime is exposed; there is no global elapsed time or timeScale yet.", "unsupported", {}, {"Time.deltaTime"});
+    add("Transform.forward", "unsupported", "Transform.forward/right/up are not exposed; derive directions from transform.rotation with Mathf.Sin/Cos.", "unsupported", {}, {"Transform.rotation", "Mathf.Sin", "Mathf.Cos"});
     add("Physics.Move", "method", "Moves the current character using desired velocity.", "void Physics.Move(float x, float y, float z)");
     add("Physics.IsGrounded", "method", "Returns whether the current character is grounded.", "bool Physics.IsGrounded()");
     add("Physics.IsGroundedWithin", "method", "Returns whether walkable collision is within a downward distance.", "bool Physics.IsGroundedWithin(float distance)");
     add("Physics.UseCharacterController", "method", "Configures the current entity for sliding character physics.", "void Physics.UseCharacterController()");
     add("Physics.UseKinematicController", "method", "Configures the current entity for script-driven kinematic movement.", "void Physics.UseKinematicController()");
     add("Physics.Raycast", "method", "Returns the hit entity ID or zero.", "int Physics.Raycast(float ox, float oy, float oz, float dx, float dy, float dz, float maxDistance)");
+    add("Physics.MoveKinematic", "method", "Moves a kinematic body with script-driven velocity.", "void Physics.MoveKinematic(float x, float y, float z)");
+    add("Physics.otherEntityId", "property", "Other entity ID inside a collision or trigger callback.", "int Physics.otherEntityId");
     add("Animator.GetNormalizedTime", "method", "Reads the visible animation clip phase; -1 for a missing or inactive state.", "float Animator.GetNormalizedTime(string stateName = \"\")");
     add("Animator.SetFloat", "method", "Sets an Animator float parameter.", "void Animator.SetFloat(string name, float value)");
+    add("Animator.SetBool", "method", "Sets an Animator bool parameter.", "void Animator.SetBool(string name, bool value)");
+    add("Animator.SetInt", "method", "Sets an Animator int parameter.", "void Animator.SetInt(string name, int value)");
+    add("Animator.SetTrigger", "method", "Starts an Animator trigger.", "void Animator.SetTrigger(string name)");
     add("Animator.SetTriggerHeld", "method", "Starts a trigger and holds its Exit Time pose until released.", "void Animator.SetTriggerHeld(string name)");
     add("Animator.ReleaseTrigger", "method", "Releases a held Animator trigger into its authored transition.", "void Animator.ReleaseTrigger(string name)");
     add("AudioSource.Play", "method", "Starts playback on the entity AudioSource.", "void AudioSource.Play()");
+    add("AudioSource.Stop", "method", "Stops playback on the entity AudioSource.", "void AudioSource.Stop()");
+    add("AudioSource.Pause", "method", "Pauses playback on the entity AudioSource.", "void AudioSource.Pause()");
+    add("AudioSource.UnPause", "method", "Resumes playback on the entity AudioSource.", "void AudioSource.UnPause()");
+    add("AudioSource.volume", "property", "AudioSource volume, 0..1.", "float AudioSource.volume");
+    add("AudioSource.loop", "property", "AudioSource loop flag.", "bool AudioSource.loop");
+    add("AudioSource.mute", "property", "AudioSource mute flag.", "bool AudioSource.mute");
+    add("AudioSource.isPlaying", "property", "Whether the AudioSource is currently playing.", "bool AudioSource.isPlaying");
     add("Log.Info", "method", "Writes values to the engine console.", "void Log.Info(...values)");
 }
 
@@ -449,9 +534,12 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
              Param("type-preset", ValueType::String, false,
                    "prop, corridor, character, viewmodel or floor."),
              Param("view-model", ValueType::Boolean, false,
-                   "Legacy alias: true selects viewmodel, false selects prop.")},
+                   "Legacy alias: true selects viewmodel, false selects prop."),
+             Param("ps1-depth-bias", ValueType::Number, false,
+                   "PS1 draw-order bias in metres (-32..32). Positive sorts the mesh farther so objects on or around it paint over it, e.g. roads or wheels.")},
             "entity", ExecutionMode::Editor, {SideEffect::EditorMutation},
-            {"mipsync mesh set Wall --material assets/materials/Wall.nmat"}, ForwardEditor},
+            {"mipsync mesh set Wall --material assets/materials/Wall.nmat",
+             "mipsync mesh set Road --ps1-depth-bias 3"}, ForwardEditor},
         {"material.create", "Create or update a color material.", "Writes a project .nmat asset using the Editor material format and refreshes scene users.",
             {Param("path", ValueType::Path, true, "Project-relative assets/*.nmat path."),
              Param("r", ValueType::Number, true, "Red channel, 0..1."),
@@ -475,7 +563,8 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
         {"runtime.play", "Enter Editor play mode.", "Returns preparing, playing or save_required explicitly. Poll runtime.inspect until state=playing. Use --save-current true to save before starting.",
             {Param("save-current",ValueType::Boolean,false,"Save unsaved scene changes before Play.",false)}, "runtime_state", ExecutionMode::Editor, {SideEffect::RuntimeMutation}, {"mipsync runtime play --save-current true"}, ForwardEditor},
         {"runtime.stop", "Exit Editor play mode.", "Stops play mode and restores the edit scene.", {}, "runtime_state", ExecutionMode::Editor, {SideEffect::RuntimeMutation}, {"mipsync runtime stop"}, ForwardEditor},
-        {"runtime.inspect", "Inspect Editor runtime state.", "Reports playing, paused state, mapped PS1 input/cursor capture and P-Sync workload/timing diagnostics.", {}, "runtime_state", ExecutionMode::Editor, {SideEffect::ReadOnly}, {"mipsync runtime inspect"}, ForwardEditor},
+        {"runtime.inspect", "Inspect Editor runtime state.", "Reports playing, paused state, mapped PS1 input/cursor capture, animators and script execution.", {}, "runtime_state", ExecutionMode::Editor, {SideEffect::ReadOnly}, {"mipsync runtime inspect"}, ForwardEditor},
+        {"runtime.pool", "Inspect fixed runtime pools.", "Reports each registered Pool prefix with capacity, active/inactive members, exhaustion and entity IDs. Pools come from Pool.Register in Mips#.", {}, "runtime_pools", ExecutionMode::Editor, {SideEffect::ReadOnly}, {"mipsync runtime pool --json"}, ForwardEditor},
         {"build.start", "Start an Editor build without dialogs.", "Starts the same background build used by Build Settings without progress/error dialogs or opening Explorer. Dirty scenes return save_required. Use language.validate for preflight and build.inspect to poll completion, errors and logs.",
             {Param("target", ValueType::String, true, "pc, ps1 or disc."), Param("save-current", ValueType::Boolean, false, "Save unsaved scene changes before building.", false)}, "build_state", ExecutionMode::Editor,
             {SideEffect::ProjectMutation, SideEffect::FilesystemWrite, SideEffect::ExternalProcess}, {"mipsync build start pc --json"}, ForwardEditor},
@@ -495,16 +584,20 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
     commands.Register({"language.reference","Read Mips# syntax and limitations.","Self-contained syntax and small examples without reading engine sources.",{},"language_reference",
         ExecutionMode::Local,{SideEffect::ReadOnly},{"mipsync language reference --json"},
         [](const CommandRequest&,CommandContext&){return CommandResult::Ok({
-            {"version",Mips::kLanguageVersion},{"types",{"int","float","double","bool","Vector3","AudioClip","Entity","Camera","AudioSource","int[]","float[]","bool[]"}},
-            {"fields","Declare public fields after class declaration. Fields require public; private and SerializeField are not supported. [Header], [Tooltip], [InspectorName], [Range], [Min], [Order], [Space], [HideInInspector], [ReadOnly] are supported. Methods may be public or omit an access modifier."},
-            {"controlFlow","if/else, while, for, break, continue, return; arithmetic and comparison operators; typed locals and var."},
-            {"arrays","new int[20], [1,2,3], indexing, Length, Count, Add, RemoveAt, Clear. PS1 arrays are bounded."},
-            {"methods","Awake, Start, Update, LateUpdate; coroutines using yield return null or WaitForSeconds. Custom method calls are not currently supported; compiler errors identify the source location."},
-            {"destruction","Destroy(gameObject) or Destroy(entityId), including Physics.otherEntityId in void OnTriggerEnter(). Removes descendants after callbacks finish and invokes OnDestroy once. null, zero, invalid IDs and repeated requests are harmless. PC and PS1 supported; no delayed overload."},
-            {"objectReferences","public Entity target; public Transform pose; Scene.Find(name), Scene.FindById(id); target.transform.worldPosition; target.GetComponent<Health>().hp; Vector3.Distance(a,b). PC and PS1 supported; missing/destroyed references are null. Other-script fields are read-only; arbitrary method calls remain unsupported."},
-            {"input","Use Input.GetButton/GetButtonDown/GetButtonUp with PS1 names and Input.GetAxis with LeftStickX/Y, RightStickX/Y. Editor mappings are in Preferences."},
-            {"examples",{"class Counter : MipsBehaviour { [Header(\"Score\")] public int score = 0; void Update() { if (Input.GetButtonDown(\"Cross\")) score = score + 1; } }",
-                "class Board : MipsBehaviour { public int[] rows; void Start() { rows = new int[20]; rows[0] = 1; } }"}},
+            {"version",Mips::kLanguageVersion},
+            {"types",{"int","float","double","bool","string","Vector3","AudioClip","Prefab","Entity","Camera","AudioSource","Transform","int[]","float[]","bool[]","Entity[]"}},
+            {"fields","public/private/protected/internal fields and methods. Public fields serialize; private fields are runtime state and are not saved unless marked [SerializeField] or [ShowInInspector]. Auto-properties such as public float Speed { get; private set; } are supported. Attributes: [Header], [Tooltip], [InspectorName], [Range], [Min], [Order], [Space], [HideInInspector], [ReadOnly], [SerializeField], [ShowInInspector]. Prefab fields serialize as asset paths and are Inspector drag-and-drop slots."},
+            {"controlFlow","if/else, while, for, break, continue, return. Ternary condition ? a : b. Assignment =, compound += -= *= /= %=, prefix/postfix ++ --. switch/foreach/do-while are not supported."},
+            {"methods","Lifecycle: Awake, Start, Update, LateUpdate, OnDestroy, OnCollisionEnter/Exit, OnTriggerEnter/Exit, OnSpawn, OnDespawn. Same-class user methods are inlined at compile time (recursion rejected). Coroutines: StartCoroutine, yield return null/WaitForSeconds. No delegates/events."},
+            {"math","Mathf: Sin, Cos, Sqrt, Abs, Min, Max, Clamp, Clamp01, Lerp, MoveTowards, Floor, Ceil, Round, Sign, Atan2, PI, Deg2Rad, Rad2Deg. Vector3: Add, Sub, Scale, Length, Normalize, Distance, zero, one, up, forward, right."},
+            {"arrays","new int[20], [1,2,3], indexing, Length, Count, Add, RemoveAt, Clear. PS1 arrays are bounded (8 arrays x 32 elements)."},
+            {"destruction","Destroy(gameObject) or Destroy(entityId). Removes descendants after callbacks finish and invokes OnDestroy once. Scene.Despawn(entity) deactivates and keeps it available for reuse."},
+            {"objectReferences","public Entity target; public Transform pose; public Prefab prefab; Scene.Find(name), Scene.FindById(id); target.transform.worldPosition; target.GetComponent<Health>().hp; Vector3.Distance(a,b). Entity references are numeric IDs in scenes; Prefab and AudioClip fields are asset paths."},
+            {"prefabs","Scene.Prewarm(Prefab, capacity) or Scene.Prewarm(stringLiteral, capacity); Scene.Spawn(Prefab, x, y, z) or Scene.Spawn(stringLiteral, x, y, z). PC reads the .nprefab directly. PS1 bakes fixed copies at build time; capacity defaults to 4 and never grows. Missing/unset prefab fields fail PS1 export. Literal string paths must be used when passing a string."},
+            {"pools","Pool.Register(prefix), Pool.Acquire(prefix), Pool.Release(entity), Pool.Count(prefix) recycle pre-placed entities (name == prefix or prefix.*). Entity.SetActive(bool), Entity.IsActive(), OnSpawn/OnDespawn. runtime.pool reports fixed and prefab pools."},
+            {"input","Input.GetButton/GetButtonDown/GetButtonUp with PS1 names and Input.GetAxis with LeftStickX/Y, RightStickX/Y. Editor mappings are in Preferences."},
+            {"examples",{"class Counter : MipsBehaviour { [Header(\"Score\")] public int score = 0; void Update() { if (Input.GetButtonDown(\"Cross\")) score += 1; } }",
+                "class Board : MipsBehaviour { public Prefab piece; void Start() { Scene.Prewarm(piece, 8); } void Update() { Entity e = Scene.Spawn(piece, 0, 1, 0); } }"}},
             {"limits",Ps1Limits()}});}});
     commands.Register({"language.validate","Validate a set of scripts against the build's PS1 verifier.","Checks aggregate module/instance limits as well as all bytecode/data limits. Pass project-relative source paths as a JSON array; --bindings is the scene script-instance count. Does not validate textures/audio or replace a full build.",
         {Param("files",ValueType::Json,true,"JSON array of script paths."),Param("bindings",ValueType::Integer,false,"Script instance count in the target scene.",0)},"ps1_validation",
@@ -530,7 +623,7 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
         }});
     auto editorCommand=[&](const char* id,const char* summary,std::vector<ParameterDescriptor> parameters, bool mutation=true){
         std::vector<SideEffect> effects{mutation?SideEffect::EditorMutation:SideEffect::ReadOnly};
-        if(std::string(id).starts_with("runtime.")&&std::string(id)!="runtime.fields"&&std::string(id)!="runtime.animator")effects={std::string(id)=="runtime.capture"?SideEffect::FilesystemWrite:SideEffect::RuntimeMutation};
+        if(std::string(id).starts_with("runtime.")&&std::string(id)!="runtime.fields"&&std::string(id)!="runtime.animator"&&std::string(id)!="runtime.pool"&&std::string(id)!="runtime.inspect")effects={std::string(id)=="runtime.capture"?SideEffect::FilesystemWrite:SideEffect::RuntimeMutation};
         commands.Register({id,summary,summary,std::move(parameters),"editor_result",ExecutionMode::Editor,
             effects,{std::string("mipsync ")+id+" --json"},ForwardEditor});
     };
@@ -550,6 +643,7 @@ void RegisterCoreCommands(CommandRegistry& commands, SymbolRegistry& symbols) {
         "batch_result",ExecutionMode::Editor,{SideEffect::EditorMutation},{"mipsync batch run --file - --summary --json","mipsync batch run --file tools/roof.json --dry-run --json"},ForwardEditor});
     editorCommand("runtime.fields","Read actual script runtime variables, including arrays.",{Param("entity",ValueType::String,true,"Entity ID/name."),Param("index",ValueType::Integer,false,"Zero-based script index.",0)},false);
     editorCommand("runtime.pause","Set runtime pause state.",{Param("paused",ValueType::Boolean,false,"Pause or resume.",true)},false);
+    editorCommand("runtime.resume","Resume a paused Play session.",{},false);
     editorCommand("runtime.step","Queue deterministic gameplay frames while paused.",{Param("frames",ValueType::Integer,false,"Frames, 1..600.",1),Param("delta",ValueType::Number,false,"Seconds per frame.",1.0/60.0),Param("buttons",ValueType::Json,false,"Optional PS1 button names to set atomically before stepping."),Param("axes",ValueType::Json,false,"Optional PS1 stick axes to set atomically before stepping.")},false);
     editorCommand("runtime.input","Inject virtual PS1 input for queued runtime.step frames.",{Param("buttons",ValueType::Json,false,"Held PS1 button names.",Json::array()),Param("axes",ValueType::Json,false,"Object containing LeftStickX/Y and RightStickX/Y, -1..1.",Json::object())},false);
     editorCommand("runtime.capture","Save Game View, or render a custom camera when position/target are supplied.",{Param("file",ValueType::Path,true,"Project-relative output PNG path."),Param("position",ValueType::String,false,"Camera x,y,z."),Param("target",ValueType::String,false,"Look-at x,y,z."),Param("width",ValueType::Integer,false,"PNG width, 16..4096.",960),Param("height",ValueType::Integer,false,"PNG height, 16..4096.",720)},false);

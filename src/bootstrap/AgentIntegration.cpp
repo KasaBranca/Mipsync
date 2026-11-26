@@ -27,6 +27,7 @@ const char* kManagedInstructions = R"(<!-- mipsync-agent-skill:start -->
 - For every task that inspects or changes this Mipsync project's scenes, entities, components, meshes, materials, Mips# scripts, or Editor runtime, you MUST invoke `$mipsync-cli` and follow its `SKILL.md` before acting.
 - Use the Mipsync CLI for live project authoring and inspection. Do not edit `.nscene` files directly when the CLI can perform the operation.
 - The Skill is project-scoped at `.agents/skills/mipsync-cli/SKILL.md` and is synchronized from the currently running Mipsync Editor version.
+- When writing Mips# scripts, follow `.agents/skills/mipsync-cli/references/mips-sharp.md`: Unity C#-style fields/attributes, whole-vector assignment, small inlined helper methods, private fields for internal state, and `language.compile` with `ps1Compatible: true`.
 - Project renderer sources live in `renderer/`: edit these files directly, following the Skill's renderer reference. The Editor preserves customized renderer sources during upgrades.
 - Changes to the Mipsync engine C++ source itself are outside this project Skill.
 <!-- mipsync-agent-skill:end -->)";

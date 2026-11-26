@@ -39,6 +39,7 @@ struct Ps1TransformAnimKey {
 struct Ps1ExportedEntity {
     uint32_t id = 0;
     uint32_t sourceEntityId = 0;
+    bool active = true;
     std::string name;
     // Source-scene hierarchy. Transforms below remain flattened world-space
     // values for the renderer; the PS1 runtime uses this relationship to
@@ -66,6 +67,8 @@ struct Ps1ExportedEntity {
     bool renderUnlit = false;
     bool prerenderOccluder = false;
     bool seamFill = false;
+    /// MeshRenderer.ps1DepthBias in ordering-table slots (32 per metre).
+    int16_t depthBiasOt = 0;
     uint8_t meshSubdivisionLevels = 0;
     float meshSubdivisionMaxEdgeLength = 0.0f;
     bool meshSubdivisionExplicit = false;
@@ -310,9 +313,18 @@ struct Ps1ExportedLight {
     int16_t cosOuter = 0, cosInner = 4096;
 };
 
+inline constexpr uint32_t kPs1PrefabRootCap = 32;
+
+struct Ps1ExportedPrefab {
+    std::string path;
+    std::vector<uint32_t> rootSourceIds;
+    std::vector<uint16_t> rootIndices;
+};
+
 struct Ps1SceneExportResult {
     unsigned int buildSceneIndex = 0;
     std::vector<Ps1ExportedEntity> entities;
+    std::vector<Ps1ExportedPrefab> prefabs;
     int cameraEntityIndex = -1;
     std::vector<CompiledModule> modules; // unique, scene-referenced scripts only
     std::vector<std::string> moduleClassNames;
@@ -332,6 +344,11 @@ struct Ps1SceneExportResult {
     float    fogStart = 10.0f;
     float    fogEnd = 40.0f;
     Ps1::ColorGrading colorGrading;
+    // Procedural gradient sky from the same volume (zenith / horizon / ground).
+    bool     skyEnabled = false;
+    uint8_t  skyTop[3] = { 56, 115, 217 };
+    uint8_t  skyHorizon[3] = { 179, 214, 245 };
+    uint8_t  skyGround[3] = { 92, 87, 79 };
 
     // Custom mesh export.
     std::vector<std::string> meshPaths; // unique project-relative

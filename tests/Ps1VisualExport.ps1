@@ -160,7 +160,7 @@ $textureData = Get-Content -Raw "$generated/textures_data.c"
 if ($textureData -notmatch 'cutout_png_\d+_tim\[0\]\),\s*0,\s*1\s*\}') { throw 'Cutout metadata missing' }
 $sceneData = Get-Content -Raw "$generated/scene_data.c"
 $lut = [regex]::Match($sceneData, '(?s)k_ps1_color_grading_lut\[32768\] = \{(.*?)\};').Groups[1].Value
-if ([regex]::Matches($lut,'\d+u').Count -ne 32768 -or $sceneData -notmatch 'k_ps1_color_grading_lut\s*\n\};') {
+if ([regex]::Matches($lut,'\d+u').Count -ne 32768 -or $sceneData -notmatch 'k_ps1_color_grading_lut\s*\n(\s*PS1_SCENE_SKY\([^)]*\)\s*\n)?\};') {
     throw 'Authored final-frame color grading LUT was not exported/bound'
 }
 # Disabled and inactive higher-priority volumes must not shadow the active one.

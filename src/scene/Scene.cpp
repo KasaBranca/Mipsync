@@ -31,7 +31,7 @@ namespace MipsyncEngine {
 
 namespace {
 
-constexpr uint32_t kPs1PreviewMeshVersion = 20;
+constexpr uint32_t kPs1PreviewMeshVersion = 21;
 
 void EnsurePs1PreviewMesh(MeshRendererComponent& meshRenderer) {
     if (meshRenderer.meshPrimitive != "File" || !meshRenderer.mesh)
@@ -1593,6 +1593,7 @@ Entity* Scene::CreateEntityWithId(uint32_t id, const std::string& name) {
 void Scene::Clear() {
     m_Entities.clear();
     m_NextEntityID = 1;
+    Entity::NotifyStructureChanged();
 }
 
 void Scene::DetachFromParent(Entity* child) {
@@ -1619,6 +1620,7 @@ void Scene::DestroyEntityRecursive(uint32_t id) {
     auto it = std::remove_if(m_Entities.begin(), m_Entities.end(),
         [id](const std::unique_ptr<Entity>& e) { return e->GetID() == id; });
     m_Entities.erase(it, m_Entities.end());
+    Entity::NotifyStructureChanged();
 }
 
 void Scene::DestroyEntity(Entity* entity) {
@@ -1979,6 +1981,7 @@ Entity* Scene::DuplicateEntity(Entity& source) {
       dstMr.typePreset = srcMr->typePreset;
       dstMr.renderType = srcMr->renderType;
       dstMr.ps1SeamFill = srcMr->ps1SeamFill;
+      dstMr.ps1DepthBias = srcMr->ps1DepthBias;
       dstMr.texture = srcMr->texture;
       dstMr.RebuildMesh();
         if (!dstMr.texturePath.empty())
@@ -2041,11 +2044,9 @@ Entity* Scene::DuplicateEntity(Entity& source) {
       dstPost.vignetteIntensity = srcPost->vignetteIntensity;
       dstPost.vignetteSmoothness = srcPost->vignetteSmoothness;
       dstPost.skyboxEnabled = srcPost->skyboxEnabled;
-      dstPost.skyboxTexturePath = srcPost->skyboxTexturePath;
-      dstPost.skyboxTexture = srcPost->skyboxTexture;
-      dstPost.skyboxRotationDegrees = srcPost->skyboxRotationDegrees;
-      dstPost.skyboxExposure = srcPost->skyboxExposure;
-      dstPost.skyboxTint = srcPost->skyboxTint;
+      dstPost.skyTopColor = srcPost->skyTopColor;
+      dstPost.skyHorizonColor = srcPost->skyHorizonColor;
+      dstPost.skyGroundColor = srcPost->skyGroundColor;
     }
 
     if (auto* srcAudio = src->GetComponent<AudioSourceComponent>()) {
@@ -2665,6 +2666,9 @@ void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* target
                 continue;
         }
 
+        // The material reference is the only serialized appearance; resolve
+        // it here so every creation and load path draws the same surface.
+        AssetManager::Get().EnsureMeshRendererMaterial(*meshRenderer);
         const Mesh* drawMesh = meshRenderer->mesh.get();
         renderer.SetObjectUnlit(meshRenderer->renderType == RendererType::Unlit);
         float projectionDepthClamp = 0.0f;
@@ -2687,11 +2691,7 @@ void Scene::Render(Renderer& renderer, const Camera& camera, Framebuffer* target
             renderer.DrawMesh(*drawMesh, worldMatrix,
                               ResolveSceneViewTexture(*meshRenderer, usePs1PreviewMeshes), meshRenderer->color,
                               meshRenderer->textureTiling, meshRenderer->textureOffset,
-                              0, 0, projectionDepthClamp, false,
-                              {meshRenderer->meshPrimitive == "File", true,
-                               meshRenderer->meshPrimitive == "Plane" &&
-                                   !(subdivider && subdivider->enabled && subdivider->maxLevels > 0),
-                               static_cast<uint8_t>(subdivider && subdivider->enabled ? std::clamp(subdivider->maxLevels, 0, 4) : 0)});
+                              0, 0, projectionDepthClamp, false);
         }
 
         if (entity->GetID() == highlightEntityId) {

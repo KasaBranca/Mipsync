@@ -103,7 +103,7 @@ std::unique_ptr<Ast::EnumDecl> Parser::ParseEnum() {
             Consume(TokenType::Comma, "expected ',' between enum members");
     }
     Consume(TokenType::RBrace, "expected '}' after enum");
-    Consume(TokenType::Semicolon, "expected ';' after enum");
+    Match(TokenType::Semicolon);
     return decl;
 }
 
@@ -149,10 +149,20 @@ std::unique_ptr<Ast::ClassDecl> Parser::ParseClass() {
         const Token attributeStart = Peek();
         const bool annotated = Check(TokenType::LBracket);
         auto inspector = ParseInspectorAttributes();
-        if (Check(TokenType::KwPublic)) {
+        bool hasModifier = false;
+        bool isPublic = false;
+        if (Check(TokenType::KwPublic) || Check(TokenType::KwPrivate) ||
+            Check(TokenType::KwProtected) || Check(TokenType::KwInternal)) {
+            hasModifier = true;
+            isPublic = Check(TokenType::KwPublic);
             Advance();
+        }
+        const bool looksLikeMethod = Check(TokenType::KwVoid) ||
+            (Check(TokenType::Identifier) && Peek(1).type == TokenType::Identifier &&
+             Peek(2).type == TokenType::LParen);
+        if (hasModifier || looksLikeMethod || LooksLikeField()) {
             if (LooksLikeField()) {
-                auto field = ParseField();
+                auto field = ParseField(isPublic);
                 field->inspector = std::move(inspector);
                 if ((field->inspector.hasRange || field->inspector.hasMin) &&
                     field->typeName != "int" && field->typeName != "float")
@@ -169,13 +179,10 @@ std::unique_ptr<Ast::ClassDecl> Parser::ParseClass() {
                 decl->fields.push_back(std::move(field));
             } else {
                 if (annotated) Error(attributeStart, "inspector attributes can only annotate fields");
-                decl->methods.push_back(ParseMethod(true));
+                decl->methods.push_back(ParseMethod(isPublic));
             }
-        } else if (Check(TokenType::KwVoid)) {
-            if (annotated) Error(attributeStart, "inspector attributes can only annotate fields");
-            decl->methods.push_back(ParseMethod());
         } else {
-            Error(Peek(), "expected 'public' field or method");
+            Error(Peek(), "expected field, method, or access modifier");
             Synchronize();
         }
     }
@@ -239,10 +246,12 @@ InspectorAttributes Parser::ParseInspectorAttributes() {
                 if (count != 1 || !numeric() || arguments[0].number != std::trunc(arguments[0].number) ||
                     arguments[0].number < std::numeric_limits<int>::min() || arguments[0].number > std::numeric_limits<int>::max()) invalid();
                 else result.order = static_cast<int>(arguments[0].number);
-            } else if (name == "ReadOnly" || name == "HideInInspector") {
+            } else if (name == "ReadOnly" || name == "HideInInspector" ||
+                       name == "SerializeField" || name == "ShowInInspector") {
                 if (count) invalid();
                 else if (name == "ReadOnly") result.readOnly = true;
-                else result.hidden = true;
+                else if (name == "HideInInspector") result.hidden = true;
+                else result.serialize = true;
             } else Error(attribute, "unknown inspector attribute [" + name + "]");
         } while (Match(TokenType::Comma));
         Consume(TokenType::RBracket, "expected ']' after inspector attributes");
@@ -277,7 +286,7 @@ bool Parser::LooksLikeField() const {
     return Peek(offset + 1).type != TokenType::LParen;
 }
 
-std::unique_ptr<Ast::FieldDecl> Parser::ParseField() {
+std::unique_ptr<Ast::FieldDecl> Parser::ParseField(bool isPublic) {
     const SourceLocation typeLocation = Peek().location;
     const std::string typeName = ParseTypeName();
     const Token nameToken = Consume(TokenType::Identifier, "expected field name");
@@ -286,10 +295,14 @@ std::unique_ptr<Ast::FieldDecl> Parser::ParseField() {
     field->location = typeLocation;
     field->typeName = typeName;
     field->name = nameToken.lexeme;
+    field->isPublic = isPublic;
 
     if (Match(TokenType::LBrace)) {
         field->isAutoProperty = true;
         while (!Check(TokenType::RBrace) && !IsAtEnd()) {
+            if (Check(TokenType::KwPublic) || Check(TokenType::KwPrivate) ||
+                Check(TokenType::KwProtected) || Check(TokenType::KwInternal))
+                Advance();
             if (!Check(TokenType::Identifier)) {
                 Error(Peek(), "expected 'get' or 'set' in property");
                 break;
@@ -308,7 +321,7 @@ std::unique_ptr<Ast::FieldDecl> Parser::ParseField() {
             field->hasGetter = true;
             field->hasSetter = true;
         }
-        Consume(TokenType::Semicolon, "expected ';' after property");
+        Match(TokenType::Semicolon);
         return field;
     }
 
@@ -517,20 +530,47 @@ std::unique_ptr<Ast::Expr> Parser::ParseExpression() {
 }
 
 std::unique_ptr<Ast::Expr> Parser::ParseAssignment() {
-    auto expr = ParseLogicalOr();
-    if (Match(TokenType::Assign)) {
-        const Token op = Previous();
+    auto expr = ParseConditional();
+    Ast::BinaryOp op = Ast::BinaryOp::Assign;
+    bool isAssignment = true;
+    if (Match(TokenType::Assign)) op = Ast::BinaryOp::Assign;
+    else if (Match(TokenType::PlusAssign)) op = Ast::BinaryOp::AddAssign;
+    else if (Match(TokenType::MinusAssign)) op = Ast::BinaryOp::SubAssign;
+    else if (Match(TokenType::StarAssign)) op = Ast::BinaryOp::MulAssign;
+    else if (Match(TokenType::SlashAssign)) op = Ast::BinaryOp::DivAssign;
+    else if (Match(TokenType::PercentAssign)) op = Ast::BinaryOp::ModAssign;
+    else isAssignment = false;
+    if (isAssignment) {
+        const Token token = Previous();
         auto right = ParseAssignment();
         auto binary = std::make_unique<Ast::Expr>();
         binary->kind = Ast::Expr::Kind::Binary;
-        binary->location = op.location;
+        binary->location = token.location;
         binary->binary = std::make_unique<Ast::BinaryExpr>();
-        binary->binary->op = Ast::BinaryOp::Assign;
+        binary->binary->op = op;
         binary->binary->left = std::move(expr);
         binary->binary->right = std::move(right);
         return binary;
     }
     return expr;
+}
+
+std::unique_ptr<Ast::Expr> Parser::ParseConditional() {
+    auto condition = ParseLogicalOr();
+    if (!Match(TokenType::Question))
+        return condition;
+    const Token question = Previous();
+    auto thenExpr = ParseExpression();
+    Consume(TokenType::Colon, "expected ':' in conditional expression");
+    auto elseExpr = ParseConditional();
+    auto node = std::make_unique<Ast::Expr>();
+    node->kind = Ast::Expr::Kind::Conditional;
+    node->location = question.location;
+    node->conditional = std::make_unique<Ast::ConditionalExpr>();
+    node->conditional->condition = std::move(condition);
+    node->conditional->thenExpr = std::move(thenExpr);
+    node->conditional->elseExpr = std::move(elseExpr);
+    return node;
 }
 
 std::unique_ptr<Ast::Expr> Parser::ParseLogicalOr() {
@@ -644,6 +684,17 @@ std::unique_ptr<Ast::Expr> Parser::ParseFactor() {
 }
 
 std::unique_ptr<Ast::Expr> Parser::ParseUnary() {
+    if (Match(TokenType::PlusPlus) || Match(TokenType::MinusMinus)) {
+        const Token op = Previous();
+        auto operand = ParseUnary();
+        auto node = std::make_unique<Ast::Expr>();
+        node->kind = Ast::Expr::Kind::Unary;
+        node->location = op.location;
+        node->unary = std::make_unique<Ast::UnaryExpr>();
+        node->unary->op = op.type == TokenType::PlusPlus ? Ast::UnaryOp::PreInc : Ast::UnaryOp::PreDec;
+        node->unary->operand = std::move(operand);
+        return node;
+    }
     if (Match(TokenType::Bang)) {
         const Token op = Previous();
         auto operand = ParseUnary();
@@ -717,6 +768,16 @@ std::unique_ptr<Ast::Expr> Parser::ParseCallOrPrimary() {
             }
             Consume(TokenType::RParen, "expected ')' after arguments");
             expr = std::move(node);
+        } else if (Match(TokenType::PlusPlus) || Match(TokenType::MinusMinus)) {
+            const Token op = Previous();
+            auto node = std::make_unique<Ast::Expr>();
+            node->kind = Ast::Expr::Kind::Unary;
+            node->location = op.location;
+            node->unary = std::make_unique<Ast::UnaryExpr>();
+            node->unary->op = op.type == TokenType::PlusPlus ? Ast::UnaryOp::PostInc : Ast::UnaryOp::PostDec;
+            node->unary->operand = std::move(expr);
+            expr = std::move(node);
+            break;
         } else {
             break;
         }

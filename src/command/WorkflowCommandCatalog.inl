@@ -19,7 +19,10 @@ editorCommand("entity.bounds","Read local or world render geometry AABB (not col
 editorCommand("entity.overlap","Test world render AABB overlap; conservative, not exact mesh/collider collision.",{Param("entity",ValueType::String,true,"First entity."),Param("other",ValueType::String,true,"Second entity.")},false);
 editorCommand("entity.find","Filter by component and/or point contained in world render AABB.",{Param("component",ValueType::String,false,"Component name."),Param("bounds-contains",ValueType::String,false,"World point x,y,z.")},false);
 editorCommand("scene.raycast","Intersect a normalized world ray with render AABBs, sorted nearest first; not triangle/collider tests.",{Param("origin",ValueType::String,true,"World x,y,z."),Param("direction",ValueType::String,true,"Nonzero x,y,z."),Param("max-distance",ValueType::Number,false,"Positive world distance.",10000.0)},false);
-editorCommand("asset.list","List project assets, filtered by type.",{Param("type",ValueType::String,false,"all, material or texture.","all")},false);
+    editorCommand("asset.list","List project assets, filtered by type.",{Param("type",ValueType::String,false,"all, material, texture or prefab.","all")},false);
+    editorCommand("prefab.create","Save an entity hierarchy as a .nprefab asset.",{Param("entity",ValueType::String,true,"Entity ID/name."),Param("file",ValueType::Path,true,"Project-relative assets/*.nprefab path.")});
+    editorCommand("prefab.list","List .nprefab assets.",{},false);
+    editorCommand("prefab.inspect","Inspect a .nprefab hierarchy, scripts and references.",{Param("file",ValueType::Path,true,"Project-relative .nprefab path.")},false);
 editorCommand("material.list","List project .nmat assets.",{},false);
 editorCommand("material.inspect","Read a project material document.",{Param("path",ValueType::Path,true,"Project-relative assets/*.nmat path.")},false);
 auto shapeParameters=std::vector<ParameterDescriptor>{Param("shape",ValueType::String,false,"box, plane, wedge/ramp, stairs, cylinder, cone or pyramid."),

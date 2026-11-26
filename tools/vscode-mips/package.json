@@ -2,7 +2,7 @@
   "name": "mipsync-mipssharp-vscode",
   "displayName": "Mips# for Mipsync Engine",
   "description": "Mips# language support for Mipsync Engine projects.",
-  "version": "0.2.5",
+  "version": "0.2.9",
   "publisher": "mipsync",
   "engines": {
     "vscode": "^1.88.0"

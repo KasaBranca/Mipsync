@@ -10,8 +10,10 @@
 #include "../core/Log.h"
 #include "../scene/Scene.h"
 #include "../scene/SceneIO.h"
+#include "../scene/SceneDefaults.h"
 #include "../assets/AssetManager.h"
 #include "../assets/Material.h"
+#include "../assets/BuiltinAssets.h"
 #include "../animation/AnimatorControllerIO.h"
 #include "../animation/SkeletalModel.h"
 #include "../renderer/Texture.h"
@@ -135,15 +137,31 @@ std::string NewMipsScriptBody(const std::string& stem);
 /// Unity-style project panel roots (project filesystem root is hidden).
 constexpr const char* kAssetsRoot = "assets";
 constexpr const char* kScenesRoot = "scenes";
+/// Engine-shipped, read-only assets (Unity's Built-in Resources). Shown in
+/// the panel but never modified: no create, import, rename, move or delete.
+constexpr const char* kBuiltinRoot = BuiltinAssets::kRoot;
+constexpr const char* kReadOnlyError = "Built-in resources are read-only";
 
 bool IsContentRoot(const std::string& folder) {
-    return folder == kAssetsRoot || folder == kScenesRoot;
+    return folder == kAssetsRoot || folder == kScenesRoot || folder == kBuiltinRoot;
+}
+
+bool IsReadOnlyAsset(const std::string& projectRel) {
+    return BuiltinAssets::IsBuiltinPath(projectRel);
 }
 
 std::string ContentRootFor(const std::string& folder) {
     if (folder.rfind(kScenesRoot, 0) == 0)
         return kScenesRoot;
+    if (IsReadOnlyAsset(folder))
+        return kBuiltinRoot;
     return kAssetsRoot;
+}
+
+const char* ContentRootLabel(const std::string& root) {
+    if (root == kScenesRoot) return "Scenes";
+    if (root == kBuiltinRoot) return BuiltinAssets::kDisplayName;
+    return "Assets";
 }
 
 std::string NormalizeContentFolder(std::string folder) {
@@ -528,7 +546,7 @@ bool AssetBrowserPanel::TryRestoreFolder(const std::string& projectRelPath) {
     if (root.empty())
         return false;
 
-    const fs::path absFolder = PathUtf8::FromString(root) / PathUtf8::FromString(folder);
+    const fs::path absFolder = PathUtf8::FromString(AssetManager::Get().ToAbsolute(folder));
     std::error_code ec;
     if (!fs::exists(absFolder, ec) || !fs::is_directory(absFolder, ec))
         return false;
@@ -566,7 +584,7 @@ void AssetBrowserPanel::OnHistoryRestored() {
     });
     m_SelectionAnchorIndex = SIZE_MAX;
     m_RenameTargetPath.clear();
-    while (m_CurrentFolder != kAssetsRoot && m_CurrentFolder != kScenesRoot &&
+    while (!IsContentRoot(m_CurrentFolder) &&
            !std::filesystem::exists(PathUtf8::FromString(AssetManager::Get().ToAbsolute(m_CurrentFolder))))
         m_CurrentFolder = NormalizeContentFolder(ParentProjectRel(m_CurrentFolder));
     RescanFolderTree();
@@ -662,6 +680,10 @@ bool AssetBrowserPanel::DeleteAssetAt(const std::string& projectRelPath, AssetKi
         return false;
     }
 
+    if (IsReadOnlyAsset(projectRelPath)) {
+        outError = kReadOnlyError;
+        return false;
+    }
     if (projectRelPath == kAssetsRoot || projectRelPath == kScenesRoot) {
         outError = "cannot delete a project root folder";
         return false;
@@ -723,6 +745,10 @@ bool AssetBrowserPanel::RenameAssetAt(const std::string& projectRelPath, const s
                                       std::string& outError) {
     if (newName.empty() || newName.find_first_of("\\/:*?\"<>|") != std::string::npos) {
         outError = "invalid name";
+        return false;
+    }
+    if (IsReadOnlyAsset(projectRelPath)) {
+        outError = kReadOnlyError;
         return false;
     }
     if (projectRelPath == kAssetsRoot || projectRelPath == kScenesRoot) {
@@ -891,6 +917,8 @@ void AssetBrowserPanel::CommitInlineRename(const AssetEntry& entry) {
 
 void AssetBrowserPanel::CreateAssetAndBeginRename(AssetKind kind) {
     std::string folder = NormalizeContentFolder(m_CurrentFolder);
+    if (IsReadOnlyAsset(folder))
+        folder = kAssetsRoot;
     if (kind == AssetKind::Scene) {
         if (folder.rfind(kScenesRoot, 0) != 0)
             folder = kScenesRoot;
@@ -942,13 +970,7 @@ void AssetBrowserPanel::CreateAssetAndBeginRename(AssetKind kind) {
             SaveAnimatorController(PathUtf8::ToString(absolute), *controller, error);
     } else if (kind == AssetKind::Scene) {
         Scene scene;
-        Entity* camera = scene.CreateEntity("Main Camera");
-        auto& cameraComponent = camera->AddComponent<CameraComponent>();
-        cameraComponent.camera.fov = 60.0f;
-        cameraComponent.camera.nearClip = 0.1f;
-        cameraComponent.camera.farClip = 100.0f;
-        cameraComponent.primary = true;
-        camera->GetComponent<TransformComponent>()->position = {0.0f, 2.0f, 6.0f};
+        PopulateNewScene(scene);
         created = SceneIO::SaveToFile(scene, PathUtf8::ToString(absolute), error);
     }
 
@@ -969,11 +991,47 @@ void AssetBrowserPanel::CreateAssetAndBeginRename(AssetKind kind) {
     BeginInlineRename(rel, true);
 }
 
+void AssetBrowserPanel::DuplicateBuiltinToAssets(const AssetEntry& entry) {
+    const fs::path source = PathUtf8::FromString(AssetManager::Get().ToAbsolute(entry.projectRelPath));
+    const std::string folder = entry.kind == AssetKind::Material ? "assets/materials"
+                             : entry.kind == AssetKind::Texture  ? "assets/textures"
+                                                                 : kAssetsRoot;
+    const std::string rel = MakeUniqueAssetPath(
+        folder, PathUtf8::ToString(source.stem()), PathUtf8::ToString(source.extension()));
+    const fs::path destination = PathUtf8::FromString(AssetManager::Get().ToAbsolute(rel));
+    std::error_code ec;
+    if (!TrackAssetUndo(m_Editor, destination.parent_path(), true) ||
+        !TrackAssetUndo(m_Editor, destination)) {
+        m_LastError = "Cannot record asset duplication";
+        return;
+    }
+    fs::create_directories(destination.parent_path(), ec);
+    if (!ec)
+        fs::copy_file(source, destination, fs::copy_options::none, ec);
+    if (ec) {
+        m_LastError = ec.message();
+        return;
+    }
+    m_CurrentFolder = folder;
+    ExpandTreeToFolder(folder);
+    m_SelectedAssets.clear();
+    m_SelectedAssets.push_back(SelectedAsset{rel, entry.kind});
+    m_SelectionAnchorIndex = SIZE_MAX;
+    m_LastError.clear();
+    m_LastInfo = "Duplicated to: " + rel;
+    RescanFolderTree();
+    Refresh();
+}
+
 void AssetBrowserPanel::OpenRenameDialogForSelection() {
     if (m_SelectedAssets.size() != 1)
         return;
     if (m_SelectedAssets.front().kind == AssetKind::AnimationClip)
         return;
+    if (IsReadOnlyAsset(m_SelectedAssets.front().projectRelPath)) {
+        m_LastError = kReadOnlyError;
+        return;
+    }
     BeginInlineRename(m_SelectedAssets.front().projectRelPath);
 }
 
@@ -985,6 +1043,19 @@ void AssetBrowserPanel::DrawAssetContextMenu(const AssetEntry& entry, size_t ent
         SelectAssetOnly(entry, entryIndex);
 
     const size_t selCount = m_SelectedAssets.size();
+    const bool readOnly = IsReadOnlyAsset(entry.projectRelPath);
+
+    if (readOnly) {
+        // Unity: built-in assets are used as-is; to customize one, work on
+        // a copy inside Assets.
+        ImGui::TextDisabled("%s (read-only)", BuiltinAssets::kDisplayName);
+        ImGui::Separator();
+        if (selCount == 1 && !entry.isDirectory &&
+            EditorMenu::MenuItem("Duplicate to Assets"))
+            DuplicateBuiltinToAssets(entry);
+        EditorMenu::EndPopup();
+        return;
+    }
 
     if (selCount == 1 && !entry.isSubAsset && EditorMenu::MenuItem("Rename"))
         OpenRenameDialogForSelection();
@@ -1065,6 +1136,8 @@ void AssetBrowserPanel::RescanFolderTree() {
     fs::create_directories(PathUtf8::FromString(root) / kScenesRoot, ec);
     m_FolderTreeRoots.push_back(kAssetsRoot);
     m_FolderTreeRoots.push_back(kScenesRoot);
+    if (fs::is_directory(BuiltinAssets::Directory(), ec))
+        m_FolderTreeRoots.push_back(kBuiltinRoot);
 }
 
 void AssetBrowserPanel::RescanProjectAssets() {
@@ -1091,6 +1164,14 @@ void AssetBrowserPanel::RescanProjectAssets() {
             asset.kind = asset.isDirectory ? AssetKind::Folder : ClassifyByExtension(name);
             m_ProjectEntries.push_back(std::move(asset));
         }
+    }
+    for (const std::string& builtin : BuiltinAssets::List()) {
+        AssetEntry asset;
+        asset.projectRelPath = builtin;
+        asset.absolutePath = AssetManager::Get().ToAbsolute(builtin);
+        asset.name = PathUtf8::ToString(PathUtf8::FromString(builtin).filename());
+        asset.kind = ClassifyByExtension(asset.name);
+        m_ProjectEntries.push_back(std::move(asset));
     }
     std::sort(m_ProjectEntries.begin(), m_ProjectEntries.end(), [](const AssetEntry& a, const AssetEntry& b) {
         if (a.isDirectory != b.isDirectory) return a.isDirectory;
@@ -1119,9 +1200,8 @@ void AssetBrowserPanel::RescanFolder() {
         return;
     }
 
-    fs::path rootPath = PathUtf8::FromString(root);
     const std::string folder = NormalizeContentFolder(m_CurrentFolder);
-    fs::path absFolder = rootPath / PathUtf8::FromString(folder);
+    fs::path absFolder = PathUtf8::FromString(assets.ToAbsolute(folder));
 
     std::error_code ec;
     if (!fs::exists(absFolder, ec) || !fs::is_directory(absFolder, ec))
@@ -1184,6 +1264,8 @@ std::vector<AssetEntry> AssetBrowserPanel::BuildDisplayEntries() const {
 }
 
 void AssetBrowserPanel::HandleEntityDropOnFolder(const std::string& projectRelFolder) {
+    if (IsReadOnlyAsset(projectRelFolder))
+        return;
     const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(DragDrop::kEntityId);
     if (!payload || !payload->Data ||
         payload->DataSize < static_cast<int>(sizeof(uint32_t)) ||
@@ -1278,6 +1360,10 @@ bool AssetBrowserPanel::MoveAssetToFolder(const std::string& srcProjectRel,
                                           std::string& outError) {
     if (srcProjectRel.empty() || srcProjectRel == kAssetsRoot || srcProjectRel == kScenesRoot) {
         outError = "cannot move a project root folder";
+        return false;
+    }
+    if (IsReadOnlyAsset(srcProjectRel) || IsReadOnlyAsset(destFolderRel)) {
+        outError = kReadOnlyError;
         return false;
     }
 
@@ -1448,6 +1534,11 @@ void AssetBrowserPanel::DrawPanelContextMenu() {
 
     if (EditorMenu::MenuItem("Refresh"))
         Refresh();
+    const bool inReadOnlyFolder = IsReadOnlyAsset(NormalizeContentFolder(m_CurrentFolder));
+    const bool selectionReadOnly = std::any_of(
+        m_SelectedAssets.begin(), m_SelectedAssets.end(),
+        [](const SelectedAsset& sel) { return IsReadOnlyAsset(sel.projectRelPath); });
+    ImGui::BeginDisabled(inReadOnlyFolder);
     if (EditorMenu::MenuItem("New Folder"))
         CreateAssetAndBeginRename(AssetKind::Folder);
     if (EditorMenu::MenuItem("New Scene"))
@@ -1468,13 +1559,16 @@ void AssetBrowserPanel::DrawPanelContextMenu() {
             AssetManager::Get().ToAbsolute(NormalizeContentFolder(m_CurrentFolder));
         RevealFolderInOS(abs);
     }
+    ImGui::EndDisabled();
 
     if (!m_SelectedAssets.empty()) {
         ImGui::Separator();
+        ImGui::BeginDisabled(selectionReadOnly);
         if (m_SelectedAssets.size() == 1 && EditorMenu::MenuItem("Rename Selected"))
             OpenRenameDialogForSelection();
         if (EditorMenu::MenuItem("Delete Selected"))
             DeleteSelectedAssets();
+        ImGui::EndDisabled();
     }
 
     EditorMenu::EndPopup();
@@ -1483,7 +1577,9 @@ void AssetBrowserPanel::DrawPanelContextMenu() {
 void AssetBrowserPanel::DrawFolderTreeNode(const std::string& projectRelPath, const std::string& displayName) {
     const std::string& root = AssetManager::Get().GetProjectRoot();
     fs::path rootPath = PathUtf8::FromString(root);
-    fs::path abs = projectRelPath.empty() ? rootPath : rootPath / PathUtf8::FromString(projectRelPath);
+    fs::path abs = projectRelPath.empty()
+        ? rootPath : PathUtf8::FromString(AssetManager::Get().ToAbsolute(projectRelPath));
+    const bool readOnly = IsReadOnlyAsset(projectRelPath);
 
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
                                ImGuiTreeNodeFlags_DrawLinesNone;
@@ -1505,9 +1601,13 @@ void AssetBrowserPanel::DrawFolderTreeNode(const std::string& projectRelPath, co
     }
 
     ImGui::PushStyleColor(ImGuiCol_Header, kProjectSelectionBg);
+    if (readOnly)
+        ImGui::PushStyleColor(ImGuiCol_Text, EditorTheme::TextMuted);
     bool open = ImGui::TreeNodeEx(projectRelPath.empty() ? "(root)" : projectRelPath.c_str(),
                                   flags, "%s", displayName.c_str());
-    ImGui::PopStyleColor();
+    ImGui::PopStyleColor(readOnly ? 2 : 1);
+    if (readOnly && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Read-only assets shipped with the engine.");
 
     if (open)
         m_ExpandedTreeFolders.insert(projectRelPath);
@@ -1523,7 +1623,7 @@ void AssetBrowserPanel::DrawFolderTreeNode(const std::string& projectRelPath, co
     if (!OsFileDrop::Peek().empty() && ImGui::IsItemHovered())
         m_OsDropTargetFolder = projectRelPath;
 
-    if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+    if (!readOnly && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
         std::vector<std::string> paths;
         if (IsAssetSelected(projectRelPath)) {
             for (const auto& sel : m_SelectedAssets)
@@ -1541,7 +1641,7 @@ void AssetBrowserPanel::DrawFolderTreeNode(const std::string& projectRelPath, co
         ImGui::EndDragDropSource();
     }
 
-    if (ImGui::BeginDragDropTarget()) {
+    if (!readOnly && ImGui::BeginDragDropTarget()) {
         HandleFolderDropTargets(projectRelPath);
         ImGui::EndDragDropTarget();
     }
@@ -1567,12 +1667,7 @@ void AssetBrowserPanel::DrawFolderTreeNode(const std::string& projectRelPath, co
 
 void AssetBrowserPanel::DrawFolderTree() {
     for (const auto& topLevel : m_FolderTreeRoots) {
-        const char* label = topLevel.c_str();
-        if (topLevel == kAssetsRoot)
-            label = "Assets";
-        else if (topLevel == kScenesRoot)
-            label = "Scenes";
-        DrawFolderTreeNode(topLevel, label);
+        DrawFolderTreeNode(topLevel, ContentRootLabel(topLevel));
     }
     DrawPanelContextMenu();
 }
@@ -1842,7 +1937,7 @@ void AssetBrowserPanel::DrawFileGridCell(const AssetEntry& entry, size_t display
         }
     } else {
         ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + cellThumb);
-        if (entry.isSubAsset)
+        if (entry.isSubAsset || IsReadOnlyAsset(entry.projectRelPath))
             ImGui::TextColored(EditorTheme::TextMuted, "%s", entry.name.c_str());
         else
             ImGui::TextWrapped("%s", entry.name.c_str());
@@ -1870,10 +1965,12 @@ void AssetBrowserPanel::DrawFileGrid() {
     const std::string folder = NormalizeContentFolder(m_CurrentFolder);
     const std::string display = DisplayFolderPath(folder);
     const std::string root = ContentRootFor(folder);
-    const char* rootLabel = (root == kScenesRoot) ? "Scenes" : "Assets";
+    const char* rootLabel = ContentRootLabel(root);
     EditorToolbar toolbar;
     toolbar.Text(m_SearchTerms.empty() ? (std::string(rootLabel) + "/" + display).c_str() :
                  "Search results", EditorTheme::TextSecondary);
+    if (m_SearchTerms.empty() && root == kBuiltinRoot)
+        toolbar.Text("Read-only", EditorTheme::TextMuted);
     if (!m_LastError.empty()) {
         toolbar.Text(m_LastError.c_str(), EditorTheme::Error);
     } else if (!m_LastInfo.empty()) {
@@ -2201,13 +2298,7 @@ void AssetBrowserPanel::DrawNewSceneDialog() {
             std::string abs = AssetManager::Get().ToAbsolute(rel);
 
             Scene sc;
-            Entity* cam = sc.CreateEntity("Main Camera");
-            auto& cc = cam->AddComponent<CameraComponent>();
-            cc.camera.fov = 60.0f;
-            cc.camera.nearClip = 0.1f;
-            cc.camera.farClip = 100.0f;
-            cc.primary = true;
-            cam->GetComponent<TransformComponent>()->position = { 0.0f, 2.0f, 6.0f };
+            PopulateNewScene(sc);
 
             std::string err;
             if (TrackAssetUndo(m_Editor, PathUtf8::FromString(abs)) && SceneIO::SaveToFile(sc, abs, err)) {
@@ -2474,6 +2565,10 @@ int AssetBrowserPanel::ImportExternalPathToFolder(
     }
 
     std::string targetSubdir = NormalizeContentFolder(projectRelFolder);
+    if (IsReadOnlyAsset(targetSubdir)) {
+        m_LastError = kReadOnlyError;
+        return 0;
+    }
     fs::path destDir = PathUtf8::FromString(AssetManager::Get().GetProjectRoot()) /
                        PathUtf8::FromString(targetSubdir);
 

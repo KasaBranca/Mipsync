@@ -172,6 +172,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $engineStage "resources\\ic
 Copy-Item (Join-Path $root "resources\\icons\\app_icon.png") (Join-Path $engineStage "resources\\icons\\app_icon.png") -Force
 Copy-Item (Join-Path $root "resources\\icons\\project") (Join-Path $engineStage "resources\\icons\\project") -Recurse -Force
 Copy-Item (Join-Path $root "resources\\fonts") (Join-Path $engineStage "resources\\fonts") -Recurse -Force
+Copy-Item (Join-Path $root "resources\\builtin") (Join-Path $engineStage "resources\\builtin") -Recurse -Force
 if (Test-Path (Join-Path $root "resources\\licenses")) {
   Copy-Item (Join-Path $root "resources\\licenses") (Join-Path $engineStage "resources\\licenses") -Recurse -Force
 }

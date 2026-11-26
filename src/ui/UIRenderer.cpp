@@ -1,5 +1,4 @@
 #include "UIRenderer.h"
-#include "../ps1/PSync.h"
 #include "RectTransform.h"
 #include "UICanvasLayout.h"
 #include "UILayout.h"
@@ -343,14 +342,6 @@ void UIRenderer::EndPass() {
 }
 
 void UIRenderer::DrawSolidQuad(const glm::mat4& mvp, const glm::vec4& color, const Texture* texture) {
-    if (m_PSyncWorkload && color.a > 0.0f) {
-        const auto& vertices = m_Quad.GetVertices();
-        if (vertices.size() >= 4)
-            m_PSyncWorkload->UIQuad(mvp * glm::vec4(vertices[0].position, 1.0f),
-                mvp * glm::vec4(vertices[1].position, 1.0f),
-                mvp * glm::vec4(vertices[2].position, 1.0f),
-                mvp * glm::vec4(vertices[3].position, 1.0f), texture != nullptr);
-    }
     if (!m_UIShader.IsValid())
         return;
 
@@ -375,12 +366,6 @@ void UIRenderer::DrawSolidQuad(const glm::mat4& mvp, const glm::vec4& color, con
 
 void UIRenderer::DrawGlyphQuad(const glm::mat4& mvp, const glm::vec4& color, GLuint textureId,
                                const glm::vec3 corners[4], const glm::vec2 uvs[4]) {
-    if (m_PSyncWorkload && color.a > 0.0f) {
-        for (const auto& triangle : {glm::ivec3(0, 1, 2), glm::ivec3(0, 2, 3)})
-            m_PSyncWorkload->Triangle(mvp * glm::vec4(corners[triangle.x], 1.0f),
-                mvp * glm::vec4(corners[triangle.y], 1.0f), mvp * glm::vec4(corners[triangle.z], 1.0f),
-                true, false, true, true, 4);
-    }
     if (!m_UIShader.IsValid() || m_TextVAO == 0 || textureId == 0)
         return;
 

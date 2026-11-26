@@ -150,7 +150,7 @@ static inline void native_get_member(vm_state* vm, const char* member) {
                     break;
                 }
                 if (obj.tag == HOST_VAL_HOST && obj.ref.kind == HOST_REF_TRANSFORM) {
-                    if (name_equals(member, "position")) {
+                    if (name_equals(member, "position") || name_equals(member, "localPosition")) {
                         vm_push(vm, make_host(HOST_REF_VEC3, obj.ref.entity_idx, 0));
                     } else if (name_equals(member, "rotation")) {
                         vm_push(vm, make_host(HOST_REF_VEC3, obj.ref.entity_idx, 1));
@@ -318,6 +318,13 @@ static inline void native_eq(vm_state* vm) {
                 if(a.tag==HOST_VAL_HOST || b.tag==HOST_VAL_HOST) equal=vm_entity_index(a)==vm_entity_index(b);
                 else if((a.tag==HOST_VAL_STRING||a.tag==HOST_VAL_NATIVE_STRING) && (b.tag==HOST_VAL_STRING||b.tag==HOST_VAL_NATIVE_STRING))
                     equal=strcmp(vm_value_string(vm,a),vm_value_string(vm,b))==0;
+                else if(a.tag==HOST_VAL_STRING||a.tag==HOST_VAL_NATIVE_STRING||b.tag==HOST_VAL_STRING||b.tag==HOST_VAL_NATIVE_STRING){
+                    /* Asset references (AudioClip/Prefab fields) are paths and null
+                     * compiles to 0: a reference equals null only while unassigned. */
+                    int as=a.tag==HOST_VAL_STRING||a.tag==HOST_VAL_NATIVE_STRING;
+                    const char* text=vm_value_string(vm,as?a:b);
+                    equal=(!text||!*text)&&!val_as_bool(as?b:a);
+                }
                 else equal=val_as_num(a)==val_as_num(b);
                 vm_push(vm,make_bool(equal));break;
             } while (0);
@@ -331,6 +338,13 @@ static inline void native_ne(vm_state* vm) {
                 if(a.tag==HOST_VAL_HOST || b.tag==HOST_VAL_HOST) equal=vm_entity_index(a)==vm_entity_index(b);
                 else if((a.tag==HOST_VAL_STRING||a.tag==HOST_VAL_NATIVE_STRING) && (b.tag==HOST_VAL_STRING||b.tag==HOST_VAL_NATIVE_STRING))
                     equal=strcmp(vm_value_string(vm,a),vm_value_string(vm,b))==0;
+                else if(a.tag==HOST_VAL_STRING||a.tag==HOST_VAL_NATIVE_STRING||b.tag==HOST_VAL_STRING||b.tag==HOST_VAL_NATIVE_STRING){
+                    /* Asset references (AudioClip/Prefab fields) are paths and null
+                     * compiles to 0: a reference equals null only while unassigned. */
+                    int as=a.tag==HOST_VAL_STRING||a.tag==HOST_VAL_NATIVE_STRING;
+                    const char* text=vm_value_string(vm,as?a:b);
+                    equal=(!text||!*text)&&!val_as_bool(as?b:a);
+                }
                 else equal=val_as_num(a)==val_as_num(b);
                 vm_push(vm,make_bool(!equal));break;
             } while (0);

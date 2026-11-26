@@ -41,8 +41,9 @@ inline const Json& ComponentCatalog() {
         props("MipsScript",{{"path",""}});
         props("Animator",{{"model",""},{"controller",""},{"state",""},{"speed",1.0},{"animationFps",30.0},
             {"floatParams",Json::object()},{"boolParams",Json::object()}});
-        props("MeshRenderer",{{"primitive","Cube"},{"size",1.0},{"mesh",""},{"material",""},
-            {"prerenderOccluder",false},{"typePreset","Prop"},{"renderType","Lit"},{"editorOnly",false}});
+        props("MeshRenderer",{{"primitive","Cube"},{"size",1.0},{"mesh",""},{"material","builtin/default.nmat"},
+            {"prerenderOccluder",false},{"typePreset","Prop"},{"renderType","Lit"},{"editorOnly",false},
+            {"ps1DepthBias",0.0}});
         props("SkinnedMeshRenderer",{{"model",""},{"material",""},{"color",{1,1,1,1}},{"meshPart",-1},
             {"typePreset","Character"},{"renderType","Lit"},{"ps1ExportMode",2},{"ps1VertexAnimFps",30},
             {"ps1VertexAnimMaxFrames",96},{"ps1VertexAnimTargetTris",320},{"ps1VertexAnimTargetVerts",1000},

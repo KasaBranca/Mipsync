@@ -11,6 +11,9 @@ Use normal source-file editing here; scene JSON does not need to change.
   the supplied shaders when their engine inputs are needed.
 - `screen.vert` and `screen.frag` control the final screen pass. The screen
   vertex stage is also used with `skybox.frag`.
+  `skybox.frag` draws the Post Process Volume's procedural gradient sky
+  (`uSkyTop`, `uSkyHorizon`, `uSkyGround`, blended by tan(elevation)); the PS1
+  runtime draws the same gradient with Gouraud quads. HDRI skyboxes were removed.
 - `outline-mask.*` and `outline-compose.*` control the selection outline.
 
 The Editor checks source contents about once per second. Saving a valid set

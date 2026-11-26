@@ -24,14 +24,14 @@ constexpr const char* kDefaultSceneTemplate = R"({
       "id": 1,
       "name": "PS1 Cube",
       "transform": { "position": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0] },
-      "meshRenderer": { "primitive": "Cube", "size": 2.0, "color": [1.0, 1.0, 1.0, 1.0] },
-      "mipsScript": { "path": "Rotator.mips" }
+      "meshRenderer": { "primitive": "Cube", "size": 2.0, "material": "builtin/default.nmat" },
+      "mipsScript": { "path": "scripts/Rotator.mips" }
     },
     {
       "id": 2,
       "name": "Floor",
       "transform": { "position": [0.0, -1.5, 0.0], "rotation": [0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0] },
-      "meshRenderer": { "primitive": "Plane", "size": 20.0, "color": [1.0, 1.0, 1.0, 1.0] },
+      "meshRenderer": { "primitive": "Plane", "size": 20.0, "material": "builtin/default.nmat" },
       "collider": { "shape": 0, "center": [0.0, 0.0, 0.0], "halfExtents": [10.0, 0.05, 10.0], "radius": 0.5, "capsuleHeight": 1.0, "isTrigger": false },
       "rigidbody": { "bodyType": 0, "mass": 1.0, "useGravity": true, "linearDrag": 0.05, "bounciness": 0.2, "freezeRotation": false }
     },
@@ -40,6 +40,18 @@ constexpr const char* kDefaultSceneTemplate = R"({
       "name": "Main Camera",
       "transform": { "position": [0.0, 2.0, 6.0], "rotation": [0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0] },
       "camera": { "primary": true, "fov": 60.0, "nearClip": 0.1, "farClip": 100.0 }
+    },
+    {
+      "id": 4,
+      "name": "Directional Light",
+      "transform": { "position": [0.0, 5.0, 0.0], "rotation": [-50.0, 30.0, 0.0], "scale": [1.0, 1.0, 1.0] },
+      "light": { "type": 0, "color": [1.0, 0.96, 0.9], "intensity": 1.0, "range": 0.0, "spotAngle": 45.0, "spotInnerAngle": 30.0 }
+    },
+    {
+      "id": 5,
+      "name": "Post Process Volume",
+      "transform": { "position": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0] },
+      "postProcessVolume": { "isGlobal": true, "priority": 0, "skyboxEnabled": true, "skyTopColor": [0.22, 0.45, 0.85], "skyHorizonColor": [0.70, 0.84, 0.96], "skyGroundColor": [0.36, 0.34, 0.31], "fogEnabled": true, "fogColor": [0.70, 0.84, 0.96], "fogStart": 15.0, "fogEnd": 60.0 }
     }
   ]
 }

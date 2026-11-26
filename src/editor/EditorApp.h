@@ -99,7 +99,11 @@ public:
     bool CaptureSceneView(const std::string& file, const Camera& camera, int width, int height, bool sceneView, std::string& error);
     Camera CommandSceneCamera() const { return m_SceneCamera.GetCamera(); }
     void CommandSetPreview(bool enabled) { m_CommandPreview = enabled; }
-    void CommandMarkSceneDirty() { if (!m_CommandPreview) m_SceneDirty = true; }
+    void CommandMarkSceneDirty() {
+        if (m_CommandPreview) return;
+        m_SceneDirty = true;
+        m_SceneDirtyCheckPending = true;
+    }
     void CommandRefreshSceneDirtyState() { UpdateSceneDirtyState(); }
     bool CommandSaveScene(std::string& outError);
     bool CommandOpenScene(const std::string& absolutePath, bool saveCurrent, std::string& outError);

@@ -14,6 +14,10 @@ int ps1_input_key_down(const char* name);
 int ps1_input_key_up(const char* name);
 int32_t ps1_input_axis_q16(const char* name);
 
+/* ps1_named_button_mask() with a small per-name cache: scripts query the same
+ * button names every frame, which otherwise costs up to 21 strcmp calls. */
+uint16_t ps1_input_button_mask(const char* name);
+
 /* Right stick look deltas in Q16.16 units per frame (maps mouseDeltaX/Y). */
 int32_t ps1_input_look_delta_x_q16(void);
 int32_t ps1_input_look_delta_y_q16(void);

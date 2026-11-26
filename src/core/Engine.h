@@ -60,7 +60,6 @@ public:
     Mips::MipsRuntime& GetMipsRuntime() { return *m_MipsRuntime; }
     PhysicsWorld& GetPhysicsWorld() { return *m_PhysicsWorld; }
     AudioSystem& GetAudioSystem() { return *m_AudioSystem; }
-    PSyncState& GetPSyncState() { return m_PSync; }
     void QueueCliSteps(unsigned frames,float delta) { m_CliFrames=frames;m_CliFrameDelta=delta; }
     void ClearCliSteps() { m_CliFrames=0;Input::ClearInjectedPS1Input(); }
     unsigned GetQueuedCliFrames() const { return m_CliFrames; }
@@ -94,8 +93,6 @@ private:
     std::string m_PendingSceneLoad;
     bool m_RequestQuit = false;
     bool m_Running = true;
-    PSyncState m_PSync;
-    double m_PSyncLastTime = 0.0;
     unsigned m_CliFrames = 0;
     float m_CliFrameDelta = 1.0f/60.0f;
 };

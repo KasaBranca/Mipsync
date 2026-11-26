@@ -48,16 +48,65 @@ if(request.command=="scene.raycast") {
     std::stable_sort(hits.begin(),hits.end(),[](const Json& a,const Json& b){return a["distance"].get<float>()<b["distance"].get<float>();});
     return CommandResult::Ok({{"hits",hits},{"count",hits.size()},{"method","render-aabb"}});
 }
+if(request.command=="prefab.create") {
+    CommandResult blocked;if(!RequireEditMode(editor,blocked))return blocked;
+    auto* entity=entityByArgument();
+    const auto path=projectPath(request.arguments.at("file").get<std::string>(),".nprefab");
+    if(!editor.RecordAssetUndoSnapshot(PathUtf8::ToString(path)))
+        return CommandResult::Fail("MIPSYNC_ASSET_UNDO","Could not record asset Undo.");
+    std::string error;
+    if(!SceneIO::SaveEntityToFile(*entity,scene,PathUtf8::ToString(path),error))
+        return CommandResult::Fail("MIPSYNC_PREFAB_SAVE",error);
+    entity->SetPrefabSourcePath(PathUtf8::ToString(path));
+    editor.CommandMarkSceneDirty();
+    return CommandResult::Ok({{"path",PathUtf8::ToString(path.lexically_relative(PathUtf8::FromString(m_Engine.GetProjectPath())))},
+        {"entity",entity->GetID()},{"name",EntityName(*entity)}});
+}
+if(request.command=="prefab.list") {
+    Json prefabs=Json::array();std::vector<std::string> paths;
+    const auto root=PathUtf8::FromString(m_Engine.GetProjectPath());
+    const auto prefabRoot=root/"assets"/"prefabs";
+    if(std::filesystem::is_directory(prefabRoot))
+        for(const auto& entry:std::filesystem::recursive_directory_iterator(prefabRoot))
+            if(entry.is_regular_file()&&Lower(PathUtf8::ToString(entry.path().extension()))==".nprefab")
+                paths.push_back(PathUtf8::ToString(entry.path().lexically_relative(root)));
+    std::sort(paths.begin(),paths.end());
+    for(const auto& path:paths)prefabs.push_back({{"path",path}});
+    return CommandResult::Ok({{"prefabs",prefabs},{"count",prefabs.size()}});
+}
+if(request.command=="prefab.inspect") {
+    const auto path=projectPath(request.arguments.at("file").get<std::string>(),".nprefab");
+    std::ifstream file(path,std::ios::binary);
+    if(!file)return CommandResult::Fail("MIPSYNC_PREFAB_FILE","Cannot open prefab.");
+    Json root;try{file>>root;}catch(const std::exception& e){return CommandResult::Fail("MIPSYNC_PREFAB_JSON",e.what());}
+    if(!root.contains("entity")||!root["entity"].is_object())return CommandResult::Fail("MIPSYNC_PREFAB_FORMAT","Prefab is missing entity.");
+    size_t entityCount=0,scriptCount=0,meshCount=0;
+    std::vector<std::string> scriptPaths;
+    std::function<void(const Json&)> visit=[&](const Json& ent){
+        ++entityCount;
+        if(ent.contains("meshRenderer"))++meshCount;
+        if(ent.contains("mipsScripts")&&ent["mipsScripts"].is_array())
+            for(const auto& script:ent["mipsScripts"])if(script.is_object()&&script.contains("path")&&script["path"].is_string()){
+                ++scriptCount;scriptPaths.push_back(script["path"].get<std::string>());
+            }
+        if(ent.contains("children")&&ent["children"].is_array())
+            for(const auto& child:ent["children"])visit(child);
+    };
+    visit(root["entity"]);
+    return CommandResult::Ok({{"path",PathUtf8::ToString(path.lexically_relative(PathUtf8::FromString(m_Engine.GetProjectPath())))},
+        {"name",root["entity"].value("name",std::string("Prefab"))},{"entityCount",entityCount},
+        {"meshCount",meshCount},{"scriptCount",scriptCount},{"scripts",scriptPaths},{"document",root}});
+}
 if(request.command=="material.list"||request.command=="asset.list") {
     const auto type=request.command=="material.list"?std::string("material"):Lower(request.arguments.value("type",std::string("all")));
-    if(type!="material"&&type!="texture"&&type!="all")return CommandResult::Fail("MIPSYNC_ASSET_TYPE","type must be all, material or texture.");
+    if(type!="material"&&type!="texture"&&type!="prefab"&&type!="all")return CommandResult::Fail("MIPSYNC_ASSET_TYPE","type must be all, material, texture or prefab.");
     const auto root=PathUtf8::FromString(m_Engine.GetProjectPath());Json assets=Json::array();std::vector<std::string> paths;
     const auto assetRoot=root/"assets";
     if(std::filesystem::is_directory(assetRoot))for(const auto& entry:std::filesystem::recursive_directory_iterator(assetRoot)) {
         if(!entry.is_regular_file())continue;
         const auto ext=Lower(PathUtf8::ToString(entry.path().extension()));
-        const bool material=ext==".nmat",texture=ext==".png"||ext==".jpg"||ext==".jpeg"||ext==".bmp"||ext==".tga"||ext==".dds"||ext==".psd"||ext==".hdr";
-        if((type=="material"&&!material)||(type=="texture"&&!texture))continue;
+        const bool material=ext==".nmat",prefab=ext==".nprefab",texture=ext==".png"||ext==".jpg"||ext==".jpeg"||ext==".bmp"||ext==".tga"||ext==".dds"||ext==".psd"||ext==".hdr";
+        if((type=="material"&&!material)||(type=="texture"&&!texture)||(type=="prefab"&&!prefab))continue;
         paths.push_back(PathUtf8::ToString(entry.path().lexically_relative(root)));
     }
     std::sort(paths.begin(),paths.end());for(const auto& path:paths)assets.push_back({{"path",path}});

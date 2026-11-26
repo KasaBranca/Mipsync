@@ -27,8 +27,15 @@ private:
     void CompileStatement(const Ast::Stmt& stmt);
     void CompileExpression(const Ast::Expr& expr);
     void CompileAssignment(const Ast::Expr& lhs, const Ast::Expr& rhs);
+    void CompileCompoundAssignment(const Ast::Expr& lhs, const Ast::Expr& rhs,
+                                   Ast::BinaryOp op);
+    void CompileIncDec(const Ast::Expr& target, bool increment, bool postfix);
     void CompileLValueStore(const Ast::Expr& lhs);
     bool TryCompileBuiltinCall(const Ast::CallExpr& call);
+    bool TryCompileUserMethodCall(const Ast::CallExpr& call);
+    const Ast::MethodDecl* FindUserMethod(const std::string& name) const;
+    void EmitNumber(double value);
+    void EmitBinaryOp(Ast::BinaryOp op);
 
     bool IsTransformVecAxis(const Ast::Expr& expr, std::string& outVecMember,
                             char& outAxis) const;
@@ -61,6 +68,12 @@ private:
     std::vector<std::string> m_Locals;
     std::vector<size_t> m_ScopeBases;
     std::vector<LoopContext> m_Loops;
+    std::unordered_map<std::string, const Ast::MethodDecl*> m_UserMethods;
+    std::vector<std::string> m_InlineStack;
+    std::vector<std::vector<size_t>> m_InlineReturnJumps;
+    std::vector<std::unordered_map<std::string, int>> m_InlineNameMaps;
+    std::vector<std::vector<std::string>> m_InlineNameInsertions;
+    int m_InlineTempCounter = 0;
     SourceLocation m_CurrentLocation;
 };
 

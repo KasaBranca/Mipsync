@@ -9,6 +9,9 @@ namespace {
 const std::unordered_map<std::string, TokenType> kKeywords = {
     { "class", TokenType::KwClass },
     { "public", TokenType::KwPublic },
+    { "private", TokenType::KwPrivate },
+    { "protected", TokenType::KwProtected },
+    { "internal", TokenType::KwInternal },
     { "void", TokenType::KwVoid },
     { "if", TokenType::KwIf },
     { "else", TokenType::KwElse },
@@ -194,11 +197,29 @@ const std::vector<Token>& Lexer::Tokenize() {
         };
 
         switch (c) {
-        case '+': push(TokenType::Plus, "+"); break;
-        case '-': push(TokenType::Minus, "-"); break;
-        case '*': push(TokenType::Star, "*"); break;
-        case '/': push(TokenType::Slash, "/"); break;
-        case '%': push(TokenType::Percent, "%"); break;
+        case '+':
+            if (Peek() == '+') push(TokenType::PlusPlus, "++", 2);
+            else if (Peek() == '=') push(TokenType::PlusAssign, "+=", 2);
+            else push(TokenType::Plus, "+");
+            break;
+        case '-':
+            if (Peek() == '-') push(TokenType::MinusMinus, "--", 2);
+            else if (Peek() == '=') push(TokenType::MinusAssign, "-=", 2);
+            else push(TokenType::Minus, "-");
+            break;
+        case '*':
+            if (Peek() == '=') push(TokenType::StarAssign, "*=", 2);
+            else push(TokenType::Star, "*");
+            break;
+        case '/':
+            if (Peek() == '=') push(TokenType::SlashAssign, "/=", 2);
+            else push(TokenType::Slash, "/");
+            break;
+        case '%':
+            if (Peek() == '=') push(TokenType::PercentAssign, "%=", 2);
+            else push(TokenType::Percent, "%");
+            break;
+        case '?': push(TokenType::Question, "?"); break;
         case '(': push(TokenType::LParen, "("); break;
         case ')': push(TokenType::RParen, ")"); break;
         case '{': push(TokenType::LBrace, "{"); break;

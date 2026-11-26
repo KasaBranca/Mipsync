@@ -9,6 +9,7 @@
 #include "../physics/ColliderUtils.h"
 #include "../audio/AudioSystem.h"
 #include "../scene/SceneIO.h"
+#include "../scene/SceneDefaults.h"
 #include "../bootstrap/ProjectBootstrap.h"
 #include "../bootstrap/AgentIntegration.h"
 #include "../assets/AssetManager.h"
@@ -342,15 +343,14 @@ void Engine::SetupDefaultScene() {
     auto cubeEntity = m_Scene->CreateEntity("PS1 Cube");
     auto& renderer = cubeEntity->AddComponent<MeshRendererComponent>();
     renderer.SetPrimitive("Cube", 2.0f);
-    renderer.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
     auto& mipsScript = cubeEntity->AddComponent<MipsScriptComponent>();
-    mipsScript.scriptPath = "Rotator.mips";
+    // New projects write the script to scripts/Rotator.mips (Project::Create).
+    mipsScript.scriptPath = "scripts/Rotator.mips";
 
     // Create a plane
     auto planeEntity = m_Scene->CreateEntity("Floor");
     auto& pRenderer = planeEntity->AddComponent<MeshRendererComponent>();
     pRenderer.SetPrimitive("Plane", 20.0f);
-    pRenderer.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(256, 32));
     planeEntity->GetComponent<TransformComponent>()->position.y = -1.5f;
     {
         auto& col = planeEntity->AddComponent<ColliderComponent>();
@@ -378,6 +378,10 @@ void Engine::SetupDefaultScene() {
     cameraComp.camera.SetPosition({ 0.0f, 2.0f, 6.0f });
     cameraComp.camera.LookAt({ 0.0f, 0.0f, 0.0f });
     cameraComp.camera.SyncTransformFromCamera(*cameraEntity->GetComponent<TransformComponent>());
+
+    // Directional Light + procedural-sky Post Process Volume (shared with
+    // editor-created scenes).
+    AddDefaultSceneEnvironment(*m_Scene);
 }
 
 void Engine::Run() {
@@ -391,7 +395,6 @@ void Engine::Run() {
         if (m_Editor->IsPlayPreparationRunning()) {
             m_Editor->PumpPreparationCommands();
             glfwPollEvents();
-            m_PSyncLastTime = glfwGetTime();
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
@@ -452,7 +455,6 @@ void Engine::Update() {
         if (m_Editor->IsPreparingPlay()) {
             // Preparation may take seconds. Do not advance scripts/animation,
             // physics, scene requests or game input with that elapsed time.
-            m_PSyncLastTime = glfwGetTime();
             Time::Init();
             Input::EndGameFrame();
             return;
@@ -470,28 +472,17 @@ void Engine::Update() {
     const bool playing = m_MipsRuntime->IsPlaying() && !m_MipsRuntime->IsPaused();
     const bool playPaused = animateCharacters && m_MipsRuntime->IsPaused();
 
-    const double now = glfwGetTime();
-    const double elapsed = m_PSyncLastTime > 0.0 ? now - m_PSyncLastTime : 0.0;
-    m_PSyncLastTime = now;
-    const bool sync = !IsPlayerMode() && m_Editor->GetGameViewSettings().pSync;
-    if (!sync || !playing || stepOneFrame) {
-        m_PSync.clock.Reset();
-    }
-    m_PSync.frameDue = !sync || !playing || stepOneFrame ||
-        m_PSync.clock.Advance(elapsed, m_PSync.estimate.frameSeconds);
-    const float gameDt = cliStep ? m_CliFrameDelta : sync && playing
-        ? (stepOneFrame ? PSyncSimulationDeltaTime(m_PSync.estimate.vblanks) : m_PSync.clock.SimulationDeltaTime()) : dt;
+    const float gameDt = cliStep ? m_CliFrameDelta : dt;
 
-    if (playing && m_PSync.frameDue) {
+    if (playing) {
         const bool inputWasEnabled = Input::IsGameInputEnabled();
         if (cliStep) Input::SetGameInputEnabled(true);
-        Input::BeginGameFrame(sync);
+        Input::BeginGameFrame();
         if (cliStep) Input::BeginInjectedPS1Frame();
-        m_MipsRuntime->BeginPerformanceFrame(sync);
         // Scripts run before AnimationSystem so Animator.Set* applies same frame.
         m_MipsRuntime->Update(*m_Scene, gameDt);
         m_Scene->Update(gameDt);
-        m_PhysicsWorld->Simulate(*m_Scene, gameDt, sync ? PSyncSimulationDeltaTime(4) : 1.0f / 20.0f);
+        m_PhysicsWorld->Simulate(*m_Scene, gameDt, 1.0f / 20.0f);
         m_MipsRuntime->DispatchPhysicsEvents(*m_Scene);
         // Camera and other follow behaviours must observe transforms written
         // back by the current physics step, especially characters riding

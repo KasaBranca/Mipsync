@@ -245,9 +245,32 @@ static int stick_held(int axis, int negative) {
     return (s_curr_stick_nav & bit) != 0;
 }
 
+#define PS1_BUTTON_NAME_CACHE 8u
+#define PS1_BUTTON_NAME_MAX 16u
+uint16_t ps1_input_button_mask(const char* name) {
+    /* Keyed by pointer (script constants are stable), verified against a
+     * private copy so reused runtime string buffers stay correct. */
+    static const char* cached_ptr[PS1_BUTTON_NAME_CACHE];
+    static char cached_name[PS1_BUTTON_NAME_CACHE][PS1_BUTTON_NAME_MAX];
+    static uint16_t cached_mask[PS1_BUTTON_NAME_CACHE];
+    unsigned int slot;
+    uint16_t mask;
+    if (!name) return 0;
+    slot = (unsigned int)(((uintptr_t)name >> 2) & (PS1_BUTTON_NAME_CACHE - 1u));
+    if (cached_ptr[slot] == name && strcmp(cached_name[slot], name) == 0)
+        return cached_mask[slot];
+    mask = ps1_named_button_mask(name);
+    if (mask && strlen(name) < PS1_BUTTON_NAME_MAX) {
+        strcpy(cached_name[slot], name);
+        cached_mask[slot] = mask;
+        cached_ptr[slot] = name;
+    }
+    return mask;
+}
+
 int ps1_input_key_held(const char* name) {
     if (!name) return 0;
-    { const uint16_t mask=ps1_named_button_mask(name); if (mask) return !(s_curr_btn & mask); }
+    { const uint16_t mask=ps1_input_button_mask(name); if (mask) return !(s_curr_btn & mask); }
     if (strcmp(name, "W") == 0 || strcmp(name, "Up") == 0)
         return button_held(PAD_UP) || stick_held(1, 1);
     if (strcmp(name, "S") == 0 || strcmp(name, "Down") == 0)
@@ -277,7 +300,7 @@ int ps1_input_key_held(const char* name) {
 
 int ps1_input_key_down(const char* name) {
     if (!name) return 0;
-    { const uint16_t mask=ps1_named_button_mask(name); if (mask) return (s_frame_down & mask)!=0; }
+    { const uint16_t mask=ps1_input_button_mask(name); if (mask) return (s_frame_down & mask)!=0; }
     if (strcmp(name, "W") == 0 || strcmp(name, "Up") == 0)
         return button_down(PAD_UP) || (s_frame_stick_down & 1u);
     if (strcmp(name, "S") == 0 || strcmp(name, "Down") == 0)
@@ -306,7 +329,7 @@ int ps1_input_key_down(const char* name) {
 
 int ps1_input_key_up(const char* name) {
     if (!name) return 0;
-    { const uint16_t mask=ps1_named_button_mask(name); if (mask) return (s_frame_up & mask)!=0; }
+    { const uint16_t mask=ps1_input_button_mask(name); if (mask) return (s_frame_up & mask)!=0; }
     if (strcmp(name, "W") == 0 || strcmp(name, "Up") == 0) return button_up(PAD_UP);
     if (strcmp(name, "S") == 0 || strcmp(name, "Down") == 0) return button_up(PAD_DOWN);
     if (strcmp(name, "A") == 0 || strcmp(name, "Left") == 0) return button_up(PAD_LEFT);

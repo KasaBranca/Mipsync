@@ -34,7 +34,7 @@ std::shared_ptr<CompiledModule> DeserializePlayerModule(const std::vector<uint8_
     m->ps1CompatibilityErrors=j.at("ps1Errors").get<std::vector<std::string>>();
     if(j.at("fields").size()>65535 || j.at("methods").size()>65535 || m->numberConstants.size()>65535 || m->stringConstants.size()>65535 || m->nameConstants.size()>65535)throw std::runtime_error("Compiled script exceeds limits");
     for(const auto& v:j.at("fields")) {
-        if(!v.is_array() || (v.size()!=6 && v.size()!=7) || v.at(2).get<unsigned>()>static_cast<unsigned>(FieldValueKind::EntityReference))throw std::runtime_error("Invalid compiled field");
+        if(!v.is_array() || (v.size()!=6 && v.size()!=7) || v.at(2).get<unsigned>()>static_cast<unsigned>(FieldValueKind::Prefab))throw std::runtime_error("Invalid compiled field");
         CompiledField f;f.name=v.at(0);f.typeName=v.at(1);f.valueKind=static_cast<FieldValueKind>(v.at(2).get<unsigned>());f.defaultConstIndex=v.at(3);f.hasGetter=v.at(4);f.hasSetter=v.at(5);
         if(v.size()==7) {
             const auto& j=v.at(6); if(!j.is_object()) throw std::runtime_error("Invalid inspector metadata");
@@ -94,7 +94,7 @@ std::vector<size_t> InspectorFieldIndices(const std::vector<CompiledField>& fiel
     std::vector<size_t> indices;
     for(size_t i=0;i<fields.size();++i) {
         if(fields[i].typeName=="Vector3.y" || fields[i].typeName=="Vector3.z") continue;
-        if(!fields[i].inspector.hidden) indices.push_back(i);
+        if(fields[i].isPublic && !fields[i].inspector.hidden) indices.push_back(i);
     }
     std::stable_sort(indices.begin(),indices.end(),[&](size_t a,size_t b) {
         return fields[a].inspector.order<fields[b].inspector.order;

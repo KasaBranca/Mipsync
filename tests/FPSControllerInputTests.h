@@ -70,7 +70,7 @@ inline bool RunFPSControllerInputTests(std::string& error) {
                 Input::SamplePS1Pad(sample);
                 if ((sampleIndex+1)%samplesPerTick) continue;
                 const float dt=samplesPerTick/60.f;
-                Input::BeginGameFrame(samplesPerTick>1);
+                Input::BeginGameFrame();
                 runtime.Update(scene,dt); physics.Simulate(scene,dt,dt); runtime.LateUpdate(scene,dt);
                 Input::EndGameFrame();
             }
@@ -85,7 +85,7 @@ inline bool RunFPSControllerInputTests(std::string& error) {
                 (childCamera && (std::abs(rotation.x)>.001f || std::abs(viewRotation.y)>.001f)))
                 throw std::runtime_error("right-stick FPS look failed at "+std::to_string(60/samplesPerTick)+" FPS");
             PS1PadSample idle; idle.seconds=1.f/60; Input::SamplePS1Pad(idle);
-            Input::BeginGameFrame(true); runtime.Update(scene,1.f/60); Input::EndGameFrame();
+            Input::BeginGameFrame(); runtime.Update(scene,1.f/60); Input::EndGameFrame();
             if (glm::length(entity->GetComponent<TransformComponent>()->rotation-rotation)>.001f ||
                 glm::length(view->GetComponent<TransformComponent>()->rotation-viewRotation)>.001f)
                 throw std::runtime_error("FPS keeps looking after right stick stops");
@@ -121,11 +121,11 @@ inline bool RunFPSControllerInputTests(std::string& error) {
             Input::SetPS1PadMapping({});
             PhysicsWorld physics; Mips::MipsRuntime runtime; runtime.SetPhysicsWorld(&physics); runtime.OnPlayStarted(scene);
             PS1PadSample sample; sample.seconds=1.f/60; sample.physicalAxes={0,0,0,1};
-            Input::SamplePS1Pad(sample); Input::BeginGameFrame(false); runtime.Update(scene,1.f/60); Input::EndGameFrame();
+            Input::SamplePS1Pad(sample); Input::BeginGameFrame(); runtime.Update(scene,1.f/60); Input::EndGameFrame();
             if (std::abs(camera->GetComponent<TransformComponent>()->rotation.x-12.4f)>.01f ||
                 body->GetComponent<TransformComponent>()->rotation.x!=0)
                 throw std::runtime_error("FPS lost authored camera pitch or tilted the body");
-            Input::SamplePS1Pad(sample); Input::BeginGameFrame(false); runtime.Update(scene,2); Input::EndGameFrame();
+            Input::SamplePS1Pad(sample); Input::BeginGameFrame(); runtime.Update(scene,2); Input::EndGameFrame();
             if (camera->GetComponent<TransformComponent>()->rotation.x!=85)
                 throw std::runtime_error("child camera pitch clamp failed");
             runtime.OnPlayStopped(scene);

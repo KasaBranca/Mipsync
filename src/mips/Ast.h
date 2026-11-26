@@ -13,9 +13,10 @@ enum class BinaryOp {
     Eq, NotEq, Less, Greater, LessEq, GreaterEq,
     And, Or,
     Assign,
+    AddAssign, SubAssign, MulAssign, DivAssign, ModAssign,
 };
 
-enum class UnaryOp { Neg, Not };
+enum class UnaryOp { Neg, Not, PreInc, PreDec, PostInc, PostDec };
 
 struct Expr;
 struct Stmt;
@@ -54,6 +55,7 @@ struct FieldDecl {
     bool isAutoProperty = false;
     bool hasGetter = true;
     bool hasSetter = true;
+    bool isPublic = true;
 };
 
 struct MethodDecl {
@@ -187,10 +189,16 @@ struct NewExpr {
     std::vector<std::unique_ptr<Expr>> arguments;
 };
 
+struct ConditionalExpr {
+    std::unique_ptr<Expr> condition;
+    std::unique_ptr<Expr> thenExpr;
+    std::unique_ptr<Expr> elseExpr;
+};
+
 struct Expr {
     enum class Kind {
         Literal, Identifier, Binary, Unary, Call, Member, GenericCall,
-        ArrayLiteral, Index, New
+        ArrayLiteral, Index, New, Conditional
     };
 
     Kind kind = Kind::Literal;
@@ -206,6 +214,7 @@ struct Expr {
     std::unique_ptr<ArrayLiteralExpr> arrayLiteral;
     std::unique_ptr<IndexExpr> index;
     std::unique_ptr<NewExpr> newExpr;
+    std::unique_ptr<ConditionalExpr> conditional;
 };
 
 } // namespace MipsyncEngine::Mips::Ast

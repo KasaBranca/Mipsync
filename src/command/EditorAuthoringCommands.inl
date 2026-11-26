@@ -162,9 +162,11 @@ if(request.command=="script.attach"||request.command=="script.fields") {
         const auto& field=candidate.module->fields[index];
         if(!field.hasSetter)return CommandResult::Fail("MIPSYNC_FIELD_READONLY",it.key()+" is read-only.");
         if(field.valueKind==Mips::FieldValueKind::Array)return CommandResult::Fail("MIPSYNC_FIELD_ARRAY","Serialized array overrides are not supported; initialize arrays in Start.");
-        if(field.valueKind==Mips::FieldValueKind::AudioClip) {
-            if(!it.value().is_string())return CommandResult::Fail("MIPSYNC_FIELD_TYPE","AudioClip fields require asset path strings.");
-            const auto value=it.value().get<std::string>();if(!value.empty()&&!std::filesystem::is_regular_file(projectPath(value)))return CommandResult::Fail("MIPSYNC_ASSET_MISSING","AudioClip asset does not exist.");
+        if(field.valueKind==Mips::FieldValueKind::AudioClip||field.valueKind==Mips::FieldValueKind::Prefab) {
+            const bool prefab=field.valueKind==Mips::FieldValueKind::Prefab;
+            if(!it.value().is_string())return CommandResult::Fail("MIPSYNC_FIELD_TYPE",prefab?"Prefab fields require asset path strings.":"AudioClip fields require asset path strings.");
+            const auto value=it.value().get<std::string>();
+            if(!value.empty()&&!std::filesystem::is_regular_file(projectPath(value,prefab?".nprefab":"")))return CommandResult::Fail("MIPSYNC_ASSET_MISSING",prefab?"Prefab asset does not exist.":"AudioClip asset does not exist.");
             candidate.fieldAssetPaths[index]=value;
         } else {
             if(field.valueKind==Mips::FieldValueKind::Bool) {
@@ -258,9 +260,17 @@ if(request.command=="runtime.fields") {
     if(index<0||index>=static_cast<int64_t>(scripts.size()))return CommandResult::Fail("MIPSYNC_SCRIPT_INDEX","Script index is out of range.");
     return CommandResult::Ok(m_Engine.GetMipsRuntime().InspectFields(*scripts[index]));
 }
+if(request.command=="runtime.pool") {
+    if(!editor.IsPlaying())return CommandResult::Fail("MIPSYNC_RUNTIME_INACTIVE","Start Play first.");
+    return CommandResult::Ok(m_Engine.GetMipsRuntime().InspectPools());
+}
 if(request.command=="runtime.pause") {
     if(!editor.IsPlaying())return CommandResult::Fail("MIPSYNC_RUNTIME_INACTIVE","Start Play first.");
     editor.SetPlayPaused(request.arguments.value("paused",true));m_Engine.ClearCliSteps();return CommandResult::Ok({{"paused",editor.IsPaused()}});
+}
+if(request.command=="runtime.resume") {
+    if(!editor.IsPlaying())return CommandResult::Fail("MIPSYNC_RUNTIME_INACTIVE","Start Play first.");
+    editor.SetPlayPaused(false);m_Engine.ClearCliSteps();return CommandResult::Ok({{"paused",false}});
 }
 if(request.command=="runtime.step") {
     if(!editor.IsPlaying()||!editor.IsPaused())return CommandResult::Fail("MIPSYNC_RUNTIME_PAUSE","runtime.step requires paused Play.");

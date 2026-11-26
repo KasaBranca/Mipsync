@@ -59,7 +59,11 @@ AudioSystem::~AudioSystem() {
 }
 
 void AudioSystem::BeginPlay(Scene& scene, const std::string& projectRoot) {
-    EndPlay();
+    // Runs on the Play-preparation worker in the editor. Devices from a
+    // previous session must be closed by the owner thread, which calls
+    // EndPlay() before preparation starts; only reset when already there.
+    if (OnOwnerThread())
+        EndPlay();
     m_ProjectRoot = projectRoot;
     m_Paused = false;
     // Decode/synthesize once before input begins, so a UI click only opens a
@@ -81,6 +85,10 @@ void AudioSystem::BeginPlay(Scene& scene, const std::string& projectRoot) {
 }
 
 void AudioSystem::EndPlay() {
+    {
+        std::lock_guard lock(m_PendingMutex);
+        m_Pending.clear();
+    }
 #ifdef _WIN32
     for (const auto& [id, voice] : m_Voices) {
         if (voice.memory) continue;
@@ -119,8 +127,49 @@ bool AudioSystem::Play(Scene& scene, uint32_t entityId, const std::string& proje
     const std::string playbackPath = source->type != AudioSourceType::BGM
         ? PrepareResidentClip(PathUtf8::ToString(path), source->type == AudioSourceType::SFX) : PathUtf8::ToString(path);
     if (playbackPath.empty()) return false;
+    if (!OnOwnerThread()) {
+        Defer({ PendingOp::Kind::Start, entityId, playbackPath, source->volume, source->mute,
+                source->loop, source->type != AudioSourceType::BGM });
+        return true;
+    }
     return OpenAndPlay(entityId, playbackPath, source->volume, source->mute,
                        source->loop, source->type != AudioSourceType::BGM);
+}
+
+void AudioSystem::Defer(PendingOp op) {
+    std::lock_guard lock(m_PendingMutex);
+    if (op.kind == PendingOp::Kind::Start || op.kind == PendingOp::Kind::Stop) {
+        // A later start/stop supersedes an earlier queued start.
+        std::erase_if(m_Pending, [&](const PendingOp& queued) {
+            return queued.entityId == op.entityId && queued.kind == PendingOp::Kind::Start;
+        });
+    }
+    m_Pending.push_back(std::move(op));
+}
+
+bool AudioSystem::HasPendingStart(uint32_t entityId) const {
+    std::lock_guard lock(m_PendingMutex);
+    return std::any_of(m_Pending.begin(), m_Pending.end(), [&](const PendingOp& op) {
+        return op.entityId == entityId && op.kind == PendingOp::Kind::Start;
+    });
+}
+
+void AudioSystem::FlushPending() {
+    std::vector<PendingOp> ops;
+    {
+        std::lock_guard lock(m_PendingMutex);
+        ops.swap(m_Pending);
+    }
+    for (const PendingOp& op : ops) {
+        switch (op.kind) {
+        case PendingOp::Kind::Start:
+            OpenAndPlay(op.entityId, op.path, op.volume, op.mute, op.loop, op.sfx);
+            break;
+        case PendingOp::Kind::Stop: Stop(op.entityId); break;
+        case PendingOp::Kind::Pause: Pause(op.entityId); break;
+        case PendingOp::Kind::Resume: Resume(op.entityId); break;
+        }
+    }
 }
 
 std::string AudioSystem::PrepareResidentClip(const std::string& absolutePath, bool isMidi) {
@@ -233,6 +282,10 @@ bool AudioSystem::OpenAndPlay(uint32_t entityId, const std::string& absolutePath
 }
 
 void AudioSystem::Stop(uint32_t entityId) {
+    if (!OnOwnerThread()) {
+        Defer({ PendingOp::Kind::Stop, entityId });
+        return;
+    }
     auto it = m_Voices.find(entityId);
     if (it == m_Voices.end())
         return;
@@ -244,6 +297,10 @@ void AudioSystem::Stop(uint32_t entityId) {
 }
 
 void AudioSystem::Pause(uint32_t entityId) {
+    if (!OnOwnerThread()) {
+        Defer({ PendingOp::Kind::Pause, entityId });
+        return;
+    }
     auto it = m_Voices.find(entityId);
     if (it == m_Voices.end())
         return;
@@ -256,6 +313,10 @@ void AudioSystem::Pause(uint32_t entityId) {
 }
 
 void AudioSystem::Resume(uint32_t entityId) {
+    if (!OnOwnerThread()) {
+        Defer({ PendingOp::Kind::Resume, entityId });
+        return;
+    }
     auto it = m_Voices.find(entityId);
     if (it == m_Voices.end())
         return;
@@ -326,6 +387,7 @@ void AudioSystem::UpdateSpectrum(Voice& voice) {
 }
 
 void AudioSystem::Update(Scene& scene, bool paused) {
+    FlushPending();
 #ifdef _WIN32
     if (paused != m_Paused) {
         for (auto& [id, voice] : m_Voices) {
@@ -395,6 +457,10 @@ const std::vector<float>& AudioSystem::GetSpectrum(uint32_t entityId) const {
 }
 
 bool AudioSystem::IsPlaying(uint32_t entityId) const {
+    if (HasPendingStart(entityId))
+        return true;
+    if (!OnOwnerThread())
+        return false;
     const auto it = m_Voices.find(entityId);
     if (it == m_Voices.end() || it->second.manuallyPaused)
         return false;

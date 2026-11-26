@@ -14,7 +14,7 @@ struct Component;
 void DrawComponentIcon(const Component& component, ImDrawList* drawList,
                        ImVec2 center, float size);
 
-enum class ToolbarIcon { PSync, Statistics, Gizmos, Local, World };
+enum class ToolbarIcon { Statistics, Gizmos, Local, World };
 void DrawToolbarIcon(ToolbarIcon icon, ImDrawList* drawList, ImVec2 center,
                      float size, ImU32 color);
 

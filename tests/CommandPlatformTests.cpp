@@ -56,7 +56,9 @@ int main() {
         Json files=Json::array();for(int i=0;i<5;++i){auto name="Module"+std::to_string(i);compile(name.c_str(),"class "+name+" : MipsBehaviour { void Update() {} }");files.push_back((root/(name+".mips")).string());}
         const auto aggregate=run("language.validate",{{"files",files},{"bindings",33}});if(aggregate.value["ps1Compatible"]!=false)return 1;
         const auto nativeAggregate=run("language.validate",{{"files",files},{"bindings",5}});if(nativeAggregate.value["ps1Compatible"]!=true)return 1;
-        const auto located=compile("Unsupported","class Unsupported : MipsBehaviour {\n void Helper() {}\n void Start() { Helper(); }\n }");
+        const auto inlined=compile("Inlined","class Inlined : MipsBehaviour {\n float Helper(float v) { return v + 1.0; }\n void Start() { float v = Helper(2.0); }\n }");
+        if(!inlined.success||inlined.value["ps1Compatible"]!=true)return 1;
+        const auto located=compile("Unsupported","class Unsupported : MipsBehaviour {\n void Helper() {}\n void Start() { Missing(); }\n }");
         if(located.success||located.diagnostics.empty()||located.diagnostics.front().location.value("line",0)!=3)return 1;
         const auto properties=run("describe",{{"symbol","Transform"}});if(properties.value["properties"].size()<3)return 1;
         const auto catalog=run("component.list");if(catalog.value["components"].size()!=20)return 1;

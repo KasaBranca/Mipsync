@@ -16,7 +16,6 @@ struct GameViewSettings {
     GameViewPlayMode playMode = GameViewPlayMode::Focused;
     bool showGizmos = false;
     bool showStatistics = false;
-    bool pSync = true;
 
     bool IsMaximized(bool playing, bool paused = false) const {
         return playing && !paused && playMode == GameViewPlayMode::Maximized;

@@ -24,6 +24,7 @@ int FntPrint(int,const char*,...){return 0;}
 void ps1_platform_quit(void){}
 int ps1_input_key_held(const char*){return 0;} int ps1_input_key_down(const char*){return 0;}
 int ps1_input_key_up(const char*){return 0;} int32_t ps1_input_axis_q16(const char*){return 0;}
+uint16_t ps1_input_button_mask(const char*){return 0;}
 int32_t ps1_input_look_delta_x_q16(){return 0;} int32_t ps1_input_look_delta_y_q16(){return 0;}
 int ps1_audio_play(unsigned){return 0;} void ps1_audio_stop(unsigned){} void ps1_audio_pause(unsigned){}
 void ps1_audio_unpause(unsigned){} int ps1_audio_is_playing(unsigned){return 0;} void ps1_audio_apply_entity(unsigned){}
@@ -76,11 +77,18 @@ int main(int argc,char** argv){try{
         for(unsigned j=0;j<decoded[i].field_count;++j){auto value=ToFixed16((i?health:module)->numberConstants[(i?health:module)->fields[j].defaultConstIndex]);
             if(i==0 && (std::string(decoded[i].fields[j].name)=="target"||std::string(decoded[i].fields[j].name)=="targetTransform"))value=2*FIX16_ONE;
             instances[i].fields[j]=value;instances[i].runtime_fields[j].tag=HOST_VAL_NUMBER;instances[i].runtime_fields[j].ival=value;
+            // Asset fields are bound like main.c: a path string, "" when unassigned.
+            const std::string fieldName=decoded[i].fields[j].name;
+            if(i==0 && (fieldName=="spawnPrefab"||fieldName=="missingPrefab")){
+                instances[i].runtime_fields[j].tag=HOST_VAL_NATIVE_STRING;
+                instances[i].runtime_fields[j].text=fieldName=="spawnPrefab"?"assets/prefabs/Road.nprefab":"";
+            }
         }
     }
     check(vm_run_method(&vm,&decoded[0],&instances[0],mbc_find_method(&decoded[0],"Start")),"PS1 object reference execution failed");
     auto value=[&](const char* name){int field=module->FindFieldIndex(name);auto v=instances[0].runtime_fields[field];return v.tag==HOST_VAL_BOOL?(v.ival?1.:0.):v.ival/65536.;};
     check(value("referencesOK")==1 && value("health")==7,"PS1 lookup/null/equality/GetComponent mismatch");
+    check(value("prefabNullOK")==1,"PS1 Prefab asset reference null comparison mismatch");
     check(std::abs(value("before")-5)<.001 && std::abs(value("after")-10)<.001,"PS1 distance/transform mismatch");
     auto* owner=ps1_scene_mutable_entity(0);auto* target=ps1_scene_mutable_entity(149);
     check(target!=nullptr,"late static target was not promoted to a mutable slot");
@@ -97,6 +105,10 @@ int main(int argc,char** argv){try{
     static script_instance extra[2];
     for(unsigned n=0;n<2;++n){
         auto& instance=extra[n]; instance.module=&decoded[n+2]; instance.entity_index=0;
+        // Bind like main.c: every runtime field starts as the number 0. A
+        // zeroed (Nil) field once made "tick=" + repeats a number, which
+        // passed only because strings used to compare numerically.
+        for(unsigned f=0;f<VM_FIELD_CAP;++f){instance.runtime_fields[f].tag=HOST_VAL_NUMBER;instance.runtime_fields[f].ival=0;}
         check(vm_run_method(&vm,instance.module,&instance,mbc_find_method(instance.module,"Start")),"native control flow failed");
         if(n==0){
             check(instance.runtime_fields[0].ival==31*FIX16_ONE,"native arrays mismatch");

@@ -8,6 +8,7 @@
 #include "AssetThumbnail.h"
 #include "../scene/Scene.h"
 #include "../core/Log.h"
+#include "BuiltinAssets.h"
 #include <filesystem>
 
 namespace MipsyncEngine {
@@ -30,7 +31,12 @@ void AssetManager::SetProjectRoot(const std::string& root) {
 }
 
 std::string AssetManager::ToProjectRelative(const std::string& anyPath) const {
-    if (anyPath.empty() || m_Root.empty())
+    if (anyPath.empty() || BuiltinAssets::IsBuiltinPath(anyPath))
+        return anyPath;
+    if (std::string builtin = BuiltinAssets::ToBuiltinPath(PathUtf8::FromString(anyPath));
+        !builtin.empty())
+        return builtin;
+    if (m_Root.empty())
         return anyPath;
     std::error_code ec;
     fs::path full = fs::absolute(PathUtf8::FromString(anyPath), ec);
@@ -50,6 +56,8 @@ std::string AssetManager::ToProjectRelative(const std::string& anyPath) const {
 
 std::string AssetManager::ToAbsolute(const std::string& projectRelativePath) const {
     if (projectRelativePath.empty()) return {};
+    if (BuiltinAssets::IsBuiltinPath(projectRelativePath))
+        return PathUtf8::ToString(BuiltinAssets::Resolve(projectRelativePath));
     fs::path p = PathUtf8::FromString(projectRelativePath);
     if (p.is_absolute()) return PathUtf8::ToString(p);
     if (m_Root.empty()) return PathUtf8::ToString(p);
@@ -88,48 +96,9 @@ std::shared_ptr<Texture> AssetManager::GetTexture(const std::string& projectRela
     return tex;
 }
 
-std::shared_ptr<Texture> AssetManager::GetSkyboxTexture(const std::string& projectRelativePath) {
-    if (projectRelativePath.empty())
-        return nullptr;
-
-    if (m_FailedSkyboxTexturePaths.count(projectRelativePath))
-        return nullptr;
-
-    auto it = m_SkyboxTextures.find(projectRelativePath);
-    if (it != m_SkyboxTextures.end())
-        return it->second;
-
-    const std::string abs = ToAbsolute(projectRelativePath);
-    std::error_code ec;
-    if (!AssetFiles::Exists(PathUtf8::FromString(abs))) {
-        MIPSYNC_WARN("Skybox texture not found: {}", abs);
-        m_FailedSkyboxTexturePaths.insert(projectRelativePath);
-        return nullptr;
-    }
-
-    TextureParams params;
-    params.nearestFilter = false;
-    params.clampToEdge = true;
-    params.maxSize = 4096;
-    // Equirectangular skyboxes use shader-generated UVs where v=0 is the top
-    // of the panorama. Do not apply the authored-texture flip used by regular
-    // material textures, or the sky will appear upside-down.
-    params.flipVerticallyOnLoad = false;
-    auto tex = std::make_shared<Texture>(abs, params);
-    if (tex->GetID() == 0) {
-        MIPSYNC_WARN("Skybox texture failed to upload: {}", abs);
-        m_FailedSkyboxTexturePaths.insert(projectRelativePath);
-        return nullptr;
-    }
-    m_SkyboxTextures.emplace(projectRelativePath, tex);
-    return tex;
-}
-
 void AssetManager::DropTexture(const std::string& projectRelativePath) {
     m_Textures.erase(projectRelativePath);
-    m_SkyboxTextures.erase(projectRelativePath);
     m_FailedTexturePaths.erase(projectRelativePath);
-    m_FailedSkyboxTexturePaths.erase(projectRelativePath);
 }
 
 std::shared_ptr<Mesh> AssetManager::GetMesh(const std::string& projectRelativePath, int meshPart) {
@@ -249,12 +218,10 @@ void AssetManager::DropAnimatorController(const std::string& projectRelPath) {
 
 void AssetManager::Clear() {
     m_Textures.clear();
-    m_SkyboxTextures.clear();
     m_Meshes.clear();
     m_SkeletalModels.clear();
     m_Controllers.clear();
     m_FailedTexturePaths.clear();
-    m_FailedSkyboxTexturePaths.clear();
     m_FailedMeshPaths.clear();
     m_FailedSkeletalModelPaths.clear();
     AssetThumbnail::Get().Clear();
@@ -270,19 +237,48 @@ void AssetManager::ApplyMaterialToMeshRenderer(MeshRendererComponent& mr, const 
     mr.texture = mat.texturePath.empty() ? nullptr : GetTexture(mat.texturePath);
     mr.ps1PreviewTexture.reset();
     mr.ps1PreviewTexturePath.clear();
-    if (!mat.texturePath.empty() && !mr.texture)
-        mr.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
+    // A material image that cannot be loaded leaves the surface untextured,
+    // like a material whose texture slot is None.
+    mr.resolvedMaterialPath = materialPath;
 }
 
-void AssetManager::ClearMeshRendererMaterial(MeshRendererComponent& mr) {
-    mr.materialPath.clear();
-    mr.color = { 1.0f, 1.0f, 1.0f, 1.0f };
+namespace {
+/// No material, or one that cannot be read: Unity's error-shader magenta.
+void ApplyErrorAppearance(MeshRendererComponent& mr) {
+    mr.color = MeshRendererComponent::kErrorColor;
     mr.texturePath.clear();
     mr.textureTiling = { 1.0f, 1.0f };
     mr.textureOffset = { 0.0f, 0.0f };
     mr.texture = nullptr;
     mr.ps1PreviewTexture.reset();
     mr.ps1PreviewTexturePath.clear();
+    mr.resolvedMaterialPath = mr.materialPath;
+}
+} // namespace
+
+void AssetManager::ClearMeshRendererMaterial(MeshRendererComponent& mr) {
+    mr.materialPath.clear();
+    ApplyErrorAppearance(mr);
+}
+
+void AssetManager::ResolveMeshRendererMaterial(MeshRendererComponent& mr) {
+    if (mr.materialPath.empty()) {
+        ApplyErrorAppearance(mr);
+        return;
+    }
+    Material material;
+    std::string error;
+    if (Material::Load(ToAbsolute(mr.materialPath), material, error)) {
+        ApplyMaterialToMeshRenderer(mr, material, mr.materialPath);
+        return;
+    }
+    MIPSYNC_WARN("MeshRenderer material '{}' could not be loaded: {}", mr.materialPath, error);
+    ApplyErrorAppearance(mr);
+}
+
+void AssetManager::EnsureMeshRendererMaterial(MeshRendererComponent& mr) {
+    if (!mr.resolvedMaterialPath || *mr.resolvedMaterialPath != mr.materialPath)
+        ResolveMeshRendererMaterial(mr);
 }
 
 void AssetManager::ApplyMaterialToSkinnedMeshRenderer(SkinnedMeshRendererComponent& mr, const Material& mat,
@@ -293,8 +289,6 @@ void AssetManager::ApplyMaterialToSkinnedMeshRenderer(SkinnedMeshRendererCompone
     mr.textureTiling = mat.mainTextureTiling;
     mr.textureOffset = mat.mainTextureOffset;
     mr.texture = mat.texturePath.empty() ? nullptr : GetTexture(mat.texturePath);
-    if (!mat.texturePath.empty() && !mr.texture)
-        mr.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
 }
 
 void AssetManager::ClearSkinnedMeshRendererMaterial(SkinnedMeshRendererComponent& mr) {

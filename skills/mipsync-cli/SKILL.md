@@ -78,6 +78,11 @@ scene mutations.
 
 ## Work with Mips#
 
+Read [references/mips-sharp.md](references/mips-sharp.md) before writing or
+reviewing a Mips# script. It defines the Unity C#-style conventions, the
+current language features (user methods, ternary, compound assignment,
+`++`/`--`, private fields, `Mathf` completion) and the PS1 limits.
+
 Use normal workspace file editing for `.mips` source, then validate through the
 real compiler:
 
@@ -85,9 +90,25 @@ real compiler:
 mipsync --project "D:\Games\MyGame" language compile assets/scripts/Player.mips --json
 ```
 
-Read structured diagnostics and the module's `ps1Compatible` result. Discover
-engine bindings with `search` and `describe`; do not invent Unity or .NET APIs
-that Mips# has not exposed.
+Read structured diagnostics and the module's `ps1Compatible` result. Require
+`success: true` and `ps1Compatible: true` before Play Mode. Discover engine
+bindings with `search` and `describe`; do not invent Unity or .NET APIs that
+Mips# has not exposed. If `describe` disagrees with the compiler, trust
+`language.compile` and note the mismatch in your summary.
+
+Style essentials:
+
+- Keep inspector attributes on one line and prefer whole-vector assignment
+  (`transform.position = Vector3(...)`).
+- Use `Mathf` helpers instead of manual `if` chains.
+- Keep helpers small; user method calls are inlined and recursion is rejected.
+- Private fields are internal runtime state and are not serialized to the
+  scene; use `[SerializeField]` when they need Inspector tuning.
+- Prefer `public Prefab` fields for spawnables and author assets with
+  `prefab.create` / `prefab.inspect` / `asset.list --type prefab` instead of
+  hand-writing `.nprefab` JSON.
+- Use `runtime.resume` (or `runtime.play`) to resume a paused Play session.
+- Split oversized `Update` methods into multiple MipsScript components.
 
 ## Handle failures
 

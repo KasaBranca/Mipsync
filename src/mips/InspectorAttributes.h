@@ -10,6 +10,7 @@ struct InspectorAttributes {
     double space = 0.0, rangeMin = 0.0, rangeMax = 0.0, minimum = 0.0;
     int order = 0;
     bool hasRange = false, hasMin = false, readOnly = false, hidden = false;
+    bool serialize = false; // [SerializeField] exposes a private field
 
     double Constrain(double value, bool integer = false) const {
         if (hasRange) value = std::clamp(value, integer ? std::ceil(rangeMin) : rangeMin,

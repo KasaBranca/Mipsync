@@ -157,7 +157,8 @@ bool AssetFileExists(const AssetManager& assets, const std::string& projectRelPa
 
 std::string ResolveAssetPathWithAssetsFallback(const AssetManager& assets,
                                                const std::string& projectRelPath) {
-    if (projectRelPath.empty() || AssetFileExists(assets, projectRelPath))
+    if (projectRelPath.empty() || BuiltinAssets::IsBuiltinPath(projectRelPath) ||
+        AssetFileExists(assets, projectRelPath))
         return projectRelPath;
 
     const bool alreadyAssetsRelative =
@@ -186,6 +187,11 @@ uint64_t HashLegacyMaterial(const Material& material, const char* rendererKind) 
     addBytes(&material.mainTextureOffset, sizeof(material.mainTextureOffset));
     addBytes(&material.ps1TextureMaxSize, sizeof(material.ps1TextureMaxSize));
     return hash;
+}
+
+bool LegacyAppearanceNeedsMaterial(const std::string& texturePath, const glm::vec4& color,
+                                   const glm::vec2& tiling, const glm::vec2& offset) {
+    return BuiltinAssets::LegacyAppearanceNeedsMaterial(texturePath, color, tiling, offset);
 }
 
 std::string MigrateLegacyAppearanceToMaterial(AssetManager& assets, const char* rendererKind,
@@ -283,13 +289,17 @@ json EntityComponentsToJson(const Entity& entity) {
         mr["size"] = mesh->meshSize;
         mr["typePreset"] = MeshRendererPresetName(mesh->typePreset);
         mr["renderType"] = mesh->renderType == RendererType::Unlit ? "Unlit" : "Lit";
-        if (!mesh->materialPath.empty()) mr["material"] = mesh->materialPath;
+        // Always written: an empty string is an explicit "None (Material)",
+        // distinct from pre-reference scenes that omit the key.
+        mr["material"] = mesh->materialPath;
         if (mesh->editorOnly)
             mr["editorOnly"] = true;
         if (mesh->prerenderOccluder)
             mr["prerenderOccluder"] = true;
         if (mesh->ps1SeamFill)
             mr["ps1SeamFill"] = true;
+        if (mesh->ps1DepthBias != 0.0f)
+            mr["ps1DepthBias"] = mesh->ps1DepthBias;
         if (!mesh->meshPath.empty()) mr["mesh"] = mesh->meshPath;
         if (mesh->meshPartIndex >= 0) mr["meshPart"] = mesh->meshPartIndex;
         ent["meshRenderer"] = mr;
@@ -486,11 +496,16 @@ json EntityComponentsToJson(const Entity& entity) {
             json fields;
             for (size_t i = 0; i < script->module->fields.size(); ++i) {
                 const auto& field = script->module->fields[i];
-                if (field.valueKind == Mips::FieldValueKind::AudioClip)
+                if (!field.isPublic)
+                    continue;
+                if (field.valueKind == Mips::FieldValueKind::AudioClip ||
+                    field.valueKind == Mips::FieldValueKind::Prefab)
                     fields[field.name] = i < script->fieldAssetPaths.size()
                         ? script->fieldAssetPaths[i] : std::string{};
                 else if (field.valueKind == Mips::FieldValueKind::Array)
                     fields[field.name] = json::array();
+                else if (field.valueKind == Mips::FieldValueKind::Bool)
+                    fields[field.name] = script->fieldValues[i] != 0.0;
                 else
                     fields[field.name] = script->fieldValues[i];
             }
@@ -551,12 +566,10 @@ json EntityComponentsToJson(const Entity& entity) {
             { "vignetteIntensity", post->vignetteIntensity },
             { "vignetteSmoothness", post->vignetteSmoothness },
             { "skyboxEnabled", post->skyboxEnabled },
-            { "skyboxRotation", post->skyboxRotationDegrees },
-            { "skyboxExposure", post->skyboxExposure },
-            { "skyboxTint", Vec3ToJson(post->skyboxTint) },
+            { "skyTopColor", Vec3ToJson(post->skyTopColor) },
+            { "skyHorizonColor", Vec3ToJson(post->skyHorizonColor) },
+            { "skyGroundColor", Vec3ToJson(post->skyGroundColor) },
         };
-        if (!post->skyboxTexturePath.empty())
-            postJson["skyboxTexture"] = post->skyboxTexturePath;
         if (!post->enabled)
             postJson["enabled"] = false;
         ent["postProcessVolume"] = postJson;
@@ -765,6 +778,7 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         meshComp.editorOnly   = mr.value("editorOnly", false);
         meshComp.prerenderOccluder = mr.value("prerenderOccluder", false);
         meshComp.ps1SeamFill  = mr.value("ps1SeamFill", false);
+        meshComp.ps1DepthBias = std::clamp(mr.value("ps1DepthBias", 0.0f), -32.0f, 32.0f);
         if (!meshComp.prerenderOccluder) {
             static constexpr const char* kOccluderMarker = "_PrerenderOccluder";
             meshComp.prerenderOccluder =
@@ -777,37 +791,31 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
             meshComp.SetPrimitive(primitive, meshComp.meshSize);
         }
 
-        meshComp.materialPath = ResolveAssetPathWithAssetsFallback(
-            assets, mr.value("material", std::string{}));
+        glm::vec2 legacyTiling{ 1.0f };
+        glm::vec2 legacyOffset{ 0.0f };
         if (mr.contains("tiling"))
-            Vec2FromJson(mr["tiling"], meshComp.textureTiling);
+            Vec2FromJson(mr["tiling"], legacyTiling);
         if (mr.contains("offset"))
-            Vec2FromJson(mr["offset"], meshComp.textureOffset);
+            Vec2FromJson(mr["offset"], legacyOffset);
 
-        if (!meshComp.materialPath.empty()) {
-            Material mat;
-            std::string err;
-            if (Material::Load(assets.ToAbsolute(meshComp.materialPath), mat, err)) {
-                assets.ApplyMaterialToMeshRenderer(meshComp, mat, meshComp.materialPath);
-            } else {
-                meshComp.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
-            }
-        } else if (!legacyTexturePath.empty() || hasLegacyColor ||
-                   mr.contains("tiling") || mr.contains("offset")) {
-            meshComp.materialPath = MigrateLegacyAppearanceToMaterial(
+        // The material reference is the renderer's only appearance. "" is an
+        // explicit "None (Material)". Scenes written before the reference was
+        // always serialized omit the key: they keep the built-in default
+        // material (MeshRendererComponent's default) unless they carry legacy
+        // renderer-local appearance, which is migrated into its own material.
+        if (const auto material = mr.find("material"); material != mr.end()) {
+            meshComp.materialPath = material->is_string()
+                ? ResolveAssetPathWithAssetsFallback(assets, material->get<std::string>())
+                : std::string{};
+        } else if (LegacyAppearanceNeedsMaterial(legacyTexturePath, legacyColor,
+                                                 legacyTiling, legacyOffset)) {
+            std::string migrated = MigrateLegacyAppearanceToMaterial(
                 assets, "MeshRenderer", legacyTexturePath, legacyColor,
-                meshComp.textureTiling, meshComp.textureOffset);
-            if (!meshComp.materialPath.empty()) {
-                Material migrated;
-                std::string error;
-                if (Material::Load(assets.ToAbsolute(meshComp.materialPath), migrated, error))
-                    assets.ApplyMaterialToMeshRenderer(meshComp, migrated, meshComp.materialPath);
-            }
-            if (!meshComp.texture)
-                meshComp.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
-        } else {
-            meshComp.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
+                legacyTiling, legacyOffset);
+            if (!migrated.empty())
+                meshComp.materialPath = std::move(migrated);
         }
+        assets.ResolveMeshRendererMaterial(meshComp);
     }
 
     if (ent.contains("meshSubdivider") && ent["meshSubdivider"].is_object()) {
@@ -982,10 +990,6 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
                 if (Material::Load(assets.ToAbsolute(skinComp.materialPath), migrated, error))
                     assets.ApplyMaterialToSkinnedMeshRenderer(skinComp, migrated, skinComp.materialPath);
             }
-            if (!skinComp.texture)
-                skinComp.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
-        } else {
-            skinComp.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
         }
     }
 
@@ -1062,13 +1066,12 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
         if (pj.contains("vignetteColor")) Vec3FromJson(pj["vignetteColor"], post.vignetteColor);
         post.vignetteIntensity = pj.value("vignetteIntensity", post.vignetteIntensity);
         post.vignetteSmoothness = pj.value("vignetteSmoothness", post.vignetteSmoothness);
+        // Legacy HDRI keys (skyboxTexture/Rotation/Exposure/Tint) are ignored:
+        // an enabled skybox now always uses the procedural gradient.
         post.skyboxEnabled = pj.value("skyboxEnabled", post.skyboxEnabled);
-        post.skyboxTexturePath = pj.value("skyboxTexture", std::string{});
-        post.skyboxRotationDegrees = pj.value("skyboxRotation", post.skyboxRotationDegrees);
-        post.skyboxExposure = pj.value("skyboxExposure", post.skyboxExposure);
-        if (pj.contains("skyboxTint")) Vec3FromJson(pj["skyboxTint"], post.skyboxTint);
-        if (!post.skyboxTexturePath.empty())
-            post.skyboxTexture = AssetManager::Get().GetSkyboxTexture(post.skyboxTexturePath);
+        if (pj.contains("skyTopColor")) Vec3FromJson(pj["skyTopColor"], post.skyTopColor);
+        if (pj.contains("skyHorizonColor")) Vec3FromJson(pj["skyHorizonColor"], post.skyHorizonColor);
+        if (pj.contains("skyGroundColor")) Vec3FromJson(pj["skyGroundColor"], post.skyGroundColor);
     }
 
     if (ent.contains("audioSource")) {
@@ -1139,13 +1142,16 @@ void ApplyEntityJson(Entity& entity, const json& ent, const std::string& name) {
             for (size_t i = 0; i < script.module->fields.size(); ++i) {
                 const auto& field = script.module->fields[i];
                 const std::string& fieldName = field.name;
-                const bool hasSaved = scriptJson["fields"].contains(fieldName);
-                if (field.valueKind == Mips::FieldValueKind::AudioClip) {
+                const bool hasSaved = field.isPublic && scriptJson["fields"].contains(fieldName);
+                if (field.valueKind == Mips::FieldValueKind::AudioClip ||
+                    field.valueKind == Mips::FieldValueKind::Prefab) {
                     if (hasSaved && scriptJson["fields"][fieldName].is_string())
                         script.fieldAssetPaths[i] = scriptJson["fields"][fieldName].get<std::string>();
                     script.fieldValues[i] = 0.0;
                 } else if (field.valueKind == Mips::FieldValueKind::Array) {
                     script.fieldValues[i] = 0.0;
+                } else if (hasSaved && scriptJson["fields"][fieldName].is_boolean()) {
+                    script.fieldValues[i] = scriptJson["fields"][fieldName].get<bool>() ? 1.0 : 0.0;
                 } else if (hasSaved && scriptJson["fields"][fieldName].is_number()) {
                     script.fieldValues[i] = scriptJson["fields"][fieldName].get<double>();
                 } else {
@@ -1597,13 +1603,11 @@ Entity* SpawnModelFromAsset(Scene& scene, const std::string& projectRelPath, std
             auto& renderer = child->AddComponent<MeshRendererComponent>();
             renderer.meshPartIndex = static_cast<int>(i);
             renderer.SetMeshFile(projectRelPath);
-            renderer.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
         }
         return entity;
     }
     auto& meshComp = entity->AddComponent<MeshRendererComponent>();
     meshComp.SetMeshFile(projectRelPath);
-    meshComp.texture = std::make_shared<Texture>(Texture::CreateCheckerboard(128, 16));
     return entity;
 }
 

@@ -177,7 +177,12 @@ typedef struct ps1_entity {
     fix16_t animator_action_threshold;
     uint8_t render_unlit;
     uint32_t source_entity_id; /* editor ID for UI visibility, zero for generated mesh parts */
+    uint8_t inactive;          /* runtime inactive flag for pools/SetActive (0 = active) */
+    int16_t depth_bias_ot;     /* MeshRenderer.ps1DepthBias in OT slots; + = farther */
 } ps1_entity;
+
+/* Generated scene data appends depth_bias_ot through this macro. */
+#define PS1_ENTITY_DEPTH_BIAS(x) , (x)
 
 typedef struct ps1_rigid_anim_frame {
     fix16_t position[3];
@@ -196,6 +201,7 @@ typedef struct ps1_script_binding {
     uint16_t module_index;
     uint8_t  field_count;
     fix16_t  fields[PS1_MAX_FIELD_VALUES];
+    const char* const* asset_paths; /* per-field strings; NULL = none */
 } ps1_script_binding;
 
 typedef struct ps1_light {
@@ -282,6 +288,14 @@ typedef struct ps1_ui_button_group {
     uint16_t navigation_audio_source, confirm_audio_source; /* entity index + 1, zero = None */
 } ps1_ui_button_group;
 
+#define PS1_PREFAB_ROOT_CAP 32
+
+typedef struct ps1_prefab_entry {
+    const char* path;
+    uint16_t    count;
+    uint16_t    roots[PS1_PREFAB_ROOT_CAP];
+} ps1_prefab_entry;
+
 typedef struct ps1_scene {
     const ps1_entity*         entities;
     unsigned int              entity_count;
@@ -316,8 +330,19 @@ typedef struct ps1_scene {
     unsigned int              background_texture_index;
     const ps1_scene_light*     lights;
     unsigned int              light_count;
+    const ps1_prefab_entry*    prefabs;
+    unsigned int               prefab_count;
     const uint16_t*            color_grading_lut;
+    /* Procedural gradient sky (PostProcessVolume). Zenith/horizon/ground RGB. */
+    uint8_t                    sky_enabled;
+    uint8_t                    sky_top[3], sky_horizon[3], sky_ground[3];
 } ps1_scene;
+
+/* Generated scene data appends the sky through this macro; runtimes whose
+ * scene.h predates the sky fields simply drop it. */
+#define PS1_SCENE_HAS_SKY 1
+#define PS1_SCENE_SKY(en, tr, tg, tb, hr, hg, hb, gr, gg, gb) \
+    , (en), {(tr), (tg), (tb)}, {(hr), (hg), (hb)}, {(gr), (gg), (gb)}
 
 extern const ps1_scene g_ps1_scene;
 extern const ps1_mesh  g_ps1_meshes[];

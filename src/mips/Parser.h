@@ -28,13 +28,14 @@ private:
 
     std::unique_ptr<Ast::EnumDecl> ParseEnum();
     std::unique_ptr<Ast::ClassDecl> ParseClass();
-    std::unique_ptr<Ast::FieldDecl> ParseField();
+    std::unique_ptr<Ast::FieldDecl> ParseField(bool isPublic = true);
     std::unique_ptr<Ast::MethodDecl> ParseMethod(bool isPublic = false);
     std::unique_ptr<Ast::BlockStmt> ParseBlock();
     std::unique_ptr<Ast::Stmt> ParseStatement();
     std::unique_ptr<Ast::Stmt> ParseVarDeclOrExprStatement();
     std::unique_ptr<Ast::Expr> ParseExpression();
     std::unique_ptr<Ast::Expr> ParseAssignment();
+    std::unique_ptr<Ast::Expr> ParseConditional();
     std::unique_ptr<Ast::Expr> ParseLogicalOr();
     std::unique_ptr<Ast::Expr> ParseLogicalAnd();
     std::unique_ptr<Ast::Expr> ParseEquality();

@@ -16,12 +16,12 @@ void MipsSceneSnapshot::Capture(Scene& scene) {
             m_UITexts.push_back({entity->GetID(), text->enabled});
         if (const auto* image = entity->GetComponent<UIImageComponent>())
             m_UIImages.push_back({entity->GetID(), image->enabled});
-        if (!entity->IsActive()) continue;
         const auto* transform = entity->GetComponent<TransformComponent>();
         if (!transform)
             continue;
-        m_Transforms.push_back({ entity->GetID(), transform->position,
-                                transform->rotation, transform->scale });
+        m_Transforms.push_back({ entity->GetID(), entity->IsActive(),
+                                transform->position, transform->rotation,
+                                transform->scale });
     }
 }
 
@@ -44,6 +44,7 @@ void MipsSceneSnapshot::Restore(Scene& scene) const {
         Entity* entity = scene.FindEntity(entry.entityId);
         if (!entity)
             continue;
+        entity->SetActive(entry.active);
         if (auto* transform = entity->GetComponent<TransformComponent>()) {
             transform->position = entry.position;
             transform->rotation = entry.rotation;

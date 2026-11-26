@@ -63,6 +63,23 @@ uncertain.
 
 ## Edit and validate Mips#
 
+Read [mips-sharp.md](mips-sharp.md) for the language/version, Unity-style
+conventions, inlined helper methods and private-field serialization rules.
+
+For repeated objects (road tiles, enemies, coins), do not duplicate a script per
+instance. Pre-place the instances, call `Pool.Register("Road")` once, and cycle
+them with `Pool.Acquire("Road")` / `Pool.Release(entity)`. Inspect runtime
+pools with `runtime.pool --json`; use `OnSpawn` / `OnDespawn` to reset state.
+PS1 has no depth buffer. If a large mesh (road, floor) or an enclosed part
+(wheels inside arches) paints over actors in a PS1 build, push it back with
+`mesh set <entity> --ps1-depth-bias <metres>` instead of changing its type
+preset or renaming entities. Model parts (`meshPart`) keep whole-model scale in
+the Editor, PC and PS1.
+
+For prefab assets use `Scene.Prewarm("assets/prefabs/X.nprefab", capacity)` and
+`Scene.Spawn("assets/prefabs/X.nprefab", x, y, z)`; PS1 bakes fixed copies,
+PC reads the prefab directly. The path must be a literal in PS1 builds.
+
 1. Discover bindings related to the intended behavior:
 
    ```powershell
@@ -88,11 +105,15 @@ mipsync --project "D:\Games\MyGame" runtime play --json
 mipsync --project "D:\Games\MyGame" runtime inspect --json
 ```
 
-Stop only after the requested observation or test:
+Pause, resume, or stop only after the requested observation or test:
 
 ```powershell
+mipsync --project "D:\Games\MyGame" runtime pause --paused true --json
+mipsync --project "D:\Games\MyGame" runtime resume --json
 mipsync --project "D:\Games\MyGame" runtime stop --json
 ```
+
+`runtime.play` on an already-running paused session also resumes it.
 
 Play Mode changes are not authoring changes. Make persistent corrections after
 stopping, verify them, and save the edit scene again.
@@ -195,7 +216,7 @@ expose model/controller/state, meshPart and PS1 export settings. Use
 `animator.set --entity ... --properties '{...}'`, `skinned-mesh.set` or
 `component.set --component MeshRenderer` to author typed properties with Undo.
 Both renderer types support `renderType: "Lit"` (default) and `"Unlit"`.
-Unlit skips lighting on desktop and PS1; P-Sync excludes that lighting work.
+Unlit skips lighting on desktop and PS1.
 
 Read `animator.controller.schema` before creating a controller, then use
 `animator.controller.set --path assets/animations/Controller.ncontroller

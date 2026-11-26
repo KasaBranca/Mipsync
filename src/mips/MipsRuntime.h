@@ -31,13 +31,8 @@ public:
 
     bool IsPlaying() const { return m_Playing; }
     bool IsPaused() const { return m_Paused; }
+    nlohmann::json InspectPools() const;
     void SetPaused(bool paused) { m_Paused = paused; }
-    void BeginPerformanceFrame(bool enabled) {
-        m_VM.SetPerformanceCounting(enabled);
-        m_VM.ResetPerformanceCounts();
-    }
-    const auto& GetOpcodeCounts() const { return m_VM.GetOpcodeCounts(); }
-    const auto& GetHostCounts() const { return m_VM.GetHostCounts(); }
 
     /// Captures current scene transforms as the edit-mode baseline (call after scene load or inspector edits).
     void SyncEditSnapshot(MipsyncEngine::Scene& scene);
@@ -75,6 +70,7 @@ private:
     bool AddInstance(Entity* entity, MipsScriptComponent& script);
     void InvokeLifecycleAll(const char* method, MipsyncEngine::Scene& scene, float deltaTime);
     void FlushDestroyRequests(MipsyncEngine::Scene& scene);
+    void FlushRuntimeEvents(MipsyncEngine::Scene& scene);
 
     VM m_VM;
     MipsPhysicsEventQueue m_PhysicsEvents;
@@ -82,6 +78,7 @@ private:
     std::vector<ScriptInstance> m_Instances;
     MipsSceneSnapshot m_EditSnapshot;
     MipsyncEngine::PhysicsWorld* m_PhysicsWorld = nullptr;
+    uint64_t m_LastStructureRevision = 0;
     bool m_Playing = false;
     bool m_Paused = false;
     std::vector<std::string> m_ExecutionErrors;

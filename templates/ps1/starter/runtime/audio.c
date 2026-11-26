@@ -232,9 +232,27 @@ static void key_on_current(void) {
     s_spectrum_ticks = 0;
 }
 
+static int s_cd_ready;
+
+int ps1_audio_cd_ready(void) { return s_cd_ready; }
+
+/* MIDI and resident-sample clips never touch the CD. CdInit resets the drive
+ * and blocks for ~12 fields, which froze the first presented frame of every
+ * scene even when nothing streams from disc. */
+static int audio_needs_cd(void) {
+    unsigned int i;
+    for (i = 0; i < g_ps1_audio_clip_count && i < 64u; ++i)
+        if (g_ps1_audio_clips[i].cd_path && !g_ps1_audio_clips[i].midi &&
+            !g_ps1_audio_clips[i].sample_data)
+            return 1;
+    return 0;
+}
+
 void ps1_audio_init(void) {
     SpuInit();
-    CdInit();
+    s_cd_ready = audio_needs_cd();
+    if (s_cd_ready)
+        CdInit();
     SpuSetCommonMasterVolume(0x3fff, 0x3fff);
     reset_spu_channels();
     ps1_midi_init();
@@ -247,7 +265,7 @@ void ps1_audio_init(void) {
     s_buffer_started = 0;
     s_spectrum_ticks = 0;
 
-    for (unsigned int i = 0; i < g_ps1_audio_clip_count && i < 64u; ++i) {
+    for (unsigned int i = 0; s_cd_ready && i < g_ps1_audio_clip_count && i < 64u; ++i) {
         CdlFILE file;
         if (!g_ps1_audio_clips[i].cd_path ||
             !CdSearchFile(&file, g_ps1_audio_clips[i].cd_path))

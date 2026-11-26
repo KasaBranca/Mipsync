@@ -11,10 +11,12 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdint>
+#include <optional>
 
 #include "../mips/PS1SceneExport.h"
 #include <glm/glm.hpp>
 #include "../renderer/Camera.h"
+#include "../assets/BuiltinAssets.h"
 
 namespace MipsyncEngine {
 
@@ -163,9 +165,18 @@ struct MeshRendererComponent : public Component {
     /// Imported mesh instance; -1 keeps the legacy combined model.
     int meshPartIndex = -1;
 
-    /// Optional asset-bound texture / material (project-relative paths).
+    /// Error-shader color for "None (Material)" or an unreadable material.
+    static inline const glm::vec4 kErrorColor{ 1.0f, 0.0f, 1.0f, 1.0f };
+
+    /// Resolved texture of the assigned material (project-relative path).
     std::string texturePath;
-    std::string materialPath;
+    /// The renderer's material, the only serialized appearance property.
+    /// New renderers use the read-only built-in default (checkerboard);
+    /// empty means "None (Material)".
+    std::string materialPath = BuiltinAssets::kDefaultMaterial;
+    /// materialPath whose values color/texture/tiling/offset currently hold.
+    /// Empty optional means not resolved yet; the renderer resolves on draw.
+    std::optional<std::string> resolvedMaterialPath;
     /// Resolved UV scale/offset from the assigned material.
     glm::vec2 textureTiling = { 1.0f, 1.0f };
     glm::vec2 textureOffset = { 0.0f, 0.0f };
@@ -176,6 +187,10 @@ struct MeshRendererComponent : public Component {
     /// Writes depth over a pre-rendered background without drawing color.
     bool prerenderOccluder = false;
     bool ps1SeamFill = false;
+    /// PS1 has no depth buffer. Positive metres sort this mesh farther away so
+    /// objects standing on or wrapped around it paint over it (roads, wheels
+    /// inside arches); negative values sort it nearer. Desktop ignores it.
+    float ps1DepthBias = 0.0f;
 
     void RebuildMesh();
     void SetPrimitive(const std::string& primitive, float size);
@@ -396,7 +411,7 @@ struct PostProcessVolumeComponent : public Component {
     int priority = 0;
 
     bool fogEnabled = true;
-    glm::vec3 fogColor{ 0.05f, 0.05f, 0.08f };
+    glm::vec3 fogColor{ 0.70f, 0.84f, 0.96f }; // matches the default sky horizon
     float fogStart = 10.0f;
     float fogEnd = 40.0f;
 
@@ -411,12 +426,14 @@ struct PostProcessVolumeComponent : public Component {
     float vignetteIntensity = 0.35f;
     float vignetteSmoothness = 0.45f;
 
-    bool skyboxEnabled = false;
-    std::string skyboxTexturePath;
-    std::shared_ptr<Texture> skyboxTexture;
-    float skyboxRotationDegrees = 0.0f;
-    float skyboxExposure = 0.0f;
-    glm::vec3 skyboxTint{ 1.0f, 1.0f, 1.0f };
+    /// Procedural gradient sky drawn behind the scene on PC and PS1. The
+    /// colour is a function of tan(elevation): zenith at 45 degrees and above,
+    /// ground from ~18 degrees below the horizon. When disabled the background
+    /// is cleared to the fog colour (legacy behaviour).
+    bool skyboxEnabled = true;
+    glm::vec3 skyTopColor{ 0.22f, 0.45f, 0.85f };
+    glm::vec3 skyHorizonColor{ 0.70f, 0.84f, 0.96f };
+    glm::vec3 skyGroundColor{ 0.36f, 0.34f, 0.31f };
 };
 
 /// Unity-style audio emitter. Clip paths are project-relative and currently
@@ -565,6 +582,11 @@ struct UIAudioSpectrumComponent : public Component {
 
 class Entity {
 public:
+    /// Monotonic counter for entity/component structure changes. Runtime
+    /// systems use it to avoid rescanning every entity on every frame.
+    static uint64_t GetStructureRevision() { return s_StructureRevision; }
+    static void NotifyStructureChanged() { ++s_StructureRevision; }
+
     Entity(uint32_t id, const std::string& name = "Entity") : m_ID(id) {
         AddComponent<TagComponent>(name);
         AddComponent<TransformComponent>();
@@ -586,6 +608,7 @@ public:
         comp->entity = this;
         T* rawPtr = comp.get();
         m_Components.push_back(std::move(comp));
+        ++s_StructureRevision;
         return *rawPtr;
     }
 
@@ -604,6 +627,7 @@ public:
         component->entity = this;
         Component* result = component.get();
         m_Components.push_back(std::move(component));
+        ++s_StructureRevision;
         return result;
     }
 
@@ -679,6 +703,7 @@ public:
         for (auto it = m_Components.begin(); it != m_Components.end(); ++it) {
             if (dynamic_cast<T*>(it->get())) {
                 m_Components.erase(it);
+                ++s_StructureRevision;
                 return;
             }
         }
@@ -690,6 +715,7 @@ public:
         for (auto it = m_Components.begin(); it != m_Components.end(); ++it) {
             if (it->get() == target) {
                 m_Components.erase(it);
+                ++s_StructureRevision;
                 return;
             }
         }
@@ -707,6 +733,7 @@ public:
     bool IsPrefabInstance() const { return !m_PrefabSourcePath.empty(); }
 
 private:
+    inline static uint64_t s_StructureRevision = 0;
     uint32_t m_ID;
     bool m_Active = true;
     bool m_Static = false;

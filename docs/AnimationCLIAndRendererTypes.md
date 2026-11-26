@@ -5,8 +5,7 @@ or Unlit. The setting survives scene save/load, duplication, component copy and
 Undo. Legacy scenes default to Lit. Unlit preserves texture, material and vertex
 colors while skipping vertex lighting, light matrices and normal corrections;
 skinned desktop draws also skip bone normal inverse matrices. PS1 export records
-the mode per drawable part. P-Sync keeps geometry/raster costs and excludes
-lighting cost, including correct cache invalidation when the mode changes.
+the mode per drawable part.
 
 The public animation CLI provides model/clip metadata, typed component setters,
 controller schema and validation, state/parameter/transition authoring, runtime
@@ -35,7 +34,7 @@ Older marked builtins still receive bundled updates.
 Regression coverage includes all 16 protocol buttons on digital/DualShock/analog
 stick responses, held/down/up and a complete short tap between gameplay frames;
 custom action thresholds, reset/hold/repeat and idle return for vertex and rigid
-animation; command discovery/schema/search; and P-Sync Unlit work accounting.
+animation; and command discovery/schema/search.
 Native CLI verification uses a copy of Train to exercise asset Undo, invalid clip
 and stack rejection, left/right extraction, all boxing input cases, runtime
 inspection, renderer Undo and a complete PS1 disc build. Results are retained in

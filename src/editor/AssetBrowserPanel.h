@@ -139,6 +139,8 @@ private:
     void HandleAssetClickSelection(const AssetEntry& entry, size_t entryIndex);
     void DrawAssetContextMenu(const AssetEntry& entry, size_t entryIndex);
     void OpenRenameDialogForSelection();
+    /// Copies a read-only built-in asset into Assets so it can be edited.
+    void DuplicateBuiltinToAssets(const AssetEntry& entry);
     void BeginInlineRename(const std::string& projectRelPath, bool createdAsset = false);
     void CommitInlineRename(const AssetEntry& entry);
     void CreateAssetAndBeginRename(AssetKind kind);

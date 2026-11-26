@@ -207,7 +207,12 @@ static void PresentFrame(void) {
 
     PutDispEnv(&disp[db]);
 
+#ifdef PS1_SCENE_HAS_SKY
+    /* The procedural sky covers every pixel, so skip the redundant clear. */
+    if (has_background || g_ps1_scene.sky_enabled) {
+#else
     if (has_background) {
+#endif
         draw[db].isbg = 0;
     } else {
         draw[db].isbg = 1;
@@ -282,6 +287,15 @@ static void BindSceneScripts(void) {
                 inst->runtime_fields[f].ival=binding->fields[f]!=0;
             }
         }
+        if (binding->asset_paths) {
+            for (uint8_t f = 0; f < binding->field_count && f < VM_FIELD_CAP; ++f) {
+                if (f < mod->field_count &&
+                    (mod->fields[f].value_kind == 2 || mod->fields[f].value_kind == 5)) {
+                    inst->runtime_fields[f].tag = HOST_VAL_NATIVE_STRING;
+                    inst->runtime_fields[f].text = binding->asset_paths[f] ? binding->asset_paths[f] : "";
+                }
+            }
+        }
 
 
 
@@ -325,7 +339,8 @@ static void RunPendingStarts(void) {
 static void RunUpdates(fix16_t delta_time) {
 
     for (int i = 0; i < g_instance_count; ++i) {
-        if (ps1_scene_destroy_pending(g_instances[i].entity_index)) continue;
+        const ps1_entity* self = ps1_scene_entity(g_instances[i].entity_index);
+        if (!self || self->inactive || ps1_scene_destroy_pending(g_instances[i].entity_index)) continue;
 
         if (g_update[i])
 
@@ -340,7 +355,8 @@ static void RunUpdates(fix16_t delta_time) {
 
 static void RunLateUpdates(void) {
     for (int i = 0; i < g_instance_count; ++i) {
-        if (ps1_scene_destroy_pending(g_instances[i].entity_index)) continue;
+        const ps1_entity* self = ps1_scene_entity(g_instances[i].entity_index);
+        if (!self || self->inactive || ps1_scene_destroy_pending(g_instances[i].entity_index)) continue;
         if (g_late_update[i])
             vm_run_method(&g_vm, g_instances[i].module, &g_instances[i],
                           g_late_update[i]);
@@ -367,6 +383,30 @@ static void ProcessDestroyRequests(void) {
             ps1_ui_set_image_visible(entity->source_entity_id, 0);
         }
         ps1_scene_finish_destroy((unsigned int)index);
+    }
+}
+
+static void ProcessPoolEvents(void) {
+    uint16_t ids[VM_POOL_MEMBER_CAP];
+    int count;
+    int i, j;
+    count = host_take_pool_spawn(ids, VM_POOL_MEMBER_CAP);
+    for (i = 0; i < count; ++i) {
+        for (j = 0; j < g_instance_count; ++j) {
+            const mbc_method* method;
+            if (g_instances[j].entity_index != ids[i]) continue;
+            method = mbc_find_method(g_instances[j].module, "OnSpawn");
+            if (method) vm_run_method(&g_vm, g_instances[j].module, &g_instances[j], method);
+        }
+    }
+    count = host_take_pool_despawn(ids, VM_POOL_MEMBER_CAP);
+    for (i = 0; i < count; ++i) {
+        for (j = 0; j < g_instance_count; ++j) {
+            const mbc_method* method;
+            if (g_instances[j].entity_index != ids[i]) continue;
+            method = mbc_find_method(g_instances[j].module, "OnDespawn");
+            if (method) vm_run_method(&g_vm, g_instances[j].module, &g_instances[j], method);
+        }
     }
 }
 
@@ -468,6 +508,7 @@ int main(void) {
     }
 
     RunPendingStarts();
+    ProcessPoolEvents();
     ProcessDestroyRequests();
     ps1_scene_resolve_hierarchy();
     last_vblank = VSync(-1);
@@ -494,6 +535,7 @@ int main(void) {
 
         ps1_physics_begin_frame();
         RunUpdates(delta_time);
+        ProcessPoolEvents();
         ProcessDestroyRequests();
         DispatchContactEvents();
         /* Update/coroutines may move kinematic platforms and carry their
@@ -502,6 +544,7 @@ int main(void) {
         /* LateUpdate observes the pose rendered this frame, matching desktop. */
         ps1_scene_update_vertex_anims(delta_time);
         RunLateUpdates();
+        ProcessPoolEvents();
         ProcessDestroyRequests();
         ps1_audio_update();
         ps1_scene_resolve_hierarchy();

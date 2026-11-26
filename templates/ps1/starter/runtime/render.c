@@ -153,6 +153,45 @@ static int mesh_triangle_otz_fine(int32_t avsz) {
     return otz;
 }
 
+static int world_to_psx(fix16_t v);
+
+/* Prop/Corridor horizontal faces are only treated as ground when the whole
+ * mesh is ground-sized. Applying the rule to a car's roof, trunk or fenders
+ * sent those faces to their farthest depth, so neighbouring body panels were
+ * painted over them (black holes beside the trunk). Smaller ground pieces can
+ * use the Floor preset or MeshRenderer.ps1DepthBias explicitly. */
+#define PS1_GROUND_SURFACE_MIN_RADIUS 256 /* PSX units = 4 m */
+
+static int entity_is_ground_sized(const ps1_entity* ent) {
+    static const ps1_entity* cached_entity = 0;
+    static fix16_t cached_scale[3];
+    static int cached_result = 0;
+    fix16_t max_scale;
+    int axis;
+    int radius;
+    if (ent == cached_entity && ent->scale[0] == cached_scale[0] &&
+        ent->scale[1] == cached_scale[1] && ent->scale[2] == cached_scale[2])
+        return cached_result;
+    max_scale = 0;
+    for (axis = 0; axis < 3; ++axis) {
+        const fix16_t magnitude = ent->scale[axis] < 0 ? -ent->scale[axis] : ent->scale[axis];
+        if (magnitude > max_scale) max_scale = magnitude;
+    }
+    if (ent->mesh == PS1_MESH_CUSTOM && ent->mesh_index > 0 &&
+        ent->mesh_index <= g_ps1_mesh_count) {
+        const ps1_mesh* mesh = &g_ps1_meshes[ent->mesh_index - 1u];
+        const int64_t local = ((int64_t)mesh->bounds_radius * mesh->scale_q12) >> 12;
+        radius = (int)((local * max_scale) >> 16);
+    } else {
+        /* Primitive: mesh_size is the edge length; ~0.87 * size encloses it. */
+        radius = world_to_psx(fix16_mul(ent->mesh_size, max_scale)) * 7 / 8;
+    }
+    cached_entity = ent;
+    for (axis = 0; axis < 3; ++axis) cached_scale[axis] = ent->scale[axis];
+    cached_result = radius >= PS1_GROUND_SURFACE_MIN_RADIUS;
+    return cached_result;
+}
+
 static int floor_surface_otz(const ps1_entity* ent, const ps1_mesh_tri* triangle,
                              int current_otz, int32_t z0, int32_t z1,
                              int32_t z2, int32_t z3) {
@@ -165,7 +204,8 @@ static int floor_surface_otz(const ps1_entity* ent, const ps1_mesh_tri* triangle
     horizontal_world_surface =
         (ent->render_preset == PS1_RENDER_PRESET_PROP ||
          ent->render_preset == PS1_RENDER_PRESET_CORRIDOR) &&
-        (triangle->ny >= 3584 || triangle->ny <= -3584);
+        (triangle->ny >= 3584 || triangle->ny <= -3584) &&
+        entity_is_ground_sized(ent);
     if (ent->render_preset != PS1_RENDER_PRESET_FLOOR && !horizontal_world_surface)
         return current_otz;
 
@@ -208,20 +248,52 @@ static int ascii_contains_folded(const char* text, const char* needle) {
     return 0;
 }
 
-static int character_shell_ot_bias(const ps1_entity* ent) {
-    if (!ent || !ent->name)
-        return 0;
+static int character_shell_ot_bias_uncached(const char* name) {
     /* PS1 has no Z-buffer. Use only a tie-breaking offset for headwear: a
      * larger whole-mesh offset also drags the hat's inner/back surfaces in
      * front of the face even when their real camera depth is farther away. */
-    if (ascii_contains_folded(ent->name, "hat") ||
-        ascii_contains_folded(ent->name, "helmet") ||
-        ascii_contains_folded(ent->name, "headwear") ||
-        ascii_contains_folded(ent->name, "headdress"))
+    if (ascii_contains_folded(name, "hat") ||
+        ascii_contains_folded(name, "helmet") ||
+        ascii_contains_folded(name, "headwear") ||
+        ascii_contains_folded(name, "headdress"))
         return 1;
-    if (ascii_contains_folded(ent->name, "hair"))
+    if (ascii_contains_folded(name, "hair"))
         return 3;
     return 0;
+}
+
+/* Entity names are immutable exported strings, so the result is memoized by
+ * name pointer in a small direct-mapped table. Collisions only recompute. */
+#define PS1_SHELL_BIAS_CACHE 64u
+static int character_shell_ot_bias(const ps1_entity* ent) {
+    static const char* cached_name[PS1_SHELL_BIAS_CACHE];
+    static int8_t cached_bias[PS1_SHELL_BIAS_CACHE];
+    unsigned int slot;
+    if (!ent || !ent->name)
+        return 0;
+    slot = (unsigned int)(((uintptr_t)ent->name >> 2) & (PS1_SHELL_BIAS_CACHE - 1u));
+    if (cached_name[slot] != ent->name) {
+        cached_bias[slot] = (int8_t)character_shell_ot_bias_uncached(ent->name);
+        cached_name[slot] = ent->name;
+    }
+    return cached_bias[slot];
+}
+
+/* Ordering-table offset for a whole entity, in OT slots (negative = nearer).
+ * Combines the costume-shell tie-break with MeshRenderer.ps1DepthBias, which
+ * lets authors push roads/ground or wheels inside arches behind the actors
+ * that stand on or wrap around them. */
+static int entity_ot_offset(const ps1_entity* ent) {
+    return (ent ? ent->depth_bias_ot : 0) - character_shell_ot_bias(ent) * 2;
+}
+
+static int offset_otz(int otz, int offset) {
+    otz += offset;
+    if (otz < PS1_WORLD_OT_MIN)
+        return PS1_WORLD_OT_MIN;
+    if (otz >= OT_LEN)
+        return OT_LEN - 1;
+    return otz;
 }
 
 typedef struct {
@@ -467,6 +539,15 @@ typedef struct {
 
 static int world_to_psx(fix16_t v);
 static void unity_pos_to_psx(const fix16_t pos[3], VECTOR* out);
+
+static int ps1_sky_active(unsigned int background_index) {
+#ifdef PS1_SCENE_HAS_SKY
+    return background_index == 0 && g_ps1_scene.sky_enabled;
+#else
+    (void)background_index;
+    return 0;
+#endif
+}
 
 static unsigned int active_background_texture_index(void) {
     unsigned int index = g_ps1_scene.background_texture_index;
@@ -2173,7 +2254,7 @@ typedef struct {
     uint16_t vertex_offset;
     uint16_t triangle_offset;
     int32_t near_z;
-    int shell_ot_bias;
+    int ot_offset;
     int fog_enabled;
     int visibility_certified;
     int use_tex;
@@ -2333,11 +2414,8 @@ static int __attribute__((noinline)) draw_cached_flat_quad(
     otz = floor_surface_otz(ctx->ent,
                             &ctx->mesh->tris[triangle_index], otz,
                             z[0], z[1], z[2], z[3]);
-    if (ctx->shell_ot_bias > 0) {
-        otz -= ctx->shell_ot_bias * 2;
-        if (otz < PS1_WORLD_OT_MIN)
-            otz = PS1_WORLD_OT_MIN;
-    }
+    if (ctx->ot_offset != 0)
+        otz = offset_otz(otz, ctx->ot_offset);
 
     for (i = 0; i < 4; ++i) {
         r[i] = s_static_face_light_cache[ctx->triangle_offset + triangle_index][0];
@@ -2503,7 +2581,7 @@ static int __attribute__((noinline)) draw_cached_flat_fog_triangle(
 static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* ot,
                                  const ps1_entity* ent, const ps1_mesh* mesh,
                                  uint16_t vertex_offset, uint16_t triangle_offset,
-                                 int32_t near_z, int shell_ot_bias,
+                                 int32_t near_z, int ot_offset,
                                  int default_use_tex, uint16_t default_tpage,
                                  uint16_t default_clut,
                                  int default_uoff, int default_voff, int skip_unsafe,
@@ -2529,7 +2607,7 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
     quad_ctx.vertex_offset = vertex_offset;
     quad_ctx.triangle_offset = triangle_offset;
     quad_ctx.near_z = near_z;
-    quad_ctx.shell_ot_bias = shell_ot_bias;
+    quad_ctx.ot_offset = ot_offset;
     quad_ctx.fog_enabled = fog_enabled;
     /* The visible list already certified face indices, strict winding and
      * native-safe depth. The pair branch below excludes clipped faces. Keep
@@ -2649,11 +2727,8 @@ static int draw_cached_flat_mesh(char** pri, const char* packet_end, uint32_t* o
         avsz = (z0 + z1 + z2) / 12;
         otz = mesh_triangle_otz_fine(avsz);
         otz = floor_surface_otz(ent, face, otz, z0, z1, z2, z2);
-        if (shell_ot_bias > 0) {
-            otz -= shell_ot_bias * 2;
-            if (otz < PS1_WORLD_OT_MIN)
-                otz = PS1_WORLD_OT_MIN;
-        }
+        if (ot_offset != 0)
+            otz = offset_otz(otz, ot_offset);
 
         /* Resolve materials only after rejection. Most meshes stay entirely
          * on the default descriptor; ProModeler face overrides reuse the last
@@ -3221,7 +3296,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
     int     fi, otz;
     uint8_t base_r, base_g, base_b;
     uint8_t rigid_light_colors[27][3];
-    int     shell_ot_bias = 0;
+    int     ot_offset = 0;
     int     added = 0;
     int     shared_character_transform_hit = 0;
     int fog_bounds_clear = !g_ps1_scene.fog_enabled;
@@ -3238,7 +3313,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
      * animation. Baked meshes are separate material parts too, so submitting
      * Hat after Head in one coarse OT bucket would draw Hat first and then let
      * Head overwrite it. Keep costume shells in a nearer bucket. */
-    shell_ot_bias = character_shell_ot_bias(ent);
+    ot_offset = entity_ot_offset(ent);
     if (rigid_frame) {
         const ps1_rigid_anim_frame* rigid_next = entity_rigid_next_frame(ent);
         fix16_t rigid_pos[3];
@@ -4080,7 +4155,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                 const int fast_added = draw_cached_flat_mesh(
                     pri, packet_end, ot, ent, m,
                     static_vertex_offset, static_triangle_offset,
-                    entity_near_z, shell_ot_bias,
+                    entity_near_z, ot_offset,
                     use_tex, tpage, clut, tex_uoff, tex_voff,
                     static_cache->needs_safe_clip,
                     static_cache->visible_list_valid ? &s_static_visible_triangles[static_triangle_offset] : 0,
@@ -4138,13 +4213,7 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                      * collapsed nearby body surfaces into the same buckets,
                      * making limbs, torso and clothing overwrite each other. */
                     rigid_otz = (int)((z0 + z1 + z2) / 3) >> 3;
-                    /* Accessory bias was authored in the previous /16 bucket
-                     * scale; double it to preserve the same physical offset. */
-                    rigid_otz -= shell_ot_bias * 2;
-                    if (rigid_otz < PS1_WORLD_OT_MIN)
-                        rigid_otz = PS1_WORLD_OT_MIN;
-                    else if (rigid_otz >= OT_LEN)
-                        rigid_otz = OT_LEN - 1;
+                    rigid_otz = offset_otz(rigid_otz, ot_offset);
 
                     const int32_t skinned_tri_depth = (z0 + z1 + z2) / 3;
                     const int tri_use_tex = use_tex && tpage && !is_triangle_fully_fogged(skinned_tri_depth) && (scene_fog_amount_q8(skinned_tri_depth) <= 0);
@@ -4805,11 +4874,8 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                                 authored_floor ? src[2].p.vz : c2->z);
                             if (smooth_object_otz_floor > 0 && otz < smooth_object_otz_floor)
                                 otz = smooth_object_otz_floor;
-                            if (shell_ot_bias > 0) {
-                                otz -= shell_ot_bias * 2;
-                                if (otz < PS1_WORLD_OT_MIN)
-                                    otz = PS1_WORLD_OT_MIN;
-                            }
+                            if (ot_offset != 0)
+                                otz = offset_otz(otz, ot_offset);
 
                             if (clipped_smooth) {
                                 cr0 = clamp_u8(c0->r); cg0 = clamp_u8(c0->g); cb0 = clamp_u8(c0->b);
@@ -5024,11 +5090,8 @@ static int draw_entity(char** pri, const char* packet_end, uint32_t* ot, const p
                     otz = floor_surface_otz(ent, t, otz, z0, z1, z2, z2);
                 if (smooth_object_otz_floor > 0 && otz < smooth_object_otz_floor)
                     otz = smooth_object_otz_floor;
-                if (!is_viewmodel && shell_ot_bias > 0) {
-                    otz -= shell_ot_bias * 2;
-                    if (otz < PS1_WORLD_OT_MIN)
-                        otz = PS1_WORLD_OT_MIN;
-                }
+                if (!is_viewmodel && ot_offset != 0)
+                    otz = offset_otz(otz, ot_offset);
 
                 /* Per-face GTE lighting using the exported face normal.
                  * For reversed-winding copies (back faces), the cross product
@@ -6211,6 +6274,152 @@ static int __attribute__((noinline)) draw_entity(char** pri, const char* packet_
 }
 #endif
 
+/* ---------------------------------------------------------------------------
+ * Procedural gradient sky. The desktop shader blends by tan(elevation):
+ * horizon -> zenith over 0..1 above the horizon and horizon -> ground over
+ * 0..1/3 below it. For a level camera tan(elevation) is linear in screen Y
+ * (offset / geom_screen), so Gouraud-shaded bands bounded by lines parallel
+ * to the horizon reproduce the same gradient with four untextured quads.
+ * ------------------------------------------------------------------------- */
+static void sky_lerp_rgb(const uint8_t a[3], const uint8_t b[3], int t_q12, uint8_t out[3]) {
+    int c;
+    if (t_q12 < 0) t_q12 = 0;
+    if (t_q12 > ONE) t_q12 = ONE;
+    for (c = 0; c < 3; ++c)
+        out[c] = (uint8_t)(a[c] + (((int)b[c] - (int)a[c]) * t_q12 >> 12));
+}
+
+/* Colour on one vertical screen edge where the band runs from y0 (c0) to
+ * y1 (c1), evaluated at the clamped row y. */
+static void sky_edge_rgb(int y, int y0, int y1, const uint8_t c0[3], const uint8_t c1[3],
+                         uint8_t out[3]) {
+    const int span = y1 - y0;
+    sky_lerp_rgb(c0, c1, span != 0 ? ((y - y0) * ONE) / span : 0, out);
+}
+
+static char* draw_sky_band(char* pri, const char* packet_end, uint32_t* ot,
+                           int top_l, int top_r, const uint8_t top_rgb[3],
+                           int bottom_l, int bottom_r, const uint8_t bottom_rgb[3]) {
+    /* Clamp each vertical edge to the screen; the GPU drops polygons taller
+     * than 511 lines, and clamping keeps the colour exact along each edge. */
+    const int h = s_screen_h;
+    const int tl = top_l < 0 ? 0 : top_l > h ? h : top_l;
+    const int tr = top_r < 0 ? 0 : top_r > h ? h : top_r;
+    const int bl = bottom_l < 0 ? 0 : bottom_l > h ? h : bottom_l;
+    const int br = bottom_r < 0 ? 0 : bottom_r > h ? h : bottom_r;
+    uint8_t ctl[3], ctr[3], cbl[3], cbr[3];
+    POLY_G4* quad;
+    if (tl >= bl && tr >= br)
+        return pri;
+    if ((const char*)(pri + sizeof(POLY_G4)) > packet_end)
+        return pri;
+    sky_edge_rgb(tl, top_l, bottom_l, top_rgb, bottom_rgb, ctl);
+    sky_edge_rgb(tr, top_r, bottom_r, top_rgb, bottom_rgb, ctr);
+    sky_edge_rgb(bl, top_l, bottom_l, top_rgb, bottom_rgb, cbl);
+    sky_edge_rgb(br, top_r, bottom_r, top_rgb, bottom_rgb, cbr);
+    quad = (POLY_G4*)pri;
+    setPolyG4(quad);
+    setXY4(quad, 0, tl, s_screen_w, tr, 0, bl, s_screen_w, br);
+    setRGB0(quad, ctl[0], ctl[1], ctl[2]);
+    setRGB1(quad, ctr[0], ctr[1], ctr[2]);
+    setRGB2(quad, cbl[0], cbl[1], cbl[2]);
+    setRGB3(quad, cbr[0], cbr[1], cbr[2]);
+    add_world_primitive(ot + (OT_LEN - 1), quad);
+    return (char*)(quad + 1);
+}
+
+/* Screen position of a world direction (camera rotation only). Returns 0 when
+ * the direction is behind the camera. */
+static int sky_project_direction(int32_t dx, int32_t dz, int32_t* sx, int32_t* sy) {
+    const int64_t cx = (int64_t)s_cam_mtx.m[0][0] * dx + (int64_t)s_cam_mtx.m[0][2] * dz;
+    const int64_t cy = (int64_t)s_cam_mtx.m[1][0] * dx + (int64_t)s_cam_mtx.m[1][2] * dz;
+    const int64_t cz = (int64_t)s_cam_mtx.m[2][0] * dx + (int64_t)s_cam_mtx.m[2][2] * dz;
+    if (cz <= 0)
+        return 0;
+    *sx = (int32_t)(s_screen_w / 2 + cx * s_geom_screen / cz);
+    *sy = (int32_t)(s_screen_h / 2 + cy * s_geom_screen / cz);
+    return 1;
+}
+
+/* Draw-mode packet toggling GPU dithering. The engine keeps dithering off,
+ * but an undithered 15-bit gradient shows hard bands across the sky. */
+static char* sky_draw_mode(char* pri, const char* packet_end, uint32_t* ot, int dither) {
+    DR_TPAGE* mode;
+    if ((const char*)(pri + sizeof(DR_TPAGE)) > packet_end)
+        return pri;
+    mode = (DR_TPAGE*)pri;
+    setDrawTPage(mode, 0, dither, 0);
+    addPrim(ot + (OT_LEN - 1), mode);
+    return (char*)(mode + 1);
+}
+
+static char* draw_procedural_sky_bands(char* pri, const char* packet_end, uint32_t* ot) {
+#ifdef PS1_SCENE_HAS_SKY
+    const uint8_t* top = g_ps1_scene.sky_top;
+    const uint8_t* horizon = g_ps1_scene.sky_horizon;
+    const uint8_t* ground = g_ps1_scene.sky_ground;
+    const int far_above = -4096, far_below = 4096;
+    /* Camera rows are right, -up, forward (world columns x, y, z). */
+    const int32_t fx = s_cam_mtx.m[2][0], fz = s_cam_mtx.m[2][2];
+    const int32_t rx = s_cam_mtx.m[0][0], rz = s_cam_mtx.m[0][2];
+    int32_t ax, ay, bx, by;
+    int left, right, up_sign, span_up, span_down;
+
+    if ((int64_t)fx * fx + (int64_t)fz * fz < (int64_t)(ONE / 64) * (ONE / 64) ||
+        !sky_project_direction(fx, fz, &ax, &ay)) {
+        /* Looking straight up or down: one flat colour. */
+        const uint8_t* flat = s_cam_mtx.m[2][1] > 0 ? top : ground;
+        return draw_sky_band(pri, packet_end, ot, far_above, far_above, flat,
+                             far_below, far_below, flat);
+    }
+    /* A second horizontal direction gives the horizon's slope (camera roll). */
+    if (sky_project_direction(fx * 4 + rx, fz * 4 + rz, &bx, &by) && bx != ax) {
+        left = (int)(ay + (int64_t)(by - ay) * (0 - ax) / (bx - ax));
+        right = (int)(ay + (int64_t)(by - ay) * (s_screen_w - ax) / (bx - ax));
+    } else {
+        left = right = (int)ay;
+    }
+    left = left < -2048 ? -2048 : left > 2048 ? 2048 : left;
+    right = right < -2048 ? -2048 : right > 2048 ? 2048 : right;
+    /* World up projects towards smaller screen Y unless the camera is
+     * upside down (|roll| > 90 degrees), where the -up row flips sign. */
+    up_sign = s_cam_mtx.m[1][1] <= 0 ? -1 : 1;
+    span_up = s_geom_screen;          /* tan(elevation) = 1   -> zenith */
+    span_down = s_geom_screen / 3;    /* tan(depression) = 1/3 -> ground */
+    if (up_sign < 0) {
+        pri = draw_sky_band(pri, packet_end, ot, far_above, far_above, top,
+                            left - span_up, right - span_up, top);
+        pri = draw_sky_band(pri, packet_end, ot, left - span_up, right - span_up, top,
+                            left, right, horizon);
+        pri = draw_sky_band(pri, packet_end, ot, left, right, horizon,
+                            left + span_down, right + span_down, ground);
+        pri = draw_sky_band(pri, packet_end, ot, left + span_down, right + span_down, ground,
+                            far_below, far_below, ground);
+    } else {
+        pri = draw_sky_band(pri, packet_end, ot, far_above, far_above, ground,
+                            left - span_down, right - span_down, ground);
+        pri = draw_sky_band(pri, packet_end, ot, left - span_down, right - span_down, ground,
+                            left, right, horizon);
+        pri = draw_sky_band(pri, packet_end, ot, left, right, horizon,
+                            left + span_up, right + span_up, top);
+        pri = draw_sky_band(pri, packet_end, ot, left + span_up, right + span_up, top,
+                            far_below, far_below, top);
+    }
+    return pri;
+#else
+    (void)packet_end; (void)ot;
+    return pri;
+#endif
+}
+
+static char* draw_procedural_sky(char* pri, const char* packet_end, uint32_t* ot) {
+    /* addPrim prepends within a bucket, so insert in reverse draw order:
+     * dither on -> sky bands -> dither off -> world. */
+    pri = sky_draw_mode(pri, packet_end, ot, 0);
+    pri = draw_procedural_sky_bands(pri, packet_end, ot);
+    return sky_draw_mode(pri, packet_end, ot, 1);
+}
+
 void ps1_render_frame(uint32_t* ot, char** nextpri, const char* packet_end) {
     char* pri;
     unsigned int i, count;
@@ -6284,8 +6493,9 @@ void ps1_render_frame(uint32_t* ot, char** nextpri, const char* packet_end) {
      * reached fully opaque fog is visually identical to the cleared pixels.
      * Skip its GPU packet entirely. Keep it when a prerendered background is
      * active because that polygon may still be needed to hide the image. */
+    /* Only valid against the flat fog-colour clear; the gradient sky differs. */
     s_discard_solid_fog_polygons =
-        (uint8_t)(g_ps1_scene.fog_enabled && background_index == 0);
+        (uint8_t)(g_ps1_scene.fog_enabled && background_index == 0 && !ps1_sky_active(background_index));
     if (background_index != 0) {
         const uint16_t bw = ps1_texture_width(background_index);
         const uint16_t bh = ps1_texture_height(background_index);
@@ -6297,13 +6507,6 @@ void ps1_render_frame(uint32_t* ot, char** nextpri, const char* packet_end) {
         uint16_t source_x = 0;
         int background_ok = bw > 0 && bh > 0;
 
-        if (!is_baked_background) {
-            /* HDRI/equirectangular skyboxes use the upper half as the cheap
-             * runtime sky band. Pre-rendered backgrounds use all 320x240. */
-            sample_height = (uint16_t)(bh / 2u);
-            if (sample_height == 0)
-                sample_height = bh;
-        }
 
         /* A 16-bpp PS1 texture page exposes at most 256 horizontal texels.
          * Pre-rendered backgrounds are 320x240, so drawing one FT4 cropped
@@ -6465,6 +6668,13 @@ void ps1_render_frame(uint32_t* ot, char** nextpri, const char* packet_end) {
             break;
         }
     }
+
+    /* Added last into the farthest bucket: addPrim prepends, so the sky is
+     * drawn before every world primitive, including far geometry clamped into
+     * the same bucket. Uses the UI reserve so it is never dropped (the frame
+     * buffer is not cleared while the sky is active). */
+    if (ps1_sky_active(background_index))
+        pri = draw_procedural_sky(pri, packet_end, ot);
 
     ps1_ui_render(ot, &pri, packet_end);
     *nextpri = pri;
