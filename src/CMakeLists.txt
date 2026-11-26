@@ -390,6 +390,12 @@ add_executable(MipsyncPs1TexturePaletteTests
 target_include_directories(MipsyncPs1TexturePaletteTests PRIVATE
     ${CMAKE_SOURCE_DIR}/tests/stubs/ps1_textures)
 add_test(NAME MipsyncPs1TexturePalette COMMAND MipsyncPs1TexturePaletteTests)
+add_executable(MipsyncPs1TextureUnpackTests
+    ${CMAKE_SOURCE_DIR}/tests/Ps1TextureUnpackTests.c
+    ${CMAKE_SOURCE_DIR}/templates/ps1/starter/runtime/textures.c)
+target_include_directories(MipsyncPs1TextureUnpackTests PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests/stubs/ps1_textures)
+add_test(NAME MipsyncPs1TextureUnpack COMMAND MipsyncPs1TextureUnpackTests)
 add_executable(MipsyncPs1TextureResolutionTests
     ${CMAKE_SOURCE_DIR}/tests/Ps1TextureResolutionTests.cpp
     mips/PS1TextureExport.cpp assets/Material.cpp assets/BuiltinAssets.cpp
